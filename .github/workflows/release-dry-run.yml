@@ -23,7 +23,8 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      # No rust-cache: its cleanup walks the unpacked crates under target/package and reports
+      # errors for their tests' directories, and a packaging check gains little from a cache.
       # Both crates at once, so terrio-cli is verified against the terrio being released rather
       # than the version on crates.io.
       - name: Package and verify terrio and terrio-cli
