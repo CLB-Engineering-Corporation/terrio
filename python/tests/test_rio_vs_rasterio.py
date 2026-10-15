@@ -5,8 +5,10 @@ tests are skipped when rasterio is not installed; checks on real files need `TER
 the remote one `TERRIO_TEST_REMOTE`.
 """
 
+import dataclasses
 import importlib.util
 import os
+import platform
 import sys
 from pathlib import Path
 
@@ -44,8 +46,22 @@ def _data():
     return Path(value) if value and Path(value).is_dir() else None
 
 
+# rasterio's macOS arm64 wheel builds GDAL with fused multiply-adds, so map coordinates on pixel
+# boundaries (a line's end at x = 500000 on a grid starting there) can turn into pixel coordinates
+# a hair below the integer: GDAL then burns the neighbouring pixel (the whole line shifts by one
+# column). Linux and Windows wheels agree with terrio exactly.
+FMA_SENSITIVE = {
+    "rasterize: replace, all_touched, add, out, dtypes",
+    "geometry_mask, geometry_window, raster_geometry_mask",
+    "mask: crop, filled, invert, all_touched, pad, indexes, nodata",
+}
+MACOS_ARM = sys.platform == "darwin" and platform.machine() == "arm64"
+
+
 @pytest.mark.parametrize("check", compare.CHECKS, ids=_id)
 def test_check(check, scratch):
+    if MACOS_ARM and check.name in FMA_SENSITIVE:
+        check = dataclasses.replace(check, expect="tolerance", max_frac=0.01)
     data = _data()
     if check.needs_data and data is None:
         pytest.skip("TERRIO_TEST_DATA is not set")
