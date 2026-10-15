@@ -13,6 +13,11 @@ pub struct Args {
     /// returns and give each dimension's range.
     #[arg(long)]
     stats: bool,
+    /// Compute band histograms as `gdalinfo -hist` does: 256 buckets over the type's range for
+    /// Byte and Int8 bands, otherwise over the band's approximate minimum and maximum (exact with
+    /// `--stats`) widened by half a bucket.
+    #[arg(long)]
+    hist: bool,
     /// Only these layers of a vector dataset.
     #[arg(short, long = "layer")]
     layers: Vec<String>,
@@ -23,7 +28,7 @@ pub struct Args {
 }
 
 pub fn run(a: Args) -> terrio::Result<()> {
-    let options = InfoOptions { statistics: a.stats };
+    let options = InfoOptions { statistics: a.stats, histogram: a.hist };
     let input = super::with_driver(&a.input, a.driver.as_deref())?;
     let info = if a.layers.is_empty() {
         // GeoTIFFs are read in place: only their headers are fetched.

@@ -28,6 +28,8 @@ pub(crate) struct GeoTags {
     pub crs: Option<wbraster::CrsInfo>,
     /// Dataset metadata items from the `GDAL_METADATA` tag.
     pub metadata: Vec<(String, String)>,
+    /// Band metadata items from the `GDAL_METADATA` tag: `(band from 0, name, value)`.
+    pub band_metadata: Vec<(usize, String, String)>,
     /// Whether the raster type is `RasterPixelIsPoint`.
     pub pixel_is_point: bool,
     /// The `GDAL_NODATA` value.
@@ -195,6 +197,7 @@ pub(crate) fn read_geo_tags_from<R: Read + Seek>(mut f: R) -> Option<GeoTags> {
     }
     out.nodata = ascii(GDAL_NODATA).and_then(|s| parse_nodata(s.trim()));
     out.metadata = ascii(GDAL_METADATA).map(crate::drivers::gtiff_write::parse_gdal_metadata).unwrap_or_default();
+    out.band_metadata = ascii(GDAL_METADATA).map(crate::drivers::gtiff_write::parse_gdal_band_metadata).unwrap_or_default();
 
     if let Some(keys) = keys {
         apply_geokeys(&mut out, keys, doubles(GEO_DOUBLE_PARAMS), ascii(GEO_ASCII_PARAMS));

@@ -10,6 +10,8 @@ details of every case that is not identical.
 Suites:
 
     summaries         ``terrio info`` and the pixels of every file vs GDAL (compare_with_gdal.py)
+    subdatasets       netCDF groups and HDF5 datasets, one subdataset at a time (compare_with_gdal.py)
+    histograms        ``terrio info --hist`` vs ``gdalinfo -hist`` (compare_hist_with_gdal.py)
     vector-roundtrip  vector files converted by terrio, read back by GDAL (compare_with_gdal.py)
     raster-roundtrip  raster drivers, GDAL writing and terrio reading and back (raster_roundtrip.py)
     windows           windowed and overview reads of GeoTIFFs (compare_windows_with_gdal.py)
@@ -200,6 +202,52 @@ def suite_summaries(ctx):
     return s
 
 
+def suite_subdatasets(ctx):
+    """netCDF groups and HDF5 datasets, subdataset by subdataset, against GDAL."""
+    s = Suite(
+        "subdatasets",
+        "NetCDF and HDF5 subdatasets",
+        "GDAL's netCDF and HDF5 drivers",
+        "Every netCDF and HDF5 file of the test data (netCDF-4 groups, HDF5 products): the "
+        "subdataset list (names and descriptions) and, for HDF5, the metadata as GDAL reports them, "
+        "then each subdataset's summary and every pixel.",
+    )
+    _code, out, err = run(
+        [sys.executable, str(SCRIPTS / "compare_with_gdal.py"), "--subdatasets", ctx.data], {"TERRIO_BIN": ctx.terrio}
+    )
+    for line in out.splitlines():
+        m = re.match(r"^(OK|DIFF)\s+(\S+) (.+?)(?::\s+(.*))?$", line)
+        if m:
+            group = "HDF5" if m[2].lower().endswith(".h5") else "netCDF"
+            s.cases.append(Case(group, f"{m[2]} {m[3]}", IDENTICAL if m[1] == "OK" else DIFFERS, m[4] or ""))
+    if not s.cases:
+        s.error = tail(err or out)
+    return s
+
+
+def suite_histograms(ctx):
+    """``terrio info --hist`` against ``gdalinfo -hist``."""
+    s = Suite(
+        "histograms",
+        "Band histograms",
+        "`gdalinfo -hist`, `gdalinfo -json -hist`",
+        "Rasters of every integer and floating-point type (GeoTIFF strips, tiles and overviews, "
+        "statistics in the metadata, and formats read by scanline): the histogram lines of "
+        "`gdalinfo -hist` byte for byte, the JSON histograms (with `min` and `max` as GDAL prints "
+        "them), with `-stats`, and the histograms GDAL stored in the `.aux.xml` sidecar.",
+    )
+    _code, out, err = run([sys.executable, str(SCRIPTS / "compare_hist_with_gdal.py"), ctx.data, "--terrio", ctx.terrio, "--json"])
+    try:
+        results = json.loads(out)
+    except json.JSONDecodeError:
+        s.error = tail(err or out)
+        return s
+    for r in results:
+        status = IDENTICAL if not r["differences"] else DIFFERS
+        s.cases.append(Case(r["case"], r["file"], status, "; ".join(r["differences"])))
+    return s
+
+
 VECTOR_ROUNDTRIPS = [
     ("countries.geojson", ["geojson", "fgb", "gpkg", "shp", "parquet", "csv", "gml", "kml", "mif", "tab", "topojson"]),
     ("cables.geojson", ["fgb", "gpkg", "parquet", "shp"]),
@@ -318,7 +366,7 @@ def classify_raster(r):
         return DIFFERS, f"error: {r['error']}"
     if not r.get("same_size"):
         return DIFFERS, f"size differs (GDAL {r.get('size')})"
-    same = [k for k in ("same_type", "same_crs", "same_nodata") if r.get(k) is False]
+    same = [k for k in ("same_type", "same_crs", "same_nodata", "same_metadata") if r.get(k) is False]
     if same:
         return DIFFERS, ", ".join(k.replace("same_", "") + " differs" for k in same)
     if r.get("valid_mismatch"):
@@ -573,6 +621,8 @@ def suite_gpkg(ctx):
 SUITES = OrderedDict(
     [
         ("summaries", suite_summaries),
+        ("subdatasets", suite_subdatasets),
+        ("histograms", suite_histograms),
         ("vector-roundtrip", suite_vector_roundtrip),
         ("raster-roundtrip", suite_raster_roundtrip),
         ("windows", suite_windows),

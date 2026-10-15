@@ -257,7 +257,7 @@ impl Dataset {
 
     /// The summary `terrio info --json` prints, as an object.
     pub fn info(&mut self, stats: Option<bool>) -> Result<JsValue, JsError> {
-        let options = terrio::info::InfoOptions { statistics: stats.unwrap_or(false) };
+        let options = terrio::info::InfoOptions { statistics: stats.unwrap_or(false), histogram: false };
         match &mut self.inner {
             Inner::Raster(r) => {
                 let info = terrio::info::lazy_raster_info(r, &options).map_err(js_err)?;

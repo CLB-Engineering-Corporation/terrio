@@ -161,6 +161,108 @@ fn netcdf4_variables_as_subdatasets() {
     assert_eq!((s.min, s.max), (-22.77, 21.12));
 }
 
+/// The subdatasets a container lists as GDAL's metadata: `(name, description)`.
+fn subdataset_items(ds: &terrio::RasterDataset) -> Vec<(String, String)> {
+    let get = |k: String| ds.raster.metadata.iter().find(|(m, _)| *m == k).map(|(_, v)| v.clone());
+    (1..).map_while(|i| Some((get(format!("SUBDATASET_{i}_NAME"))?, get(format!("SUBDATASET_{i}_DESC")).unwrap_or_default()))).collect()
+}
+
+/// A Sentinel-5P methane product: netCDF-4 with its variables in nested groups.
+#[test]
+fn netcdf4_groups_sentinel5p() {
+    let Some(p) = data("S5P_OFFL_L2__CH4____20230101T000319_20230101T014449_27036_03_020400_20230103T110255.nc") else { return };
+    let ds = terrio::open_raster(&p).unwrap();
+    // As GDAL: every variable of two dimensions or more, in every group, by its full path.
+    let subs = subdataset_items(&ds);
+    assert_eq!(subs.len(), 85);
+    assert_eq!(subs[0], (format!("NETCDF:\"{p}\":/PRODUCT/delta_time"), "[1x4172] /PRODUCT/delta_time (32-bit integer)".into()));
+    assert_eq!(subs[5].1, "[1x4172x215] dry_atmosphere_mole_fraction_of_methane (32-bit floating-point)");
+    assert!(subs[8].0.ends_with(":/PRODUCT/SUPPORT_DATA/GEOLOCATIONS/satellite_latitude"), "{:?}", subs[8]);
+    // The first raster variable opens, as GDAL's first subdataset.
+    assert_eq!((ds.raster.cols, ds.raster.rows), (4172, 1));
+    let ch4 = terrio::open_raster(&format!("NETCDF:\"{p}\":/PRODUCT/methane_mixing_ratio")).unwrap();
+    assert_eq!((ch4.raster.cols, ch4.raster.rows, ch4.raster.bands), (215, 4172, 1));
+    assert_eq!(ch4.raster.data_type, terrio::DataType::F32);
+    assert_eq!(ch4.nodata(), Some(9.969_209_968_386_869e36));
+    let s = terrio::info::band_statistics(&ch4, 0).unwrap();
+    assert_eq!((s.min, s.max), (1551.9571533203125, 1996.517822265625));
+    assert!((s.mean - 1732.069238199635).abs() < 1e-6, "{}", s.mean);
+    let flags = terrio::open_raster(&format!("NETCDF:\"{p}\":/PRODUCT/SUPPORT_DATA/DETAILED_RESULTS/processing_quality_flags")).unwrap();
+    assert_eq!(flags.raster.data_type, terrio::DataType::U32);
+    let s = terrio::info::band_statistics(&flags, 0).unwrap();
+    assert_eq!((s.min, s.max), (0.0, 1343488.0));
+}
+
+/// JPSS products (ATMS and VIIRS sensor data records): HDF5 with a user block, read as GDAL's
+/// HDF5 driver reads them.
+#[test]
+fn hdf5_jpss_products() {
+    let Some(p) = data("SATMS_j01_d20230101_t0000026_e0000343_b26525_c20230101002941202701_oeac_ops.h5") else { return };
+    let ds = terrio::open_raster(&p).unwrap();
+    assert_eq!(ds.driver, terrio::formats::RasterDriver::HDF5);
+    let subs = subdataset_items(&ds);
+    assert_eq!(subs.len(), 8);
+    assert_eq!(
+        subs[1],
+        (
+            format!("HDF5:\"{p}\"://All_Data/ATMS-SDR_All/BrightnessTemperature"),
+            "[12x96x22] //All_Data/ATMS-SDR_All/BrightnessTemperature (16-bit unsigned integer)".into()
+        )
+    );
+    let md = |k: &str| ds.raster.metadata.iter().find(|(m, _)| m == k).map(|(_, v)| v.as_str());
+    assert_eq!(md("Mission_Name"), Some("S-NPP/JPSS"));
+    assert_eq!(md("Data_Products_ATMS-SDR_Operational_Mode"), Some("J01 Normal Operations, ATMS Operational and Diagnostic"));
+    let bt = terrio::open_raster(&subs[1].0).unwrap();
+    assert_eq!((bt.raster.cols, bt.raster.rows, bt.raster.bands), (22, 96, 12));
+    let s = terrio::info::band_statistics(&bt, 0).unwrap();
+    assert_eq!((s.min, s.max), (34170.0, 56401.0));
+    assert!((s.mean - 47520.356534091).abs() < 1e-6, "{}", s.mean);
+
+    let Some(p) = data("SVI01_j01_d20220629_t1513542_e1515187_b23896_c20220629153147215027_oeac_pop.h5") else { return };
+    let radiance = terrio::open_raster(&format!("HDF5:\"{p}\"://All_Data/VIIRS-I1-SDR_All/Radiance")).unwrap();
+    assert_eq!((radiance.raster.cols, radiance.raster.rows), (6400, 1536));
+    assert_eq!(radiance.nodata(), None);
+    let s = terrio::info::band_statistics(&radiance, 0).unwrap();
+    assert_eq!((s.min, s.max), (878.0, 65533.0));
+    assert!((s.mean - 13690.189571126302).abs() < 1e-6, "{}", s.mean);
+}
+
+/// Histograms as `gdalinfo -hist` computes them (expected values from GDAL 3.12, without a
+/// `.aux.xml` sidecar): GDAL's approximate minimum and maximum (strips sampled, or an overview).
+#[test]
+fn histograms_like_gdalinfo() {
+    let dir = tempfile::tempdir().unwrap();
+    // Copies without the sidecar statistics the data directory may hold.
+    let copy = |name: &str| -> Option<String> {
+        let src = data(name)?;
+        let dst = dir.path().join(name);
+        std::fs::copy(src, &dst).unwrap();
+        Some(dst.to_string_lossy().into_owned())
+    };
+    let options = terrio::info::InfoOptions { histogram: true, ..Default::default() };
+    let first = |path: &str| -> terrio::info::Histogram {
+        match terrio::info::info_path(path, &options).unwrap() {
+            terrio::info::Info::Raster(r) => r.bands[0].histogram.clone().unwrap(),
+            _ => panic!("not a raster"),
+        }
+    };
+    let Some(p) = copy("srtm_sub.tif") else { return };
+    let h = first(&p);
+    assert_eq!((h.count, h.min, h.max), (256, 365.2274509803922, 2808.772549019608));
+    assert_eq!(h.buckets[..6], [5, 23, 30, 52, 37, 52]);
+    assert_eq!(h.buckets.iter().sum::<u64>(), 200000);
+    let Some(p) = copy("srtm90.tif") else { return };
+    let h = first(&p);
+    assert_eq!((h.min, h.max), (14.66470588235294, 4282.335294117647));
+    assert_eq!(h.buckets[..6], [40070, 238060, 282657, 261440, 204610, 158456]);
+    assert_eq!(h.buckets.iter().sum::<u64>(), 10523085);
+    let Some(p) = copy("landsat.tif") else { return };
+    let h = first(&p);
+    assert_eq!((h.count, h.min, h.max), (256, -0.5, 255.5));
+    assert_eq!(h.buckets.iter().sum::<u64>(), 3304640);
+    assert_eq!((0..256).max_by_key(|i| h.buckets[*i]), Some(29));
+}
+
 #[test]
 fn gdal_derived_las_vegas_dem() {
     for name in ["lv_dem.asc", "lv_dem.envi", "lv_dem.img", "lv_dem.jp2", "lv_dem.zarr"] {
@@ -272,6 +374,8 @@ fn netcdf_and_zarr_v3_written_by_terrio_read_back() {
     for (name, driver, compression, options) in [
         ("a.nc", terrio::formats::RasterDriver::NetCDF, None, vec![]),
         ("b.nc", terrio::formats::RasterDriver::NetCDF, None, co("FORMAT", "NC2")),
+        ("b4.nc", terrio::formats::RasterDriver::NetCDF, None, co("FORMAT", "NC4")),
+        ("b4z.nc", terrio::formats::RasterDriver::NetCDF, Some("DEFLATE"), co("FORMAT", "NC4C")),
         ("c.zarr", terrio::formats::RasterDriver::Zarr, Some("ZSTD"), co("FORMAT", "ZARR_V3")),
     ] {
         let out = dir.path().join(name);

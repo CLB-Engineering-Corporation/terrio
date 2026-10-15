@@ -146,6 +146,7 @@ pub mod formats;
 #[cfg_attr(docsrs, doc(cfg(feature = "gdal")))]
 pub mod gdal_backend;
 mod geotiff;
+mod histogram;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod http;
 pub mod info;

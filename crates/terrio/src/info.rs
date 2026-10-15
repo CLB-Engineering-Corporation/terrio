@@ -8,6 +8,8 @@ use crate::dataset::{Dataset, RasterDataset, VectorDataset};
 use serde::Serialize;
 use std::fmt::Write as _;
 
+pub use crate::histogram::Histogram;
+
 /// A summary of a dataset.
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
@@ -50,7 +52,8 @@ pub struct RasterInfo {
     pub subdatasets: Vec<Subdataset>,
 }
 
-/// A dataset inside a file (GDAL's subdatasets): a raster table of a GeoPackage.
+/// A dataset inside a file (GDAL's subdatasets): a raster table of a GeoPackage, a netCDF
+/// variable, an HDF5 dataset.
 #[derive(Debug, Clone, Serialize)]
 pub struct Subdataset {
     /// The name that opens it, such as `GPKG:file.gpkg:table`.
@@ -71,6 +74,9 @@ pub struct BandInfo {
     pub nodata: Option<f64>,
     /// Statistics, when requested.
     pub statistics: Option<Statistics>,
+    /// The histogram, when requested: `gdalinfo -hist`'s (see [`InfoOptions::histogram`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub histogram: Option<Histogram>,
 }
 
 fn serialize_nodata<S: serde::Serializer>(v: &Option<f64>, s: S) -> Result<S::Ok, S::Error> {
@@ -157,6 +163,11 @@ pub struct FieldInfo {
 pub struct InfoOptions {
     /// Compute band statistics (reads every pixel).
     pub statistics: bool,
+    /// Compute band histograms as `gdalinfo -hist` does (reads every pixel): 256 buckets over
+    /// the type's range for Byte and Int8 bands, otherwise over GDAL's approximate minimum and
+    /// maximum (or the exact ones when statistics are computed too) widened by half a bucket; a
+    /// histogram stored in the `.aux.xml` sidecar is used as it is.
+    pub histogram: bool,
 }
 
 /// Summarizes a dataset.
@@ -169,15 +180,26 @@ pub fn info(ds: &Dataset, options: &InfoOptions) -> Info {
 
 /// Summarizes a raster dataset.
 pub fn raster_info(ds: &RasterDataset, options: &InfoOptions) -> RasterInfo {
+    raster_info_at(ds, options, None, None)
+}
+
+/// Summarizes a raster dataset read from `path` (whose sidecar files hold stored statistics and
+/// histograms), with its lazily opened GeoTIFF (its blocks and overviews) when there is one.
+fn raster_info_at(ds: &RasterDataset, options: &InfoOptions, path: Option<&str>, mut lazy: Option<&mut LazyRaster>) -> RasterInfo {
     let r = &ds.raster;
     let crs = ds.crs();
     let extent = [r.x_min, r.y_min, r.x_max(), r.y_max()];
     let bands = (0..r.bands)
-        .map(|b| BandInfo {
-            band: b + 1,
-            data_type: gdal_type_name(r.data_type).to_string(),
-            nodata: ds.nodata(),
-            statistics: options.statistics.then(|| band_statistics(ds, b)).flatten(),
+        .map(|b| {
+            let statistics = options.statistics.then(|| band_statistics(ds, b)).flatten();
+            let histogram = options
+                .histogram
+                .then(|| {
+                    let ctx = histogram_context(ds, b, path, lazy.as_deref_mut());
+                    crate::histogram::default_histogram(ds, b, &ctx, statistics.map(|s| (s.min, s.max)))
+                })
+                .flatten();
+            BandInfo { band: b + 1, data_type: gdal_type_name(r.data_type).to_string(), nodata: ds.nodata(), statistics, histogram }
         })
         .collect();
     RasterInfo {
@@ -190,16 +212,80 @@ pub fn raster_info(ds: &RasterDataset, options: &InfoOptions) -> RasterInfo {
         extent,
         bands,
         overviews: Vec::new(),
-        metadata: r.metadata.clone(),
-        subdatasets: Vec::new(),
+        metadata: r.metadata.iter().filter(|(k, _)| subdataset_index(k).is_none()).cloned().collect(),
+        subdatasets: subdatasets_from_metadata(&r.metadata),
     }
 }
 
-/// Summarizes a raster opened lazily. Only statistics read the pixels.
+/// The index and kind (`NAME` or `DESC`) of a `SUBDATASET_N_NAME` metadata key.
+fn subdataset_index(key: &str) -> Option<(usize, bool)> {
+    let rest = key.strip_prefix("SUBDATASET_")?;
+    let (n, kind) = rest.split_once('_')?;
+    let is_name = match kind {
+        "NAME" => true,
+        "DESC" => false,
+        _ => return None,
+    };
+    Some((n.parse().ok()?, is_name))
+}
+
+/// The subdatasets a driver listed as GDAL's `SUBDATASET_N_NAME`/`SUBDATASET_N_DESC` metadata.
+fn subdatasets_from_metadata(metadata: &[(String, String)]) -> Vec<Subdataset> {
+    let mut out: Vec<Subdataset> = Vec::new();
+    for (k, v) in metadata {
+        let Some((n, is_name)) = subdataset_index(k) else { continue };
+        if n == 0 {
+            continue;
+        }
+        while out.len() < n {
+            out.push(Subdataset { name: String::new(), description: String::new() });
+        }
+        if is_name {
+            out[n - 1].name = v.clone();
+        } else {
+            out[n - 1].description = v.clone();
+        }
+    }
+    out.retain(|s| !s.name.is_empty());
+    out
+}
+
+/// What GDAL knows of a band besides its pixels, for its default histogram: a histogram or range
+/// stored with the dataset, its block size and the overview approximate statistics use.
+fn histogram_context(ds: &RasterDataset, band: usize, path: Option<&str>, lazy: Option<&mut LazyRaster>) -> crate::histogram::BandContext {
+    let mut ctx = crate::histogram::BandContext::default();
+    let local = path.filter(|p| std::path::Path::new(p).is_file());
+    if let Some(p) = local {
+        ctx.stored_histogram = crate::histogram::pam_histogram(p, band + 1);
+        ctx.stored_range = crate::histogram::stored_range(ds, p, band + 1);
+    }
+    match lazy {
+        Some(l) if l.block_size().is_some() => {
+            ctx.block = l.block_size();
+            let overviews = l.overviews();
+            if ctx.stored_range.is_none()
+                && let Some(i) = crate::histogram::sample_overview(l.width(), l.height(), &overviews)
+            {
+                let (w, h) = overviews[i];
+                let options = crate::WindowOptions { bands: vec![band + 1], overview: Some(i) };
+                ctx.overview = l.read_window(crate::Window::full(w, h), &options).ok().map(|o| crate::ops::band_f64(&o.raster, 0));
+            }
+        }
+        _ => ctx.block = crate::histogram::driver_block(ds),
+    }
+    ctx
+}
+
+/// Summarizes a raster opened lazily. Only statistics and histograms read the pixels.
 pub fn lazy_raster_info(r: &mut LazyRaster, options: &InfoOptions) -> crate::Result<RasterInfo> {
+    lazy_raster_info_at(r, options, None)
+}
+
+fn lazy_raster_info_at(r: &mut LazyRaster, options: &InfoOptions, path: Option<&str>) -> crate::Result<RasterInfo> {
     let overviews = r.overviews().into_iter().map(|(w, h)| [w, h]).collect();
-    if options.statistics {
-        let mut info = raster_info(&r.read()?, options);
+    if options.statistics || options.histogram {
+        let ds = r.read()?;
+        let mut info = raster_info_at(&ds, options, path, Some(r));
         info.overviews = overviews;
         return Ok(info);
     }
@@ -208,7 +294,13 @@ pub fn lazy_raster_info(r: &mut LazyRaster, options: &InfoOptions) -> crate::Res
     let (w, h) = (r.width() as f64, r.height() as f64);
     let extent = [gt[0], gt[3] + h * gt[5], gt[0] + w * gt[1], gt[3]];
     let bands = (0..r.band_count())
-        .map(|b| BandInfo { band: b + 1, data_type: gdal_type_name(r.data_type()).to_string(), nodata: r.nodata(), statistics: None })
+        .map(|b| BandInfo {
+            band: b + 1,
+            data_type: gdal_type_name(r.data_type()).to_string(),
+            nodata: r.nodata(),
+            statistics: None,
+            histogram: None,
+        })
         .collect();
     Ok(RasterInfo {
         driver: r.driver().name().to_string(),
@@ -231,7 +323,7 @@ pub fn lazy_raster_info(r: &mut LazyRaster, options: &InfoOptions) -> crate::Res
 /// ```no_run
 /// use terrio::info::{Info, InfoOptions, info_path};
 ///
-/// let summary = info_path("https://example.com/cog.tif", &InfoOptions { statistics: false })?;
+/// let summary = info_path("https://example.com/cog.tif", &InfoOptions::default())?;
 /// print!("{}", summary.to_text()); // as `terrio info` prints it
 /// println!("{}", serde_json::to_string_pretty(&summary).unwrap()); // as `terrio info --json`
 /// if let Info::Raster(r) = &summary {
@@ -267,12 +359,15 @@ pub fn info_path(path: &str, options: &InfoOptions) -> crate::Result<Info> {
     if !matches!(loc, crate::vfs::Location::Zip { .. })
         && let Some(mut r) = LazyRaster::open_tiff(path)?
     {
-        return Ok(Info::Raster(Box::new(lazy_raster_info(&mut r, options)?)));
+        return Ok(Info::Raster(Box::new(lazy_raster_info_at(&mut r, options, Some(path))?)));
     }
     if let Some(v) = gpkg_vector_info(path)? {
         return Ok(Info::Vector(v));
     }
-    let mut summary = info(&crate::open(path)?, options);
+    let mut summary = match crate::open(path)? {
+        Dataset::Raster(r) => Info::Raster(Box::new(raster_info_at(&r, options, Some(path), None))),
+        Dataset::Vector(v) => Info::Vector(vector_info(&v)),
+    };
     // A GeoPackage's raster tables: all of them besides vector layers, or besides the first.
     if crate::formats::extension(path).as_deref() == Some("gpkg")
         && let Ok(local) = crate::vfs::resolve(path)
@@ -418,6 +513,9 @@ impl Info {
                             "  min={} max={} mean={:.6} std_dev={:.6} valid={}",
                             st.min, st.max, st.mean, st.std_dev, st.valid_count
                         );
+                    }
+                    if let Some(h) = &b.histogram {
+                        s.push_str(&h.to_text());
                     }
                 }
             }

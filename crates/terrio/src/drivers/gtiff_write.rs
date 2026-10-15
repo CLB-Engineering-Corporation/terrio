@@ -534,6 +534,22 @@ pub(crate) fn parse_gdal_metadata(xml: &str) -> Vec<(String, String)> {
     out
 }
 
+/// The band items of a `GDAL_METADATA` tag (default domain, no role): `(band from 0, name, value)`.
+pub(crate) fn parse_gdal_band_metadata(xml: &str) -> Vec<(usize, String, String)> {
+    let mut out = Vec::new();
+    for item in xml.split("<Item ").skip(1) {
+        let Some((attrs, rest)) = item.split_once('>') else { continue };
+        if attrs.contains("role=") || attrs.contains("domain=") {
+            continue;
+        }
+        let attr = |key: &str| attrs.split(&format!("{key}=\"")).nth(1).and_then(|s| s.split('"').next());
+        let (Some(name), Some(sample)) = (attr("name"), attr("sample").and_then(|s| s.parse().ok())) else { continue };
+        let Some(value) = rest.split("</Item>").next() else { continue };
+        out.push((sample, xml_unescape(name), xml_unescape(value)));
+    }
+    out
+}
+
 fn xml_unescape(s: &str) -> String {
     s.replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", "\"").replace("&apos;", "'").replace("&amp;", "&")
 }

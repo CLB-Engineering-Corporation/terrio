@@ -189,16 +189,19 @@ fn list_layers(py: Python<'_>, path: &str) -> PyResult<Vec<String>> {
 ///     path: The dataset's path or URL.
 ///     stats: Compute band statistics (reads every pixel).
 ///     layers: Only these layers of a vector dataset.
+///     hist: Compute band histograms as `gdalinfo -hist` does (each band's `histogram`:
+///         `count`, `min`, `max` and `buckets`).
 ///
 /// Returns:
-///     dict: The summary: driver, size, bands, CRS, extent... for rasters; driver and layers
+///     dict: The summary: driver, size, bands, CRS, extent... for rasters (with the
+///     `subdatasets` of netCDF, HDF5 and GeoPackage files); driver and layers
 ///     (fields, geometry type, feature count, CRS, extent) for vector datasets; header, CRS,
 ///     dimensions, VLRs and the COPC octree for point clouds (LAS, LAZ, COPC), with
 ///     classification and return counts when `stats` is true.
 #[pyfunction]
-#[pyo3(signature = (path, stats=false, layers=None))]
-fn info<'py>(py: Python<'py>, path: &str, stats: bool, layers: Option<Vec<String>>) -> PyResult<Bound<'py, PyAny>> {
-    let options = terrio::info::InfoOptions { statistics: stats };
+#[pyo3(signature = (path, stats=false, layers=None, hist=false))]
+fn info<'py>(py: Python<'py>, path: &str, stats: bool, layers: Option<Vec<String>>, hist: bool) -> PyResult<Bound<'py, PyAny>> {
+    let options = terrio::info::InfoOptions { statistics: stats, histogram: hist };
     let summary = py
         .detach(|| match layers {
             Some(layers) => {
