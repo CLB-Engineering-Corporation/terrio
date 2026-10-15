@@ -3,16 +3,8 @@ name: Release dry run
 # Builds and checks everything a release publishes, without publishing: the wheels for every
 # platform, the source distribution and the Pyodide wheel (release-build.yml, as the release
 # builds them), the crates as `cargo publish` packages and verifies them, and the npm package.
-# It runs on pull requests that change what a release builds, and by hand.
+# Run it by hand before tagging a release (Actions > Release dry run > Run workflow).
 on:
-  pull_request:
-    paths:
-      - ".github/workflows/release*.yml"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - "crates/*/Cargo.toml"
-      - "python/**"
-      - "js/**"
   workflow_dispatch:
 
 permissions:
