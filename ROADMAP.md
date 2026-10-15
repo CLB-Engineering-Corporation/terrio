@@ -88,6 +88,12 @@ of GDAL: the long tail of formats stays reachable through an optional GDAL backe
   layers as GeoJSON, WKB and GeoDataFrames, Arrow through the PyCapsule interface (pyarrow,
   GeoPandas, Polars, GDAL), and every operation, with arrays checked against GDAL's Python
   bindings; type stubs checked with `mypy --strict` and `stubtest`.
+- A rasterio-compatible Python API, `terrio.rio` (`import terrio.rio as rasterio`). Done:
+  datasets read lazily by window (remote COGs included) and written by window, with rasterio's
+  profiles, tags, band metadata, masks, overviews and resampled reads; `crs`, `transform`,
+  `windows`, `features`, `warp`, `merge`, `mask`, `vrt.WarpedVRT`, `io.MemoryFile`, `env`,
+  `plot`; every function compared with rasterio on synthetic and real files, and rasterio's
+  documentation examples run unchanged but for the import.
 - An npm package built from the WebAssembly target. Done: datasets opened from bytes (GeoTIFF,
   ASCII grid and the text and FlatGeobuf vector formats), bands as typed arrays, GeoJSON out,
   conversion to bytes, CRS transforms, zipped Shapefile and MapInfo and GeoPackage from memory,

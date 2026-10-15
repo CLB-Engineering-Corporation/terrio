@@ -28,7 +28,7 @@ pip install terrio
 ```
 
 Wheels are built for Linux (x86_64 and aarch64; musl on x86_64), macOS (Intel and Apple silicon)
-and Windows, for Python 3.10 and later. They need only NumPy.
+and Windows, for Python 3.10 and later. They need only NumPy (and the small `affine` package).
 
 ## JavaScript
 

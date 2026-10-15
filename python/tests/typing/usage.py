@@ -221,6 +221,60 @@ def points(tmp: Path) -> None:
     terrio.convert_points(path, str(tmp / "points.gpkg"), classes=[2], dimensions=["z"])
 
 
+def rio(tmp: Path) -> None:
+    """The rasterio-compatible API: writing, reading, windows, CRSs, features and warping.
+
+    Args:
+        tmp: A scratch directory.
+    """
+    import terrio.rio as rasterio
+    from terrio.rio.enums import Resampling
+    from terrio.rio.features import rasterize, shapes
+    from terrio.rio.warp import calculate_default_transform, reproject
+    from terrio.rio.windows import Window
+
+    path = str(tmp / "rio.tif")
+    transform = rasterio.transform.from_origin(500000.0, 4100000.0, 30.0, 30.0)
+    data: NDArray[np.int16] = np.arange(40 * 50, dtype="int16").reshape(1, 40, 50)
+    with rasterio.open(
+        path,
+        "w",
+        driver="GTiff",
+        width=50,
+        height=40,
+        count=1,
+        dtype="int16",
+        crs="EPSG:32611",
+        transform=transform,
+        nodata=-1,
+        tiled=True,
+    ) as dst:
+        dst.write(data)
+        dst.update_tags(source="usage")
+        dst.build_overviews([2], Resampling.nearest)
+    with rasterio.open(path) as src:
+        window = Window(5, 5, 20, 10)
+        part = src.read(1, window=window, masked=True)
+        small = src.read(out_shape=(1, 20, 25), resampling=Resampling.bilinear)
+        print(src.profile["blockxsize"], src.crs, src.bounds, part.shape, small.shape)
+        print(src.window_transform(window), src.index(500100.0, 4099900.0), src.overviews(1))
+        values = [v.tolist() for v in src.sample([(500100.0, 4099900.0)])]
+        dst_t, w, h = calculate_default_transform(
+            src.crs, "EPSG:4326", src.width, src.height, *src.bounds
+        )
+        out = np.zeros((h, w), "int16")
+        reproject(rasterio.band(src, 1), out, dst_transform=dst_t, dst_crs="EPSG:4326")
+        polys = list(shapes(src.read(1) // 500, transform=src.transform))
+        print(values, out.shape, len(polys))
+    mask = rasterize(
+        [({"type": "Point", "coordinates": (500100.0, 4099900.0)}, 1)],
+        (40, 50),
+        transform=transform,
+    )
+    crs = rasterio.crs.CRS.from_epsg(4326)
+    print(mask.sum(), crs.to_epsg(), crs.is_geographic)
+
+
 def main() -> None:
     """Runs every example in a temporary directory."""
     with tempfile.TemporaryDirectory() as d:
@@ -228,6 +282,7 @@ def main() -> None:
         raster = rasters(tmp)
         vectors(tmp, raster)
         points(tmp)
+        rio(tmp)
     try:
         terrio.open_raster("does-not-exist.tif")
     except terrio.NotFoundError as e:

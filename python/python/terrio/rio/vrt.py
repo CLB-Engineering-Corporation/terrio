@@ -1,0 +1,236 @@
+"""`WarpedVRT`: a dataset reprojected on the fly, as rasterio's warped VRT."""
+
+from __future__ import annotations
+
+from typing import Any
+
+import numpy as np
+from affine import Affine
+
+from terrio import _terrio
+from terrio.rio._tiff import Structure
+from terrio.rio.crs import CRS
+from terrio.rio.enums import ColorInterp, Resampling
+from terrio.rio.errors import WarpedVRTError
+from terrio.rio.io import DatasetReader
+from terrio.rio.warp import _WARP_NAMES, _crs_text, calculate_default_transform
+
+# Warped grids up to this many pixels (all bands) are warped whole and cached.
+_CACHE_PIXELS = 100_000_000
+
+
+class WarpedVRT(DatasetReader):
+    """A read-only view of a dataset reprojected into another CRS or grid.
+
+    Pixels are warped with terrio's `warp` when they are read, window by window.
+    """
+
+    def __init__(
+        self,
+        src_dataset: Any,
+        src_crs: Any = None,
+        crs: Any = None,
+        resampling: Resampling = Resampling.nearest,
+        tolerance: float = 0.125,
+        src_nodata: Any = None,
+        nodata: Any = None,
+        width: int | None = None,
+        height: int | None = None,
+        src_transform: Affine | None = None,
+        transform: Affine | None = None,
+        init_dest_nodata: bool = True,
+        src_alpha: int = 0,
+        add_alpha: bool = False,
+        warp_mem_limit: int = 0,
+        dtype: Any = None,
+        **warp_extras: Any,
+    ) -> None:
+        """Creates the view.
+
+        Args:
+            src_dataset: The source dataset (a `DatasetReader`).
+            src_crs: The source CRS, overriding the dataset's.
+            crs: The output CRS; by default, the source's.
+            resampling: The resampling method.
+            tolerance: The approximate transformer's maximum error, in pixels.
+            src_nodata: The source nodata value, overriding the dataset's.
+            nodata: The output nodata value; by default, the source's.
+            width: The output width (with `height`; with `transform`, the grid itself).
+            height: The output height.
+            src_transform: The source transform, overriding the dataset's.
+            transform: The output transform.
+            init_dest_nodata: Unused: pixels outside the source are nodata (or 0).
+            src_alpha: Unsupported (0).
+            add_alpha: Unsupported (False).
+            warp_mem_limit: Unused.
+            dtype: The output data type; by default, the source's.
+            **warp_extras: Unused GDAL warp options.
+
+        Raises:
+            WarpedVRTError: If the options are not supported.
+        """
+        super(DatasetReader, self).__init__()
+        if src_alpha or add_alpha:
+            raise WarpedVRTError("terrio.rio does not support alpha bands in WarpedVRT")
+        if (width is None) != (height is None):
+            raise WarpedVRTError("width and height must be given together")
+        self.src_dataset = src_dataset
+        self.name = f"WarpedVRT({src_dataset.name})"
+        self.mode = "r"
+        self.driver = "VRT"
+        self.resampling = Resampling(resampling)
+        self.tolerance = tolerance
+        self.src_crs = CRS.from_user_input(src_crs) if src_crs is not None else src_dataset.crs
+        self.dst_crs = CRS.from_user_input(crs) if crs is not None else self.src_crs
+        self.src_transform = src_transform or src_dataset.transform
+        self.src_nodata = src_nodata if src_nodata is not None else src_dataset.nodata
+        self.dst_nodata = nodata if nodata is not None else self.src_nodata
+        self.working_dtype = src_dataset.dtypes[0]
+        self.warp_extras = warp_extras
+        if transform is not None and width is not None:
+            t, w, h = transform, int(width), int(height)  # type: ignore[arg-type]
+        else:
+            left, bottom, right, top = src_dataset.bounds
+            kw: dict[str, Any] = {}
+            if width is not None:
+                kw = {"dst_width": width, "dst_height": height}
+            t, w, h = calculate_default_transform(
+                self.src_crs,
+                self.dst_crs,
+                src_dataset.width,
+                src_dataset.height,
+                left,
+                bottom,
+                right,
+                top,
+                **kw,
+            )
+            if transform is not None:
+                t = transform
+        self._transform = t
+        self.width, self.height = int(w), int(h)
+        self._count = src_dataset.count
+        self._dtype = np.dtype(dtype).name if dtype is not None else src_dataset.dtypes[0]
+        self._nodata = None if self.dst_nodata is None else float(self.dst_nodata)
+        self._crs = self.dst_crs
+        self._overview_sizes = []
+        n = self._count
+        s = Structure(
+            count=n,
+            width=self.width,
+            height=self.height,
+            block_shape=(min(128, self.height), min(512, self.width)),
+        )
+        s.tiled = True
+        s.colorinterp = (
+            list(src_dataset.colorinterp) if src_dataset.count == n else [ColorInterp.gray] * n
+        )
+        s.band_tags = [{} for _ in range(n)]
+        s.descriptions = list(src_dataset.descriptions)
+        s.scales = list(src_dataset.scales)
+        s.offsets = list(src_dataset.offsets)
+        s.units = list(src_dataset.units)
+        s.tags = {"AREA_OR_POINT": "Area"}
+        self._structure = s
+        self._source: Any = None
+        self._full: np.ndarray | None = None
+
+    def _src_raster(self) -> Any:
+        """The source raster in memory, read on first use.
+
+        Returns:
+            terrio.Raster: The source.
+        """
+        if self._source is None:
+            ds = self.src_dataset
+            arr = ds.read()
+            self._source = _terrio.Raster.from_array(
+                arr,
+                self.src_transform.to_gdal(),
+                _crs_text(self.src_crs),
+                None if self.src_nodata is None else float(self.src_nodata),
+            )
+        return self._source
+
+    def _read_level(
+        self, bands: Any, window: tuple[int, int, int, int], level: int | None
+    ) -> np.ndarray:
+        """Warps an integer window of the output grid.
+
+        Args:
+            bands: The bands, from 1.
+            window: `(x, y, w, h)` in the output grid.
+            level: Unused.
+
+        Returns:
+            numpy.ndarray: `(bands, h, w)`.
+        """
+        self._check_open()
+        x, y, w, h = window
+        if self.width * self.height * self._count <= _CACHE_PIXELS:
+            # Warp the whole grid once, as GDAL caches the warped blocks: windows then read the
+            # same pixels as a full read.
+            if self._full is None:
+                self._full = self._warp(0, 0, self.width, self.height)
+            return self._full[[b - 1 for b in bands], y : y + h, x : x + w]
+        return self._warp(x, y, w, h)[[b - 1 for b in bands]]
+
+    def _warp(self, x: int, y: int, w: int, h: int) -> np.ndarray:
+        """Warps a window of the output grid, every band.
+
+        Args:
+            x: The first column.
+            y: The first row.
+            w: The number of columns.
+            h: The number of rows.
+
+        Returns:
+            numpy.ndarray: `(count, h, w)`.
+        """
+        t = self._transform
+        left = t.c + x * t.a
+        top = t.f + y * t.e
+        te = (left, top + h * t.e, left + w * t.a, top)
+        nd: Any = (
+            "none"
+            if self.dst_nodata is None
+            else ("nan" if np.isnan(self.dst_nodata) else float(self.dst_nodata))
+        )
+        out = _terrio.warp(
+            self._src_raster(),
+            t_srs=_crs_text(self.dst_crs),
+            te=te,
+            ts=(w, h),
+            resampling=_WARP_NAMES[self.resampling],
+            srcnodata="none" if self.src_nodata is None else float(self.src_nodata),
+            dstnodata=nd,
+            ot=_gdal(self._dtype),
+            et=self.tolerance,
+        )
+        return np.asarray(out.read())
+
+    def close(self) -> None:
+        """Closes the view (not the source dataset)."""
+        self._source = None
+        self._full = None
+        super(DatasetReader, self).close()
+
+    def start(self) -> None:
+        """Opens the view (it is open once created)."""
+
+
+def _gdal(dtype: str) -> str:
+    """The GDAL name of a data type.
+
+    Args:
+        dtype: A NumPy dtype name.
+
+    Returns:
+        str: The GDAL name.
+    """
+    from terrio.rio.dtypes import _gdal_typename
+
+    return _gdal_typename(dtype)
+
+
+__all__ = ["WarpedVRT"]

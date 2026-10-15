@@ -161,6 +161,10 @@ The operations (`convert`, `translate`, `warp`, `mosaic`, `rasterize`, `polygoni
 `calc`, `proximity`, `sieve`) take the command-line options as keyword arguments. See
 [python/README.md](python/README.md).
 
+rasterio scripts run with an import change, `import terrio.rio as rasterio`: datasets, windows,
+CRSs, features, warping, merging, masking and memory files follow rasterio's API, compared with
+rasterio on real files. See [Coming from rasterio](https://terrio.opengeos.org/rasterio/).
+
 ## JavaScript
 
 The `terrio-js` npm package is the library compiled to WebAssembly, for browsers and Node.js:

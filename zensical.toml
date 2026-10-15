@@ -22,6 +22,7 @@ nav = [
   { "Remote Data" = "remote-data.md" },
   { "Coordinate Systems" = "crs.md" },
   { "Coming from GDAL" = "gdal.md" },
+  { "Coming from rasterio" = "rasterio.md" },
   { "Rust Library" = "rust.md" },
   { "Python" = "python.md" },
   { "JavaScript" = "javascript.md" },

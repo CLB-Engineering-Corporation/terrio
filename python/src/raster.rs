@@ -3,7 +3,7 @@
 use crate::{PyResultExt, crs_string, invalid};
 use numpy::{PyArray1, PyArrayDescrMethods, PyArrayDyn, PyArrayMethods, PyUntypedArray, PyUntypedArrayMethods};
 use pyo3::prelude::*;
-use pyo3::types::PyBytes;
+use pyo3::types::{PyBytes, PyDict};
 use terrio::crs::SpatialRef;
 use terrio::formats::RasterDriver;
 use terrio::{DataType, LazyRaster, RasterDataset, RasterWriteOptions, Window, WindowOptions};
@@ -244,6 +244,8 @@ impl PyRaster {
     ///         -pixel_height)` of a north-up raster.
     ///     crs: The CRS: `"EPSG:4326"`, WKT or a PROJ string. `None` leaves it unknown.
     ///     nodata: The nodata value, or `None`.
+    ///     metadata: Dataset metadata items: a mapping, or `(key, value)` pairs. GeoTIFFs store
+    ///         them in the `GDAL_METADATA` tag.
     ///
     /// Returns:
     ///     Raster: The raster, in memory.
@@ -252,8 +254,15 @@ impl PyRaster {
     ///     InvalidArgumentError: If the array or the transform is not supported.
     ///     CRSError: If the CRS cannot be parsed.
     #[staticmethod]
-    #[pyo3(signature = (array, transform, crs=None, nodata=None))]
-    fn from_array(array: &Bound<'_, PyUntypedArray>, transform: [f64; 6], crs: Option<&str>, nodata: Option<f64>) -> PyResult<Self> {
+    #[pyo3(signature = (array, transform, crs=None, nodata=None, metadata=None))]
+    fn from_array(
+        array: &Bound<'_, PyUntypedArray>,
+        transform: [f64; 6],
+        crs: Option<&str>,
+        nodata: Option<f64>,
+        metadata: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Self> {
+        let metadata = metadata.map(string_pairs).transpose()?.unwrap_or_default();
         let shape = array.shape().to_vec();
         let (bands, rows, cols) = match shape[..] {
             [r, c] => (1, r, c),
@@ -276,6 +285,7 @@ impl PyRaster {
             nodata: nodata.unwrap_or(-9999.0),
             data_type: data.data_type(),
             crs: crs.to_crs_info(),
+            metadata,
             ..Default::default()
         };
         let mut raster = terrio::Raster::from_data_native(cfg, data).map_err(terrio::Error::from).py()?;
@@ -296,12 +306,24 @@ impl PyRaster {
     ///     tile_size: Write GeoTIFF tiles of this size (COG tiles default to 512).
     ///     bigtiff: Write a BigTIFF.
     ///     options: Format-specific creation options, as GDAL names them, such as
+    ///         `{"TILED": "YES", "BLOCKXSIZE": "256", "INTERLEAVE": "BAND"}` for GeoTIFF,
     ///         `{"FORMAT": "ZARR_V3", "GEOREFERENCING_CONVENTION": "SPATIAL_PROJ"}` for Zarr, or
     ///         `{"FORMAT": "NC4", "COMPRESS": "DEFLATE", "ZLEVEL": "6"}` for netCDF-4.
+    ///     band_metadata: GeoTIFF band metadata, one dictionary per band with any of the keys
+    ///         `description`, `scale`, `offset`, `unit`, `color_interp` (a GDAL name such as
+    ///         `"Red"`) and `items` (a mapping of metadata items).
+    ///     colormap: The color table of a single-band Byte or UInt16 GeoTIFF: `(r, g, b, a)`
+    ///         entries from index 0.
+    ///     overviews: GeoTIFF overviews to build, as decimation factors such as `[2, 4]`.
+    ///     overview_resampling: `"nearest"` (the default), `"average"`, `"min"`, `"max"` or
+    ///         `"mode"`.
     ///
     /// Raises:
     ///     TerrioError: If the raster cannot be written.
-    #[pyo3(signature = (path, driver=None, compress=None, tile_size=None, bigtiff=false, options=None))]
+    #[pyo3(signature = (
+        path, driver=None, compress=None, tile_size=None, bigtiff=false, options=None, *,
+        band_metadata=None, colormap=None, overviews=None, overview_resampling=None
+    ))]
     #[allow(clippy::too_many_arguments)]
     fn write(
         &mut self,
@@ -312,9 +334,17 @@ impl PyRaster {
         tile_size: Option<u32>,
         bigtiff: bool,
         options: Option<std::collections::BTreeMap<String, String>>,
+        band_metadata: Option<Vec<Bound<'_, PyDict>>>,
+        colormap: Option<Vec<[u8; 4]>>,
+        overviews: Option<Vec<usize>>,
+        overview_resampling: Option<String>,
     ) -> PyResult<()> {
         let mut options_ = write_options(driver, compress, tile_size, bigtiff)?;
         options_.creation_options = options.unwrap_or_default().into_iter().collect();
+        options_.band_metadata = band_metadata.unwrap_or_default().iter().map(parse_band_metadata).collect::<PyResult<_>>()?;
+        options_.color_table = colormap.unwrap_or_default();
+        options_.overviews = overviews.unwrap_or_default();
+        options_.overview_resampling = overview_resampling;
         let options = options_;
         py.detach(|| self.with_dataset(|ds| terrio::write_raster_dataset(ds, path, &options))).py()
     }
@@ -385,4 +415,35 @@ pub(crate) fn write_options(
 ) -> PyResult<RasterWriteOptions> {
     let driver = driver.map(|d| RasterDriver::from_name(d).ok_or_else(|| invalid(format!("unknown raster format '{d}'")))).transpose()?;
     Ok(RasterWriteOptions { driver, compression: compress, tile_size, bigtiff, ..Default::default() })
+}
+
+/// `(key, value)` string pairs from a mapping or a sequence of pairs, in order.
+fn string_pairs(obj: &Bound<'_, PyAny>) -> PyResult<Vec<(String, String)>> {
+    let items = if obj.hasattr("items")? { obj.call_method0("items")? } else { obj.clone() };
+    let mut out = Vec::new();
+    for item in items.try_iter()? {
+        let (k, v): (Bound<'_, PyAny>, Bound<'_, PyAny>) = item?.extract()?;
+        out.push((k.str()?.to_string(), v.str()?.to_string()));
+    }
+    Ok(out)
+}
+
+/// A band's metadata from a dictionary with the keys `description`, `scale`, `offset`, `unit`,
+/// `color_interp` and `items`.
+fn parse_band_metadata(d: &Bound<'_, PyDict>) -> PyResult<terrio::BandMetadata> {
+    let get = |key: &str| -> PyResult<Option<Bound<'_, PyAny>>> { Ok(d.get_item(key)?.filter(|v| !v.is_none())) };
+    for key in d.keys() {
+        let key: String = key.extract()?;
+        if !matches!(key.as_str(), "description" | "scale" | "offset" | "unit" | "color_interp" | "items") {
+            return Err(invalid(format!("unknown band metadata key '{key}'")));
+        }
+    }
+    Ok(terrio::BandMetadata {
+        description: get("description")?.map(|v| v.extract()).transpose()?,
+        scale: get("scale")?.map(|v| v.extract()).transpose()?,
+        offset: get("offset")?.map(|v| v.extract()).transpose()?,
+        unit: get("unit")?.map(|v| v.extract()).transpose()?,
+        color_interp: get("color_interp")?.map(|v| v.extract()).transpose()?,
+        items: get("items")?.map(|v| string_pairs(&v)).transpose()?.unwrap_or_default(),
+    })
 }

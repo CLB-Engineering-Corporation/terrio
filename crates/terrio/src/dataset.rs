@@ -398,8 +398,36 @@ pub struct RasterWriteOptions {
     /// Force BigTIFF.
     pub bigtiff: bool,
     /// Format-specific creation options, as GDAL names them (`KEY`, `VALUE`): Zarr
-    /// `FORMAT=ZARR_V2|ZARR_V3`; netCDF `FORMAT=NC|NC2|NC5`.
+    /// `FORMAT=ZARR_V2|ZARR_V3`; netCDF `FORMAT=NC|NC2|NC5`; GeoTIFF `TILED=YES`,
+    /// `BLOCKXSIZE`, `BLOCKYSIZE`, `INTERLEAVE=PIXEL|BAND`, `PHOTOMETRIC=MINISBLACK|RGB|PALETTE`,
+    /// `ALPHA=YES`, `BIGTIFF=YES`, `COMPRESS`, and terrio's `GEOREFERENCED=NO` (no geotransform).
     pub creation_options: Vec<(String, String)>,
+    /// Descriptive metadata of each band (GeoTIFF: written to the `GDAL_METADATA` tag).
+    pub band_metadata: Vec<BandMetadata>,
+    /// A color table for a single-band Byte or UInt16 GeoTIFF: `(red, green, blue, alpha)`
+    /// entries from index 0. Empty for none.
+    pub color_table: Vec<[u8; 4]>,
+    /// GeoTIFF overviews to build, as decimation factors such as `[2, 4, 8]`.
+    pub overviews: Vec<usize>,
+    /// The overview resampling: `nearest` (the default), `average`, `min`, `max` or `mode`.
+    pub overview_resampling: Option<String>,
+}
+
+/// The descriptive metadata of a band, as GDAL keeps it.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct BandMetadata {
+    /// The band's description.
+    pub description: Option<String>,
+    /// The scale applied to pixel values to get physical values.
+    pub scale: Option<f64>,
+    /// The offset added to scaled pixel values.
+    pub offset: Option<f64>,
+    /// The unit of the physical values, such as `m`.
+    pub unit: Option<String>,
+    /// The color interpretation, as GDAL names it: `Gray`, `Red`, `Alpha`, `Palette`...
+    pub color_interp: Option<String>,
+    /// Metadata items (GDAL's band metadata, default domain).
+    pub items: Vec<(String, String)>,
 }
 
 /// Writes a raster, declaring its nodata value.
@@ -439,18 +467,8 @@ fn write_raster_with_nodata(raster: &Raster, nodata: Option<f64>, path: &str, op
         return Err(Error::Unsupported(format!("the {} driver cannot write", driver.name())));
     }
     if matches!(driver, RasterDriver::GTiff | RasterDriver::Cog) {
-        use crate::drivers::gtiff_write::{Compression, TiffOptions};
-        let name = options.compression.as_deref().unwrap_or(if driver == RasterDriver::Cog { "LZW" } else { "NONE" });
         // terrio's writer handles the lossless compressions; wbraster the lossy ones.
-        if let Some(compression) = Compression::parse(name) {
-            let opts = TiffOptions {
-                compression,
-                tile_size: options.tile_size,
-                bigtiff: options.bigtiff,
-                cog: driver == RasterDriver::Cog,
-                nodata,
-                ..Default::default()
-            };
+        if let Some(opts) = crate::drivers::gtiff_write::TiffOptions::from_write_options(options, driver == RasterDriver::Cog, nodata)? {
             return crate::drivers::gtiff_write::write(raster, path, &opts);
         }
     }

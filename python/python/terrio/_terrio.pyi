@@ -40,6 +40,9 @@ __all__ = [
     "read_points",
     "read_points_bytes",
     "convert_points",
+    "tiff_tags",
+    "crs_info",
+    "suggested_grid",
 ]
 
 __version__: str
@@ -112,6 +115,7 @@ class Raster:
         transform: Sequence[float],
         crs: str | None = None,
         nodata: float | None = None,
+        metadata: Mapping[str, Any] | Sequence[tuple[Any, Any]] | None = None,
     ) -> Raster: ...
     def write(
         self,
@@ -121,6 +125,11 @@ class Raster:
         tile_size: int | None = None,
         bigtiff: bool = False,
         options: Mapping[str, str] | None = None,
+        *,
+        band_metadata: Sequence[Mapping[str, Any]] | None = None,
+        colormap: Sequence[tuple[int, int, int, int]] | None = None,
+        overviews: Sequence[int] | None = None,
+        overview_resampling: str | None = None,
     ) -> None: ...
     def to_bytes(
         self,
@@ -592,3 +601,11 @@ def convert_points(
     offset: _XYZ | None = None,
     dimensions: Sequence[str] | None = None,
 ) -> None: ...
+
+# Helpers of terrio.rio.
+
+def tiff_tags(path: str) -> list[dict[int, str | bytes | list[int] | list[float]]] | None: ...
+def crs_info(crs: str) -> dict[str, Any]: ...
+def suggested_grid(
+    width: int, height: int, transform: Sequence[float], src_crs: str, dst_crs: str
+) -> tuple[tuple[float, float, float, float, float, float], int, int]: ...

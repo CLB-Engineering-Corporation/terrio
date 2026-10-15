@@ -116,11 +116,154 @@ pub(crate) struct TiffOptions {
     pub nodata: Option<f64>,
     /// Overview resampling: nearest neighbour instead of averaging.
     pub nearest_overviews: bool,
+    /// Tiles of `(width, height)`, overriding `tile_size` (GeoTIFF only).
+    pub block: Option<(u32, u32)>,
+    /// Rows per strip, for striped GeoTIFFs. By default, strips of 64 KiB.
+    pub rows_per_strip: Option<u32>,
+    /// One plane per band (`INTERLEAVE=BAND`) instead of interleaved pixels.
+    pub planar: bool,
+    /// The `PhotometricInterpretation`: 1 (min-is-black), 2 (RGB) or 3 (palette). By default, RGB
+    /// for three Byte bands, else min-is-black.
+    pub photometric: Option<u16>,
+    /// The last band is an (unassociated) alpha band.
+    pub alpha: bool,
+    /// Band descriptions, scales, offsets, units, color interpretations and metadata items.
+    pub band_metadata: Vec<crate::BandMetadata>,
+    /// The color table of a palette image.
+    pub color_table: Vec<[u8; 4]>,
+    /// Overview decimation factors (GeoTIFF only; COGs build their own).
+    pub overviews: Vec<usize>,
+    /// How the overviews of `overviews` are computed.
+    pub overview_resampling: OverviewResampling,
+    /// The TIFF predictor: 1 (none), 2 (horizontal differencing) or 3 (floating point).
+    pub predictor: u16,
+    /// Write the pixel scale and tie point (`GEOREFERENCED=NO` leaves the file without a
+    /// geotransform, as GDAL writes rasters whose geotransform is the identity).
+    pub georeferenced: bool,
 }
 
 impl Default for TiffOptions {
     fn default() -> Self {
-        Self { compression: Compression::None, tile_size: None, bigtiff: false, cog: false, nodata: None, nearest_overviews: false }
+        Self {
+            compression: Compression::None,
+            tile_size: None,
+            bigtiff: false,
+            cog: false,
+            nodata: None,
+            nearest_overviews: false,
+            block: None,
+            rows_per_strip: None,
+            planar: false,
+            photometric: None,
+            alpha: false,
+            band_metadata: Vec::new(),
+            color_table: Vec::new(),
+            overviews: Vec::new(),
+            overview_resampling: OverviewResampling::Nearest,
+            georeferenced: true,
+            predictor: 1,
+        }
+    }
+}
+
+/// How the overviews given as factors are computed, as GDAL does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OverviewResampling {
+    Nearest,
+    Average,
+    Min,
+    Max,
+    Mode,
+}
+
+impl OverviewResampling {
+    fn parse(s: &str) -> Result<Self> {
+        Ok(match s.to_ascii_lowercase().as_str() {
+            "near" | "nearest" => Self::Nearest,
+            "average" => Self::Average,
+            "min" => Self::Min,
+            "max" => Self::Max,
+            "mode" => Self::Mode,
+            other => {
+                return Err(Error::Unsupported(format!(
+                    "'{other}' overview resampling is not supported (nearest, average, min, max, mode)"
+                )));
+            }
+        })
+    }
+}
+
+/// Whether a creation option value means yes.
+fn yes(v: &str) -> bool {
+    matches!(v.to_ascii_uppercase().as_str(), "YES" | "TRUE" | "ON" | "1")
+}
+
+impl TiffOptions {
+    /// The options for writing a GeoTIFF (or a COG) with `options`, its creation options read as
+    /// GDAL's. `None` when the compression is one this writer does not handle (a lossy one).
+    pub(crate) fn from_write_options(options: &crate::RasterWriteOptions, cog: bool, nodata: Option<f64>) -> Result<Option<Self>> {
+        let co = |key: &str| options.creation_options.iter().rev().find(|(k, _)| k.eq_ignore_ascii_case(key)).map(|(_, v)| v.as_str());
+        let name = options.compression.as_deref().or_else(|| co("COMPRESS")).unwrap_or(if cog { "LZW" } else { "NONE" });
+        let Some(compression) = Compression::parse(name) else { return Ok(None) };
+        let size = |key: &str| -> Result<Option<u32>> {
+            co(key).map(|v| v.trim().parse::<u32>().map_err(|_| Error::InvalidArgument(format!("invalid {key} '{v}'")))).transpose()
+        };
+        let mut o = Self {
+            compression,
+            tile_size: options.tile_size,
+            bigtiff: options.bigtiff || co("BIGTIFF").is_some_and(yes),
+            cog,
+            nodata,
+            band_metadata: options.band_metadata.clone(),
+            color_table: options.color_table.clone(),
+            ..Default::default()
+        };
+        if cog {
+            if let Some(b) = size("BLOCKSIZE")? {
+                o.tile_size = Some(b);
+            }
+        } else {
+            let (bx, by) = (size("BLOCKXSIZE")?, size("BLOCKYSIZE")?);
+            if co("TILED").is_some_and(yes) {
+                let t = options.tile_size.unwrap_or(256);
+                o.block = Some((bx.unwrap_or(t), by.unwrap_or(t)));
+            } else if options.tile_size.is_none() {
+                o.rows_per_strip = by;
+            }
+            o.overviews = options.overviews.clone();
+            if let Some(r) = &options.overview_resampling {
+                o.overview_resampling = OverviewResampling::parse(r)?;
+            }
+        }
+        if let Some(i) = co("INTERLEAVE") {
+            o.planar = match i.to_ascii_uppercase().as_str() {
+                "BAND" => true,
+                "PIXEL" => false,
+                other => return Err(Error::InvalidArgument(format!("unsupported INTERLEAVE '{other}' (PIXEL, BAND)"))),
+            };
+        }
+        if let Some(p) = co("PHOTOMETRIC") {
+            o.photometric = Some(match p.to_ascii_uppercase().as_str() {
+                "MINISBLACK" => 1,
+                "RGB" => 2,
+                "PALETTE" => 3,
+                other => return Err(Error::Unsupported(format!("PHOTOMETRIC={other} is not supported (MINISBLACK, RGB, PALETTE)"))),
+            });
+        }
+        o.georeferenced = !co("GEOREFERENCED").is_some_and(|v| !yes(v));
+        if let Some(p) = co("PREDICTOR") {
+            o.predictor = match p.trim().to_ascii_uppercase().as_str() {
+                "1" | "NO" | "NONE" => 1,
+                "2" | "YES" => 2,
+                "3" => 3,
+                other => return Err(Error::InvalidArgument(format!("invalid PREDICTOR '{other}' (1, 2, 3)"))),
+            };
+        }
+        o.alpha = co("ALPHA").is_some_and(|v| yes(v) || v.eq_ignore_ascii_case("NON-PREMULTIPLIED"));
+        if !o.color_table.is_empty() && o.photometric.is_none() {
+            o.photometric = Some(3);
+        }
+        Ok(Some(o))
     }
 }
 
@@ -196,31 +339,81 @@ impl Prepared {
     }
 }
 
-/// Splits a raster (and its overviews, for a COG) into compressed chunks with their tags.
+/// Splits a raster (and its overviews) into compressed chunks with their tags.
 fn prepare(raster: &Raster, opts: &TiffOptions) -> Result<Prepared> {
     if raster.cols == 0 || raster.rows == 0 || raster.bands == 0 {
         return Err(Error::InvalidArgument("cannot write an empty raster".into()));
     }
-    let tile = if opts.cog { Some(opts.tile_size.unwrap_or(512)) } else { opts.tile_size };
-    if let Some(t) = tile
-        && (t == 0 || t % 16 != 0)
-    {
-        return Err(Error::InvalidArgument(format!("the tile size must be a multiple of 16, not {t}")));
+    let tile = if opts.cog {
+        let t = opts.tile_size.unwrap_or(512);
+        Some((t, t))
+    } else {
+        opts.block.or(opts.tile_size.map(|t| (t, t)))
+    };
+    if let Some((tw, th)) = tile {
+        for t in [tw, th] {
+            if t == 0 || t % 16 != 0 {
+                return Err(Error::InvalidArgument(format!("the tile size must be a multiple of 16, not {t}")));
+            }
+        }
     }
-    let geo = geo_tags(raster, opts.nodata)?;
+    let photometric = opts.photometric.unwrap_or(if raster.bands == 3 && raster.data_type == DataType::U8 { 2 } else { 1 });
+    let base_samples = if photometric == 2 { 3 } else { 1 };
+    if raster.bands < base_samples {
+        return Err(Error::InvalidArgument(format!("PHOTOMETRIC=RGB needs 3 bands or more, not {}", raster.bands)));
+    }
+    if photometric == 3 {
+        if raster.bands != 1 || !matches!(raster.data_type, DataType::U8 | DataType::U16) {
+            return Err(Error::InvalidArgument("a color table needs a single Byte or UInt16 band".into()));
+        }
+        if opts.color_table.is_empty() {
+            return Err(Error::InvalidArgument("PHOTOMETRIC=PALETTE needs a color table".into()));
+        }
+    }
+    let mut extra = vec![0u16; raster.bands - base_samples];
+    if opts.alpha {
+        match extra.last_mut() {
+            Some(last) => *last = 2,
+            None => return Err(Error::InvalidArgument("ALPHA=YES needs a band besides the color bands".into())),
+        }
+    }
+    // As GDAL, the predictor only applies to compressed files; 3 to floating-point samples.
+    let predictor = if opts.compression == Compression::None { 1 } else { opts.predictor };
+    if predictor == 3 && !matches!(raster.data_type, DataType::F32 | DataType::F64) {
+        return Err(Error::InvalidArgument("PREDICTOR=3 is only supported for floating-point data".into()));
+    }
+    let layout =
+        Layout { tile, rows_per_strip: opts.rows_per_strip, planar: opts.planar && raster.bands > 1, photometric, extra, predictor };
+    let mut geo = geo_tags(raster, opts.nodata, &opts.band_metadata)?;
+    if !opts.georeferenced {
+        geo.retain(|(tag, _)| !matches!(tag, 33550 | 33922));
+    }
+    let color_map = (photometric == 3).then(|| color_map_tag(&opts.color_table, raster.data_type));
 
-    // The full-resolution image, then overviews (COG) until one fits in a tile.
+    // The full-resolution image, then overviews: a COG's until one fits in a tile, or the
+    // factors asked for.
     let mut levels = vec![Level::from_raster(raster)];
-    if let (true, Some(t)) = (opts.cog, tile) {
+    if let (true, Some((t, _))) = (opts.cog, tile) {
         let t = t as usize;
         while levels.last().is_some_and(|l| l.cols > t || l.rows > t) {
             let next = levels[levels.len() - 1].downsample(opts.nodata, opts.nearest_overviews);
             levels.push(next);
         }
+    } else if !opts.cog {
+        let mut factors: Vec<usize> = opts.overviews.iter().copied().filter(|f| *f > 1).collect();
+        factors.sort_unstable();
+        factors.dedup();
+        for f in factors {
+            let (w, h) = (raster.cols.div_ceil(f), raster.rows.div_ceil(f));
+            // As GDAL does, each overview is computed from the previous (larger) one.
+            let src = levels.last().filter(|l| l.cols > w).unwrap_or(&levels[0]);
+            let next = src.resample(w, h, opts.overview_resampling, opts.nodata);
+            levels.push(next);
+        }
     }
     let mut images = Vec::with_capacity(levels.len());
     for (i, level) in levels.iter().enumerate() {
-        let mut img = level.image(raster.data_type, opts.compression, tile)?;
+        let mut img = level.image(raster.data_type, opts.compression, &layout)?;
         if i > 0 {
             img.tags.push((254, Value::Longs(vec![1])));
         }
@@ -230,6 +423,9 @@ fn prepare(raster: &Raster, opts: &TiffOptions) -> Result<Prepared> {
                 img.tags.push((*tag, v.clone()));
             }
         }
+        if let Some(cm) = &color_map {
+            img.tags.push((320, cm.clone()));
+        }
         img.tags.sort_by_key(|(t, _)| *t);
         images.push(img);
     }
@@ -237,6 +433,32 @@ fn prepare(raster: &Raster, opts: &TiffOptions) -> Result<Prepared> {
     let data_len: u64 = images.iter().flat_map(|i| i.chunks.iter()).map(|c| c.len() as u64 + 8).sum();
     let big = opts.bigtiff || data_len > (u32::MAX as u64) - (1 << 24);
     Ok(Prepared { images, big, cog: opts.cog })
+}
+
+/// The `ColorMap` tag of a color table: every red value, then green, then blue, as 16 bits.
+fn color_map_tag(table: &[[u8; 4]], t: DataType) -> Value {
+    let n = if t == DataType::U16 { 65536 } else { 256 };
+    let mut v = vec![0u16; 3 * n];
+    for (i, e) in table.iter().take(n).enumerate() {
+        for c in 0..3 {
+            v[c * n + i] = e[c] as u16 * 257;
+        }
+    }
+    Value::Shorts(v)
+}
+
+/// How the pixels are laid out in the file.
+struct Layout {
+    /// Tile width and height; strips when `None`.
+    tile: Option<(u32, u32)>,
+    rows_per_strip: Option<u32>,
+    /// One plane per band.
+    planar: bool,
+    photometric: u16,
+    /// The `ExtraSamples` values of the samples besides the color ones.
+    extra: Vec<u16>,
+    /// The TIFF predictor.
+    predictor: u16,
 }
 
 /// One resolution level's pixels, band-major: the raster's own, or an overview's.
@@ -260,44 +482,71 @@ impl<'a> Level<'a> {
         Level { cols, rows, bands: self.bands, data: std::borrow::Cow::Owned(data) }
     }
 
+    /// Resamples to `cols` x `rows` pixels, as GDAL computes overviews.
+    fn resample(&self, cols: usize, rows: usize, method: OverviewResampling, nodata: Option<f64>) -> Level<'static> {
+        let src = (self.cols, self.rows, self.bands);
+        // GDAL's mode kernel works on 16, 32 and 64-bit signed data as unsigned: a negative nodata
+        // value is out of its range, and empty blocks get 0.
+        let signed = matches!(self.data.data_type(), DataType::I16 | DataType::I32 | DataType::I64);
+        let fill =
+            if method == OverviewResampling::Mode && signed && nodata.is_some_and(|n| n < 0.0) { 0.0 } else { nodata.unwrap_or(0.0) };
+        let data = map_data!(self.data.as_ref(), v => resample(v, src, cols, rows, method, nodata, fill));
+        Level { cols, rows, bands: self.bands, data: std::borrow::Cow::Owned(data) }
+    }
+
     /// Splits the level into compressed strips or tiles, with its structural tags.
-    fn image(&self, t: DataType, compression: Compression, tile: Option<u32>) -> Result<Image> {
+    fn image(&self, t: DataType, compression: Compression, layout: &Layout) -> Result<Image> {
         let size = t.size_bytes();
         let spp = self.bands;
-        let (chunk_w, chunk_h, across, down, tiled) = match tile {
-            Some(ts) => {
-                let ts = ts as usize;
-                (ts, ts, self.cols.div_ceil(ts), self.rows.div_ceil(ts), true)
+        // Samples per chunk.
+        let chunk_spp = if layout.planar { 1 } else { spp };
+        let planes = if layout.planar { spp } else { 1 };
+        let (chunk_w, chunk_h, across, down, tiled) = match layout.tile {
+            Some((tw, th)) => {
+                let (tw, th) = (tw as usize, th as usize);
+                (tw, th, self.cols.div_ceil(tw), self.rows.div_ceil(th), true)
             }
             None => {
-                let row_bytes = self.cols * spp * size;
-                let rows_per_strip = ((1usize << 16) / row_bytes.max(1)).clamp(1, self.rows);
+                let row_bytes = self.cols * chunk_spp * size;
+                let rows_per_strip = match layout.rows_per_strip {
+                    Some(r) => (r as usize).clamp(1, self.rows),
+                    None => ((1usize << 16) / row_bytes.max(1)).clamp(1, self.rows),
+                };
                 (self.cols, rows_per_strip, 1, self.rows.div_ceil(rows_per_strip), false)
             }
         };
-        let chunks = crate::par::map_range(across * down, |i| {
-            let (x0, y0) = ((i % across) * chunk_w, (i / across) * chunk_h);
+        let per_plane = across * down;
+        let band_len = self.cols * self.rows;
+        let chunks = crate::par::map_range(planes * per_plane, |i| {
+            let (plane, j) = (i / per_plane, i % per_plane);
+            let (x0, y0) = ((j % across) * chunk_w, (j / across) * chunk_h);
             // Strips stop at the last row; tiles are padded to full size.
             let h = if tiled { chunk_h } else { chunk_h.min(self.rows - y0) };
-            let buf = with_data!(self.data.as_ref(), v => chunk_bytes(v, self.cols, self.rows, spp, x0, y0, chunk_w, h));
+            let mut buf = if layout.planar {
+                with_data!(self.data.as_ref(), v => chunk_bytes(&v[plane * band_len..(plane + 1) * band_len], self.cols, self.rows, 1, x0, y0, chunk_w, h))
+            } else {
+                with_data!(self.data.as_ref(), v => chunk_bytes(v, self.cols, self.rows, spp, x0, y0, chunk_w, h))
+            };
+            apply_predictor(&mut buf, layout.predictor, chunk_w * chunk_spp, chunk_spp, size);
             compression.compress(buf)
         });
         let chunks = chunks.into_iter().collect::<Result<Vec<_>>>()?;
         let (bits, format) = sample_format(t);
-        let rgb = spp == 3 && t == DataType::U8;
         let mut tags = vec![
             (256, Value::Longs(vec![self.cols as u32])),
             (257, Value::Longs(vec![self.rows as u32])),
             (258, Value::Shorts(vec![bits; spp])),
             (259, Value::Shorts(vec![compression.code()])),
-            (262, Value::Shorts(vec![if rgb { 2 } else { 1 }])),
+            (262, Value::Shorts(vec![layout.photometric])),
             (277, Value::Shorts(vec![spp as u16])),
-            (284, Value::Shorts(vec![1])),
+            (284, Value::Shorts(vec![if layout.planar { 2 } else { 1 }])),
             (339, Value::Shorts(vec![format; spp])),
         ];
-        let extra = if rgb { 0 } else { spp - 1 };
-        if extra > 0 {
-            tags.push((338, Value::Shorts(vec![0; extra])));
+        if !layout.extra.is_empty() {
+            tags.push((338, Value::Shorts(layout.extra.clone())));
+        }
+        if layout.predictor > 1 {
+            tags.push((317, Value::Shorts(vec![layout.predictor])));
         }
         if tiled {
             tags.push((322, Value::Longs(vec![chunk_w as u32])));
@@ -307,6 +556,152 @@ impl<'a> Level<'a> {
         }
         Ok(Image { tags, chunks, tiled })
     }
+}
+
+/// Applies a TIFF predictor to the little-endian rows of a chunk, as libtiff does: 2 differences
+/// each sample with the previous pixel's (as unsigned integers of the sample size, wrapping); 3
+/// splits each row's samples into byte planes, most significant first, then differences each
+/// byte with the one `stride` bytes before.
+fn apply_predictor(buf: &mut [u8], predictor: u16, row_samples: usize, stride: usize, size: usize) {
+    let row_len = row_samples * size;
+    if predictor < 2 || row_len == 0 {
+        return;
+    }
+    for row in buf.chunks_exact_mut(row_len) {
+        if predictor == 2 {
+            macro_rules! diff {
+                ($t:ty) => {{
+                    const N: usize = std::mem::size_of::<$t>();
+                    for i in (stride..row_samples).rev() {
+                        let cur = <$t>::from_le_bytes(row[i * N..(i + 1) * N].try_into().unwrap_or_default());
+                        let prev = <$t>::from_le_bytes(row[(i - stride) * N..(i - stride + 1) * N].try_into().unwrap_or_default());
+                        row[i * N..(i + 1) * N].copy_from_slice(&cur.wrapping_sub(prev).to_le_bytes());
+                    }
+                }};
+            }
+            match size {
+                1 => diff!(u8),
+                2 => diff!(u16),
+                4 => diff!(u32),
+                _ => diff!(u64),
+            }
+        } else {
+            let tmp = row.to_vec();
+            for i in 0..row_samples {
+                for b in 0..size {
+                    // Little-endian bytes: byte `b` is the (size - 1 - b)th most significant.
+                    row[(size - b - 1) * row_samples + i] = tmp[size * i + b];
+                }
+            }
+            for i in (stride..row_len).rev() {
+                row[i] = row[i].wrapping_sub(row[i - stride]);
+            }
+        }
+    }
+}
+
+/// Resamples a band-major image to `out_cols` x `out_rows`, as GDAL computes overviews: nearest
+/// neighbour picks the pixel at `0.5 + i * ratio`; the other methods combine the valid pixels of
+/// the source window of each output pixel (an average weighted by coverage).
+fn resample<T: Pixel>(
+    src: &[T],
+    (cols, rows, bands): (usize, usize, usize),
+    out_cols: usize,
+    out_rows: usize,
+    method: OverviewResampling,
+    nodata: Option<f64>,
+    fill: f64,
+) -> Vec<T> {
+    let (rx, ry) = (cols as f64 / out_cols as f64, rows as f64 / out_rows as f64);
+    // Source windows: (first, end, first weight, last weight).
+    let window = |i: usize, ratio: f64, n: usize| -> (usize, usize, f64, f64) {
+        let (f0, f1) = (i as f64 * ratio, (i + 1) as f64 * ratio);
+        let a = ((f0 + 1e-8) as usize).min(n - 1);
+        let mut b = (f1 - 1e-8).ceil() as usize;
+        if b <= a {
+            b = a + 1;
+        }
+        let b = b.min(n);
+        let wa = if b == a + 1 { 1.0 } else { 1.0 - (f0 - a as f64) };
+        let wb = 1.0 - (b as f64 - f1);
+        (a, b, wa, wb)
+    };
+    let xs: Vec<_> = (0..out_cols).map(|i| window(i, rx, cols)).collect();
+    let mut out = vec![T::default(); out_cols * out_rows * bands];
+    crate::par::chunks_mut(&mut out, out_cols, |k, line| {
+        let (b, r) = (k / out_rows, k % out_rows);
+        let band = &src[b * cols * rows..(b + 1) * cols * rows];
+        if method == OverviewResampling::Nearest {
+            let sy = ((0.5 + r as f64 * ry) as usize).min(rows - 1);
+            for (c, o) in line.iter_mut().enumerate() {
+                let sx = ((0.5 + c as f64 * rx) as usize).min(cols - 1);
+                *o = band[sy * cols + sx];
+            }
+            return;
+        }
+        let (y0, y1, wy0, wy1) = window(r, ry, rows);
+        let mut values: Vec<f64> = Vec::new();
+        for (c, o) in line.iter_mut().enumerate() {
+            let (x0, x1, wx0, wx1) = xs[c];
+            let (mut sum, mut weight) = (0.0, 0.0);
+            values.clear();
+            for y in y0..y1 {
+                let wy = if y == y0 {
+                    wy0
+                } else if y + 1 == y1 {
+                    wy1
+                } else {
+                    1.0
+                };
+                for x in x0..x1 {
+                    let v = band[y * cols + x].to_f64();
+                    if v.is_nan() || nodata.is_some_and(|nd| v == nd) {
+                        continue;
+                    }
+                    let wx = if x == x0 {
+                        wx0
+                    } else if x + 1 == x1 {
+                        wx1
+                    } else {
+                        1.0
+                    };
+                    sum += v * wx * wy;
+                    weight += wx * wy;
+                    values.push(v);
+                }
+            }
+            let v = if values.is_empty() {
+                fill
+            } else {
+                match method {
+                    OverviewResampling::Average => sum / weight,
+                    OverviewResampling::Min => values.iter().copied().fold(f64::INFINITY, f64::min),
+                    OverviewResampling::Max => values.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+                    _ => mode(&values),
+                }
+            };
+            *o = T::from_f64(v);
+        }
+    });
+    out
+}
+
+/// The most frequent value, as GDAL counts: the first value to reach the highest count.
+fn mode(values: &[f64]) -> f64 {
+    let mut seen: Vec<(f64, usize)> = Vec::new();
+    let mut best = 0;
+    for v in values {
+        match seen.iter().position(|(w, _)| w == v) {
+            Some(i) => {
+                seen[i].1 += 1;
+                if seen[i].1 > seen[best].1 {
+                    best = i;
+                }
+            }
+            None => seen.push((*v, 1)),
+        }
+    }
+    seen[best].0
 }
 
 /// The pixel-interleaved little-endian bytes of a chunk of `chunk_w` x `h` pixels at `(x0, y0)`,
@@ -408,7 +803,7 @@ pub(crate) fn encode_sample_le(t: DataType, v: f64, out: &mut Vec<u8>) {
 }
 
 /// The georeferencing tags: pixel scale and tie point, GeoKeys, nodata and metadata.
-fn geo_tags(r: &Raster, nodata: Option<f64>) -> Result<Vec<(u16, Value)>> {
+fn geo_tags(r: &Raster, nodata: Option<f64>, bands: &[crate::BandMetadata]) -> Result<Vec<(u16, Value)>> {
     let mut tags = vec![
         (33550, Value::Doubles(vec![r.cell_size_x, r.cell_size_y, 0.0])),
         (33922, Value::Doubles(vec![0.0, 0.0, 0.0, r.x_min, r.y_max(), 0.0])),
@@ -469,18 +864,56 @@ fn geo_tags(r: &Raster, nodata: Option<f64>) -> Result<Vec<(u16, Value)>> {
     if !ascii.is_empty() {
         tags.push((34737, Value::Ascii(ascii)));
     }
-    if !r.metadata.is_empty() {
-        let mut xml = String::from("<GDALMetadata>\n");
-        for (k, v) in &r.metadata {
-            xml.push_str(&format!("  <Item name=\"{}\">{}</Item>\n", xml_escape(k), xml_escape(v)));
-        }
-        xml.push_str("</GDALMetadata>");
+    if let Some(xml) = gdal_metadata_xml(&r.metadata, bands) {
         tags.push((42112, Value::Ascii(xml)));
     }
     if let Some(nd) = nodata {
         tags.push((42113, Value::Ascii(format_nodata(nd))));
     }
     Ok(tags)
+}
+
+/// The `GDAL_METADATA` document of dataset items and band metadata, as GDAL writes it (values
+/// escaped twice). `None` when there is nothing to write.
+fn gdal_metadata_xml(dataset: &[(String, String)], bands: &[crate::BandMetadata]) -> Option<String> {
+    let mut xml = String::from("<GDALMetadata>\n");
+    let mut any = false;
+    let mut item = |name: &str, value: &str, sample: Option<usize>, role: Option<&str>| {
+        let mut attrs = format!("name=\"{}\"", xml_escape(name));
+        if let Some(s) = sample {
+            attrs.push_str(&format!(" sample=\"{s}\""));
+        }
+        if let Some(r) = role {
+            attrs.push_str(&format!(" role=\"{r}\""));
+        }
+        xml.push_str(&format!("  <Item {attrs}>{}</Item>\n", xml_escape(&xml_escape(value))));
+        any = true;
+    };
+    for (k, v) in dataset {
+        item(k, v, None, None);
+    }
+    for (i, b) in bands.iter().enumerate() {
+        if let Some(v) = b.offset {
+            item("OFFSET", &format!("{v}"), Some(i), Some("offset"));
+        }
+        if let Some(v) = b.scale {
+            item("SCALE", &format!("{v}"), Some(i), Some("scale"));
+        }
+        if let Some(v) = &b.unit {
+            item("UNITTYPE", v, Some(i), Some("unittype"));
+        }
+        if let Some(v) = &b.description {
+            item("DESCRIPTION", v, Some(i), Some("description"));
+        }
+        for (k, v) in &b.items {
+            item(k, v, Some(i), None);
+        }
+        if let Some(v) = &b.color_interp {
+            item("COLORINTERP", v, Some(i), Some("colorinterp"));
+        }
+    }
+    xml.push_str("</GDALMetadata>");
+    any.then_some(xml)
 }
 
 /// The name and EPSG linear unit code of a `LOCAL_CS` WKT (metres and feet).
@@ -529,7 +962,7 @@ pub(crate) fn parse_gdal_metadata(xml: &str) -> Vec<(String, String)> {
         }
         let Some(name) = attrs.split("name=\"").nth(1).and_then(|s| s.split('"').next()) else { continue };
         let Some(value) = rest.split("</Item>").next() else { continue };
-        out.push((xml_unescape(name), xml_unescape(value)));
+        out.push((xml_unescape(name), xml_unescape(&xml_unescape(value))));
     }
     out
 }
@@ -545,7 +978,7 @@ pub(crate) fn parse_gdal_band_metadata(xml: &str) -> Vec<(usize, String, String)
         let attr = |key: &str| attrs.split(&format!("{key}=\"")).nth(1).and_then(|s| s.split('"').next());
         let (Some(name), Some(sample)) = (attr("name"), attr("sample").and_then(|s| s.parse().ok())) else { continue };
         let Some(value) = rest.split("</Item>").next() else { continue };
-        out.push((sample, xml_unescape(name), xml_unescape(value)));
+        out.push((sample, xml_unescape(name), xml_unescape(&xml_unescape(value))));
     }
     out
 }
@@ -755,5 +1188,116 @@ mod tests {
             assert_eq!(ds.crs().epsg, Some(32610));
             assert_eq!(ds.geo_transform(), [500000.0, 10.0, 0.0, 4000500.0, 0.0, -10.0]);
         }
+    }
+
+    fn layouts_raster(bands: usize, t: DataType) -> Raster {
+        let cfg = wbraster::RasterConfig {
+            cols: 70,
+            rows: 50,
+            bands,
+            x_min: 500000.0,
+            y_min: 4000000.0,
+            cell_size: 10.0,
+            nodata: -1.0,
+            data_type: t,
+            crs: wbraster::CrsInfo::from_epsg(32610),
+            ..Default::default()
+        };
+        let n = 70 * 50 * bands;
+        let data = match t {
+            DataType::F32 => RasterData::F32((0..n).map(|i| (i % 977) as f32 * 0.25 - 3.0).collect()),
+            DataType::U8 => RasterData::U8((0..n).map(|i| (i % 251) as u8).collect()),
+            _ => RasterData::I16((0..n).map(|i| (i % 1000) as i16 - 1).collect()),
+        };
+        Raster::from_data_native(cfg, data).unwrap()
+    }
+
+    #[test]
+    fn writes_gdal_layouts_and_predictors() {
+        for (bands, t, co) in [
+            (3, DataType::I16, vec![("TILED", "YES"), ("BLOCKXSIZE", "32"), ("BLOCKYSIZE", "16"), ("INTERLEAVE", "BAND")]),
+            (2, DataType::I16, vec![("BLOCKYSIZE", "7"), ("COMPRESS", "DEFLATE"), ("PREDICTOR", "2")]),
+            (2, DataType::F32, vec![("TILED", "YES"), ("COMPRESS", "LZW"), ("PREDICTOR", "3")]),
+            (1, DataType::F32, vec![("COMPRESS", "ZSTD"), ("PREDICTOR", "3"), ("INTERLEAVE", "BAND")]),
+            (4, DataType::U8, vec![("PHOTOMETRIC", "RGB"), ("ALPHA", "YES"), ("COMPRESS", "PACKBITS"), ("PREDICTOR", "2")]),
+        ] {
+            let r = layouts_raster(bands, t);
+            let options = crate::RasterWriteOptions {
+                creation_options: co.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+                ..Default::default()
+            };
+            let opts = TiffOptions::from_write_options(&options, false, Some(-1.0)).unwrap().unwrap();
+            let dir = tempfile::tempdir().unwrap();
+            let p = dir.path().join("t.tif");
+            write(&r, p.to_str().unwrap(), &opts).unwrap();
+            let ds = crate::geotiff::read_geotiff(&p).unwrap();
+            let same = match (&ds.raster.data, &r.data) {
+                (RasterData::I16(a), RasterData::I16(b)) => a == b,
+                (RasterData::F32(a), RasterData::F32(b)) => a == b,
+                (RasterData::U8(a), RasterData::U8(b)) => a == b,
+                _ => false,
+            };
+            assert!(same, "{co:?}");
+        }
+    }
+
+    #[test]
+    fn writes_band_metadata_color_tables_and_overviews() {
+        let r = layouts_raster(1, DataType::U8);
+        let options = crate::RasterWriteOptions {
+            band_metadata: vec![crate::BandMetadata {
+                description: Some("a<b".into()),
+                scale: Some(2.0),
+                items: vec![("k".into(), "v".into())],
+                ..Default::default()
+            }],
+            color_table: vec![[255, 0, 0, 255], [0, 255, 0, 255]],
+            overviews: vec![2, 4],
+            overview_resampling: Some("average".into()),
+            creation_options: vec![("GEOREFERENCED".into(), "NO".into())],
+            ..Default::default()
+        };
+        let opts = TiffOptions::from_write_options(&options, false, None).unwrap().unwrap();
+        assert_eq!(opts.photometric, Some(3));
+        let bytes = encode(&r, &opts).unwrap();
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(text.contains(r#"<Item name="DESCRIPTION" sample="0" role="description">a&amp;lt;b</Item>"#));
+        assert!(text.contains(r#"<Item name="k" sample="0">v</Item>"#));
+        let tags = crate::geotiff::read_geo_tags_from(std::io::Cursor::new(&bytes)).unwrap();
+        assert_eq!(tags.geo_transform, None);
+        assert_eq!(tags.band_metadata, vec![(0, "k".to_string(), "v".to_string())]);
+        let mut lazy = crate::LazyRaster::from_tiff_bytes(bytes).unwrap().unwrap();
+        assert_eq!(lazy.overviews(), vec![(35, 25), (18, 13)]);
+        let o = lazy.read_window(crate::Window::new(0, 0, 35, 25), &crate::WindowOptions { bands: vec![], overview: Some(0) }).unwrap();
+        let wbraster::raster::RasterData::U8(v) = &o.raster.data else { panic!() };
+        let wbraster::raster::RasterData::U8(src) = &r.data else { panic!() };
+        // The average of each 2x2 block, rounded half up.
+        let avg = |r0: usize, c0: usize| {
+            let s: u32 = [(0, 0), (0, 1), (1, 0), (1, 1)].iter().map(|(a, b)| src[(r0 + a) * 70 + c0 + b] as u32).sum();
+            ((s as f64 / 4.0) + 0.5).floor() as u8
+        };
+        assert_eq!(v[0], avg(0, 0));
+        assert_eq!(v[3 * 35 + 7], avg(6, 14));
+    }
+
+    #[test]
+    fn mode_counts_as_gdal() {
+        // The first value to reach the highest count wins.
+        assert_eq!(mode(&[1.0, 2.0, 2.0, 1.0]), 2.0);
+        assert_eq!(mode(&[3.0, 1.0, 2.0]), 3.0);
+        assert_eq!(mode(&[1.0, 2.0, 1.0, 2.0, 2.0]), 2.0);
+    }
+
+    #[test]
+    fn predictors_match_libtiff() {
+        // Horizontal differencing of 16-bit samples, two per pixel.
+        let mut b: Vec<u8> = [10u16, 20, 13, 25, 7, 30].iter().flat_map(|v| v.to_le_bytes()).collect();
+        apply_predictor(&mut b, 2, 6, 2, 2);
+        let v: Vec<u16> = b.chunks(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+        assert_eq!(v, vec![10, 20, 3, 5, 65530, 5]);
+        // Floating point: byte planes, most significant first, then byte differences.
+        let mut f: Vec<u8> = [1.0f32, 2.0].iter().flat_map(|v| v.to_le_bytes()).collect();
+        apply_predictor(&mut f, 3, 2, 1, 4);
+        assert_eq!(f, vec![0x3f, 0x01, 0x40, 0x80, 0x00, 0x00, 0x00, 0x00]);
     }
 }

@@ -349,6 +349,27 @@ pub(crate) fn suggested_output(ds: &RasterDataset, dst: &SpatialRef) -> Result<(
     suggested_warp_output(&t, ds.raster.cols, ds.raster.rows, &src, dst)
 }
 
+/// The output grid GDAL suggests (`GDALSuggestedWarpOutput2()`) for a raster of `width` x
+/// `height` pixels with the geotransform `gt` in the CRS `src`, reprojected to `dst`: the
+/// geotransform, the width and the height.
+///
+/// ```no_run
+/// use terrio::crs::SpatialRef;
+///
+/// let (src, dst) = (SpatialRef::parse("EPSG:32611")?, SpatialRef::parse("EPSG:4326")?);
+/// let gt = [699960.0, 30.0, 0.0, 4100040.0, 0.0, -30.0];
+/// let (gt, w, h) = terrio::ops::warp::suggested_grid(3660, 3660, gt, &src, &dst)?;
+/// # Ok::<(), terrio::Error>(())
+/// ```
+pub fn suggested_grid(width: usize, height: usize, gt: [f64; 6], src: &SpatialRef, dst: &SpatialRef) -> Result<([f64; 6], usize, usize)> {
+    if width == 0 || height == 0 {
+        return Err(Error::InvalidArgument("the source raster is empty".into()));
+    }
+    let t = GenImgProj::new(gt, src, dst)?;
+    let (gt, w, h, _) = suggested_warp_output(&t, width, height, src, dst)?;
+    Ok((gt, w, h))
+}
+
 /// GDAL's `GDALSuggestedWarpOutput2()`: the extent of the transformed source and a square pixel
 /// size that keeps the number of pixels along the diagonal. Returns the geotransform, the size and
 /// the extent `[min_x, min_y, max_x, max_y]`.
@@ -925,7 +946,9 @@ pub fn warp(sources: &[&RasterDataset], o: &WarpOptions) -> Result<RasterDataset
         ctx.collect_chunks(0, 0, grid.width, grid.height, &mut chunks);
         chunks.sort_by_key(|c| (c.dy, c.dx));
         let data = SrcData { bands: &src_bands, valid: &valid, width: s.grid.width };
-        let sink = Sink { out_type, dst_nodata, avoid_nodata: masked };
+        // As GDAL's warp kernel: valid pixels equal to the output nodata are nudged off it,
+        // except with a nodata value unified across several bands.
+        let sink = Sink { out_type, dst_nodata, avoid_nodata: masked && (bands == 1 || !unified) };
         for c in chunks {
             ctx.warp_chunk(&c, &data, &sink, chunk_rows(&mut out, grid.width, &c));
         }

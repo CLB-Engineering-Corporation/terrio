@@ -11,10 +11,24 @@
 
 Python bindings for [terrio](https://github.com/opengeos/terrio): read, write, convert and
 reproject geospatial rasters, vector datasets and point clouds in pure Rust, without GDAL. Wheels need only
-NumPy.
+NumPy (and the small `affine` package).
 
 ```sh
 pip install terrio
+```
+
+## Coming from rasterio
+
+rasterio scripts run with an import change: `terrio.rio` follows rasterio's API (datasets,
+windows, CRSs, features, warping, merging, masking, warped VRTs, memory files), compared with
+rasterio on real files. See [Coming from rasterio](https://terrio.opengeos.org/rasterio/).
+
+```python
+import terrio.rio as rasterio
+
+with rasterio.open("https://example.com/cog.tif") as src:  # read lazily, by window
+    profile = src.profile
+    dem = src.read(1, out_shape=(512, 512), masked=True)  # through the overviews
 ```
 
 ## Rasters

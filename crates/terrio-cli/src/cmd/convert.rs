@@ -145,7 +145,14 @@ pub fn run(mut a: Args) -> terrio::Result<()> {
                 .as_deref()
                 .map(|f| RasterDriver::from_name(f).ok_or_else(|| terrio::Error::InvalidArgument(format!("unknown raster format '{f}'"))))
                 .transpose()?;
-            let opts = RasterWriteOptions { driver, compression: a.compress, tile_size: a.tile_size, bigtiff: a.bigtiff, creation_options };
+            let opts = RasterWriteOptions {
+                driver,
+                compression: a.compress,
+                tile_size: a.tile_size,
+                bigtiff: a.bigtiff,
+                creation_options,
+                ..Default::default()
+            };
             terrio::write_raster_dataset(&r, &a.output, &opts)
         }
         Dataset::Vector(v) => {

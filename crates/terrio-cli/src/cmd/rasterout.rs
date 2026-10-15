@@ -41,6 +41,7 @@ impl OutputArgs {
             tile_size: self.tile_size,
             bigtiff: self.bigtiff,
             creation_options,
+            ..Default::default()
         };
         terrio::write_raster_dataset(ds, path, &opts)
     }

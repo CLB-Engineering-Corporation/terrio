@@ -171,8 +171,8 @@ pub mod vfs;
 
 pub use cog::{LazyRaster, Window, WindowOptions, open_raster_lazy};
 pub use dataset::{
-    Dataset, RasterDataset, RasterWriteOptions, VectorDataset, VectorOpenOptions, VectorWriteOptions, geo_transform, list_layers, open,
-    open_raster, open_vector, write_raster, write_raster_dataset, write_vector,
+    BandMetadata, Dataset, RasterDataset, RasterWriteOptions, VectorDataset, VectorOpenOptions, VectorWriteOptions, geo_transform,
+    list_layers, open, open_raster, open_vector, write_raster, write_raster_dataset, write_vector,
 };
 pub use drivers::vector::csv::{CsvGeometry, CsvOptions};
 pub use drivers::vector::geojson::GeoJsonOptions;

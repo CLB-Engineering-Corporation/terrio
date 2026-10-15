@@ -311,22 +311,14 @@ pub(crate) mod codec {
     /// Writes a raster to bytes with the in-memory codecs.
     /// `table` names the raster in formats that hold several (GeoPackage).
     pub(crate) fn write_raster(ds: &RasterDataset, driver: RasterDriver, options: &RasterWriteOptions, table: &str) -> Result<Vec<u8>> {
-        use crate::drivers::gtiff_write::{Compression, TiffOptions, encode};
+        use crate::drivers::gtiff_write::{TiffOptions, encode};
         match driver {
             RasterDriver::GTiff | RasterDriver::Cog => {
                 let cog = driver == RasterDriver::Cog;
-                let name = options.compression.as_deref().unwrap_or(if cog { "LZW" } else { "NONE" });
-                let compression = Compression::parse(name).ok_or_else(|| {
+                let opts = TiffOptions::from_write_options(options, cog, ds.nodata())?.ok_or_else(|| {
+                    let name = options.compression.as_deref().unwrap_or_default();
                     Error::Unsupported(format!("{name} compression cannot be written in this build (NONE, LZW, DEFLATE, PACKBITS, ZSTD)"))
                 })?;
-                let opts = TiffOptions {
-                    compression,
-                    tile_size: options.tile_size,
-                    bigtiff: options.bigtiff,
-                    cog,
-                    nodata: ds.nodata(),
-                    ..Default::default()
-                };
                 encode(&ds.raster, &opts)
             }
             RasterDriver::AAIGrid => {

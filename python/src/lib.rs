@@ -5,6 +5,7 @@ mod arrow;
 mod ops;
 mod pointcloud;
 mod raster;
+mod rio;
 mod terrain;
 mod vector;
 
@@ -65,5 +66,6 @@ fn _terrio(m: &Bound<'_, PyModule>) -> PyResult<()> {
     ops::register(m)?;
     terrain::register(m)?;
     pointcloud::register(m)?;
+    rio::register(m)?;
     Ok(())
 }
