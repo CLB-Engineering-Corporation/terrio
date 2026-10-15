@@ -296,7 +296,8 @@ impl PyRaster {
     ///     tile_size: Write GeoTIFF tiles of this size (COG tiles default to 512).
     ///     bigtiff: Write a BigTIFF.
     ///     options: Format-specific creation options, as GDAL names them, such as
-    ///         `{"FORMAT": "ZARR_V3", "GEOREFERENCING_CONVENTION": "SPATIAL_PROJ"}` for Zarr.
+    ///         `{"FORMAT": "ZARR_V3", "GEOREFERENCING_CONVENTION": "SPATIAL_PROJ"}` for Zarr, or
+    ///         `{"FORMAT": "NC4", "COMPRESS": "DEFLATE", "ZLEVEL": "6"}` for netCDF-4.
     ///
     /// Raises:
     ///     TerrioError: If the raster cannot be written.

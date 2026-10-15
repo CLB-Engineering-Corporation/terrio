@@ -134,10 +134,17 @@ thinning by voxel), and gridding with TIN or nearest-neighbour interpolation.
 
 - CRS: datum shift grids (NTv2, GeoTIFF grids), vertical datums, time-dependent transformations
   between dynamic datums (coordinate epochs).
-- NetCDF and HDF5 in pure Rust: classic and netCDF-4 reading and classic (CDF-1/2/5) writing are
-  done; netCDF-4 writing and groups below the root remain.
+- NetCDF and HDF5 in pure Rust. Done: classic and netCDF-4 reading, with variables in groups
+  below the root (`NETCDF:"file.nc":/group/var`) listed as `gdalinfo` lists them; classic
+  (CDF-1/2/5) and netCDF-4 writing (`FORMAT=NC4`/`NC4C`, chunked, deflate and shuffle, CF
+  georeferencing, as GDAL writes them; terrio's own HDF5 writer); HDF5 rasters as GDAL's HDF5
+  driver reads them (`HDF5:"file.h5"://group/dataset`, metadata, user blocks), checked on JPSS
+  and Sentinel-5P products. Still to do: HDF-EOS5 grids and swaths and other product-specific
+  georeferencing, compound and complex datasets, writing groups.
 - JPEG 2000 and other compressed raster formats as pure-Rust decoders mature.
-- Band histograms as `gdalinfo -hist` computes them; color relief written as a VRT.
+- Band histograms as `gdalinfo -hist` computes them (`terrio info --hist`, identical to GDAL's on
+  GeoTIFFs and scanline formats); color relief written as a VRT (`terrio dem color-relief -f
+  VRT`, lookup tables identical to `gdaldem`'s). Done.
 
 ## Decisions
 
@@ -153,6 +160,10 @@ thinning by voxel), and gridding with TIN or nearest-neighbour interpolation.
   the datum transformations GDAL lists for them, so that terrio picks the same transformation as
   GDAL for each point. The projection formulas are PROJ's, ported to Rust; `wbprojection` remains
   the fallback for projections EPSG CRSs do not use and for WKT 2 parsing.
+- NetCDF-4 and HDF5 are read with the pure-Rust `netcdf-reader` and `hdf5-reader` crates, and
+  netCDF-4 is written by terrio's own small HDF5 writer (superblock 2, version 2 object headers,
+  version 1 chunk B-trees, dimension scales), which the netCDF and HDF5 libraries read: no HDF5
+  write crate exists in pure Rust.
 - Point clouds use the `laz` crate for LASzip, and terrio's own LAS and COPC code rather than the
   `las` crate (whose header reader keeps only the first EVLR) or `wblidar` (which reads COPC points
   in hierarchy order and cannot read LASzip's unchunked compressor). Point clouds are not

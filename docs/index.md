@@ -15,7 +15,8 @@ terrio rasterize counties.gpkg counties.tif -a FIPS --tr 0.01 0.01
 
 ## Features
 
-- **Rasters**: GeoTIFF, Cloud Optimized GeoTIFF, JPEG 2000, Zarr v2/v3, netCDF, ERDAS Imagine,
+- **Rasters**: GeoTIFF, Cloud Optimized GeoTIFF, JPEG 2000, Zarr v2/v3, netCDF (classic and
+  netCDF-4, with groups), HDF5, ERDAS Imagine,
   ENVI, Esri grids, GeoPackage tiles, VRT and more. See [Formats](formats.md).
 - **Vectors**: GeoPackage, GeoParquet, FlatGeobuf, Shapefile, GeoJSON, CSV, KML/KMZ, GML, GPX,
   TopoJSON, MapInfo and OpenStreetMap PBF.

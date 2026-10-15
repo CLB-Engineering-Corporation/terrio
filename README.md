@@ -104,7 +104,7 @@ Datasets can also be opened from bytes and written to bytes (`terrio::memory`), 
 already in memory and for WebAssembly, which has no file system.
 
 An optional GDAL backend (the `gdal` cargo feature, off by default and the only C dependency)
-opens what terrio has no driver for (HDF4, HDF5, GRIB, NITF and the rest of GDAL's formats)
+opens what terrio has no driver for (HDF4, GRIB, NITF and the rest of GDAL's formats)
 into the same data model, and writes rasters with GDAL's drivers: `terrio::open("GDAL:file.hdf")`,
 `terrio info --driver gdal`, or a plain path when terrio's own drivers cannot open it.
 

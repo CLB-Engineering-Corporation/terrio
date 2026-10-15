@@ -26,13 +26,26 @@ option list.
 ## info
 
 ```sh
-terrio info INPUT [--json] [--stats] [-l LAYER]...
+terrio info INPUT [--json] [--stats] [--hist] [-l LAYER]...
 ```
 
 Prints the driver, size, bands, data types, nodata, geotransform, CRS and extent of a raster, or
 the layers, geometry types, feature counts, CRS, extent and fields of a vector dataset. `--stats`
 computes band minimum, maximum, mean and standard deviation over valid pixels. Remote GeoTIFFs are
-summarized from their header alone, and their overviews are listed.
+summarized from their header alone, and their overviews are listed. The subdatasets of netCDF,
+HDF5 and GeoPackage files are listed as `gdalinfo` lists them (`SUBDATASET_N_NAME` and
+`SUBDATASET_N_DESC`).
+
+`--hist` computes each band's histogram as `gdalinfo -hist` does, and prints it as it does
+(`256 buckets from -0.5 to 255.5:` and the counts; a `histogram` object of `count`, `min`, `max`
+and `buckets` in the JSON): 256 buckets over -0.5 to 255.5 for Byte bands and -128.5 to 127.5 for
+Int8 bands; for the other types over GDAL's approximate minimum and maximum (statistics stored
+in the file's metadata or `.aux.xml` sidecar, the format's own range, the smallest overview of more
+than 2500 pixels, or a sample of the blocks), widened by half a bucket on each side; with
+`--stats`, over the exact minimum and maximum. Nodata and NaN pixels are not counted, values
+outside the range fall in the first or last bucket, and a histogram GDAL stored in the `.aux.xml`
+sidecar is used as it is. The results are identical to `gdalinfo -hist`'s for GeoTIFFs (strips,
+tiles, overviews) and the formats GDAL reads by scanline.
 
 ## convert
 
@@ -42,7 +55,7 @@ terrio convert INPUT OUTPUT [-f FORMAT] [options]
 
 | Option | Applies to | Meaning |
 |---|---|---|
-| `-f`, `--format` | both | Output driver short name (`GTiff`, `COG`, `GPKG`, `ESRI Shapefile`...) |
+| `-f`, `--format`, `--of` | both | Output driver short name (`GTiff`, `COG`, `GPKG`, `ESRI Shapefile`...) |
 | `--t-srs CRS` | both | Reproject |
 | `--compress`, `--tile-size`, `--bigtiff` | rasters | GeoTIFF/COG creation options |
 | `--srcwin X Y W H`, `--overview N` | rasters | Read a window or an overview level |
@@ -56,7 +69,7 @@ terrio convert INPUT OUTPUT [-f FORMAT] [options]
 | `--s-srs`, `--a-srs` | vectors | Override or assign the CRS |
 | `--append`, `--overwrite` | vectors | Add to or replace layers of an existing GeoPackage |
 | `--oo`, `--lco KEY=VALUE` | vectors | Open and layer creation options (`RFC7946=YES`...) |
-| `--co KEY=VALUE` | rasters | Creation options (Zarr, netCDF, PMTiles and MBTiles: `TILE_FORMAT=WEBP`...) |
+| `--co KEY=VALUE` | rasters | Creation options (Zarr; netCDF: `FORMAT=NC4`, `COMPRESS=DEFLATE`, `ZLEVEL`, `CHUNKING`; PMTiles and MBTiles: `TILE_FORMAT=WEBP`...) |
 | `--minzoom N`, `--maxzoom N` | both | Zoom levels of PMTiles, MBTiles and MVT outputs |
 
 Tile archives (PMTiles, MBTiles, MVT) take `--oo ZOOM_LEVEL=N` and `--oo CLIP=NO` as inputs; see
@@ -138,6 +151,13 @@ scaled from the ellipsoid at their centre latitude, as `gdaldem` does since GDAL
 are GDAL's: `value R G B [A]` or `value colorname [A]`, where the value may be `nv` (the nodata
 value) or a percentage of the band's range; GMT `.cpt` files work too. Outputs are identical to
 `gdaldem`'s, pixel for pixel.
+
+A color relief written as a VRT (`-f VRT`, `--of VRT`, or a `.vrt` output) is a virtual raster of
+lookup tables over the DEM, as `gdaldem color-relief -of VRT` writes it: three Byte bands (four
+with `--alpha`), each a `ComplexSource` of the DEM's band with a `LUT` built from the color file
+(the midpoints between entries with `--nearest-color-entry`, zero around them with
+`--exact-color-entry`). The lookup tables are those `gdaldem` writes, so GDAL reads the same
+pixels from both, and terrio reads such VRTs (`gdaldem`'s too) as GDAL reads them.
 
 ## calc
 

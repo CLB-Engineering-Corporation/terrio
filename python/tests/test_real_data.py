@@ -410,3 +410,70 @@ def test_proximity_and_sieve_match_gdal(data_dir, gdal, tmp_path):
     assert_same_pixels(
         terrio.sieve(path, threshold=20, connectedness=8).read(1), sieved.ReadAsArray()
     )
+
+
+def test_netcdf4_written_by_terrio_read_by_gdal(data_dir, gdal, tmp_path):
+    """netCDF-4 (chunked, deflate) written by terrio reads in GDAL as the source."""
+    path = raster_path(data_dir, "srtm_sub.tif")
+    src = terrio.open_raster(path)
+    for name, options in [
+        ("a.nc", {"FORMAT": "NC4"}),
+        ("b.nc", {"FORMAT": "NC4C", "COMPRESS": "DEFLATE", "ZLEVEL": "6"}),
+    ]:
+        out = tmp_path / name
+        src.write(str(out), options=options)
+        assert out.read_bytes()[:4] == b"\x89HDF"
+        assert_same_pixels(gdal_array(gdal, out), gdal_array(gdal, path))
+        ds = gdal.Open(str(out))
+        assert ds.GetGeoTransform() == pytest.approx(src.transform)
+        assert ds.GetRasterBand(1).GetNoDataValue() == -32768
+        assert ds.GetSpatialRef().GetAuthorityCode(None) == "4326"
+
+
+def test_subdatasets_match_gdal(data_dir, gdal):
+    """HDF5 datasets and netCDF-4 group variables, listed and read as GDAL lists and reads them."""
+    for name in [
+        "SATMS_j01_d20230101_t0000026_e0000343_b26525_c20230101002941202701_oeac_ops.h5",
+        "S5P_OFFL_L2__CH4____20230101T000319_20230101T014449_27036_03_020400_20230103T110255.nc",
+    ]:
+        path = raster_path(data_dir, name)
+        expected = gdal.Open(path).GetSubDatasets()
+        listed = [(s["name"], s["description"]) for s in terrio.info(path)["subdatasets"]]
+        assert listed == [tuple(s) for s in expected]
+        sub = expected[1 if name.endswith(".h5") else 5][0]
+        assert_same_pixels(terrio.open_raster(sub).read(), gdal_array(gdal, sub))
+
+
+def test_histograms_match_gdalinfo(data_dir, gdal, tmp_path):
+    """`info(hist=True)` gives `gdalinfo -json -hist`'s histograms."""
+    for name in ["srtm_sub.tif", "landsat.tif"]:
+        copy = tmp_path / name
+        copy.write_bytes(open(raster_path(data_dir, name), "rb").read())
+        gdal.SetConfigOption("GDAL_PAM_ENABLED", "NO")
+        try:
+            expected = gdal.Info(str(copy), format="json", reportHistograms=True)
+        finally:
+            gdal.SetConfigOption("GDAL_PAM_ENABLED", None)
+        bands = terrio.info(str(copy), hist=True)["bands"]
+        assert [b["histogram"] for b in bands] == [b["histogram"] for b in expected["bands"]]
+
+
+def test_color_relief_vrt_read_by_gdal(data_dir, gdal, tmp_path):
+    """A color relief VRT written by terrio reads in GDAL as `gdaldem`'s does."""
+    path = raster_path(data_dir, "las_vegas_dem.tif")
+    colors = tmp_path / "colors.txt"
+    colors.write_text("nv 0 0 0 0\n600 blue\n650 white\n700 red\n")
+    gdal.DEMProcessing(
+        str(tmp_path / "g.vrt"),
+        path,
+        "color-relief",
+        colorFilename=str(colors),
+        format="VRT",
+        addAlpha=True,
+    )
+    relief = terrio.dem(
+        path, "color-relief", str(tmp_path / "t.vrt"), color_file=str(colors), alpha=True
+    )
+    expected = gdal_array(gdal, tmp_path / "g.vrt")
+    assert_same_pixels(gdal_array(gdal, tmp_path / "t.vrt"), expected)
+    assert_same_pixels(relief.read(), expected)

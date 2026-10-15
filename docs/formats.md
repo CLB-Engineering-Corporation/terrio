@@ -15,7 +15,8 @@ GDAL's drivers (the formats marked * are written that way): see
 | COG | Cloud Optimized GeoTIFF | ✓ | ✓ | tif, tiff |
 | JP2 | JPEG 2000 | ✓ | ✓ | jp2, j2k |
 | Zarr | Zarr v2 and v3, GeoZarr (`spatial:`, `proj:`, `multiscales`) | ✓ | ✓ | zarr |
-| netCDF | netCDF classic and netCDF-4 (writes classic CDF-1/2/5) | ✓ | ✓ | nc, nc4, cdf |
+| netCDF | netCDF classic and netCDF-4 (groups included); writes CDF-1/2/5 and netCDF-4 | ✓ | ✓ | nc, nc4, cdf |
+| HDF5 | HDF5 datasets, as GDAL's HDF5 driver reads them | ✓ | | h5, hdf5, he5 |
 | HFA | ERDAS Imagine (written with the `gdal` feature) | ✓ | ✓* | img |
 | GPKG | GeoPackage tiles and gridded coverages | ✓ | ✓ | gpkg |
 | PMTiles | PMTiles v3 raster tiles (PNG, JPEG, WebP) | ✓ | ✓ | pmtiles |
@@ -39,7 +40,39 @@ GDAL's drivers (the formats marked * are written that way): see
 
 GeoTIFF compression: none, LZW, Deflate (including the legacy code), PackBits, JPEG, WebP and
 Zstandard, with horizontal and floating-point predictors, tiled or striped, chunky or planar.
-netCDF variables are opened as `NETCDF:"file.nc":variable`, as in GDAL.
+netCDF variables are opened as `NETCDF:"file.nc":variable`, as in GDAL, and those below the
+root group by their path, `NETCDF:"file.nc":/group/variable`. A file of several variables opens
+its first and lists them all as subdatasets, as `gdalinfo` does: every variable of two or more
+dimensions, in every group (root first, then each group in definition order), named by its full
+path and described by its dimensions, standard name and type. Coordinates are used for the
+geotransform when GDAL would (named or marked as spatial axes); otherwise rows are read
+bottom-up, as GDAL reads them.
+
+netCDF files are written as GDAL writes rasters, with its creation options:
+
+| Creation option | Values |
+|---|---|
+| `FORMAT` | `NC` (CDF-1, the default), `NC2` (CDF-2), `NC5` (CDF-5), `NC4` (netCDF-4) or `NC4C` (netCDF-4, classic model) |
+| `COMPRESS` | `NONE` or `DEFLATE` (with the shuffle filter, as GDAL sets it; a classic format becomes `NC4C`, as in GDAL) |
+| `ZLEVEL` | The deflate level, 1 (the default) to 9 |
+| `CHUNKING` | `YES` (compressed variables chunked by row, GDAL's default) or `NO` (one chunk per band) |
+
+netCDF-4 files are HDF5 files written by terrio itself (no HDF5 or netCDF library): the
+coordinate variables as dimension scales, the CF grid mapping, `_FillValue` and the other
+attributes as GDAL writes them, unsigned and 64-bit types kept (`NC4`). GDAL and the netCDF
+library read them as they read GDAL's own (values, georeferencing, CRS, nodata and attributes
+are checked against GDAL's output in the conformance suite).
+
+HDF5 files (`.h5`, `.hdf5`, `.he5`, and HDF5 files without a netCDF extension) are read as GDAL's
+HDF5 driver reads them: each dataset of two or three dimensions and of a numeric type is a
+subdataset, named `HDF5:"file.h5"://group/dataset` and listed in GDAL's order; a file with one
+opens it, a file with several opens the first and lists them all, with every group's and
+dataset's attributes as metadata (`group_subgroup_attribute=value`). A three-dimensional
+dataset's first dimension is its bands; `_FillValue` is its nodata value. Files with a user
+block (JPSS products) are read too. The CF `grid_mapping` of a two-dimensional dataset gives its
+CRS, and NISAR's coordinates its geotransform, as GDAL 3.13 reads them; product-specific
+georeferencing (HDF-EOS grids and swaths, COSMO-SkyMed, GCPs from latitude and longitude
+arrays) is not read, nor are complex and compound datasets.
 
 GeoPackage rasters are written as GDAL writes them: Byte rasters (1 to 4 bands) as PNG tiles, or
 JPEG with `--compress JPEG`; one-band Int16, UInt16 and Float32 rasters as gridded coverages

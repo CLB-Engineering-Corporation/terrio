@@ -60,7 +60,7 @@ are not supported.
 
 ## The optional GDAL backend
 
-For the long tail of formats (HDF4, HDF5, GRIB, NITF, KEA, PCIDSK, SQLite, DXF, spreadsheets...),
+For the long tail of formats (HDF4, GRIB, NITF, KEA, PCIDSK, SQLite, DXF, spreadsheets...),
 terrio can hand files to GDAL. The backend is a cargo feature, `gdal`, off by default: it is
 terrio's only C dependency, and builds need GDAL 3.4 or later installed where `pkg-config` (or
 `GDAL_HOME`) finds it.
@@ -81,8 +81,9 @@ With the feature enabled:
   formats they know; when GDAL cannot open a file either, terrio's error is reported.
 - A `GDAL:` prefix forces GDAL, even for formats terrio reads itself: `terrio info GDAL:dem.tif`,
   or `--driver gdal` on `terrio info` and `terrio convert`.
-- GDAL's dataset names work as they are: `HDF5:"file.h5"://group/dataset`,
-  `HDF4_SDS:UNKNOWN:"file.hdf":0`, `NETCDF:"file.nc":variable`. A container of subdatasets opens
+- GDAL's dataset names work as they are: `HDF4_SDS:UNKNOWN:"file.hdf":0`, and with a `GDAL:`
+  prefix those terrio reads itself (`GDAL:HDF5:"file.h5"://group/dataset`,
+  `GDAL:NETCDF:"file.nc":variable`). A container of subdatasets opens
   its first one and lists the others as `SUBDATASET_N_NAME` metadata, as `gdalinfo` does.
 - Remote and zipped paths go to GDAL's virtual file systems (`/vsicurl/`, `/vsis3/`, `/vsizip/`).
 - Rasters can be written with any GDAL driver: `terrio convert dem.tif dem.ntf -f NITF`
