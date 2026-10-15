@@ -25,7 +25,7 @@ wbprojection.workspace = true
 thiserror.workspace = true
 serde.workspace = true
 # Keeps JSON object keys (properties, fields) in file order, and parses numbers exactly.
-serde_json = { workspace = true, features = ["preserve_order", "float_roundtrip"] }
+serde_json = { workspace = true, features = ["preserve_order", "float_roundtrip", "raw_value"] }
 zip.workspace = true
 tiff.workspace = true
 flatgeobuf.workspace = true
@@ -45,6 +45,7 @@ png.workspace = true
 lz4_flex.workspace = true
 ruzstd.workspace = true
 netcdf-reader.workspace = true
+hdf5-reader.workspace = true
 jpeg-decoder.workspace = true
 laz.workspace = true
 jpeg-encoder.workspace = true

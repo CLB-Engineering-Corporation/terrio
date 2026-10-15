@@ -61,8 +61,11 @@ pub enum RasterDriver {
     Zarr,
     /// DTED elevation.
     DTED,
-    /// NetCDF: classic and netCDF-4 read, classic (CDF-1, CDF-2, CDF-5) written.
+    /// NetCDF: classic and netCDF-4 (groups included) read; classic (CDF-1, CDF-2, CDF-5) and
+    /// netCDF-4 written.
     NetCDF,
+    /// HDF5 (read only): its datasets as subdatasets, as GDAL's HDF5 driver reads them.
+    HDF5,
     /// GDAL virtual raster (read by [`crate::ops::vrt`]; written by mosaics).
     VRT,
     /// A mosaic of the assets of STAC items (see [`crate::stac`]); read only.
@@ -158,6 +161,7 @@ impl RasterDriver {
         Self::Zarr,
         Self::DTED,
         Self::NetCDF,
+        Self::HDF5,
         Self::VRT,
         Self::STACIT,
         Self::MBTiles,
@@ -191,6 +195,7 @@ impl RasterDriver {
             Self::Zarr => ("Zarr", "Zarr v2/v3", &["zarr"], true, true),
             Self::DTED => ("DTED", "DTED Elevation", &["dt0", "dt1", "dt2"], true, true),
             Self::NetCDF => ("netCDF", "Network Common Data Format", &["nc", "nc4", "cdf"], true, true),
+            Self::HDF5 => ("HDF5", "Hierarchical Data Format Release 5", &["h5", "hdf5", "he5"], true, false),
             Self::VRT => ("VRT", "Virtual Raster", &["vrt"], true, true),
             Self::STACIT => ("STACIT", "Spatio-Temporal Asset Catalog Items", &[], true, false),
             Self::MBTiles => ("MBTiles", "MBTiles", &["mbtiles"], true, true),
@@ -216,6 +221,7 @@ impl RasterDriver {
             "jpg" => Some(Self::JPEG),
             "geopackage" => Some(Self::GPKG),
             "nc" | "netcdf4" => Some(Self::NetCDF),
+            "hdf5image" => Some(Self::HDF5),
             _ => None,
         };
         alias.or_else(|| Self::ALL.iter().copied().find(|d| d.name().eq_ignore_ascii_case(name)))
@@ -254,8 +260,8 @@ impl RasterDriver {
             Self::XYZ => F::Xyz,
             Self::Zarr => F::Zarr,
             Self::DTED => F::Dted,
-            // Never used: terrio reads and writes NetCDF itself.
-            Self::NetCDF => F::Zarr,
+            // Never used: terrio reads and writes NetCDF and reads HDF5 itself.
+            Self::NetCDF | Self::HDF5 => F::Zarr,
             // Never used: terrio reads and writes VRTs and tile archives, and reads STAC mosaics
             // itself; GDAL reads its formats.
             Self::VRT | Self::STACIT | Self::MBTiles | Self::PMTiles | Self::Gdal => F::GeoTiff,

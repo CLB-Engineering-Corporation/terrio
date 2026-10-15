@@ -2208,6 +2208,7 @@ dependencies = [
  "gdal",
  "gdal-sys",
  "half",
+ "hdf5-reader",
  "hmac",
  "image-webp",
  "jpeg-decoder",

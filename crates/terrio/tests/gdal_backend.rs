@@ -272,7 +272,7 @@ fn real_raster_in_formats_terrio_lacks() {
     }
 }
 
-/// An HDF5 file (netCDF-4) through GDAL's HDF5 driver: its datasets are subdatasets.
+/// An HDF5 file (netCDF-4) through GDAL's HDF5 driver and terrio's: its datasets are subdatasets.
 #[test]
 fn hdf5_subdatasets() {
     let Some(p) = data("wind_global.nc") else { return };
@@ -280,9 +280,13 @@ fn hdf5_subdatasets() {
         return;
     }
     let name = format!("HDF5:\"{p}\"://v_wind");
-    let via_hdf5 = terrio::open_raster(&name).unwrap();
+    let via_hdf5 = terrio::open_raster(&format!("GDAL:{name}")).unwrap();
     assert_eq!(via_hdf5.driver, RasterDriver::Gdal);
+    let native_hdf5 = terrio::open_raster(&name).unwrap();
+    assert_eq!(native_hdf5.driver, RasterDriver::HDF5);
     let native = terrio::open_raster(&format!("NETCDF:\"{p}\":v_wind")).unwrap();
     assert_eq!((via_hdf5.raster.cols, via_hdf5.raster.rows), (native.raster.cols, native.raster.rows));
     assert_eq!(via_hdf5.raster.data.to_f64_vec(), native.raster.data.to_f64_vec());
+    let same = |a: &[f64], b: &[f64]| a.iter().zip(b).all(|(x, y)| x == y || (x.is_nan() && y.is_nan()));
+    assert!(same(&native_hdf5.raster.data.to_f64_vec(), &via_hdf5.raster.data.to_f64_vec()));
 }

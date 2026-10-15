@@ -45,6 +45,17 @@ fi
 for t in n40w107 n41w106 n41w107; do
   [ -e "USGS_1_$t.tif" ] || curl -sSfL -o "USGS_1_$t.tif" "https://prd-tnm.s3.amazonaws.com/StagedProducts/Elevation/1/TIFF/current/$t/USGS_1_$t.tif"
 done
+# HDF5 and netCDF-4 products: JPSS ATMS and VIIRS sensor data records (HDF5 with a user block,
+# from NOAA's open data on AWS) and a Sentinel-5P methane product (netCDF-4 with nested groups, from
+# the Copernicus mirror on AWS).
+n20=https://noaa-nesdis-n20-pds.s3.amazonaws.com
+for f in ATMS-SDR/2023/01/01/SATMS_j01_d20230101_t0000026_e0000343_b26525_c20230101002941202701_oeac_ops.h5 \
+  ATMS-SDR-GEO/2023/01/01/GATMO_j01_d20230101_t0000026_e0000343_b26525_c20230101002941320788_oeac_ops.h5 \
+  VIIRS-I1-SDR/2022/06/29/SVI01_j01_d20220629_t1513542_e1515187_b23896_c20220629153147215027_oeac_pop.h5; do
+  [ -e "$(basename "$f")" ] || curl -sSfL -o "$(basename "$f")" "$n20/$f"
+done
+s5p=S5P_OFFL_L2__CH4____20230101T000319_20230101T014449_27036_03_020400_20230103T110255.nc
+[ -e $s5p ] || curl -sSfL -o $s5p "https://meeo-s5p.s3.amazonaws.com/OFFL/L2__CH4___/2023/01/01/$s5p"
 for z in ne_countries ne_places nybb; do [ -d "$z" ] || unzip -q -o "$z.zip" -d "$z"; done
 # OSM XML, when osmium is installed.
 if [ ! -e liechtenstein.osm ] && command -v osmium >/dev/null; then

@@ -38,6 +38,35 @@ def run(cmd):
         raise RuntimeError(f"{' '.join(cmd)}\n{p.stdout}{p.stderr}")
 
 
+NETCDF_ATTRIBUTES = {
+    "Conventions",
+    "long_name",
+    "standard_name",
+    "units",
+    "_FillValue",
+    "_Unsigned",
+    "valid_range",
+    "grid_mapping",
+    "grid_mapping_name",
+    "crs_wkt",
+    "spatial_ref",
+    "GeoTransform",
+    "semi_major_axis",
+    "semi_minor_axis",
+    "inverse_flattening",
+    "longitude_of_prime_meridian",
+    "longitude_of_central_meridian",
+    "longitude_of_projection_origin",
+    "latitude_of_projection_origin",
+    "straight_vertical_longitude_from_pole",
+    "standard_parallel",
+    "scale_factor_at_central_meridian",
+    "scale_factor_at_projection_origin",
+    "false_easting",
+    "false_northing",
+}
+
+
 def read(path):
     """Reads a raster's pixels, geotransform, CRS and nodata values.
 
@@ -54,7 +83,10 @@ def read(path):
     srs = ds.GetSpatialRef()
     nodata = [ds.GetRasterBand(i + 1).GetNoDataValue() for i in range(ds.RasterCount)]
     types = {gdal.GetDataTypeName(ds.GetRasterBand(i + 1).DataType) for i in range(ds.RasterCount)}
-    return {"data": data, "gt": ds.GetGeoTransform(), "srs": srs, "nodata": nodata, "type": ",".join(sorted(types))}
+    # The netCDF attributes the writers record (not the source's own metadata, which GDAL copies,
+    # nor what names the writer: GDAL's version and the history).
+    md = {k: v for k, v in ds.GetMetadata().items() if "#" in k and k.split("#", 1)[1] in NETCDF_ATTRIBUTES}
+    return {"data": data, "gt": ds.GetGeoTransform(), "srs": srs, "nodata": nodata, "type": ",".join(sorted(types)), "metadata": md}
 
 
 def compare(gdal_path, terrio_path, tol):
@@ -84,6 +116,9 @@ def compare(gdal_path, terrio_path, tol):
         res["same_crs"] = g["srs"] is None and t["srs"] is None
     else:
         res["same_crs"] = bool(g["srs"].IsSame(t["srs"], ["IGNORE_DATA_AXIS_TO_SRS_AXIS_MAPPING=YES", "CRITERION=EQUIVALENT_EXCEPT_AXIS_ORDER_GEOGCRS"]))
+    if gdal_path.endswith(".nc"):
+        # netCDF attributes, as GDAL reads them from both files.
+        res["same_metadata"] = g["metadata"] == t["metadata"]
     if not res["same_size"]:
         return res
     gd, td = g["data"], t["data"]
@@ -128,12 +163,35 @@ def cases(d, tmp):
     landsat = f"{d}/landsat.tif"
     eco = f"{d}/ECOv002_L2T_LSTE_26860_001_10SGD_20230401T203733_0710_01_LST.tif"
     cog = f"{d}/cog.tif"
+    srtm = f"{d}/srtm90.tif"
     tiles = [f"{d}/USGS_1_n40w106.tif", f"{d}/USGS_1_n40w107.tif", f"{d}/USGS_1_n41w106.tif", f"{d}/USGS_1_n41w107.tif"]
     cut = f"{d}/las_vegas_bounds.geojson"
     out = []
 
     def add(name, gdal_cmd, terrio_args, tol=0.0, out_ext="tif"):
         out.append({"name": name, "gdal": gdal_cmd, "terrio": terrio_args, "tol": tol, "ext": out_ext})
+
+    # netCDF-4 written by gdal_translate and by terrio, read by GDAL (attributes included).
+    nc = ["-of", "netCDF"]
+    add("translate netCDF-4", ["gdal_translate", *nc, "-co", "FORMAT=NC4", lv], ["translate", lv, "--co", "FORMAT=NC4"], out_ext="nc")
+    add(
+        "translate netCDF-4 deflate",
+        ["gdal_translate", *nc, "-co", "FORMAT=NC4", "-co", "COMPRESS=DEFLATE", "-co", "ZLEVEL=6", srtm],
+        ["translate", srtm, "--co", "FORMAT=NC4", "--co", "COMPRESS=DEFLATE", "--co", "ZLEVEL=6"],
+        out_ext="nc",
+    )
+    add(
+        "translate netCDF-4 classic deflate",
+        ["gdal_translate", *nc, "-co", "FORMAT=NC4C", "-co", "COMPRESS=DEFLATE", eco],
+        ["translate", eco, "--co", "FORMAT=NC4C", "--co", "COMPRESS=DEFLATE"],
+        out_ext="nc",
+    )
+    add(
+        "translate netCDF-4 projected",
+        ["gdal_translate", *nc, "-co", "FORMAT=NC4", "-co", "COMPRESS=DEFLATE", "-b", "1", landsat],
+        ["translate", landsat, "-b", "1", "--co", "FORMAT=NC4", "--co", "COMPRESS=DEFLATE"],
+        out_ext="nc",
+    )
 
     # gdal_translate
     add("translate srcwin", ["gdal_translate", "-srcwin", "100", "200", "500", "400", dem], ["translate", dem, "--srcwin", "100", "200", "500", "400"])
@@ -306,6 +364,7 @@ def format_row(r):
         f"{r['name']:<42} {r['size']:>14} type={'ok' if r['same_type'] else 'DIFF'} crs={'ok' if r['same_crs'] else 'DIFF'} "
         f"gt={r['gt_diff_px']:.1e}px valid_mismatch={r['valid_mismatch']} exact={100 * r['exact']:.3f}% ({r['differing']} differ) "
         f"tol={100 * r['within_tol']:.2f}% max={r['max_diff']:.3g}"
+        + ("" if r.get("same_metadata", True) else " metadata=DIFF")
     )
 
 

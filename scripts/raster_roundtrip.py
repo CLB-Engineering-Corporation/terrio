@@ -71,6 +71,8 @@ TYPE_CHANGES = {"netCDF": {"UInt32": "Float64", "Int64": "Float64", "UInt64": "F
 # Without a nodata value, GDAL's netCDF driver reports the type's default fill value, whoever wrote
 # the file.
 NETCDF_DEFAULT_FILL = {"Byte": None, "Int8": -127.0, "Int16": -32767.0, "UInt16": 65535.0, "Int32": -2147483647.0, "Float32": 9.969209968386869e36, "Float64": 9.969209968386869e36}
+# netCDF-4 has unsigned and 64-bit types, with default fill values of their own.
+NETCDF4_DEFAULT_FILL = NETCDF_DEFAULT_FILL | {"Byte": 255.0, "UInt32": 4294967295.0, "Int64": -9223372036854775806, "UInt64": 18446744073709551614}
 
 # Zarr v3 needs a fill value, which GDAL reads as nodata: terrio writes 0 for integers and NaN
 # for floats when the source has no nodata (GDAL writes an invalid null fill value).
@@ -81,12 +83,18 @@ WRITE_VARIANTS = {
     "GTiff": [[], ["--compress", "LZW"], ["--compress", "DEFLATE", "--tile-size", "256"], ["--compress", "ZSTD", "--bigtiff"], ["--compress", "PACKBITS"]],
     "COG": [[], ["--compress", "DEFLATE"], ["--compress", "ZSTD", "--tile-size", "256", "--bigtiff"], ["--compress", "NONE"]],
     "Zarr": [[], ["--compress", "ZLIB"], ["--co", "FORMAT=ZARR_V3"], ["--co", "FORMAT=ZARR_V3", "--compress", "ZSTD"], ["--co", "FORMAT=ZARR_V3", "--compress", "GZIP"]],
-    "netCDF": [[], ["--co", "FORMAT=NC2"]],
+    "netCDF": [
+        [],
+        ["--co", "FORMAT=NC2"],
+        ["--co", "FORMAT=NC4"],
+        ["--co", "FORMAT=NC4", "--co", "COMPRESS=DEFLATE"],
+        ["--co", "FORMAT=NC4C", "--co", "COMPRESS=DEFLATE", "--co", "ZLEVEL=6"],
+    ],
 }
 
 # More GDAL creation options to read files written with, per format (besides those in FORMATS).
 READ_VARIANTS = {
-    "netCDF": [["FORMAT=NC"]],
+    "netCDF": [["FORMAT=NC"], ["FORMAT=NC4C", "COMPRESS=DEFLATE"]],
     "Zarr": [["FORMAT=ZARR_V3"], ["FORMAT=ZARR_V3", "CHUNK_MEMORY_LAYOUT=F", "BLOCKSIZE=1,16,16"], ["CHUNK_MEMORY_LAYOUT=F"], ["COMPRESS=BLOSC", "BLOSC_SHUFFLE=BIT"]],
 }
 
@@ -331,8 +339,12 @@ def check_format(fmt, sources, tmp):
                     lossy=64 if lossy else 0,
                     check_nodata=fmt not in NO_NODATA,
                     check_type=fmt not in NO_TYPE,
-                    type_changes=TYPE_CHANGES.get(fmt),
-                    default_fill=NETCDF_DEFAULT_FILL if fmt == "netCDF" else ZARR_V3_DEFAULT_FILL if "FORMAT=ZARR_V3" in variant else None,
+                    type_changes=None if "FORMAT=NC4" in variant else TYPE_CHANGES.get(fmt),
+                    default_fill=(NETCDF4_DEFAULT_FILL if "FORMAT=NC4" in variant else NETCDF_DEFAULT_FILL)
+                    if fmt == "netCDF"
+                    else ZARR_V3_DEFAULT_FILL
+                    if "FORMAT=ZARR_V3" in variant
+                    else None,
                 )
             except RuntimeError as e:
                 diffs = [f"GDAL cannot read it: {e}"]

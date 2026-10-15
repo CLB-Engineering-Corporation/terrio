@@ -308,6 +308,34 @@ pub(crate) fn format_value(v: f64, t: DataType) -> String {
     }
 }
 
+/// Formats a number as C's `printf("%.<precision>g")` does (GDAL's metadata and histograms):
+/// `precision` significant digits, trailing zeros removed, scientific notation for exponents
+/// below -4 or from `precision` up.
+pub(crate) fn fmt_g(v: f64, precision: usize) -> String {
+    if v.is_nan() {
+        return if v.is_sign_negative() { "-nan".into() } else { "nan".into() };
+    }
+    if v.is_infinite() {
+        return if v > 0.0 { "inf".into() } else { "-inf".into() };
+    }
+    let p = precision.max(1);
+    if v == 0.0 {
+        return if v.is_sign_negative() { "-0".into() } else { "0".into() };
+    }
+    // The exponent after rounding to `p` significant digits.
+    let sci = format!("{:.*e}", p - 1, v);
+    let (mantissa, exp) = sci.split_once('e').unwrap_or((&sci, "0"));
+    let exp: i32 = exp.parse().unwrap_or(0);
+    let trim =
+        |s: &str| -> String { if s.contains('.') { s.trim_end_matches('0').trim_end_matches('.').to_string() } else { s.to_string() } };
+    if exp < -4 || exp >= p as i32 {
+        let sign = if exp < 0 { '-' } else { '+' };
+        format!("{}e{sign}{:02}", trim(mantissa), exp.abs())
+    } else {
+        trim(&format!("{:.*}", (p as i32 - 1 - exp).max(0) as usize, v))
+    }
+}
+
 /// What GDAL's `.aux.xml` sidecar (PAM) holds for formats that cannot store it themselves.
 #[derive(Debug, Default)]
 pub(crate) struct Pam {
@@ -382,6 +410,20 @@ pub(crate) const NO_GEOTRANSFORM: [f64; 6] = [0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn formats_like_printf_g() {
+        assert_eq!(fmt_g(0.1, 8), "0.1");
+        assert_eq!(fmt_g(9.96921e36, 8), "9.96921e+36");
+        assert_eq!(fmt_g(123456789.0, 8), "1.2345679e+08");
+        assert_eq!(fmt_g(1e-5, 15), "1e-05");
+        assert_eq!(fmt_g(0.0001, 15), "0.0001");
+        assert_eq!(fmt_g(-2.5, 15), "-2.5");
+        assert_eq!(fmt_g(100.0, 3), "100");
+        assert_eq!(fmt_g(1000.0, 3), "1e+03");
+        assert_eq!(fmt_g(0.1f32 as f64, 8), "0.1");
+        assert_eq!(fmt_g(0.0, 15), "0");
+    }
 
     #[test]
     fn raw_layouts_round_trip() {

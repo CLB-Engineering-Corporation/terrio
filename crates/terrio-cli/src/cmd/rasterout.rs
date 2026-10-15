@@ -8,7 +8,7 @@ use terrio::{RasterDataset, RasterWriteOptions};
 pub struct OutputArgs {
     /// The output format's short name (`GTiff`, `COG`...). By default, chosen from the output's
     /// extension.
-    #[arg(short = 'f', long = "format")]
+    #[arg(short = 'f', long = "format", visible_alias = "of")]
     pub format: Option<String>,
     /// GeoTIFF/COG compression: NONE, LZW, DEFLATE, PACKBITS, JPEG, WEBP. GeoPackage tiles: PNG, JPEG.
     #[arg(long)]
@@ -20,7 +20,7 @@ pub struct OutputArgs {
     #[arg(long)]
     pub bigtiff: bool,
     /// A creation option, as GDAL names it: `KEY=VALUE` (Zarr: FORMAT=ZARR_V2|ZARR_V3; netCDF:
-    /// FORMAT=NC|NC2|NC5).
+    /// FORMAT=NC|NC2|NC5|NC4|NC4C, COMPRESS=DEFLATE, ZLEVEL=1..9, CHUNKING=YES|NO).
     #[arg(long = "co", value_name = "KEY=VALUE")]
     pub creation_options: Vec<String>,
 }

@@ -1,5 +1,6 @@
 //! NetCDF writing: the classic formats (CDF-1, CDF-2 with 64-bit offsets, and CDF-5 for 64-bit
-//! integers), laid out as GDAL's netCDF driver writes rasters, following the CF conventions.
+//! integers) and netCDF-4 (an HDF5 file, see [`super::hdf5_write`]), laid out as GDAL's netCDF
+//! driver writes rasters, following the CF conventions.
 //!
 //! - one data variable, `Band1` (or `band_data`, with a leading `band` dimension, for several
 //!   bands), its rows stored south to north as GDAL stores them;
@@ -8,12 +9,17 @@
 //! - a grid mapping variable with the CF projection parameters of the common projections, and the
 //!   CRS as WKT in `crs_wkt` and `spatial_ref` and the geotransform in `GeoTransform`, as GDAL
 //!   writes them;
-//! - nodata as `_FillValue`; unsigned types in CDF-1/2 as signed ones with `_Unsigned = "true"`.
+//! - nodata as `_FillValue`; unsigned types in CDF-1/2 and the netCDF-4 classic model as signed
+//!   ones with `_Unsigned = "true"`;
+//! - in netCDF-4, the coordinate variables as HDF5 dimension scales, and with `COMPRESS=DEFLATE`
+//!   every variable chunked (data variables by row, as GDAL chunks them) and compressed with the
+//!   shuffle and deflate filters.
 //!
 //! The format is described at
 //! <https://docs.unidata.ucar.edu/netcdf-c/current/file_format_specifications.html>.
 
 use super::common::{self, Interleave, Layout};
+use super::hdf5_write::{self, H5Type, Values};
 use crate::{Error, Result};
 use std::path::Path;
 use wbraster::{DataType, Raster};
@@ -56,7 +62,7 @@ struct Var {
     data: Vec<u8>,
 }
 
-/// Which classic format version.
+/// Which format: the classic versions, or netCDF-4.
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Version {
     /// CDF-1: 32-bit offsets.
@@ -65,6 +71,30 @@ enum Version {
     Offset64 = 2,
     /// CDF-5: 64-bit sizes and the unsigned and 64-bit integer types.
     Cdf5 = 5,
+    /// NetCDF-4 (HDF5), with its unsigned and 64-bit integer types.
+    Nc4 = 4,
+    /// NetCDF-4 restricted to the classic model (the classic types).
+    Nc4Classic = 3,
+}
+
+impl Version {
+    /// Whether the format has the unsigned and 64-bit integer types.
+    fn extended_types(self) -> bool {
+        matches!(self, Self::Cdf5 | Self::Nc4)
+    }
+}
+
+/// GDAL's netCDF creation options.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct Options<'a> {
+    /// `FORMAT`: `NC` (the default), `NC2`, `NC5`, `NC4` or `NC4C`.
+    pub format: Option<&'a str>,
+    /// `COMPRESS`: `NONE` or `DEFLATE` (netCDF-4 only: classic formats become `NC4C`, as in GDAL).
+    pub compress: Option<&'a str>,
+    /// `ZLEVEL`: the deflate level, 1 to 9 (default 1).
+    pub zlevel: Option<&'a str>,
+    /// `CHUNKING`: whether compressed variables are chunked by row (the default) or whole.
+    pub chunking: Option<&'a str>,
 }
 
 struct Writer {
@@ -200,7 +230,7 @@ fn encode(version: Version, dims: &[(&str, usize)], globals: &[(String, Attr)], 
 
 /// The NetCDF type holding a raster type, and whether it needs `_Unsigned = "true"`.
 fn nc_type(t: DataType, version: Version) -> (NcType, bool) {
-    let cdf5 = version == Version::Cdf5;
+    let cdf5 = version.extended_types();
     match t {
         DataType::U8 if cdf5 => (NcType::UByte, false),
         DataType::U8 => (NcType::Byte, true),
@@ -349,21 +379,40 @@ fn grid_mapping(s: &crate::crs::SpatialRef) -> (String, Vec<(String, Attr)>) {
     (name, attrs)
 }
 
-/// Writes a raster as a classic NetCDF file. `format` is GDAL's `FORMAT` creation option: `NC`
-/// (CDF-1, the default), `NC2` (CDF-2) or `NC5` (CDF-5, with unsigned and 64-bit integer types,
-/// which GDAL builds often cannot read). CDF-2 is used when the data is too large for CDF-1. Outside
-/// CDF-5, UInt32 and 64-bit integers are written as doubles, as GDAL writes them.
-pub(crate) fn write(r: &Raster, nodata: Option<f64>, path: &Path, format: Option<&str>) -> Result<()> {
-    let version = match format.map(str::to_ascii_uppercase).as_deref() {
+/// Writes a raster as a NetCDF file, with GDAL's creation options (see [`Options`]): classic
+/// (CDF-1, the default; CDF-2 with `NC2`; CDF-5 with `NC5`, which GDAL builds often cannot read) or
+/// netCDF-4 (`NC4`, or `NC4C` for the classic model), chunked by row and compressed with the shuffle
+/// and deflate filters with `COMPRESS=DEFLATE`. CDF-2 is used when the data is too large for CDF-1.
+/// Outside CDF-5 and netCDF-4, UInt32 and 64-bit integers are written as doubles, as GDAL writes
+/// them.
+pub(crate) fn write(r: &Raster, nodata: Option<f64>, path: &Path, options: &Options) -> Result<()> {
+    let mut version = match options.format.map(str::to_ascii_uppercase).as_deref() {
         None | Some("NC") => Version::Classic,
         Some("NC2") => Version::Offset64,
         Some("NC5") | Some("CDF5") => Version::Cdf5,
-        Some(other) => return Err(Error::InvalidArgument(format!("netCDF format '{other}' is not supported (NC, NC2, NC5)"))),
+        Some("NC4") => Version::Nc4,
+        Some("NC4C") => Version::Nc4Classic,
+        Some(other) => {
+            return Err(Error::InvalidArgument(format!("netCDF format '{other}' is not supported (NC, NC2, NC5, NC4, NC4C)")));
+        }
     };
+    let deflate = match options.compress.map(str::to_ascii_uppercase).as_deref() {
+        None | Some("NONE") => None,
+        Some("DEFLATE") => {
+            let level = options.zlevel.and_then(|z| z.trim().parse::<u32>().ok()).filter(|z| (1..=9).contains(z)).unwrap_or(1);
+            // Compression needs netCDF-4: GDAL switches to its classic model.
+            if !matches!(version, Version::Nc4 | Version::Nc4Classic) {
+                version = Version::Nc4Classic;
+            }
+            Some(level)
+        }
+        Some(other) => return Err(Error::InvalidArgument(format!("netCDF compression '{other}' is not supported (NONE, DEFLATE)"))),
+    };
+    let chunking = !options.chunking.is_some_and(|c| matches!(c.to_ascii_uppercase().as_str(), "NO" | "FALSE" | "OFF" | "0"));
     // The classic formats have no unsigned 32-bit or 64-bit integers: GDAL reads them as signed,
     // and does not read CDF-5. They are stored as doubles, as GDAL stores them.
     let converted;
-    let r = if version != Version::Cdf5 && matches!(r.data_type, DataType::U32 | DataType::I64 | DataType::U64) {
+    let r = if !version.extended_types() && matches!(r.data_type, DataType::U32 | DataType::I64 | DataType::U64) {
         converted = common::convert(r, DataType::F64);
         &converted
     } else {
@@ -386,7 +435,8 @@ pub(crate) fn write(r: &Raster, nodata: Option<f64>, path: &Path, format: Option
         None
     } else {
         let (name, mut attrs) = grid_mapping(&crs);
-        attrs.push(("GeoTransform".into(), Attr::Text(gt.iter().map(|v| format!("{v} ")).collect())));
+        // As GDAL formats it: `%.17g` and a space after each number.
+        attrs.push(("GeoTransform".into(), Attr::Text(gt.iter().map(|v| format!("{} ", common::fmt_g(*v, 17))).collect())));
         vars.push(Var { name: name.clone(), dims: vec![], attrs, nc_type: NcType::Char, data: vec![0] });
         Some(name)
     };
@@ -430,15 +480,20 @@ pub(crate) fn write(r: &Raster, nodata: Option<f64>, path: &Path, format: Option
     if unsigned {
         attrs.push(("_Unsigned".into(), Attr::Text("true".into())));
     }
-    // As GDAL marks bytes: signed or not, with their range.
+    // As GDAL marks bytes: signed or not, with their range (netCDF-4 has unsigned bytes).
     if r.data_type == DataType::U8 && unsigned {
         attrs.push(("valid_range".into(), Attr::Shorts(vec![0, 255])));
-    } else if r.data_type == DataType::I8 {
+    } else if r.data_type == DataType::I8 && version != Version::Nc4 {
         attrs.push(("_Unsigned".into(), Attr::Text("false".into())));
         attrs.push(("valid_range".into(), Attr::Shorts(vec![-128, 127])));
     }
     if let Some(bytes) = nodata.and_then(|nd| encode_value(r.data_type, nd)) {
         attrs.push(("_FillValue".into(), Attr::Raw(t, 1, bytes)));
+    } else if nodata.is_none() && !unsigned && !matches!(t, NcType::Byte | NcType::UByte) {
+        // Without nodata, GDAL declares the type's default fill value (except for bytes).
+        let mut be = default_fill(t);
+        be.reverse();
+        attrs.push(("_FillValue".into(), Attr::Raw(t, 1, be)));
     }
     if let Some(g) = &grid_mapping_name {
         attrs.push(("grid_mapping".into(), Attr::Text(g.clone())));
@@ -472,8 +527,185 @@ pub(crate) fn write(r: &Raster, nodata: Option<f64>, path: &Path, format: Option
         }
     }
     globals.push(("history".into(), Attr::Text("Created by terrio".into())));
-    std::fs::write(path, encode(version, &dims, &globals, &vars))?;
+    let bytes = match version {
+        Version::Nc4 | Version::Nc4Classic => {
+            let storage = Nc4Storage { deflate, chunking, classic_model: version == Version::Nc4Classic };
+            hdf5_write::encode(&to_hdf5(&dims, &globals, &vars, &storage))
+        }
+        _ => encode(version, &dims, &globals, &vars),
+    };
+    std::fs::write(path, bytes)?;
     Ok(())
+}
+
+/// How a netCDF-4 file stores its variables.
+struct Nc4Storage {
+    /// The deflate level, when compressed.
+    deflate: Option<u32>,
+    /// Whether compressed data variables are chunked by row (else whole).
+    chunking: bool,
+    /// Whether the file is restricted to the classic model (`NC4C`).
+    classic_model: bool,
+}
+
+/// The HDF5 type of a netCDF type.
+fn h5_type(t: NcType) -> H5Type {
+    match t {
+        NcType::Byte => H5Type::Int { size: 1, signed: true },
+        NcType::Char => H5Type::Str { len: 1 },
+        NcType::Short => H5Type::Int { size: 2, signed: true },
+        NcType::Int => H5Type::Int { size: 4, signed: true },
+        NcType::Float => H5Type::Float { size: 4 },
+        NcType::Double => H5Type::Float { size: 8 },
+        NcType::UByte => H5Type::Int { size: 1, signed: false },
+        NcType::UShort => H5Type::Int { size: 2, signed: false },
+        NcType::UInt => H5Type::Int { size: 4, signed: false },
+        NcType::Int64 => H5Type::Int { size: 8, signed: true },
+        NcType::UInt64 => H5Type::Int { size: 8, signed: false },
+    }
+}
+
+/// netCDF's default fill value of a type, little-endian (`NC_FILL_*`).
+fn default_fill(t: NcType) -> Vec<u8> {
+    match t {
+        NcType::Byte => (-127i8).to_le_bytes().to_vec(),
+        NcType::Char => vec![0],
+        NcType::Short => (-32767i16).to_le_bytes().to_vec(),
+        NcType::Int => (-2147483647i32).to_le_bytes().to_vec(),
+        NcType::Float => (9.969_209_968_386_869e36_f64 as f32).to_le_bytes().to_vec(),
+        NcType::Double => 9.969_209_968_386_869e36_f64.to_le_bytes().to_vec(),
+        NcType::UByte => vec![255],
+        NcType::UShort => 65535u16.to_le_bytes().to_vec(),
+        NcType::UInt => u32::MAX.to_le_bytes().to_vec(),
+        NcType::Int64 => (-9223372036854775806i64).to_le_bytes().to_vec(),
+        NcType::UInt64 => 18446744073709551614u64.to_le_bytes().to_vec(),
+    }
+}
+
+/// Big-endian values of `size` bytes, made little-endian.
+fn to_le(be: &[u8], size: usize) -> Vec<u8> {
+    let mut v = be.to_vec();
+    if size > 1 {
+        for c in v.chunks_exact_mut(size) {
+            c.reverse();
+        }
+    }
+    v
+}
+
+fn h5_attr(name: &str, a: &Attr) -> hdf5_write::Attr {
+    match a {
+        Attr::Text(s) => hdf5_write::Attr::text(name, s),
+        Attr::Doubles(v) => {
+            hdf5_write::Attr::numbers(name, H5Type::Float { size: 8 }, v.len(), v.iter().flat_map(|x| x.to_le_bytes()).collect())
+        }
+        Attr::Shorts(v) => hdf5_write::Attr::numbers(
+            name,
+            H5Type::Int { size: 2, signed: true },
+            v.len(),
+            v.iter().flat_map(|x| x.to_le_bytes()).collect(),
+        ),
+        Attr::Raw(t, n, bytes) => hdf5_write::Attr::numbers(name, h5_type(*t), *n, to_le(bytes, type_size(*t))),
+    }
+}
+
+/// A string attribute of the HDF5 dimension scale conventions (NUL-terminated).
+fn h5ds_text(name: &str, s: &str) -> hdf5_write::Attr {
+    let mut bytes = s.as_bytes().to_vec();
+    bytes.push(0);
+    hdf5_write::Attr { name: name.into(), dtype: H5Type::Str { len: bytes.len() as u32 }, shape: None, values: Values::Bytes(bytes) }
+}
+
+fn int_attr(name: &str, values: &[i32], scalar: bool) -> hdf5_write::Attr {
+    hdf5_write::Attr {
+        name: name.into(),
+        dtype: H5Type::Int { size: 4, signed: true },
+        shape: (!scalar).then(|| vec![values.len() as u64]),
+        values: Values::Bytes(values.iter().flat_map(|v| v.to_le_bytes()).collect()),
+    }
+}
+
+/// The netCDF-4 layout of a file: every dimension a coordinate variable stored as an HDF5
+/// dimension scale (`CLASS`, `NAME`, `_Netcdf4Dimid`, `REFERENCE_LIST`), the other variables
+/// attached to them (`DIMENSION_LIST`, `_Netcdf4Coordinates`), as netCDF-C writes them.
+fn to_hdf5(dims: &[(&str, usize)], globals: &[(String, Attr)], vars: &[Var], storage: &Nc4Storage) -> hdf5_write::File {
+    // The variable holding each dimension's coordinates.
+    let scale_of = |d: usize| vars.iter().position(|v| v.dims == [d] && v.name == dims[d].0);
+    let mut datasets: Vec<hdf5_write::Dataset> = Vec::new();
+    for v in vars {
+        let size = type_size(v.nc_type);
+        let shape: Option<Vec<u64>> = (!v.dims.is_empty()).then(|| v.dims.iter().map(|d| dims[*d].1 as u64).collect());
+        let fill = v
+            .attrs
+            .iter()
+            .find_map(|(k, a)| match a {
+                Attr::Raw(_, 1, bytes) if k == "_FillValue" => Some(to_le(bytes, size)),
+                _ => None,
+            })
+            .unwrap_or_else(|| default_fill(v.nc_type));
+        let chunks = match (&shape, storage.deflate) {
+            (Some(s), Some(_)) if s.len() == 1 => Some(s.clone()),
+            (Some(s), Some(_)) => {
+                let n = s.len();
+                let mut c = vec![1u64; n];
+                c[n - 1] = s[n - 1];
+                if !storage.chunking {
+                    c[n - 2] = s[n - 2];
+                }
+                Some(c)
+            }
+            _ => None,
+        };
+        let mut attrs: Vec<hdf5_write::Attr> = v.attrs.iter().map(|(k, a)| h5_attr(k, a)).collect();
+        if let Some(d) = (0..dims.len()).find(|d| scale_of(*d).is_some_and(|i| std::ptr::eq(&vars[i], v))) {
+            attrs.push(h5ds_text("CLASS", "DIMENSION_SCALE"));
+            attrs.push(h5ds_text("NAME", dims[d].0));
+            attrs.push(int_attr("_Netcdf4Dimid", &[d as i32], true));
+            let refs: Vec<(usize, u32)> = vars
+                .iter()
+                .enumerate()
+                .filter(|(_, o)| !std::ptr::eq(*o, v))
+                .flat_map(|(i, o)| o.dims.iter().enumerate().filter(|(_, od)| **od == d).map(move |(k, _)| (i, k as u32)))
+                .collect();
+            if !refs.is_empty() {
+                attrs.push(hdf5_write::Attr {
+                    name: "REFERENCE_LIST".into(),
+                    dtype: H5Type::RefList,
+                    shape: Some(vec![refs.len() as u64]),
+                    values: Values::ReferenceList(refs),
+                });
+            }
+        } else if !v.dims.is_empty() {
+            let scales: Vec<usize> = v.dims.iter().filter_map(|d| scale_of(*d)).collect();
+            if scales.len() == v.dims.len() {
+                attrs.push(hdf5_write::Attr {
+                    name: "DIMENSION_LIST".into(),
+                    dtype: H5Type::RefVlen,
+                    shape: Some(vec![scales.len() as u64]),
+                    values: Values::DimensionList(scales),
+                });
+            }
+            let ids: Vec<i32> = v.dims.iter().map(|d| *d as i32).collect();
+            attrs.push(int_attr("_Netcdf4Coordinates", &ids, false));
+        }
+        datasets.push(hdf5_write::Dataset {
+            name: v.name.clone(),
+            dtype: h5_type(v.nc_type),
+            shape,
+            // A scalar character (a grid mapping) is never written, as netCDF-C leaves it.
+            data: if v.dims.is_empty() && v.nc_type == NcType::Char { Vec::new() } else { to_le(&v.data, size) },
+            fill,
+            storage: hdf5_write::Storage { chunks, deflate: storage.deflate },
+            attrs,
+        });
+    }
+    let mut attrs: Vec<hdf5_write::Attr> = globals.iter().map(|(k, a)| h5_attr(k, a)).collect();
+    // The provenance netCDF-C records (and reports as `_NCProperties`).
+    attrs.push(hdf5_write::Attr::text("_NCProperties", concat!("version=2,terrio=", env!("CARGO_PKG_VERSION"))));
+    if storage.classic_model {
+        attrs.push(int_attr("_nc3_strict", &[1], true));
+    }
+    hdf5_write::File { attrs, datasets }
 }
 
 #[cfg(test)]
@@ -505,7 +737,7 @@ mod tests {
             for (bands, crs) in [(1, 4326), (3, 32633)] {
                 let r = raster(t, bands, crs);
                 let p = dir.path().join(format!("t_{t:?}_{bands}.nc"));
-                write(&r, Some(3.0), &p, None).unwrap();
+                write(&r, Some(3.0), &p, &Options::default()).unwrap();
                 let ds = super::super::netcdf::read(&p, None).unwrap();
                 let stored = if matches!(t, DataType::U32 | DataType::I64) { DataType::F64 } else { t };
                 assert_eq!(ds.raster.data_type, stored, "{t:?}");
@@ -524,7 +756,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("t.nc");
         let r = raster(DataType::U32, 2, 4326);
-        write(&r, Some(3.0), &p, Some("NC5")).unwrap();
+        write(&r, Some(3.0), &p, &Options { format: Some("NC5"), ..Default::default() }).unwrap();
         assert_eq!(&std::fs::read(&p).unwrap()[..4], b"CDF\x05");
         let ds = super::super::netcdf::read(&p, None).unwrap();
         assert_eq!(ds.raster.data_type, DataType::U32);
@@ -535,9 +767,47 @@ mod tests {
     fn writes_64_bit_offsets() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("t.nc");
-        write(&raster(DataType::F32, 1, 4326), None, &p, Some("NC2")).unwrap();
+        write(&raster(DataType::F32, 1, 4326), None, &p, &Options { format: Some("NC2"), ..Default::default() }).unwrap();
         assert_eq!(&std::fs::read(&p).unwrap()[..4], b"CDF\x02");
         let ds = super::super::netcdf::read(&p, None).unwrap();
-        assert_eq!(ds.nodata(), None);
+        // GDAL's default fill value, declared as it declares it.
+        assert_eq!(ds.nodata(), Some((9.969_209_968_386_869e36_f64 as f32) as f64));
+    }
+
+    #[test]
+    fn writes_netcdf4() {
+        let dir = tempfile::tempdir().unwrap();
+        for (format, compress, chunking) in
+            [("NC4", None, None), ("NC4", Some("DEFLATE"), None), ("NC4C", Some("DEFLATE"), Some("NO")), ("NC4C", None, None)]
+        {
+            for t in [DataType::U8, DataType::I8, DataType::U16, DataType::I16, DataType::U32, DataType::I64, DataType::U64, DataType::F64]
+            {
+                for (bands, crs) in [(1, 4326), (3, 32633)] {
+                    let r = raster(t, bands, crs);
+                    let p = dir.path().join(format!("t_{format}_{t:?}_{bands}.nc"));
+                    let o = Options { format: Some(format), compress, zlevel: Some("6"), chunking };
+                    write(&r, Some(3.0), &p, &o).unwrap();
+                    assert_eq!(&std::fs::read(&p).unwrap()[..8], b"\x89HDF\r\n\x1a\n");
+                    let ds = super::super::netcdf::read(&p, None).unwrap();
+                    let classic_types = format == "NC4C" && matches!(t, DataType::U32 | DataType::I64 | DataType::U64);
+                    assert_eq!(ds.raster.data_type, if classic_types { DataType::F64 } else { t }, "{format} {t:?}");
+                    assert_eq!(ds.raster.bands, bands);
+                    assert_eq!(ds.raster.data.to_f64_vec(), r.data.to_f64_vec(), "{format} {t:?}");
+                    assert_eq!(ds.nodata(), Some(3.0));
+                    assert_eq!(ds.crs().epsg, Some(crs));
+                    let gt = ds.geo_transform();
+                    assert!((gt[0] - 10.0).abs() < 1e-9 && (gt[3] - 50.0).abs() < 1e-9 && (gt[5] + 0.25).abs() < 1e-12, "{gt:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn compression_switches_to_netcdf4() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("t.nc");
+        write(&raster(DataType::I16, 1, 4326), None, &p, &Options { compress: Some("DEFLATE"), ..Default::default() }).unwrap();
+        assert_eq!(&std::fs::read(&p).unwrap()[..4], b"\x89HDF");
+        assert!(write(&raster(DataType::I16, 1, 4326), None, &p, &Options { format: Some("NC9"), ..Default::default() }).is_err());
     }
 }

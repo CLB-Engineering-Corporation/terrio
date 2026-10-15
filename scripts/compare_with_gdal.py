@@ -2,10 +2,13 @@
 
 Usage:
     python scripts/compare_with_gdal.py [--pixels] DATA_DIR [FILE ...]
+    python scripts/compare_with_gdal.py --subdatasets DATA_DIR [FILE ...]
     python scripts/compare_with_gdal.py --roundtrip DATA_DIR FILE EXT [EXT ...]
 
 The first form compares ``terrio info`` with GDAL for each file (and, with ``--pixels``, the
-raster pixels). The second converts FILE with ``terrio convert`` into each format (by extension,
+raster pixels). With ``--subdatasets``, the netCDF and HDF5 files are compared subdataset by
+subdataset instead: the list of subdatasets (names and descriptions) and, for HDF5, the metadata
+GDAL reports, then each subdataset's summary and pixels. The second converts FILE with ``terrio convert`` into each format (by extension,
 such as ``fgb`` or ``csv``) and compares what GDAL reads from the output with what GDAL reads from
 FILE: feature counts, fields, CRSs, extents and a sample of geometries and attribute values.
 
@@ -29,7 +32,9 @@ gdal.UseExceptions()
 gdal.PushErrorHandler("CPLQuietErrorHandler")
 
 TERRIO = os.environ.get("TERRIO_BIN", os.path.join(os.path.dirname(__file__), "..", "target", "release", "terrio"))
-RASTER_EXT = {".tif", ".tiff", ".asc", ".jp2", ".img", ".hdr", ".zarr", ".flt", ".bil", ".envi", ".sdat", ".rst", ".ers", ".dt1", ".dt2", ".xyz", ".grd", ".png", ".jpg", ".nc"}
+RASTER_EXT = {".tif", ".tiff", ".asc", ".jp2", ".img", ".hdr", ".zarr", ".flt", ".bil", ".envi", ".sdat", ".rst", ".ers", ".dt1", ".dt2", ".xyz", ".grd", ".png", ".jpg", ".nc", ".h5"}
+# Containers of subdatasets, compared one subdataset at a time with --subdatasets.
+CONTAINER_EXT = {".nc", ".h5"}
 VECTOR_EXT = {".geojson", ".json", ".gpkg", ".parquet", ".fgb", ".shp", ".kml", ".kmz", ".gml", ".gpx", ".topojson", ".mif", ".tab", ".osm", ".csv", ".zip", ".pbf"}
 
 GDAL_TYPES = {
@@ -129,6 +134,9 @@ def compare_raster(path, t):
     if t["band_count"] != ds.RasterCount:
         diffs.append(f"bands {t['band_count']} vs {ds.RasterCount}")
     gt = ds.GetGeoTransform()
+    # A raster without georeferencing: GDAL's default geotransform is south-up, terrio's north-up.
+    if list(gt) == [0.0, 1.0, 0.0, 0.0, 0.0, 1.0]:
+        gt = [0.0, 1.0, 0.0, float(ds.RasterYSize), 0.0, -1.0]
     if not all(close(a, b, 1e-9) for a, b in zip(t["geo_transform"], gt)):
         diffs.append(f"geotransform {t['geo_transform']} vs {list(gt)}")
     g_epsg = epsg_of(ds.GetProjection())
@@ -445,11 +453,80 @@ def roundtrip_main(args):
     sys.exit(1 if failed else 0)
 
 
+def compare_subdatasets(path):
+    """Compare a netCDF or HDF5 file's subdatasets with GDAL's, one by one.
+
+    Args:
+        path: The file.
+
+    Returns:
+        A list of ``(name, differences)``: first the subdataset list (and HDF5 metadata), then
+        each subdataset GDAL opens.
+    """
+    out = []
+    t = terrio_info(path)
+    g = gdal.Open(path)
+    gsubs = g.GetSubDatasets()
+    if isinstance(t, str):
+        return [("subdataset list", [f"terrio error: {t}"])]
+    tsubs = [(s["name"], s["description"]) for s in t.get("subdatasets", [])]
+    diffs = []
+    if len(tsubs) != len(gsubs):
+        diffs.append(f"{len(tsubs)} subdatasets vs {len(gsubs)}")
+    for (tn, td), (gn, gd) in zip(tsubs, gsubs):
+        if tn != gn or td != gd:
+            diffs.append(f"{tn} [{td}] vs {gn} [{gd}]")
+            break
+    if not gsubs and g.RasterCount > 0:
+        # A file with one raster opens it directly.
+        ts = terrio_info(path, stats=True)
+        if isinstance(ts, str):
+            return [(os.path.basename(path), [f"terrio error: {ts}"])]
+        return [(os.path.basename(path), diffs + compare_raster(path, ts) + compare_pixels(path, path))]
+    if path.endswith(".h5"):
+        # GDAL's metadata of an HDF5 container: every group's attributes and its datasets'.
+        tmd = {k: v for k, v in t["metadata"]}
+        gmd = g.GetMetadata()
+        if tmd != gmd:
+            keys = sorted(set(tmd) ^ set(gmd)) or sorted(k for k in gmd if tmd.get(k) != gmd[k])
+            diffs.append(f"metadata: {len(keys)} items differ, e.g. {keys[0]}: {tmd.get(keys[0])!r} vs {gmd.get(keys[0])!r}")
+    out.append(("subdataset list", diffs))
+    for name, desc in gsubs:
+        if desc.endswith("()"):
+            continue  # strings: GDAL reads them as Float32 garbage, terrio declines them
+        try:
+            gdal.Open(name)
+        except RuntimeError:
+            continue  # what GDAL cannot open as a raster
+        ts = terrio_info(name, stats=True)
+        short = name.rsplit(":", 1)[-1]
+        if isinstance(ts, str):
+            out.append((short, [f"terrio error: {ts}"]))
+            continue
+        try:
+            out.append((short, compare_raster(name, ts) + compare_pixels(name, name)))
+        except Exception as e:  # noqa: BLE001 - report and continue with the next subdataset
+            out.append((short, [f"GDAL error: {e}"]))
+    return out
+
+
 def main():
     """Compare every dataset in the data directory (or the given files)."""
     if sys.argv[1] == "--roundtrip":
         roundtrip_main(sys.argv[2:])
         return
+    if sys.argv[1] == "--subdatasets":
+        data = sys.argv[2]
+        files = sys.argv[3:] or sorted(f for f in os.listdir(data) if os.path.splitext(f)[1].lower() in CONTAINER_EXT)
+        failed = 0
+        for name in files:
+            for sub, diffs in compare_subdatasets(os.path.join(data, name)):
+                if diffs:
+                    failed += 1
+                    print(f"DIFF  {name} {sub}: " + "; ".join(diffs))
+                else:
+                    print(f"OK    {name} {sub}")
+        sys.exit(1 if failed else 0)
     args = [a for a in sys.argv[1:] if a != "--pixels"]
     pixels = "--pixels" in sys.argv[1:]
     data = args[0]

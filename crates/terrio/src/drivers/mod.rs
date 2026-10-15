@@ -15,9 +15,11 @@ pub(crate) mod geokeys;
 pub(crate) mod gpkg;
 mod gsbg;
 pub(crate) mod gtiff_write;
+pub(crate) mod hdf5;
+mod hdf5_write;
 mod hfa;
 mod jp2;
-mod netcdf;
+pub(crate) mod netcdf;
 mod netcdf_write;
 pub(crate) mod nodata;
 mod png;
@@ -42,6 +44,8 @@ pub(crate) fn read(path: &str) -> Option<Result<RasterDataset>> {
         ehdr::read(p)
     } else if zarr::is_zarr(p) {
         zarr::read(p)
+    } else if RasterDriver::for_extension(path).is_none() && hdf5::is_hdf5(p) {
+        hdf5::read(p, path, None)
     } else if RasterDriver::for_extension(path).is_none() && netcdf::is_netcdf(p) {
         netcdf::read(p, None)
     } else if gsbg::is_gsbg(p) {
@@ -58,6 +62,7 @@ pub(crate) fn read(path: &str) -> Option<Result<RasterDataset>> {
             RasterDriver::GPKG => gpkg::read(p),
             RasterDriver::HFA => hfa::read(p),
             RasterDriver::NetCDF => netcdf::read(p, None),
+            RasterDriver::HDF5 => hdf5::read(p, path, None),
             _ => return None,
         }
     };
@@ -75,8 +80,16 @@ pub(crate) fn open_lazy(path: &str) -> Option<Result<crate::LazyRaster>> {
 }
 
 /// Opens a subdataset named as GDAL names them (`NETCDF:"file.nc":variable`,
-/// `GPKG:file.gpkg:table`). `None` when the path is not a subdataset name.
+/// `NETCDF:"file.nc":/group/variable`, `HDF5:"file.h5"://group/dataset`, `GPKG:file.gpkg:table`).
+/// `None` when the path is not a subdataset name.
 pub(crate) fn open_subdataset(path: &str) -> Option<Result<RasterDataset>> {
+    if let Some((file, dataset)) = hdf5::parse_subdataset(path) {
+        return Some(crate::vfs::resolve(&file).and_then(|local| {
+            let mut ds = hdf5::read(Path::new(local.as_str()), &file, Some(&dataset))?;
+            nodata::apply_pam(local.as_str(), &mut ds);
+            Ok(ds)
+        }));
+    }
     if let Some((file, table)) = gpkg::parse_subdataset(path) {
         return Some(crate::vfs::resolve(&file).and_then(|local| {
             let mut ds = gpkg::read_bytes(std::fs::read(local.as_str())?, Some(&table))?;
@@ -116,7 +129,15 @@ pub(crate) fn write(
         RasterDriver::PNG => png::write(r, nodata, p),
         RasterDriver::JP2 => jp2::write(r, nodata, p),
         RasterDriver::Zarr => zarr::write_with(r, nodata, p, compression, &options.creation_options),
-        RasterDriver::NetCDF => netcdf_write::write(r, nodata, p, co("FORMAT")),
+        RasterDriver::NetCDF => {
+            let o = netcdf_write::Options {
+                format: co("FORMAT"),
+                compress: co("COMPRESS").or(compression),
+                zlevel: co("ZLEVEL"),
+                chunking: co("CHUNKING"),
+            };
+            netcdf_write::write(r, nodata, p, &o)
+        }
         RasterDriver::GPKG => gpkg::write(r, nodata, p, compression.or(co("TILE_FORMAT")), co("RASTER_TABLE")),
         RasterDriver::MBTiles | RasterDriver::PMTiles => {
             let ds = RasterDataset { raster: r.clone(), driver, has_nodata: nodata.is_some() };
