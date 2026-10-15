@@ -461,8 +461,6 @@ def reproject(
     src_count, src_h, src_w = src3.shape
     if src_crs is None:
         raise CRSError("A source CRS is required")
-    if dst_crs is None:
-        dst_crs = src_crs
 
     # The destination grid.
     dest_band = None
@@ -481,6 +479,8 @@ def reproject(
         dst_h, dst_w = d3[-2], d3[-1]
     else:
         dest_arr = None
+    if dst_crs is None:
+        dst_crs = src_crs
     if dst_transform is None:
         left, bottom, right, top = array_bounds(src_h, src_w, src_transform)
         kw: dict[str, Any] = {"resolution": dst_resolution}

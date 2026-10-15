@@ -484,7 +484,7 @@ fn write_raster_with_nodata(raster: &Raster, nodata: Option<f64>, path: &str, op
         }
         return crate::gdal_backend::write_raster_with(raster, nodata, path, "HFA", &co);
     }
-    let compression = options.compression.as_deref().map(parse_compression).transpose()?;
+    let compression = effective_compression(options).map(parse_compression).transpose()?;
     match driver {
         RasterDriver::Cog => {
             let opts = wbraster::CogWriteOptions { compression, bigtiff: Some(options.bigtiff), tile_size: options.tile_size };
@@ -501,6 +501,14 @@ fn write_raster_with_nodata(raster: &Raster, nodata: Option<f64>, path: &str, op
         d => raster.write(path, d.to_wb())?,
     }
     Ok(())
+}
+
+/// The compression asked for: `compression`, or else the `COMPRESS` creation option.
+pub(crate) fn effective_compression(options: &RasterWriteOptions) -> Option<&str> {
+    options
+        .compression
+        .as_deref()
+        .or_else(|| options.creation_options.iter().rev().find(|(k, _)| k.eq_ignore_ascii_case("COMPRESS")).map(|(_, v)| v.as_str()))
 }
 
 fn parse_compression(s: &str) -> Result<wbraster::GeoTiffCompression> {

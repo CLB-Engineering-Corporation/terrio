@@ -316,7 +316,7 @@ pub(crate) mod codec {
             RasterDriver::GTiff | RasterDriver::Cog => {
                 let cog = driver == RasterDriver::Cog;
                 let opts = TiffOptions::from_write_options(options, cog, ds.nodata())?.ok_or_else(|| {
-                    let name = options.compression.as_deref().unwrap_or_default();
+                    let name = crate::dataset::effective_compression(options).unwrap_or_default();
                     Error::Unsupported(format!("{name} compression cannot be written in this build (NONE, LZW, DEFLATE, PACKBITS, ZSTD)"))
                 })?;
                 encode(&ds.raster, &opts)

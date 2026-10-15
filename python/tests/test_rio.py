@@ -402,3 +402,53 @@ def test_profile_classes():
     with pytest.raises(TypeError):
         p["affine"] = Affine.identity()
     assert json.dumps(dict(p))
+
+
+def test_review_fixes(dem, tmp_path):
+    path, data = dem
+    # The driver comes from the extension when not given.
+    out_path = str(tmp_path / "noext_driver.tif")
+    with rio.open(out_path, "w", width=4, height=3, count=1, dtype="uint8") as dst:
+        dst.write(np.ones((1, 3, 4), "uint8"))
+    with rio.open(out_path) as ds:
+        assert ds.driver == "GTiff" and ds.read().sum() == 12
+    with rio.open(path) as ds:
+        # `out` receives the pixels of a masked read too.
+        out = np.zeros((2, 203, 301), "int16")
+        m = ds.read(out=out, masked=True)
+        assert np.array_equal(out, data) and m.mask.sum() == 2 * 300
+        with pytest.raises(ValueError):
+            ds.read_masks(1, out=np.zeros((2, 203, 301), "uint8"))
+        # A destination band's dataset gives the CRS when dst_crs is omitted.
+        t, w, h = warp.calculate_default_transform(
+            ds.crs, "EPSG:4326", ds.width, ds.height, *ds.bounds
+        )
+        p = str(tmp_path / "geo.tif")
+        with rio.open(
+            p,
+            "w",
+            driver="GTiff",
+            width=w,
+            height=h,
+            count=1,
+            dtype="int16",
+            crs="EPSG:4326",
+            transform=t,
+            nodata=-9999,
+        ) as dst:
+            warp.reproject(rio.band(ds, 1), rio.band(dst, 1))
+        with rio.open(p) as r:
+            ref = np.zeros((h, w), "int16")
+            warp.reproject(
+                rio.band(ds, 1), ref, dst_transform=t, dst_crs="EPSG:4326", dst_nodata=-9999
+            )
+            assert np.array_equal(r.read(1), ref)
+    # Masked multiband writes.
+    p = str(tmp_path / "masked.tif")
+    a = np.ma.masked_equal(np.arange(2 * 4 * 5, dtype="uint8").reshape(2, 4, 5) % 7, 0)
+    with (
+        rio.open(p, "w", driver="GTiff", width=5, height=4, count=2, dtype="uint8") as dst,
+        warnings.catch_warnings(),
+    ):
+        warnings.simplefilter("ignore")
+        dst.write(a, masked=True)

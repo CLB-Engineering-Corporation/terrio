@@ -203,7 +203,7 @@ impl TiffOptions {
     /// GDAL's. `None` when the compression is one this writer does not handle (a lossy one).
     pub(crate) fn from_write_options(options: &crate::RasterWriteOptions, cog: bool, nodata: Option<f64>) -> Result<Option<Self>> {
         let co = |key: &str| options.creation_options.iter().rev().find(|(k, _)| k.eq_ignore_ascii_case(key)).map(|(_, v)| v.as_str());
-        let name = options.compression.as_deref().or_else(|| co("COMPRESS")).unwrap_or(if cog { "LZW" } else { "NONE" });
+        let name = crate::dataset::effective_compression(options).unwrap_or(if cog { "LZW" } else { "NONE" });
         let Some(compression) = Compression::parse(name) else { return Ok(None) };
         let size = |key: &str| -> Result<Option<u32>> {
             co(key).map(|v| v.trim().parse::<u32>().map_err(|_| Error::InvalidArgument(format!("invalid {key} '{v}'")))).transpose()

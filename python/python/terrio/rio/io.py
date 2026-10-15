@@ -1254,9 +1254,14 @@ class DatasetReader(DatasetBase):
                 elif len(set(nodatavals)) == 1 and nodatavals[0] is not None:
                     kwds["fill_value"] = nodatavals[0]
                 result = np.ma.array(arr, **kwds)
-        if out is not None and not isinstance(result, np.ma.MaskedArray):
-            out[...] = result
-            result = out
+        if out is not None:
+            # As rasterio, `out` receives the pixels; a masked result is a view of it.
+            if isinstance(result, np.ma.MaskedArray):
+                out[...] = np.ma.getdata(result)
+                result = np.ma.array(out, mask=np.ma.getmask(result), fill_value=result.fill_value)
+            else:
+                out[...] = result
+                result = out
         if return2d:
             result = result[0]
         return result
@@ -1335,6 +1340,10 @@ class DatasetReader(DatasetBase):
         if out is not None:
             if out.dtype != np.uint8:
                 raise ValueError(f"the out array's dtype '{out.dtype}' does not match 'uint8'")
+            if out.ndim != 3 or out.shape[0] != len(idx):
+                raise ValueError(
+                    f"'out' shape {out.shape} does not match window shape {(len(idx),) + win_shape}"
+                )
             buf = (out.shape[-2], out.shape[-1])
         elif out_shape is not None:
             buf = (int(out_shape[-2]), int(out_shape[-1]))
@@ -1937,7 +1946,11 @@ class DatasetWriter(DatasetReader):
             raise InvalidArrayError("Positional argument arr must be an array-like object")
         if isinstance(arr, np.ma.MaskedArray):
             if masked:
-                self.write_mask(~np.ma.getmaskarray(arr), window=window)
+                invalid = np.ma.getmaskarray(arr)
+                if invalid.ndim == 3:
+                    # A pixel is invalid where any band is masked.
+                    invalid = np.logical_or.reduce(invalid, axis=0)
+                self.write_mask(~invalid, window=window)
                 arr = arr.data
             else:
                 nd = self.nodatavals

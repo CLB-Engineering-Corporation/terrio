@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 import numpy as np
@@ -13,16 +14,21 @@ from terrio.rio.crs import CRS
 from terrio.rio.enums import ColorInterp, Resampling
 from terrio.rio.errors import WarpedVRTError
 from terrio.rio.io import DatasetReader
-from terrio.rio.warp import _WARP_NAMES, _crs_text, calculate_default_transform
+from terrio.rio.warp import _WARP_NAMES, _crs_text, calculate_default_transform, transform_bounds
+from terrio.rio.windows import Window
 
-# Warped grids up to this many pixels (all bands) are warped whole and cached.
-_CACHE_PIXELS = 100_000_000
+# Warped grids up to this many bytes are warped whole, once, and cached: windows then read the
+# same pixels as a full read, as GDAL's block cache gives. Larger grids are warped window by
+# window, from the source pixels each window needs.
+_CACHE_BYTES = 64 * 1024 * 1024
 
 
 class WarpedVRT(DatasetReader):
     """A read-only view of a dataset reprojected into another CRS or grid.
 
-    Pixels are warped with terrio's `warp` when they are read, window by window.
+    Pixels are warped with terrio's `warp` when they are read, from the source pixels the read
+    needs (read by window, so remote COGs are fetched in part). Grids up to 64 MiB are warped
+    whole on the first read and cached.
     """
 
     def __init__(
@@ -135,22 +141,42 @@ class WarpedVRT(DatasetReader):
         self._source: Any = None
         self._full: np.ndarray | None = None
 
-    def _src_raster(self) -> Any:
-        """The source raster in memory, read on first use.
+    def _src_raster(self, bounds: tuple[float, float, float, float]) -> Any:
+        """The part of the source a region of the output needs, read by window.
+
+        Args:
+            bounds: The region, in the output CRS.
 
         Returns:
-            terrio.Raster: The source.
+            terrio.Raster | None: The source pixels around the region (with a margin for the
+            resampling kernels), or None when the region misses the source.
         """
-        if self._source is None:
-            ds = self.src_dataset
-            arr = ds.read()
-            self._source = _terrio.Raster.from_array(
-                arr,
-                self.src_transform.to_gdal(),
-                _crs_text(self.src_crs),
-                None if self.src_nodata is None else float(self.src_nodata),
-            )
-        return self._source
+        ds = self.src_dataset
+        st = self.src_transform
+        try:
+            left, bottom, right, top = transform_bounds(self.dst_crs, self.src_crs, *bounds)
+        except Exception:
+            left, bottom, right, top = ds.bounds
+        inv = ~st
+        cols = [inv.c + x * inv.a + y * inv.b for x in (left, right) for y in (bottom, top)]
+        rows = [inv.f + x * inv.d + y * inv.e for x in (left, right) for y in (bottom, top)]
+        # Output pixels in source pixels, for the kernels' reach.
+        scale = max(1.0, abs(self._transform.a) / max(abs(st.a), 1e-300))
+        pad = int(math.ceil(4 * scale)) + 3
+        c0 = max(0, int(math.floor(min(cols))) - pad)
+        r0 = max(0, int(math.floor(min(rows))) - pad)
+        c1 = min(ds.width, int(math.ceil(max(cols))) + pad)
+        r1 = min(ds.height, int(math.ceil(max(rows))) + pad)
+        if c1 <= c0 or r1 <= r0:
+            return None
+        arr = ds.read(window=Window(c0, r0, c1 - c0, r1 - r0))
+        t = st.c + c0 * st.a, st.f + r0 * st.e
+        return _terrio.Raster.from_array(
+            arr,
+            (t[0], st.a, 0.0, t[1], 0.0, st.e),
+            _crs_text(self.src_crs),
+            None if self.src_nodata is None else float(self.src_nodata),
+        )
 
     def _read_level(
         self, bands: Any, window: tuple[int, int, int, int], level: int | None
@@ -167,7 +193,8 @@ class WarpedVRT(DatasetReader):
         """
         self._check_open()
         x, y, w, h = window
-        if self.width * self.height * self._count <= _CACHE_PIXELS:
+        size = self.width * self.height * self._count * np.dtype(self._dtype).itemsize
+        if size <= _CACHE_BYTES:
             # Warp the whole grid once, as GDAL caches the warped blocks: windows then read the
             # same pixels as a full read.
             if self._full is None:
@@ -191,13 +218,17 @@ class WarpedVRT(DatasetReader):
         left = t.c + x * t.a
         top = t.f + y * t.e
         te = (left, top + h * t.e, left + w * t.a, top)
+        src = self._src_raster(te)
+        if src is None:
+            fill = 0 if self.dst_nodata is None else self.dst_nodata
+            return np.full((self._count, h, w), fill, dtype=self._dtype)
         nd: Any = (
             "none"
             if self.dst_nodata is None
             else ("nan" if np.isnan(self.dst_nodata) else float(self.dst_nodata))
         )
         out = _terrio.warp(
-            self._src_raster(),
+            src,
             t_srs=_crs_text(self.dst_crs),
             te=te,
             ts=(w, h),
