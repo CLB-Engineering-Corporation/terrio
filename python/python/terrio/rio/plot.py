@@ -19,7 +19,7 @@ def get_plt() -> Any:
         ImportError: If matplotlib is not installed.
     """
     try:
-        import matplotlib.pyplot as plt
+        import matplotlib.pyplot as plt  # type: ignore[import-not-found,unused-ignore]
     except (ImportError, RuntimeError) as err:
         raise ImportError(
             "Could not import matplotlib\nmatplotlib required for plotting functions"
