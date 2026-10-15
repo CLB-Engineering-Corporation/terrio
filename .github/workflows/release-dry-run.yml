@@ -1,0 +1,66 @@
+name: Release dry run
+
+# Builds and checks everything a release publishes, without publishing: the wheels for every
+# platform, the source distribution and the Pyodide wheel (release-build.yml, as the release
+# builds them), the crates as `cargo publish` packages and verifies them, and the npm package.
+# It runs on pull requests that change what a release builds, and by hand.
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/release*.yml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "crates/*/Cargo.toml"
+      - "python/**"
+      - "js/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-dry-run-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    uses: ./.github/workflows/release-build.yml
+
+  crates:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Both crates at once, so terrio-cli is verified against the terrio being released rather
+      # than the version on crates.io.
+      - name: Package and verify terrio and terrio-cli
+        run: cargo publish --dry-run --locked -p terrio -p terrio-cli
+
+  npm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-pack
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - name: Build the package as the release does
+        run: |
+          wasm-pack build js --release --target web --out-dir pkg --out-name terrio
+          cp LICENSE js/pkg/
+      - name: Check its name and version, and pack it
+        working-directory: js/pkg
+        run: |
+          name=$(node -p "require('./package.json').name")
+          version=$(node -p "require('./package.json').version")
+          expected=$(cargo metadata --no-deps --format-version 1 --manifest-path ../../Cargo.toml | jq -r '.packages[] | select(.name == "terrio") | .version')
+          echo "$name $version (terrio $expected)"
+          test "$name" = terrio-js
+          test "$version" = "$expected"
+          npm pack --dry-run
