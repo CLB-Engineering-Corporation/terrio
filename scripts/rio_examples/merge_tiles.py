@@ -9,7 +9,8 @@ import rasterio
 from rasterio.merge import merge
 
 data_dir, out_dir = sys.argv[1], sys.argv[2]
-names = ["USGS_1_n40w106.tif", "USGS_1_n40w107.tif", "USGS_1_n41w106.tif", "USGS_1_n41w107.tif"]
+# usgs_dem.tif is the n40w106 tile.
+names = ["usgs_dem.tif", "USGS_1_n40w107.tif", "USGS_1_n41w106.tif", "USGS_1_n41w107.tif"]
 sources = [rasterio.open(f"{data_dir}/{n}") for n in names]
 
 mosaic, out_trans = merge(sources, res=0.001)

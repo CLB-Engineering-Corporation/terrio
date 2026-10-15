@@ -541,8 +541,8 @@ def _misc(rio: Any, ctx: Ctx) -> Any:
 def _fbounds(rio: Any, ctx: Ctx) -> Any:
     poly = {"type": "Polygon", "coordinates": [[(0, 0), (3, 0), (3, 2), (0, 2), (0, 0)]]}
     fc = {"type": "FeatureCollection", "features": [{"type": "Feature", "geometry": poly, "properties": {}}]}
-    t = rio.transform.from_origin(10, 20, 2, 2)
-    return [rio.features.bounds(poly), rio.features.bounds(fc), rio.features.bounds(poly, north_up=False), rio.features.bounds(poly, transform=t), rio.features.is_valid_geom(poly), rio.features.is_valid_geom({"type": "Polygon", "coordinates": [[(0, 0)]]})]
+    # Not compared: bounds with a transform, whose results changed between rasterio 1.5.0 and 1.5.2.
+    return [rio.features.bounds(poly), rio.features.bounds(fc), rio.features.bounds(poly, north_up=False), rio.features.is_valid_geom(poly), rio.features.is_valid_geom({"type": "Polygon", "coordinates": [[(0, 0)]]})]
 
 
 # ─── Synthetic dataset checks ───────────────────────────────────────────────────────────────────
@@ -1116,7 +1116,8 @@ def _r_mask(rio: Any, ctx: Ctx) -> Any:
 
 @check("real files", "USGS 3DEP tiles: merge (resolution, bounds, methods)", needs_data=True)
 def _r_merge(rio: Any, ctx: Ctx) -> Any:
-    fs = [ctx.path(f"USGS_1_n4{a}w10{b}.tif") for a in (0, 1) for b in (6, 7)]
+    # usgs_dem.tif is the n40w106 tile.
+    fs = [ctx.path(n) for n in ("usgs_dem.tif", "USGS_1_n40w107.tif", "USGS_1_n41w106.tif", "USGS_1_n41w107.tif")]
     out = [list(rio.merge.merge(fs, res=0.002))]
     out.append(list(rio.merge.merge(fs, bounds=(-106.5, 39.5, -105.5, 40.5), res=0.001, method="max")))
     out.append(list(rio.merge.merge(fs[:2], res=0.003, method="last", masked=True)))
