@@ -3,9 +3,10 @@
 //!
 //! A VRT is an XML description of a raster whose bands are composed of windows of other rasters
 //! ("sources"). terrio writes VRTs GDAL opens, and opens the VRTs GDAL writes for mosaics and
-//! subsets: `SimpleSource`, `ComplexSource` (with `NODATA`, `ScaleOffset` and `ScaleRatio`) and
-//! `AveragedSource`, with `SrcRect`/`DstRect` windows. Derived bands, kernel filters, pixel
-//! functions and warped VRTs are not supported.
+//! subsets: `SimpleSource`, `ComplexSource` (with `NODATA`, `ScaleOffset`, `ScaleRatio` and
+//! `LUT`, as `gdaldem color-relief -of VRT` writes them) and `AveragedSource`, with
+//! `SrcRect`/`DstRect` windows. Derived bands, kernel filters, pixel functions and warped VRTs are
+//! not supported.
 
 use super::{Grid, Resampling, band_f64, convert_value, data_type_name, is_nodata, parse_data_type};
 use crate::crs::SpatialRef;
@@ -37,6 +38,8 @@ pub struct VrtBand {
     pub data_type: DataType,
     /// The nodata value.
     pub nodata: Option<f64>,
+    /// The color interpretation (`Red`, `Green`, `Blue`, `Alpha`...), when declared.
+    pub color_interp: Option<String>,
     /// The sources, drawn in order (later ones on top).
     pub sources: Vec<VrtSource>,
 }
@@ -61,6 +64,9 @@ pub struct VrtSource {
     pub nodata: Option<f64>,
     /// Linear scaling `value * ratio + offset` (`ComplexSource` only).
     pub scale: Option<(f64, f64)>,
+    /// A lookup table `(input, output)` applied after scaling, interpolating linearly between
+    /// its inputs and clamping beyond them (`ComplexSource` only).
+    pub lut: Option<Vec<(f64, f64)>>,
     /// Resampling when the source and destination windows differ in size.
     pub resampling: Resampling,
     /// The source's size and data type, written to help GDAL open the VRT lazily.
@@ -143,9 +149,10 @@ impl VrtDataset {
                 let offset = s.child("ScaleOffset").map(|n| parse_number(&n.text)).transpose()?;
                 let ratio = s.child("ScaleRatio").map(|n| parse_number(&n.text)).transpose()?;
                 let scale = (offset.is_some() || ratio.is_some()).then(|| (offset.unwrap_or(0.0), ratio.unwrap_or(1.0)));
-                if s.child("LUT").is_some() || s.child("Exponent").is_some() {
-                    return Err(Error::Unsupported("VRT lookup tables and exponential scaling are not supported".into()));
+                if s.child("Exponent").is_some() {
+                    return Err(Error::Unsupported("VRT exponential scaling is not supported".into()));
                 }
+                let lut = s.child("LUT").map(|l| parse_lut(&l.text)).transpose()?.filter(|l| !l.is_empty());
                 let resampling = match s.attr("resampling") {
                     Some(r) => Resampling::parse(r)?,
                     None if s.name == "AveragedSource" => Resampling::Average,
@@ -160,11 +167,13 @@ impl VrtDataset {
                     complex,
                     nodata,
                     scale,
+                    lut,
                     resampling,
                     properties,
                 });
             }
-            bands.push(VrtBand { data_type, nodata, sources });
+            let color_interp = b.child("ColorInterp").map(|c| c.text.trim().to_string());
+            bands.push(VrtBand { data_type, nodata, color_interp, sources });
         }
         if bands.is_empty() {
             return Err(Error::InvalidData("VRT: no bands".into()));
@@ -188,6 +197,9 @@ impl VrtDataset {
             s += &format!("  <VRTRasterBand dataType=\"{}\" band=\"{}\">\n", data_type_name(b.data_type), i + 1);
             if let Some(nd) = b.nodata {
                 s += &format!("    <NoDataValue>{}</NoDataValue>\n", fmt_number(nd));
+            }
+            if let Some(ci) = &b.color_interp {
+                s += &format!("    <ColorInterp>{}</ColorInterp>\n", xml::escape(ci));
             }
             for src in &b.sources {
                 let tag = if src.complex { "ComplexSource" } else { "SimpleSource" };
@@ -231,6 +243,9 @@ impl VrtDataset {
                             fmt_number(off),
                             fmt_number(ratio)
                         );
+                    }
+                    if let Some(lut) = &src.lut {
+                        s += &format!("      <LUT>{}</LUT>\n", format_lut(lut));
                     }
                 }
                 s += &format!("    </{tag}>\n");
@@ -293,12 +308,32 @@ impl VrtDataset {
                     working_float: src.complex,
                     invalid_value: None,
                 };
-                req.read(self.width, self.height, &mut buf, |v| match src.scale {
-                    Some((off, ratio)) => {
-                        let v = v * ratio + off;
-                        if is_float_working(r.data_type) { v } else { v as f32 as f64 }
+                // GDAL's complex sources work in double precision for some types, else in float.
+                let double = is_float_working(r.data_type)
+                    || matches!(band.data_type, DataType::I32 | DataType::U32 | DataType::I64 | DataType::U64 | DataType::F64);
+                req.read(self.width, self.height, &mut buf, |v| {
+                    let v = match src.scale {
+                        Some((off, ratio)) => {
+                            let v = v * ratio + off;
+                            if is_float_working(r.data_type) { v } else { v as f32 as f64 }
+                        }
+                        None => v,
+                    };
+                    match &src.lut {
+                        Some(lut) => {
+                            let w = if double { v } else { v as f32 as f64 };
+                            let out = lookup(lut, w);
+                            if band.data_type == DataType::U8 {
+                                // Byte output: rounded in float, half up, and clamped.
+                                ((out as f32 + 0.5).clamp(0.0, 255.0) as u8) as f64
+                            } else if double {
+                                out
+                            } else {
+                                out as f32 as f64
+                            }
+                        }
+                        None => v,
                     }
-                    None => v,
                 });
             }
             out.push(buf);
@@ -328,6 +363,55 @@ pub fn read_vrt(path: &str) -> Result<RasterDataset> {
 #[cfg(target_arch = "wasm32")]
 pub fn read_vrt(_path: &str) -> Result<RasterDataset> {
     Err(Error::Unsupported("VRT files are not supported in WebAssembly".into()))
+}
+
+/// Parses a `LUT` element: `input:output` pairs separated by commas.
+fn parse_lut(text: &str) -> Result<Vec<(f64, f64)>> {
+    let values: Vec<&str> = text.split([',', ':']).collect();
+    if values.len() < 2 {
+        return Ok(Vec::new());
+    }
+    values.as_chunks::<2>().0.iter().map(|[a, b]| Ok((parse_number(a)?, parse_number(b)?))).collect()
+}
+
+/// Formats a lookup table as GDAL writes it: `%g`, or `%.17g` where neighbouring inputs would
+/// look the same in `%g`.
+pub(crate) fn format_lut(lut: &[(f64, f64)]) -> String {
+    let g = |v: f64| crate::drivers::common::fmt_g(v, 6);
+    let mut parts = Vec::with_capacity(lut.len());
+    for (i, (input, output)) in lut.iter().enumerate() {
+        let same_as = |j: Option<usize>| j.and_then(|j| lut.get(j)).is_some_and(|(x, _)| g(*x) == g(*input));
+        let precise = same_as(i.checked_sub(1)) || same_as(Some(i + 1));
+        let input = if precise { crate::drivers::common::fmt_g(*input, 17) } else { g(*input) };
+        parts.push(format!("{input}:{}", g(*output)));
+    }
+    parts.join(",")
+}
+
+/// GDAL's `VRTComplexSource::LookupValue()`: linear interpolation between the inputs, the first
+/// or last output beyond them, a NaN first input mapping NaN.
+fn lookup(lut: &[(f64, f64)], v: f64) -> f64 {
+    let mut start = 0;
+    if lut[0].0.is_nan() {
+        if v.is_nan() || lut.len() == 1 {
+            return lut[0].1;
+        }
+        start = 1;
+    }
+    let rest = &lut[start..];
+    let i = start + rest.partition_point(|(x, _)| *x < v);
+    if i == start {
+        return lut[start].1;
+    }
+    if i == lut.len() {
+        return lut[lut.len() - 1].1;
+    }
+    if lut[i].0 == v {
+        return lut[i].1;
+    }
+    let (x0, y0) = lut[i - 1];
+    let (x1, y1) = lut[i];
+    y0 + (v - x0) * ((y1 - y0) / (x1 - x0))
 }
 
 fn parse_number(s: &str) -> Result<f64> {

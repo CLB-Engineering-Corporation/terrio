@@ -167,8 +167,8 @@ def cases(d, tmp):
         f.write(COLORS_PCT)
     out = []
 
-    def add(name, gdal_cmd, terrio_cmd, tol=0.0):
-        out.append({"name": name, "gdal": gdal_cmd, "terrio": terrio_cmd, "tol": tol})
+    def add(name, gdal_cmd, terrio_cmd, tol=0.0, ext="tif"):
+        out.append({"name": name, "gdal": gdal_cmd, "terrio": terrio_cmd, "tol": tol, "ext": ext})
 
     def dem(name, mode, path, gdal_opts=(), terrio_opts=(), tol=0.0):
         add(
@@ -223,6 +223,20 @@ def cases(d, tmp):
     relief("usgs exact", usgs, colors, ["-exact_color_entry", "-alpha"])
     relief("srtm90 exact alpha", srtm, colors, ["-exact_color_entry", "-alpha"])
     relief("srtm90 nearest", srtm, colors, ["-nearest_color_entry"])
+
+    # Color relief as a VRT of lookup tables: both VRTs read by GDAL, and gdaldem's read by terrio.
+    def relief_vrt(name, path, cfile, opts=()):
+        mine = ["-" + o.replace("_", "-") for o in opts]
+        gdal = ["gdaldem", "color-relief", "-of", "VRT", path, cfile, "{out}", "-q", *opts]
+        add(f"dem color-relief VRT {name}", gdal, ["dem", "color-relief", path, cfile, "{out}", "-f", "VRT", *mine], ext="vrt")
+        add(f"dem color-relief VRT {name} read by terrio", gdal, ["convert", "{gout}", "{out}"], ext="vrt")
+
+    for label, p in dems:
+        relief_vrt(label, p, colors)
+    relief_vrt("usgs percentages alpha", usgs, colors_pct, ["-alpha"])
+    relief_vrt("usgs nearest", usgs, colors, ["-nearest_color_entry"])
+    relief_vrt("srtm90 exact alpha", srtm, colors, ["-exact_color_entry", "-alpha"])
+    relief_vrt("las_vegas nearest alpha", lv, colors, ["-nearest_color_entry", "-alpha"])
 
     # gdal_calc.py: terrio takes the same arguments.
     def calc(name, args, tol=0.0):
@@ -324,14 +338,16 @@ def main():
     for i, c in enumerate(cases(os.path.abspath(a.data), tmp)):
         if a.only and a.only not in c["name"]:
             continue
-        gout = os.path.join(tmp, f"case{i}_gdal.tif")
-        tout = os.path.join(tmp, f"case{i}_terrio.tif")
+        ext = c.get("ext", "tif")
+        gout = os.path.join(tmp, f"case{i}_gdal.{ext}")
+        # terrio converting GDAL's output writes a GeoTIFF.
+        tout = os.path.join(tmp, f"case{i}_terrio.{'tif' if '{gout}' in c['terrio'] else ext}")
         for p in (gout, tout):
             if os.path.exists(p):
                 os.remove(p)
         try:
             run([x.replace("{out}", gout) for x in c["gdal"]])
-            run([a.terrio] + [x.replace("{out}", tout) for x in c["terrio"]])
+            run([a.terrio] + [x.replace("{out}", tout).replace("{gout}", gout) for x in c["terrio"]])
             r = compare(gout, tout, c["tol"])
         except Exception as e:  # noqa: BLE001 - report and continue
             r = {"error": str(e).strip().splitlines()[-1][:200]}

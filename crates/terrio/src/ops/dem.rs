@@ -1274,6 +1274,82 @@ fn rgba(c: &[ColorEntry], v: f64, mode: ColorSelection) -> [i32; 4] {
     [lerp(a[0], b[0]), lerp(a[1], b[1]), lerp(a[2], b[2]), lerp(a[3], b[3])]
 }
 
+/// The color relief of a DEM band as a virtual raster (`gdaldem color-relief -of VRT`): three
+/// Byte bands (four with `alpha`), each a `ComplexSource` of the band with a lookup table from
+/// the color map, as GDAL builds them. `src_path` is the DEM's path, written in the VRT (relative
+/// to `vrt_path`'s directory when the DEM is below it); `ds` is the DEM read from it.
+///
+/// GDAL reads the pixels of such a VRT by interpolating its lookup tables, which differs from
+/// [`color_relief`] by rounding only (and not at all with exact or nearest color entries).
+pub fn color_relief_vrt(
+    ds: &RasterDataset,
+    src_path: &str,
+    colors: &ColorMap,
+    o: &DemOptions,
+    vrt_path: Option<&str>,
+) -> Result<super::vrt::VrtDataset> {
+    use super::vrt::{VrtBand, VrtDataset, VrtSource};
+    let r = &ds.raster;
+    if o.band == 0 || o.band > r.bands {
+        return Err(Error::InvalidArgument(format!("unable to fetch band #{}", o.band)));
+    }
+    let mut c = colors.entries.clone();
+    if c.is_empty() {
+        return Err(Error::InvalidArgument("the color map is empty".into()));
+    }
+    process_colors(&mut c, ds.nodata(), o.color_selection);
+    let vrt_dir = vrt_path.and_then(|p| std::path::Path::new(p).parent());
+    let (filename, relative_to_vrt) = super::mosaic::source_path(src_path, vrt_dir);
+    let (w, h) = (r.cols as f64, r.rows as f64);
+    let nbands = if o.alpha { 4 } else { 3 };
+    let bands = (0..nbands)
+        .map(|band| {
+            let component = |e: &ColorEntry| f64::from([e.r, e.g, e.b, e.a][band]);
+            // GDALGenerateVRTColorRelief(): each entry, with the midpoints between entries for
+            // the nearest entry and zero just around them for exact entries.
+            let mut lut = Vec::new();
+            for (i, e) in c.iter().enumerate() {
+                if i > 0 && o.color_selection == ColorSelection::Nearest && e.value != c[i - 1].value.next_up() {
+                    let mid = (e.value + c[i - 1].value) / 2.0;
+                    lut.push((mid.next_down(), component(&c[i - 1])));
+                    lut.push((mid, component(e)));
+                } else {
+                    if o.color_selection == ColorSelection::Exact {
+                        lut.push((e.value.next_down(), 0.0));
+                    }
+                    lut.push((e.value, component(e)));
+                }
+                if o.color_selection == ColorSelection::Exact {
+                    lut.push((e.value.next_up(), 0.0));
+                }
+            }
+            let source = VrtSource {
+                filename: filename.clone(),
+                relative_to_vrt,
+                band: o.band,
+                src_rect: [0.0, 0.0, w, h],
+                dst_rect: [0.0, 0.0, w, h],
+                complex: true,
+                nodata: None,
+                scale: None,
+                lut: Some(lut),
+                resampling: super::Resampling::Nearest,
+                properties: Some((r.cols, r.rows, r.data_type)),
+            };
+            let interp = ["Red", "Green", "Blue", "Alpha"][band];
+            VrtBand { data_type: DataType::U8, nodata: None, color_interp: Some(interp.into()), sources: vec![source] }
+        })
+        .collect();
+    let crs = ds.crs();
+    Ok(VrtDataset {
+        width: r.cols,
+        height: r.rows,
+        geo_transform: Some(ds.geo_transform()),
+        srs: (!crs.is_unknown()).then_some(crs),
+        bands,
+    })
+}
+
 /// Colors a DEM band with a color map (`gdaldem color-relief`): three Byte bands (four with
 /// `alpha`), without nodata.
 pub fn color_relief(ds: &RasterDataset, colors: &ColorMap, o: &DemOptions) -> Result<RasterDataset> {

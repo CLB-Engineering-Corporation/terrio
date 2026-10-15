@@ -52,13 +52,15 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
 ///     exact_color_entry: Only color values with an entry in the color file (color relief).
 ///     nearest_color_entry: Use the nearest entry's color rather than interpolating (color
 ///         relief).
-///     format: The output format's short name, for `dst`.
+///     format: The output format's short name, for `dst`. `"VRT"` (or a `.vrt` `dst`) writes a
+///         color relief as a VRT of lookup tables over `src`, which must then be a path, as
+///         `gdaldem color-relief -of VRT` does.
 ///     compress: GeoTIFF/COG compression, for `dst`.
 ///     tile_size: GeoTIFF/COG tile size, for `dst`.
 ///     bigtiff: Write a BigTIFF, for `dst`.
 ///
 /// Returns:
-///     Raster: The result, in memory.
+///     Raster: The result, in memory (for a VRT, its pixels as read from it).
 #[pyfunction]
 #[pyo3(signature = (
     src, processing, dst=None, *, color_file=None, band=1, z=1.0, scale=None, xscale=None, yscale=None, azimuth=None,
@@ -153,6 +155,26 @@ fn dem(
     }
     let path = src.extract::<String>().ok();
     let ds = input_raster(py, src)?;
+    let vrt = match (format, dst) {
+        (Some(f), _) => f.eq_ignore_ascii_case("VRT"),
+        (None, Some(d)) => d.to_ascii_lowercase().ends_with(".vrt"),
+        (None, None) => false,
+    };
+    if vrt {
+        let (Some(file), Some(src_path), Some(out_path)) = (color_file, path.as_deref(), dst) else {
+            return Err(invalid("a VRT output needs color-relief, a source path and dst"));
+        };
+        let out = py
+            .detach(|| {
+                let text = std::fs::read_to_string(file)
+                    .map_err(|e| terrio::Error::InvalidArgument(format!("cannot read the color file '{file}': {e}")))?;
+                let map = ColorMap::parse(&text, &ds, band, pam_statistics(src_path, band))?;
+                terrio::ops::dem::color_relief_vrt(&ds, src_path, &map, &o, Some(out_path))?.write(out_path)?;
+                terrio::open_raster(out_path)
+            })
+            .py()?;
+        return finish_raster(py, out, None, None, None, None, false);
+    }
     let out = py
         .detach(|| match (product, color_file) {
             (Some(p), _) => terrio::ops::dem::dem(&ds, p, &o),

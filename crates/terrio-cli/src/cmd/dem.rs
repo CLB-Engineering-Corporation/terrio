@@ -2,7 +2,10 @@
 
 use super::rasterout::{OutputArgs, open};
 use terrio::Error;
-use terrio::ops::dem::{ColorMap, ColorSelection, DemOptions, DemProduct, GradientAlg, Shading, TriAlg, color_relief, dem, pam_statistics};
+use terrio::formats::RasterDriver;
+use terrio::ops::dem::{
+    ColorMap, ColorSelection, DemOptions, DemProduct, GradientAlg, Shading, TriAlg, color_relief, color_relief_vrt, dem, pam_statistics,
+};
 
 #[derive(clap::Args)]
 pub struct Args {
@@ -123,12 +126,24 @@ pub fn run(a: Args) -> terrio::Result<()> {
             _ => return Err(Error::InvalidArgument("--alg applies to hillshade, slope, aspect and TRI".into())),
         }
     }
+    // A VRT output (`-f VRT` or a .vrt file): the color relief as lookup tables over the DEM.
+    let vrt = match a.out.format.as_deref() {
+        Some(f) => RasterDriver::from_name(f) == Some(RasterDriver::VRT),
+        None => RasterDriver::for_extension(output) == Some(RasterDriver::VRT),
+    };
+    if vrt && colors.is_none() {
+        return Err(Error::InvalidArgument("VRT output is only supported for color-relief".into()));
+    }
     let ds = open(input)?;
     let out = match colors {
         Some(path) => {
             let text =
                 std::fs::read_to_string(path).map_err(|e| Error::InvalidArgument(format!("cannot read the color file '{path}': {e}")))?;
-            color_relief(&ds, &ColorMap::parse(&text, &ds, o.band, pam_statistics(input, o.band))?, &o)?
+            let map = ColorMap::parse(&text, &ds, o.band, pam_statistics(input, o.band))?;
+            if vrt {
+                return color_relief_vrt(&ds, input, &map, &o, Some(output))?.write(output);
+            }
+            color_relief(&ds, &map, &o)?
         }
         None => dem(&ds, product.expect("not color-relief"), &o)?,
     };

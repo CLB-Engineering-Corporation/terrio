@@ -162,7 +162,7 @@ pub fn build_vrt(sources: &[MosaicSource], o: &MosaicOptions, vrt_dir: Option<&P
     let mut bands: Vec<VrtBand> = Vec::new();
     if !o.separate {
         for b in 0..nbands {
-            bands.push(VrtBand { data_type: first.ds.raster.data_type, nodata: vrt_nodata(b), sources: Vec::new() });
+            bands.push(VrtBand { data_type: first.ds.raster.data_type, nodata: vrt_nodata(b), color_interp: None, sources: Vec::new() });
         }
     }
     for (i, s) in sources.iter().enumerate() {
@@ -183,11 +183,12 @@ pub fn build_vrt(sources: &[MosaicSource], o: &MosaicOptions, vrt_dir: Option<&P
                 complex: nd.is_some(),
                 nodata: nd,
                 scale: None,
+                lut: None,
                 resampling: o.resampling,
                 properties: Some((s.ds.raster.cols, s.ds.raster.rows, s.ds.raster.data_type)),
             };
             if o.separate {
-                bands.push(VrtBand { data_type: s.ds.raster.data_type, nodata: vrt_nodata(i), sources: vec![src] });
+                bands.push(VrtBand { data_type: s.ds.raster.data_type, nodata: vrt_nodata(i), color_interp: None, sources: vec![src] });
             } else {
                 bands[target].sources.push(src);
             }
@@ -224,7 +225,7 @@ fn src_dst_window(ds: &RasterDataset, we: f64, ns: f64, ext: (f64, f64, f64, f64
 }
 
 /// The path to write in a VRT, relative to the VRT's directory when inside it.
-fn source_path(path: &str, vrt_dir: Option<&Path>) -> (String, bool) {
+pub(crate) fn source_path(path: &str, vrt_dir: Option<&Path>) -> (String, bool) {
     let Some(dir) = vrt_dir else { return (absolute(path), false) };
     let abs = absolute(path);
     let dir_abs = absolute(&dir.to_string_lossy());
