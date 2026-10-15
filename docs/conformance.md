@@ -9,22 +9,26 @@ cargo build --release
 python scripts/conformance.py ../terrio-data --output docs/conformance.md
 ```
 
-Generated on 2026-10-14 with terrio 0.0.1 (b019897), GDAL 3.12.2, PROJ 9.7.1, PDAL 2.9.3, laspy 2.7.0.
+Generated on 2026-10-14 with terrio 0.1.1 (f8b7319), GDAL 3.12.2, PROJ 9.7.1, PDAL 2.9.3, laspy 2.7.0.
 
 ## Summary
 
 | Suite | Reference | Cases | Identical | Within tolerance | Differs |
 |---|---|---:|---:|---:|---:|
-| [Dataset summaries and pixels](#dataset-summaries-and-pixels) | GDAL (`gdalinfo`, `ogrinfo`, Python bindings) | 64 | 62 | 0 | 2 |
+| [Dataset summaries and pixels](#dataset-summaries-and-pixels) | GDAL (`gdalinfo`, `ogrinfo`, Python bindings) | 68 | 66 | 0 | 2 |
+| [NetCDF and HDF5 subdatasets](#netcdf-and-hdf5-subdatasets) | GDAL's netCDF and HDF5 drivers | 116 | 116 | 0 | 0 |
+| [Band histograms](#band-histograms) | `gdalinfo -hist`, `gdalinfo -json -hist` | 84 | 84 | 0 | 0 |
 | [Vector conversions](#vector-conversions) | GDAL reading terrio's output | 23 | 16 | 0 | 7 |
-| [Raster drivers](#raster-drivers) | GDAL writing what terrio reads, and reading what terrio writes | 487 | 487 | 0 | 0 |
-| [Windowed and overview reads](#windowed-and-overview-reads) | GDAL reading the same windows | 186 | 186 | 0 | 0 |
-| [Raster operations](#raster-operations) | `gdal_translate`, `gdalwarp`, `gdalbuildvrt`, `gdal_merge.py` | 49 | 36 | 8 | 5 |
-| [Terrain analysis and raster algebra](#terrain-analysis-and-raster-algebra) | `gdaldem`, `gdal_calc.py`, `gdal_proximity.py`, `gdal_sieve.py` | 131 | 129 | 2 | 0 |
+| [Raster drivers](#raster-drivers) | GDAL writing what terrio reads, and reading what terrio writes | 539 | 539 | 0 | 0 |
+| [Windowed and overview reads](#windowed-and-overview-reads) | GDAL reading the same windows | 164 | 164 | 0 | 0 |
+| [Raster operations](#raster-operations) | `gdal_translate`, `gdalwarp`, `gdalbuildvrt`, `gdal_merge.py` | 53 | 40 | 8 | 5 |
+| [Terrain analysis and raster algebra](#terrain-analysis-and-raster-algebra) | `gdaldem`, `gdal_calc.py`, `gdal_proximity.py`, `gdal_sieve.py` | 147 | 145 | 2 | 0 |
 | [Vector operations](#vector-operations) | `ogr2ogr`, `gdal_rasterize`, `gdal_polygonize.py` | 51 | 51 | 0 | 0 |
-| [Point clouds](#point-clouds) | laspy (every value) and PDAL (headers, COPC queries, grids, reprojection) | 485 | 482 | 3 | 0 |
+| [Arrow and GeoArrow](#arrow-and-geoarrow) | GDAL's Arrow streams, pyarrow, GeoPandas | 180 | 171 | 9 | 0 |
+| [GeoPackage updates and spatial filters](#geopackage-updates-and-spatial-filters) | `ogr2ogr`, GDAL's `validate_gpkg.py` | 12 | 11 | 0 | 1 |
+| [Point clouds](#point-clouds) | laspy (every value) and PDAL (headers, COPC queries, grids, reprojection) | 614 | 611 | 3 | 0 |
 | [Coordinate transformations](#coordinate-transformations) | GDAL 3.12 and PROJ (`gdaltransform`) | 19,003 | 18,870 | 76 | 57 |
-| **All** | | **20,479** | **20,319** | **89** | **71** |
+| **All** | | **21,054** | **20,884** | **98** | **72** |
 
 ## Dataset summaries and pixels
 
@@ -33,6 +37,8 @@ Every raster and vector file of the test data: size, type, CRS, geotransform, no
 | Format or operation | Cases | Identical | Within tolerance | Differs |
 |---|---:|---:|---:|---:|
 | GTiff | 15 | 15 | 0 | 0 |
+| HDF5 | 3 | 3 | 0 | 0 |
+| netCDF | 3 | 3 | 0 | 0 |
 | GeoJSON | 7 | 7 | 0 | 0 |
 | FlatGeobuf | 2 | 2 | 0 | 0 |
 | GPKG | 4 | 4 | 0 | 0 |
@@ -53,7 +59,6 @@ Every raster and vector file of the test data: size, type, CRS, geotransform, no
 | EHdr | 1 | 1 | 0 | 0 |
 | ERS | 1 | 1 | 0 | 0 |
 | GSBG | 1 | 1 | 0 | 0 |
-| netCDF | 2 | 2 | 0 | 0 |
 | RST | 1 | 1 | 0 | 0 |
 | SAGA | 1 | 1 | 0 | 0 |
 | TopoJSON | 2 | 2 | 0 | 0 |
@@ -64,6 +69,26 @@ Cases that are not identical:
 |---|---|---|---|
 | KML | kml_samples.kml | differs | Styles and Markup: extent None vs [-122.0856545755255, 37.42243077405461, -122.0856545755255, 37.42243077405461] |
 | MapInfo File | roads_utm.tab | differs | roads_utm: epsg 32611 vs None |
+
+## NetCDF and HDF5 subdatasets
+
+Every netCDF and HDF5 file of the test data (netCDF-4 groups, HDF5 products): the subdataset list (names and descriptions) and, for HDF5, the metadata as GDAL reports them, then each subdataset's summary and every pixel.
+
+| Format or operation | Cases | Identical | Within tolerance | Differs |
+|---|---:|---:|---:|---:|
+| HDF5 | 27 | 27 | 0 | 0 |
+| netCDF | 89 | 89 | 0 | 0 |
+
+## Band histograms
+
+Rasters of every integer and floating-point type (GeoTIFF strips, tiles and overviews, statistics in the metadata, and formats read by scanline): the histogram lines of `gdalinfo -hist` byte for byte, the JSON histograms (with `min` and `max` as GDAL prints them), with `-stats`, and the histograms GDAL stored in the `.aux.xml` sidecar.
+
+| Format or operation | Cases | Identical | Within tolerance | Differs |
+|---|---:|---:|---:|---:|
+| text | 21 | 21 | 0 | 0 |
+| json | 21 | 21 | 0 | 0 |
+| stats | 21 | 21 | 0 | 0 |
+| stored | 21 | 21 | 0 | 0 |
 
 ## Vector conversions
 
@@ -130,22 +155,19 @@ Synthetic rasters of every data type a format holds (several bands, NaN and fini
 | XYZ (write) | 5 | 5 | 0 | 0 |
 | Zarr (read) | 65 | 65 | 0 | 0 |
 | Zarr (write) | 65 | 65 | 0 | 0 |
-| netCDF (read) | 26 | 26 | 0 | 0 |
-| netCDF (write) | 26 | 26 | 0 | 0 |
+| netCDF (read) | 39 | 39 | 0 | 0 |
+| netCDF (write) | 65 | 65 | 0 | 0 |
 | GPKG (read) | 5 | 5 | 0 | 0 |
 | GPKG (write) | 5 | 5 | 0 | 0 |
 
 ## Windowed and overview reads
 
-Windows of every GeoTIFF of the test data, at full resolution and from each overview, read in place by `terrio convert --srcwin --overview`: pixels identical, geotransforms within 1e-9. Remote: the same on public Cloud Optimized GeoTIFFs over HTTP.
+Windows of every GeoTIFF of the test data, at full resolution and from each overview, read in place by `terrio convert --srcwin --overview`: pixels identical, geotransforms within 1e-9.
 
 | Format or operation | Cases | Identical | Within tolerance | Differs |
 |---|---:|---:|---:|---:|
 | GTiff local, full resolution | 60 | 60 | 0 | 0 |
 | GTiff local, overviews | 104 | 104 | 0 | 0 |
-| GTiff remote, headers | 4 | 4 | 0 | 0 |
-| GTiff remote, full resolution | 4 | 4 | 0 | 0 |
-| GTiff remote, overviews | 14 | 14 | 0 | 0 |
 
 ## Raster operations
 
@@ -153,7 +175,7 @@ The outputs of the same command lines on real files: size, type, CRS and geotran
 
 | Format or operation | Cases | Identical | Within tolerance | Differs |
 |---|---:|---:|---:|---:|
-| translate | 14 | 9 | 1 | 4 |
+| translate | 18 | 13 | 1 | 4 |
 | warp | 28 | 20 | 7 | 1 |
 | mosaic | 5 | 5 | 0 | 0 |
 | read | 2 | 2 | 0 | 0 |
@@ -188,7 +210,7 @@ The outputs of the same command lines on real DEMs and land cover: size, type, n
 | dem TRI | 7 | 7 | 0 | 0 |
 | dem TPI | 6 | 6 | 0 | 0 |
 | dem roughness | 6 | 6 | 0 | 0 |
-| dem color-relief | 13 | 13 | 0 | 0 |
+| dem color-relief | 29 | 29 | 0 | 0 |
 | calc landsat | 13 | 13 | 0 | 0 |
 | calc usgs | 10 | 8 | 2 | 0 |
 | calc srtm90 | 4 | 4 | 0 | 0 |
@@ -223,17 +245,78 @@ Conversions with `ogr2ogr`'s options (where, spat, select, sql, nlt...) compared
 | rasterize | 18 | 18 | 0 | 0 |
 | polygonize | 4 | 4 | 0 | 0 |
 
+## Arrow and GeoArrow
+
+Every layer of the test data exported with `Layer.to_arrow()` (WKB and native GeoArrow) against GDAL's Arrow stream of the same layer, through pyarrow and GeoPandas, and imported back with `terrio.from_arrow()` (and by GDAL's `WriteArrow`): rows, geometries, attribute values and CRS. Within tolerance: geometries equal up to vertex order.
+
+| Format or operation | Cases | Identical | Within tolerance | Differs |
+|---|---:|---:|---:|---:|
+| export WKB vs GDAL | 16 | 15 | 1 | 0 |
+| export CRS vs GDAL | 16 | 16 | 0 | 0 |
+| export geoarrow.multipolygon (separated) vs GDAL | 6 | 5 | 1 | 0 |
+| import geoarrow.multipolygon (separated) | 6 | 6 | 0 | 0 |
+| export geoarrow.multipolygon (interleaved) vs GDAL | 6 | 5 | 1 | 0 |
+| import geoarrow.multipolygon (interleaved) | 6 | 6 | 0 | 0 |
+| GeoDataFrame.from_arrow vs GDAL | 12 | 11 | 1 | 0 |
+| import GDAL stream (WKB) | 16 | 15 | 1 | 0 |
+| import ogr.Layer | 16 | 15 | 1 | 0 |
+| import GeoDataFrame.to_arrow(WKB) | 12 | 11 | 1 | 0 |
+| import GeoDataFrame.to_arrow(geoarrow) | 12 | 11 | 1 | 0 |
+| GDAL WriteArrow of terrio's table | 16 | 15 | 1 | 0 |
+| export geoarrow.point (separated) vs GDAL | 5 | 5 | 0 | 0 |
+| import geoarrow.point (separated) | 5 | 5 | 0 | 0 |
+| export geoarrow.point (interleaved) vs GDAL | 5 | 5 | 0 | 0 |
+| import geoarrow.point (interleaved) | 5 | 5 | 0 | 0 |
+| export geoarrow.linestring (separated) vs GDAL | 3 | 3 | 0 | 0 |
+| import geoarrow.linestring (separated) | 3 | 3 | 0 | 0 |
+| export geoarrow.linestring (interleaved) vs GDAL | 3 | 3 | 0 | 0 |
+| import geoarrow.linestring (interleaved) | 3 | 3 | 0 | 0 |
+| export geoarrow.multilinestring (separated) vs GDAL | 2 | 2 | 0 | 0 |
+| import geoarrow.multilinestring (separated) | 2 | 2 | 0 | 0 |
+| export geoarrow.multilinestring (interleaved) vs GDAL | 2 | 2 | 0 | 0 |
+| import geoarrow.multilinestring (interleaved) | 2 | 2 | 0 | 0 |
+
+Cases that are not identical:
+
+| Format or operation | Case | Result | Details |
+|---|---|---|---|
+| export WKB vs GDAL | liechtenstein.osm.pbf:multipolygons | within tolerance | rows 24314, geometries 24274/24314 (24314 equal up to vertex order), values 607850/607850 |
+| export geoarrow.multipolygon (separated) vs GDAL | liechtenstein.osm.pbf:multipolygons | within tolerance | rows 24314, geometries 24274/24314 (24314 equal up to vertex order), values 607850/607850 |
+| export geoarrow.multipolygon (interleaved) vs GDAL | liechtenstein.osm.pbf:multipolygons | within tolerance | rows 24314, geometries 24274/24314 (24314 equal up to vertex order), values 607850/607850 |
+| GeoDataFrame.from_arrow vs GDAL | liechtenstein.osm.pbf:multipolygons | within tolerance | rows 24314, geometries 24274/24314 (24314 equal up to vertex order), values 607850/607850, crs same |
+| import GDAL stream (WKB) | liechtenstein.osm.pbf:multipolygons | within tolerance | rows 24314, geometries 24274/24314 (24314 equal up to vertex order), values 607850/607850, crs same |
+| import ogr.Layer | liechtenstein.osm.pbf:multipolygons | within tolerance | rows 24314, geometries 24274/24314 (24314 equal up to vertex order), values 607850/607850 |
+| import GeoDataFrame.to_arrow(WKB) | liechtenstein.osm.pbf:multipolygons | within tolerance | rows 24314, geometries 24274/24314 (24314 equal up to vertex order), values 607850/607850, crs same |
+| import GeoDataFrame.to_arrow(geoarrow) | liechtenstein.osm.pbf:multipolygons | within tolerance | rows 24314, geometries 24274/24314 (24314 equal up to vertex order), values 607850/607850, crs same |
+| GDAL WriteArrow of terrio's table | liechtenstein.osm.pbf:multipolygons | within tolerance | rows 24314, geometries 24274/24314 (24314 equal up to vertex order), values 607850/607850 |
+
+## GeoPackage updates and spatial filters
+
+`--append`, `--overwrite` and added layers compared with `ogr2ogr` (features, extents, counts, sequences, R-trees, `integrity_check`, the GeoPackage validator, rasters kept), and `--spat` through the R-tree compared with `ogr2ogr -spat`.
+
+| Format or operation | Cases | Identical | Within tolerance | Differs |
+|---|---:|---:|---:|---:|
+| append | 4 | 4 | 0 | 0 |
+| add | 2 | 1 | 0 | 1 |
+| --spat | 6 | 6 | 0 | 0 |
+
+Cases that are not identical:
+
+| Format or operation | Case | Result | Details |
+|---|---|---|---|
+| add | add a layer, overwrite another | differs | contents[places]: ('features', -179.5899789, -89.9999998, 179.3833036, 82.4833232, 100001) vs ('features', -179.5899789, -89.9999998, 179.3833036, 82.4833232, 4326); contents[countries]: ('features', None, None, None, None, 100001) vs ('features', None, None, None, None, 4326); geometry_columns[plac |
+
 ## Point clouds
 
 Every dimension of every point equal to laspy's; headers equal to laspy's and PDAL's; written files read back identically by laspy and PDAL; COPC queries returning the same points as PDAL's `readers.copc`; grids equal to PDAL's `writers.gdal`. Reprojections are within 2e-7 degrees or 2 mm of PDAL's.
 
 | Format or operation | Cases | Identical | Within tolerance | Differs |
 |---|---:|---:|---:|---:|
-| read vs laspy | 55 | 55 | 0 | 0 |
-| header vs laspy | 55 | 55 | 0 | 0 |
-| header vs PDAL | 55 | 55 | 0 | 0 |
-| write and read back (laspy) | 159 | 159 | 0 | 0 |
-| write and read back (PDAL) | 141 | 141 | 0 | 0 |
+| read vs laspy | 70 | 70 | 0 | 0 |
+| header vs laspy | 70 | 70 | 0 | 0 |
+| header vs PDAL | 70 | 70 | 0 | 0 |
+| write and read back (laspy) | 201 | 201 | 0 | 0 |
+| write and read back (PDAL) | 183 | 183 | 0 | 0 |
 | COPC queries vs PDAL | 9 | 9 | 0 | 0 |
 | grid vs PDAL writers.gdal | 8 | 8 | 0 | 0 |
 | reproject vs PDAL | 3 | 0 | 3 | 0 |
