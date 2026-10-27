@@ -176,13 +176,18 @@ impl PointCloud {
             .collect()
     }
 
-    /// Reprojects the `x` and `y` coordinates (and `z`, for transformations that change heights)
-    /// into another CRS.
+    /// Reprojects the coordinates into another CRS: `x` and `y`, and `z` when both CRSs have
+    /// heights (compound CRSs with a vertical CRS, geographic 3D CRSs), as PDAL's
+    /// `filters.reprojection` does: vertical units, geoid models and vertical datum
+    /// transformations apply, as in [`crate::crs::Transformer::transform_3d`]. The vertical CRS
+    /// that the CRS records of the header declare counts as part of the points' CRS. Heights are
+    /// kept when only one of the CRSs has them.
     pub fn reproject(&mut self, dst: &SpatialRef) -> Result<()> {
         if self.crs.is_unknown() {
             return Err(crate::Error::Crs("the point cloud has no CRS to reproject from".into()));
         }
-        let t = crate::crs::Transformer::new(&self.crs, dst)?;
+        let src = crs::header_crs(&self.header).with_vertical(&self.crs);
+        let t = Reprojection::new(&src, dst)?;
         self.transform_coords(&t)?;
         self.crs = dst.clone();
         // The file's scale and offset may no longer suit the coordinates: the writer picks new
@@ -192,23 +197,42 @@ impl PointCloud {
         Ok(())
     }
 
-    /// Transforms the `x` and `y` coordinates, leaving the CRS and header alone.
-    pub(crate) fn transform_coords(&mut self, t: &crate::crs::Transformer) -> Result<()> {
+    /// Transforms the coordinates (`z` too when the transformation transforms heights), leaving
+    /// the CRS and header alone.
+    pub(crate) fn transform_coords(&mut self, r: &Reprojection) -> Result<()> {
         let n = self.len();
+        let t = &r.transformer;
         let xs = self.coords("x").map(<[f64]>::to_vec).unwrap_or_default();
         let ys = self.coords("y").map(<[f64]>::to_vec).unwrap_or_default();
+        let zs = if r.heights { self.coords("z").map(<[f64]>::to_vec) } else { None };
         let mut nx = Vec::with_capacity(n);
         let mut ny = Vec::with_capacity(n);
+        let mut nz = Vec::with_capacity(if zs.is_some() { n } else { 0 });
         for i in 0..n.min(xs.len()).min(ys.len()) {
-            let (a, b) = t.transform(xs[i], ys[i])?;
-            nx.push(a);
-            ny.push(b);
+            match &zs {
+                Some(zs) => {
+                    let (a, b, c) = t.transform_3d(xs[i], ys[i], zs[i])?;
+                    nx.push(a);
+                    ny.push(b);
+                    nz.push(c);
+                }
+                None => {
+                    let (a, b) = t.transform(xs[i], ys[i])?;
+                    nx.push(a);
+                    ny.push(b);
+                }
+            }
         }
         if let Some(d) = self.dim_mut("x") {
             d.values = Values::F64(nx);
         }
         if let Some(d) = self.dim_mut("y") {
             d.values = Values::F64(ny);
+        }
+        if zs.is_some()
+            && let Some(d) = self.dim_mut("z")
+        {
+            d.values = Values::F64(nz);
         }
         Ok(())
     }
@@ -249,6 +273,31 @@ impl PointCloud {
             }
         }
         counts.iter().enumerate().filter(|(_, n)| **n > 0).map(|(c, n)| (c as u8, *n)).collect()
+    }
+}
+
+/// A transformation of points into another CRS, and whether it transforms their heights.
+pub(crate) struct Reprojection {
+    transformer: crate::crs::Transformer,
+    /// Whether both CRSs have heights, so that `z` is transformed too.
+    heights: bool,
+}
+
+impl Reprojection {
+    /// The reprojection from `src` (with its vertical CRS, if any) to `dst`. Heights are
+    /// transformed when both CRSs have them; a target with heights and a source without warns
+    /// that heights are kept.
+    pub(crate) fn new(src: &SpatialRef, dst: &SpatialRef) -> Result<Self> {
+        let transformer = crate::crs::Transformer::new(src, dst)?;
+        let (from, to) = (src.has_height(), dst.has_height());
+        if to && !from {
+            crate::warnings::warn(format!(
+                "the points' CRS ({}) has no vertical CRS: their heights are kept as they are in {}",
+                src.label(),
+                dst.label()
+            ));
+        }
+        Ok(Self { transformer, heights: from && to })
     }
 }
 
@@ -390,7 +439,9 @@ pub struct ConvertOptions {
     /// Assign this CRS to the points, without reprojecting (when the file has none or a wrong
     /// one).
     pub assign_srs: Option<SpatialRef>,
-    /// Reproject `x` and `y` into this CRS.
+    /// Reproject the points into this CRS: `x` and `y`, and `z` when this CRS and the points'
+    /// (with the vertical CRS the file declares) both have heights (see
+    /// [`PointCloud::reproject`]).
     pub target_srs: Option<SpatialRef>,
     /// How to write point cloud outputs.
     pub write: PointWriteOptions,
@@ -477,11 +528,8 @@ fn same_file(_: &std::path::Path, _: &std::path::Path) -> bool {
 }
 
 /// The template of a reader's points, as converted (the CRS assigned or reprojected into), and
-/// the transformer that reprojects them.
-pub(crate) fn source_template(
-    reader: &mut PointCloudReader,
-    options: &ConvertOptions,
-) -> Result<(PointCloud, Option<crate::crs::Transformer>)> {
+/// the reprojection of the points.
+pub(crate) fn source_template(reader: &mut PointCloudReader, options: &ConvertOptions) -> Result<(PointCloud, Option<Reprojection>)> {
     let mut template = reader.template()?;
     if let Some(crs) = &options.assign_srs {
         template.crs = crs.clone();
@@ -491,10 +539,10 @@ pub(crate) fn source_template(
             if template.crs.is_unknown() {
                 return Err(crate::Error::Crs("the point cloud has no CRS to reproject from".into()));
             }
-            let t = crate::crs::Transformer::new(&template.crs, dst_srs)?;
+            let t = Reprojection::new(&reader.crs_record().with_vertical(&template.crs), dst_srs)?;
             // The new scale and offset, from the header's bounds reprojected.
             let h = &template.header;
-            let min = t.transform_bounds((h.min[0], h.min[1], h.max[0], h.max[1])).ok().map(|b| [b.0, b.1]);
+            let min = t.transformer.transform_bounds((h.min[0], h.min[1], h.max[0], h.max[1])).ok().map(|b| [b.0, b.1]);
             reproject_header(&mut template.header, dst_srs, min);
             template.crs = dst_srs.clone();
             Some(t)

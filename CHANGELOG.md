@@ -36,6 +36,16 @@
   grid `origin`; H3 grids are not implemented. Hexagons, counts and boundaries (smoothed or not)
   are identical to PDAL 2.10's on autzen; points are assigned to hexagons as hexer assigns them
   (a port, attributed in `NOTICE`).
+- Reprojection (`terrio convert --t-srs`, `convert_points(t_srs=...)`,
+  `PointCloud.reproject`, `append_points`) now transforms `z` when the points'
+  CRS and the target CRS both have heights, as PDAL's `filters.reprojection`
+  does: vertical units, geoid models and vertical datum transformations apply.
+  It previously transformed only `x` and `y`, so 300 ftUS in
+  `EPSG:6588+6360` stayed 300 in `EPSG:6588+5703` (now 91.44018 m). The
+  vertical CRS a LAS file declares is now part of the CRS reprojected from
+  (it was dropped), and LAS files written with GeoKeys record a compound CRS's
+  vertical CRS in `VerticalCSTypeGeoKey`. When only the target has heights,
+  `z` is kept and a warning says so.
 
 ### CRS compatibility
 

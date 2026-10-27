@@ -51,6 +51,33 @@ pub(crate) fn header_crs(h: &LasHeader) -> LasCrs {
     }
 }
 
+impl LasCrs {
+    /// The CRS that `crs` (the horizontal CRS of the points, or the one assigned to them) stands
+    /// for when reprojecting: compound, with the vertical CRS the file declares, when `crs` is the
+    /// file's horizontal CRS (`EPSG:6588+6360` for `EPSG:6588` in a file declaring NAVD88 height
+    /// (ftUS)). `crs` itself otherwise, and when the vertical CRS is not an EPSG one terrio knows
+    /// or the horizontal CRS has only a PROJ string.
+    pub(crate) fn with_vertical(&self, crs: &SpatialRef) -> SpatialRef {
+        let Some(v) = self.vertical_epsg else { return crs.clone() };
+        if crs.is_unknown() || crs.has_height() || !crs.same_as(&self.horizontal) {
+            return crs.clone();
+        }
+        if let Some(code) = crs.epsg
+            && let Ok(c) = SpatialRef::compound(code, v)
+        {
+            return c;
+        }
+        let vertical = SpatialRef::from_epsg(v).ok().and_then(|v| v.to_wkt()).filter(|w| w.starts_with("VERT_CS["));
+        match (crs.proj4.is_none().then(|| crs.to_wkt()).flatten(), vertical) {
+            (Some(h), Some(v)) => {
+                let name = format!("{} + {}", crs.name().unwrap_or_default(), quoted_name(&v).unwrap_or_default());
+                SpatialRef::from_wkt(&format!("COMPD_CS[\"{name}\",{h},{v}]"))
+            }
+            _ => crs.clone(),
+        }
+    }
+}
+
 /// The CRS of a WKT definition, compound ones (and the projected CRSs with a vertical CRS inside
 /// that some writers make) split into their horizontal and vertical parts.
 fn wkt_crs(wkt: &str) -> LasCrs {
@@ -129,6 +156,16 @@ pub(crate) fn crs_vlrs(crs: &SpatialRef, wkt: bool) -> (Vec<Vlr>, bool) {
 }
 
 fn geokey_vlrs(crs: &SpatialRef) -> Option<Vec<Vlr>> {
+    // A compound CRS: its horizontal CRS, and its vertical CRS's EPSG code in
+    // VerticalCSTypeGeoKey, as GDAL writes them.
+    let (crs, vertical) = match crs.to_wkt().filter(|w| w.trim_start().starts_with("COMPD_CS[")) {
+        Some(w) => {
+            let c = wkt_crs(&w);
+            (c.horizontal, Some(c.vertical_epsg.and_then(|v| u16::try_from(v).ok())?))
+        }
+        None => (crs.clone(), None),
+    };
+    let crs = &crs;
     let mut v = crate::drivers::geokeys::GeoKeyValues::default();
     let geographic = crs.is_geographic();
     v.shorts.push((1025, 1));
@@ -144,6 +181,9 @@ fn geokey_vlrs(crs: &SpatialRef) -> Option<Vec<Vlr>> {
             v.doubles.extend(user.doubles);
             v.ascii.extend(user.ascii);
         }
+    }
+    if let Some(code) = vertical {
+        v.shorts.push((4096, code));
     }
     let mut keys: Vec<[u16; 4]> = v.shorts.iter().map(|(id, val)| [*id, 0, 1, *val]).collect();
     keys.extend(v.double_keys());

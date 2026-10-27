@@ -531,6 +531,13 @@ impl SpatialRef {
         Def::new(self).is_ok_and(|d| d.is_geocentric())
     }
 
+    /// Whether coordinates have a height that transformations change: a compound CRS (with a
+    /// vertical CRS), a geographic 3D or a geocentric CRS. [`Transformer::transform_3d`]
+    /// transforms heights between two such CRSs.
+    pub fn has_height(&self) -> bool {
+        Def::new(self).is_ok_and(|d| d.has_height())
+    }
+
     /// Whether the enabled engines recognize a geographic (longitude/latitude) CRS.
     /// Unrecognized definitions return `false`, as do projected and geocentric CRSs.
     pub fn is_geographic(&self) -> bool {

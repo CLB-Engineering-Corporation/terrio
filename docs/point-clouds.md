@@ -205,6 +205,20 @@ dividing by the cell size; `filters.decimation` keeps the points it keeps when s
 `pdal translate` runs it; `filters.normal`'s `refine` changes nothing in PDAL 2.9 and is left
 out). Reprojection (`filters.reprojection`) is `terrio convert --t-srs`.
 
+Reprojection transforms `z` too when the points' CRS and the target CRS both have heights:
+compound CRSs (`EPSG:6588+6360`, a horizontal CRS with NAVD88 height in US survey feet) and
+geographic 3D CRSs (`EPSG:4979`). Vertical units, geoid models and vertical datum transformations
+apply as in [CRS transformations](crs.md#heights-and-vertical-datums), and the vertical CRS a
+LAS file declares (in its WKT or its `VerticalCSTypeGeoKey`) counts as part of the points' CRS.
+When only one of the CRSs has heights, `z` is kept as it is, as PDAL keeps it; a target with
+heights and points without warn. LAS files written with GeoKeys record the vertical CRS of a
+compound CRS in `VerticalCSTypeGeoKey`.
+
+```sh
+terrio convert tile.laz metres.laz --t-srs EPSG:6588+5703   # NAVD88 height (ftUS) to metres
+terrio convert utm.laz itrf.laz --t-srs EPSG:7912           # EPSG:6343+5703 through GEOID18
+```
+
 The neighbourhood filters find neighbours as PDAL does: nanoflann's k-d tree and its order of
 neighbours as far as each other, radius searches sorted as libstdc++'s `std::sort` sorts them,
 covariances with PDAL's running means and offsets rounded to floats, and eigenvalues and
