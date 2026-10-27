@@ -15,6 +15,20 @@
   `--input @filelist.txt` does (#323). MCP tool calls refuse `@FILE`, so that a
   client cannot read a file back through the errors naming its lines.
 
+### Point clouds
+
+- PDAL's `filters.hexbin`: the boundary of points on a grid of hexagons (the hexagons with at
+  least a threshold of points, as polygons with holes), with its area, density and point
+  spacing, and the hexagons with their counts. `terrio filter hexbin` (and MCP) writes them as
+  vector datasets, reading the points in chunks; Python's `PointCloud.hexbin` returns PDAL's
+  metadata (`boundary` as WKT, `boundary_json`...) with both as layers; JavaScript's
+  `PointCloud.hexbin` returns both as a vector dataset; Rust has `pointcloud::filters::hexbin`
+  and `HexBinner`. PDAL's options (`edge_length`/`edge_size` or its estimate from
+  `sample_size` points, `threshold`, `smooth`, `hole_cull_area_tolerance`, `precision`) and a
+  grid `origin`; H3 grids are not implemented. Hexagons, counts and boundaries (smoothed or not)
+  are identical to PDAL 2.10's on autzen; points are assigned to hexagons as hexer assigns them
+  (a port, attributed in `NOTICE`).
+
 ### CRS compatibility
 
 - Transformer construction now checks celestial-body compatibility for all CRS
