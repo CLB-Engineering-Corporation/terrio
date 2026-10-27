@@ -768,8 +768,9 @@ impl LazyRaster {
     /// Writes the full-resolution image to `path`, as [`crate::write_raster_dataset`] writes the
     /// raster [`LazyRaster::read`] reads. A GeoTIFF or JPEG 2000 file read in place and written as
     /// a GeoTIFF or a COG (in a compression terrio's own writer encodes) is read and written a
-    /// strip of rows at a time, so that it is never held whole; other rasters are read whole, then
-    /// written.
+    /// strip of rows at a time, so that it is never held whole; a PMTiles or MBTiles archive is
+    /// built a tile row at a time (and a raster already on its zoom level's Web Mercator pixel
+    /// grid read a strip at a time); other rasters are read whole, then written.
     ///
     /// ```no_run
     /// use terrio::RasterWriteOptions;
@@ -780,6 +781,13 @@ impl LazyRaster {
     /// # Ok::<(), terrio::Error>(())
     /// ```
     pub fn write(&mut self, path: &str, options: &crate::RasterWriteOptions) -> Result<()> {
+        // Tile archives are built a tile row at a time (see `crate::tiles`).
+        #[cfg(all(feature = "tiles", not(target_family = "wasm")))]
+        if let Some(driver @ (RasterDriver::PMTiles | RasterDriver::MBTiles)) = options.driver.or_else(|| RasterDriver::for_extension(path))
+            && !crate::ops::strips::overwrites(path, &self.input_paths()?)
+        {
+            return crate::tiles::write_raster_lazy(self, path, driver, options);
+        }
         let (width, height, bands) = (self.width(), self.height(), self.band_count());
         let block = self.block_size().map(|(_, h)| h);
         let value_size = self.data_type().size_bytes();
