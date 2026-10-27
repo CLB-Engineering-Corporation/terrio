@@ -157,11 +157,12 @@ pub(crate) fn crs_vlrs(crs: &SpatialRef, wkt: bool) -> (Vec<Vlr>, bool) {
 
 fn geokey_vlrs(crs: &SpatialRef) -> Option<Vec<Vlr>> {
     // A compound CRS: its horizontal CRS, and its vertical CRS's EPSG code in
-    // VerticalCSTypeGeoKey, as GDAL writes them.
+    // VerticalCSTypeGeoKey, as GDAL writes them. A vertical CRS without one is left out, so
+    // that the GeoKeys still describe the horizontal CRS rather than falling back to WKT.
     let (crs, vertical) = match crs.to_wkt().filter(|w| w.trim_start().starts_with("COMPD_CS[")) {
         Some(w) => {
             let c = wkt_crs(&w);
-            (c.horizontal, Some(c.vertical_epsg.and_then(|v| u16::try_from(v).ok())?))
+            (c.horizontal, c.vertical_epsg.and_then(|v| u16::try_from(v).ok()))
         }
         None => (crs.clone(), None),
     };
@@ -242,6 +243,18 @@ mod tests {
     #[test]
     fn geokeys_round_trip() {
         let crs = SpatialRef::from_epsg(26915).unwrap();
+        let (vlrs, wkt) = crs_vlrs(&crs, false);
+        assert!(!wkt);
+        let h = LasHeader { vlrs, version: (1, 2), ..Default::default() };
+        assert_eq!(header_crs(&h).horizontal.epsg, Some(26915));
+    }
+
+    #[test]
+    fn compound_crs_with_a_vertical_crs_without_a_code_keeps_geokeys() {
+        let horizontal = SpatialRef::from_epsg(26915).unwrap().to_wkt().unwrap();
+        let vertical = r#"VERT_CS["local height",VERT_DATUM["unknown",2000],UNIT["metre",1],AXIS["Up",UP]]"#;
+        let crs = SpatialRef::from_wkt(&format!("COMPD_CS[\"local\",{horizontal},{vertical}]"));
+        // A LAS 1.2 file cannot carry a WKT record, so the GeoKeys stay.
         let (vlrs, wkt) = crs_vlrs(&crs, false);
         assert!(!wkt);
         let h = LasHeader { vlrs, version: (1, 2), ..Default::default() };
