@@ -188,13 +188,12 @@ impl PointCloud {
         }
         let src = crs::header_crs(&self.header).with_vertical(&self.crs);
         let t = Reprojection::new(&src, dst)?;
-        let z_factor = self.bounds().and_then(|b| t.z_factor(b[0], b[1], b[2]));
+        let z_factor = if t.heights { self.bounds().and_then(|b| t.z_factor(b[0], b[1], b[2])) } else { None };
         self.transform_coords(&t)?;
         self.crs = dst.clone();
         // The header's CRS records describe the points no longer (a later reprojection would
         // read the old vertical CRS from them); the writer makes new ones from `crs`.
-        self.header.vlrs.retain(|v| !crs::is_crs_vlr(v));
-        self.header.evlrs.retain(|v| !crs::is_crs_vlr(v));
+        drop_crs_records(&mut self.header);
         // The file's scale and offset may no longer suit the coordinates: the writer picks new
         // ones from these.
         let bounds = self.bounds().map(|b| [b[0], b[1]]);
@@ -315,6 +314,12 @@ impl Reprojection {
         let (_, _, b) = self.transformer.transform_3d(x, y, z + 1.0).ok()?;
         Some(b - a).filter(|f| f.is_finite() && *f > 0.0)
     }
+}
+
+/// Drops the records that describe the header's CRS, vertical CRS included.
+fn drop_crs_records(header: &mut LasHeader) {
+    header.vlrs.retain(|v| !crs::is_crs_vlr(v));
+    header.evlrs.retain(|v| !crs::is_crs_vlr(v));
 }
 
 /// A scale and offset for coordinates reprojected into `dst`, whose minimum x and y are `min`:
@@ -527,8 +532,7 @@ pub fn convert(src: &str, dst: &str, options: &ConvertOptions) -> Result<()> {
     if let Some(crs) = &options.assign_srs {
         cloud.crs = crs.clone();
         // The file's CRS records (and the vertical CRS they declare) no longer apply.
-        cloud.header.vlrs.retain(|v| !crs::is_crs_vlr(v));
-        cloud.header.evlrs.retain(|v| !crs::is_crs_vlr(v));
+        drop_crs_records(&mut cloud.header);
     }
     if let Some(dst_srs) = &options.target_srs {
         cloud.reproject(dst_srs)?;

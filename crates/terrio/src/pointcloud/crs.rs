@@ -98,12 +98,16 @@ fn wkt_crs(wkt: &str) -> LasCrs {
     LasCrs { horizontal: horizontal.map(|h| SpatialRef::from_wkt(&h)).unwrap_or_default(), vertical_epsg, vertical_name }
 }
 
-/// The bracketed element starting with `keyword` (such as `PROJCS[`), brackets included.
+/// The bracketed element starting with `keyword` (such as `PROJCS[`), brackets included. Brackets
+/// inside quoted names do not count.
 fn bracketed<'a>(s: &'a str, keyword: &str) -> Option<&'a str> {
     let start = s.find(keyword)?;
     let mut depth = 0;
+    let mut quoted = false;
     for (i, c) in s[start..].char_indices() {
         match c {
+            '"' => quoted = !quoted,
+            _ if quoted => {}
             '[' => depth += 1,
             ']' => {
                 depth -= 1;
@@ -118,12 +122,16 @@ fn bracketed<'a>(s: &'a str, keyword: &str) -> Option<&'a str> {
 }
 
 /// The code of the element's own `AUTHORITY["EPSG","code"]` (or `ID["EPSG",code]`): one directly
-/// inside it, not that of a datum or unit nested in it.
+/// inside it, not that of a datum or unit nested in it. Brackets and commas inside quoted names
+/// do not count.
 fn own_authority_code(s: &str) -> Option<u32> {
     let mut depth = 0;
+    let mut quoted = false;
     let mut own = None;
     for (i, c) in s.char_indices() {
         match c {
+            '"' => quoted = !quoted,
+            _ if quoted => {}
             '[' => depth += 1,
             ']' => depth -= 1,
             ',' if depth == 1 => {
@@ -259,6 +267,14 @@ mod tests {
         let c = wkt_crs(w);
         assert_eq!(c.horizontal.epsg, Some(2903));
         assert_eq!(c.vertical_epsg, Some(5703));
+    }
+
+    #[test]
+    fn brackets_in_a_quoted_vertical_name_do_not_shift_the_nesting() {
+        let w = r#"COMPD_CS["NAD83 / Oregon + depth",PROJCS["NAD83 / Oregon LCC (m)",GEOGCS["NAD83",UNIT["degree",0.0174532925199433]],UNIT["metre",1]],VERT_CS["Mean Sea Level [ft",VERT_DATUM["Mean Sea Level",2005,AUTHORITY["EPSG","5100"]],UNIT["US survey foot",0.304800609601219],AXIS["Gravity-related height",UP],AUTHORITY["EPSG","5714"]]]"#;
+        let c = wkt_crs(w);
+        assert_eq!(c.vertical_epsg, Some(5714));
+        assert_eq!(c.vertical_name.as_deref(), Some("Mean Sea Level [ft"));
     }
 
     #[test]
