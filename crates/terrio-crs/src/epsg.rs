@@ -651,7 +651,6 @@ pub(crate) fn geoid_models(vertical: u32) -> Vec<(u32, u32, Vec<Arc<Op>>)> {
                 let (ops, grid_ops) = lazy.get(&t.text, |ids| t.lists(ids));
                 (*g, v, usable(ops, grid_ops))
             })
-            .filter(|(_, _, ops)| !ops.is_empty())
             .collect()
     };
     if let Some(list) = t.geoids.get(&vertical) {

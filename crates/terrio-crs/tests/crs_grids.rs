@@ -127,6 +127,8 @@ fn geoid_models_match_gdal() {
     assert_eq!(t.transform_3d(-100.0, 40.0, 100.0).unwrap(), (-100.0, 40.0, 100.0));
 }
 
+/// Needs the test data: without it the checks return early. The grid-free refusals and the
+/// heights kept without a grid are checked in `refusal_kinds.rs`.
 #[test]
 fn geoid_models_of_the_vertical_datum_match_proj() {
     if grids().is_none() {
