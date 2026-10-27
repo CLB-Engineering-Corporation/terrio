@@ -157,12 +157,20 @@ pub(crate) fn crs_vlrs(crs: &SpatialRef, wkt: bool) -> (Vec<Vlr>, bool) {
 
 fn geokey_vlrs(crs: &SpatialRef) -> Option<Vec<Vlr>> {
     // A compound CRS: its horizontal CRS, and its vertical CRS's EPSG code in
-    // VerticalCSTypeGeoKey, as GDAL writes them. A vertical CRS without one is left out, so
+    // VerticalCSTypeGeoKey, as GDAL writes them in GeoTIFF (GDAL 3.13 writes 3072 = 6588 and
+    // 4096 = 6360 for EPSG:6588+6360). A vertical CRS without one is left out (with a warning), so
     // that the GeoKeys still describe the horizontal CRS rather than falling back to WKT.
     let (crs, vertical) = match crs.to_wkt().filter(|w| w.trim_start().starts_with("COMPD_CS[")) {
         Some(w) => {
             let c = wkt_crs(&w);
-            (c.horizontal, c.vertical_epsg.and_then(|v| u16::try_from(v).ok()))
+            let vertical = c.vertical_epsg.and_then(|v| u16::try_from(v).ok());
+            if vertical.is_none() {
+                crate::warnings::warn(format!(
+                    "the vertical CRS of {} has no EPSG code for GeoKeys: only the horizontal CRS is written",
+                    crs.label()
+                ));
+            }
+            (c.horizontal, vertical)
         }
         None => (crs.clone(), None),
     };
@@ -250,13 +258,28 @@ mod tests {
     }
 
     #[test]
+    fn compound_crs_geokeys_match_gdal() {
+        // The keys GDAL 3.13 writes in a GeoTIFF in EPSG:6588+6360 (besides the citation).
+        let (vlrs, wkt) = crs_vlrs(&SpatialRef::parse("EPSG:6588+6360").unwrap(), false);
+        assert!(!wkt);
+        let keys = shorts(&vlrs[0].data);
+        let keys: Vec<[u16; 4]> = keys[4..].as_chunks::<4>().0.to_vec();
+        for k in [[1024, 0, 1, 1], [1025, 0, 1, 1], [3072, 0, 1, 6588], [4096, 0, 1, 6360]] {
+            assert!(keys.contains(&k), "{k:?} in {keys:?}");
+        }
+    }
+
+    #[test]
     fn compound_crs_with_a_vertical_crs_without_a_code_keeps_geokeys() {
         let horizontal = SpatialRef::from_epsg(26915).unwrap().to_wkt().unwrap();
         let vertical = r#"VERT_CS["local height",VERT_DATUM["unknown",2000],UNIT["metre",1],AXIS["Up",UP]]"#;
         let crs = SpatialRef::from_wkt(&format!("COMPD_CS[\"local\",{horizontal},{vertical}]"));
-        // A LAS 1.2 file cannot carry a WKT record, so the GeoKeys stay.
+        // A LAS 1.2 file cannot carry a WKT record, so the GeoKeys stay, and the vertical CRS
+        // left out is reported.
+        let _ = crate::warnings::take();
         let (vlrs, wkt) = crs_vlrs(&crs, false);
         assert!(!wkt);
+        assert!(crate::warnings::take().iter().any(|w| w.contains("only the horizontal CRS")));
         let h = LasHeader { vlrs, version: (1, 2), ..Default::default() };
         assert_eq!(header_crs(&h).horizontal.epsg, Some(26915));
     }

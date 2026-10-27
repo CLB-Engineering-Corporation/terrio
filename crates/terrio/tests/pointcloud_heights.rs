@@ -82,6 +82,35 @@ fn reprojection_converts_vertical_units_of_the_file_crs() {
 }
 
 #[test]
+fn chained_reprojections_follow_the_points_vertical_crs() {
+    // The header's records keep declaring NAVD88 in ftUS; after the first reprojection the
+    // points are in metres, through a 2D CRS (heights kept) and back.
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("ft14.laz");
+    let src = src.to_str().unwrap();
+    let write = PointWriteOptions { point_format: Some(6), minor_version: Some(4), scale: Some(MM), ..Default::default() };
+    pointcloud::write_points(&cloud(&[(3000000.0, 13800000.0, 300.0)], "EPSG:6588+6360"), src, &write).unwrap();
+    let mut points = pointcloud::read_points(src, &Default::default()).unwrap();
+    for dst in ["EPSG:6588+5703", "EPSG:6588", "EPSG:6588+5703"] {
+        points.reproject(&SpatialRef::parse(dst).unwrap()).unwrap();
+        let z = points.dim("z").unwrap().values.get_f64(0);
+        assert!((z - 91.44018288036575).abs() < 1e-9, "{dst}: {z}");
+    }
+}
+
+#[test]
+fn reprojected_heights_keep_their_precision() {
+    // 0.01 ftUS is 3 mm: stored in metres to the millimetre, not to the centimetre.
+    let mut points = cloud(&[(3000000.0, 13800000.0, 300.0)], "EPSG:6588+6360");
+    points.header.scale = [0.01, 0.01, 0.01];
+    points.reproject(&SpatialRef::parse("EPSG:6588+5703").unwrap()).unwrap();
+    assert_eq!(points.header.scale[2], 0.001);
+    // A transformation that keeps the unit keeps the scale.
+    points.reproject(&SpatialRef::parse("EPSG:3857+5703").unwrap()).unwrap();
+    assert_eq!(points.header.scale[2], 0.001);
+}
+
+#[test]
 fn reprojection_into_heights_from_none_keeps_them_and_warns() {
     let _ = terrio::warnings::take();
     let mut points = cloud(&[(3000000.0, 13800000.0, 300.0)], "EPSG:6588");
@@ -102,6 +131,15 @@ fn reprojection_applies_geoid_models_as_proj() {
         eprintln!("us_noaa_g2018u0.tif is missing: run scripts/fetch_test_data.sh");
         return;
     }
+    // The settings are process-wide: back to the environment's when the test ends.
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            terrio::crs::set_grid_search_paths(None);
+            terrio::crs::set_network_enabled(None);
+        }
+    }
+    let _restore = Restore;
     terrio::crs::set_grid_search_paths(Some(vec![dir]));
     terrio::crs::set_network_enabled(Some(false));
     let tmp = tempfile::tempdir().unwrap();

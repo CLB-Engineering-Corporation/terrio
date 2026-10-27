@@ -188,12 +188,17 @@ impl PointCloud {
         }
         let src = crs::header_crs(&self.header).with_vertical(&self.crs);
         let t = Reprojection::new(&src, dst)?;
+        let z_factor = self.bounds().and_then(|b| t.z_factor(b[0], b[1], b[2]));
         self.transform_coords(&t)?;
         self.crs = dst.clone();
+        // The header's CRS records describe the points no longer (a later reprojection would
+        // read the old vertical CRS from them); the writer makes new ones from `crs`.
+        self.header.vlrs.retain(|v| !crs::is_crs_vlr(v));
+        self.header.evlrs.retain(|v| !crs::is_crs_vlr(v));
         // The file's scale and offset may no longer suit the coordinates: the writer picks new
         // ones from these.
         let bounds = self.bounds().map(|b| [b[0], b[1]]);
-        reproject_header(&mut self.header, dst, bounds);
+        reproject_header(&mut self.header, dst, bounds, z_factor);
         Ok(())
     }
 
@@ -299,14 +304,33 @@ impl Reprojection {
         }
         Ok(Self { transformer, heights: from && to })
     }
+
+    /// How much a height difference of 1 at `(x, y, z)` changes into, when heights are
+    /// transformed: the ratio of the vertical units, for the precision of the stored `z`.
+    fn z_factor(&self, x: f64, y: f64, z: f64) -> Option<f64> {
+        if !self.heights {
+            return None;
+        }
+        let (_, _, a) = self.transformer.transform_3d(x, y, z).ok()?;
+        let (_, _, b) = self.transformer.transform_3d(x, y, z + 1.0).ok()?;
+        Some(b - a).filter(|f| f.is_finite() && *f > 0.0)
+    }
 }
 
 /// A scale and offset for coordinates reprojected into `dst`, whose minimum x and y are `min`:
-/// 1e-7 for geographic CRSs, otherwise the old scale (within 0.1 mm and 1 cm).
-pub(crate) fn reproject_header(header: &mut LasHeader, dst: &SpatialRef, min: Option<[f64; 2]>) {
+/// 1e-7 for geographic CRSs, otherwise the old scale (within 0.1 mm and 1 cm). When heights are
+/// transformed and a height difference of 1 becomes `z_factor`, the z scale keeps at least the
+/// old precision: the old scale in the new unit, rounded down to a power of ten.
+pub(crate) fn reproject_header(header: &mut LasHeader, dst: &SpatialRef, min: Option<[f64; 2]>, z_factor: Option<f64>) {
     let s = if dst.is_angular() { 1e-7 } else { header.scale[0].max(header.scale[1]).clamp(1e-4, 0.01) };
     header.scale[0] = s;
     header.scale[1] = s;
+    if let Some(f) = z_factor.filter(|f| (f - 1.0).abs() > 1e-6) {
+        let z = header.scale[2] * f;
+        if z.is_finite() && z > 0.0 {
+            header.scale[2] = 10f64.powf(z.log10().floor());
+        }
+    }
     if let Some(m) = min {
         header.offset[0] = round_offset(m[0], s);
         header.offset[1] = round_offset(m[1], s);
@@ -543,7 +567,8 @@ pub(crate) fn source_template(reader: &mut PointCloudReader, options: &ConvertOp
             // The new scale and offset, from the header's bounds reprojected.
             let h = &template.header;
             let min = t.transformer.transform_bounds((h.min[0], h.min[1], h.max[0], h.max[1])).ok().map(|b| [b.0, b.1]);
-            reproject_header(&mut template.header, dst_srs, min);
+            let z_factor = t.z_factor(h.min[0], h.min[1], h.min[2]);
+            reproject_header(&mut template.header, dst_srs, min, z_factor);
             template.crs = dst_srs.clone();
             Some(t)
         }
