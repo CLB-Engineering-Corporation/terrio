@@ -141,6 +141,19 @@ fn an_assigned_crs_replaces_the_files_vertical_crs() {
 }
 
 #[test]
+fn assign_crs_replaces_the_headers_vertical_crs() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("ft14.laz");
+    let src = src.to_str().unwrap();
+    let write = PointWriteOptions { point_format: Some(6), minor_version: Some(4), scale: Some(MM), ..Default::default() };
+    pointcloud::write_points(&cloud(&[(3000000.0, 13800000.0, 300.0)], "EPSG:6588+6360"), src, &write).unwrap();
+    let mut points = pointcloud::read_points(src, &Default::default()).unwrap();
+    points.assign_crs(SpatialRef::parse("EPSG:6588").unwrap());
+    points.reproject(&SpatialRef::parse("EPSG:6588+5703").unwrap()).unwrap();
+    assert_eq!(points.dim("z").unwrap().values.get_f64(0), 300.0);
+}
+
+#[test]
 fn reprojected_heights_keep_their_precision() {
     // 0.01 ftUS is 3 mm: stored in metres to the millimetre, not to the centimetre.
     let mut points = cloud(&[(3000000.0, 13800000.0, 300.0)], "EPSG:6588+6360");

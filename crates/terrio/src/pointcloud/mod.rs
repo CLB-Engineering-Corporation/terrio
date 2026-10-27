@@ -67,7 +67,8 @@ pub struct PointCloud {
     /// file, not necessarily the points read (see [`PointCloud::len`] and
     /// [`PointCloud::bounds`]).
     pub header: LasHeader,
-    /// The horizontal CRS.
+    /// The horizontal CRS. [`PointCloud::reproject`] adds the vertical CRS the header's CRS
+    /// records declare; [`PointCloud::assign_crs`] replaces both.
     pub crs: SpatialRef,
     /// The dimensions.
     pub dimensions: Vec<Dimension>,
@@ -174,6 +175,14 @@ impl PointCloud {
                 })
             })
             .collect()
+    }
+
+    /// Assigns a CRS to the points, without reprojecting: it replaces the file's CRS, vertical
+    /// CRS included (the header's CRS records are dropped), so that a CRS without heights keeps
+    /// `z` in a later reprojection.
+    pub fn assign_crs(&mut self, crs: SpatialRef) {
+        self.crs = crs;
+        drop_crs_records(&mut self.header);
     }
 
     /// Reprojects the coordinates into another CRS: `x` and `y`, and `z` when both CRSs have
@@ -530,9 +539,7 @@ pub fn convert(src: &str, dst: &str, options: &ConvertOptions) -> Result<()> {
     }
     let mut cloud = read_points(src, &options.read)?;
     if let Some(crs) = &options.assign_srs {
-        cloud.crs = crs.clone();
-        // The file's CRS records (and the vertical CRS they declare) no longer apply.
-        drop_crs_records(&mut cloud.header);
+        cloud.assign_crs(crs.clone());
     }
     if let Some(dst_srs) = &options.target_srs {
         cloud.reproject(dst_srs)?;
