@@ -222,6 +222,20 @@ let window = cog.read_window(terrio::Window::new(0, 0, 512, 512), &options)?; //
 # Ok::<(), terrio::Error>(())
 ```
 
+`terrio::validate_cog(path, strict)` checks a Cloud Optimized GeoTIFF, local or remote (read with
+range requests, headers and chunk offsets only), with the checks and messages of rio-cogeo's
+`cog_validate` (GDAL's `validate_cloud_optimized_geotiff.py`): tiled full resolution and overviews
+above 512 pixels, overviews sorted, IFDs first (the main one within 300 bytes), image data from
+the smallest overview to the full resolution, no `.ovr` sidecar, no
+`KNOWN_INCOMPATIBLE_EDITION=YES`, and a warning for a large image without overviews. Masks are
+also checked against GDAL's COG layout (`layout_notes`, which do not affect validity). `strict` makes warnings errors.
+
+```rust,no_run
+let v = terrio::validate_cog("https://example.com/dem.tif", false)?;
+assert!(v.is_valid, "{:?}", v.errors);
+# Ok::<(), terrio::Error>(())
+```
+
 ## Bytes in memory
 
 ```rust,no_run
