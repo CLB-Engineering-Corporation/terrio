@@ -176,6 +176,11 @@ impl SpatialRef {
     pub fn is_geocentric(&self) -> bool {
         self.as_core().is_geocentric()
     }
+    /// Whether coordinates have a height that transformations change: a compound CRS (with a
+    /// vertical CRS), a geographic 3D or a geocentric CRS.
+    pub fn has_height(&self) -> bool {
+        self.as_core().has_height()
+    }
     /// Whether this is a rotated-pole grid (PROJ's `+proj=ob_tran`, CF's
     /// `rotated_latitude_longitude`): its coordinates are in degrees but are not longitudes and
     /// latitudes, so it is not geographic.

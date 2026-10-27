@@ -314,6 +314,11 @@ impl PointCloudReader {
         (c.vertical_epsg, c.vertical_name.clone())
     }
 
+    /// The CRS the file declares, horizontal and vertical.
+    pub(crate) fn crs_record(&self) -> &LasCrs {
+        self.inner.crs()
+    }
+
     /// The dimensions of the points: `(name, type)`.
     pub fn dimensions(&self) -> Vec<(String, ValueType)> {
         self.inner.dimensions()

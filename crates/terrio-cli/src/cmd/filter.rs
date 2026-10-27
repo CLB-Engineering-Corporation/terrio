@@ -801,7 +801,7 @@ fn read_template(io: &Io) -> terrio::Result<PointCloud> {
 /// Assigns `--a-srs`, when given, to a cloud.
 fn assign_srs(a_srs: &Option<String>, cloud: &mut PointCloud) -> terrio::Result<()> {
     if let Some(s) = a_srs {
-        cloud.crs = terrio::crs::SpatialRef::parse(s)?;
+        cloud.assign_crs(terrio::crs::SpatialRef::parse(s)?);
     }
     Ok(())
 }
