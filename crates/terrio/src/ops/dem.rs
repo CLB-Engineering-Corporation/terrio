@@ -18,7 +18,7 @@
 //! - on x86-64, the default hillshade uses the same approximate reciprocal square root as GDAL's
 //!   SSE code path on the rows where it uses it.
 
-use super::{Grid, build_raster};
+use super::Grid;
 use crate::{Error, RasterDataset, Result};
 use std::f64::consts::PI;
 use wbraster::DataType;
@@ -136,6 +136,11 @@ pub struct DemOptions {
     pub color_selection: ColorSelection,
     /// Add an alpha band to the color relief (`-alpha`).
     pub alpha: bool,
+    /// For the operations written to a path a strip of rows at a time ([`dem_to_path`],
+    /// [`color_relief_to_path`]): about how much memory, in MiB, the strips in flight may take
+    /// (read ahead, computed, being written), which sets their height (like `gdalwarp -wm`). By
+    /// default, 256 MiB. The values do not depend on it.
+    pub max_memory_mib: Option<f64>,
 }
 
 impl Default for DemOptions {
@@ -158,6 +163,7 @@ impl Default for DemOptions {
             compute_edges: false,
             color_selection: ColorSelection::Interpolate,
             alpha: false,
+            max_memory_mib: None,
         }
     }
 }
@@ -185,6 +191,9 @@ impl DemOptions {
         }
         if self.xscale.is_some() != self.yscale.is_some() {
             return Err(Error::InvalidArgument("xscale and yscale go together".into()));
+        }
+        if self.max_memory_mib.is_some_and(|m| m.is_nan() || m <= 0.0) {
+            return bad("max_memory_mib");
         }
         Ok(())
     }
@@ -1132,8 +1141,34 @@ pub fn dem_to_path(
     path: &str,
     options: &crate::RasterWriteOptions,
 ) -> Result<()> {
-    let rows = super::strips::strip_rows(src.width(), 1, src.data_type().size_bytes().max(4), src.block_size().map(|b| b.1));
+    o.validate()?;
+    // A DEM that is also the output is read whole first.
+    if super::strips::overwrites(path, &src.input_paths()?) {
+        return crate::write_raster_dataset(&dem(&src.read()?, product, o)?, path, options);
+    }
+    let out_bytes = if product == DemProduct::Hillshade { 1 } else { 4 };
+    let rows = strip_rows(src, o, out_bytes);
     dem_in_strips(src, product, o, path, options, rows)
+}
+
+/// The memory budget of the operations written a strip at a time, when none is given.
+const DEFAULT_MEMORY_MIB: f64 = 256.0;
+
+/// The rows of the strips a DEM operation written a strip at a time processes, for an output of
+/// `out_bytes` bytes per pixel (all bands): as many rows as `max_memory_mib` (by default
+/// [`DEFAULT_MEMORY_MIB`]) holds. About three strips of input (read ahead, read, worked on) and three of
+/// output (computed, queued, being written) are in flight, with the `f64` values of one.
+fn strip_rows(src: &crate::LazyRaster, o: &DemOptions, out_bytes: usize) -> usize {
+    let (w, block) = (src.width().max(1), src.block_size().map(|b| b.1));
+    let value = src.data_type().size_bytes().max(4);
+    let mib = o.max_memory_mib.unwrap_or(DEFAULT_MEMORY_MIB);
+    let row = w * (3 * value + 8 + 4 + 3 * out_bytes);
+    let rows = ((mib * 1048576.0) as usize / row).max(1);
+    // Whole rows of the input's blocks, when they fit.
+    match block.filter(|b| *b > 1 && rows >= *b) {
+        Some(b) => rows / b * b,
+        None => rows,
+    }
 }
 
 /// [`dem_to_path`] in strips of `rows` rows.
@@ -1220,7 +1255,23 @@ impl ColorMap {
     /// resolves percentages: `range` when given (GDAL uses the statistics cached in the
     /// dataset's `.aux.xml`, see [`pam_statistics`]), otherwise the band's minimum and maximum.
     pub fn parse(text: &str, ds: &RasterDataset, band: usize, range: Option<(f64, f64)>) -> Result<Self> {
-        let nodata = ds.nodata();
+        Self::parse_with(text, ds.nodata(), range, || band_range(ds, band))
+    }
+
+    /// [`ColorMap::parse`] for a DEM read by window: percentages, when there are some and no
+    /// `range` is given, are of the band's range read a strip of rows at a time.
+    pub fn parse_lazy(text: &str, src: &mut crate::LazyRaster, band: usize, range: Option<(f64, f64)>) -> Result<Self> {
+        let nodata = src.header().nodata();
+        Self::parse_with(text, nodata, range, || lazy_band_range(src, band))
+    }
+
+    fn parse_with(
+        text: &str,
+        nodata: Option<f64>,
+        range: Option<(f64, f64)>,
+        band_range: impl FnOnce() -> Result<(f64, f64)>,
+    ) -> Result<Self> {
+        let mut band_range = Some(band_range);
         let mut range = range;
         let mut entries = Vec::new();
         let mut gmt = false;
@@ -1258,7 +1309,7 @@ impl ColorMap {
                     }
                     let (lo, hi) = match range {
                         Some(r) => r,
-                        None => *range.insert(band_range(ds, band)?),
+                        None => *range.insert(band_range.take().expect("computed once")()?),
                     };
                     lo + pct * (hi - lo)
                 } else {
@@ -1309,6 +1360,33 @@ fn band_range(ds: &RasterDataset, band: usize) -> Result<(f64, f64)> {
         }
         lo = lo.min(v);
         hi = hi.max(v);
+    }
+    if lo > hi {
+        return Err(Error::InvalidArgument("the band has no valid value to compute percentages from".into()));
+    }
+    Ok((lo, hi))
+}
+
+/// The minimum and maximum of the valid values of a band read by window, a strip of rows at a time.
+fn lazy_band_range(src: &mut crate::LazyRaster, band: usize) -> Result<(f64, f64)> {
+    if band == 0 || band > src.band_count() {
+        return Err(Error::InvalidArgument(format!("unable to fetch band #{band}")));
+    }
+    let header = src.header();
+    let nodata = header.nodata();
+    let (w, h) = (src.width(), src.height());
+    let rows = super::strips::strip_rows(w, 1, 8, src.block_size().map(|b| b.1));
+    let read = crate::WindowOptions { bands: vec![band], ..Default::default() };
+    let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
+    for y in (0..h).step_by(rows.max(1)) {
+        let strip = src.read_window(crate::Window::new(0, y, w, rows.min(h - y)), &read)?;
+        for v in super::band_f64(&strip.raster, 0) {
+            if v.is_nan() || nodata.is_some_and(|nd| super::is_nodata(v, nd)) {
+                continue;
+            }
+            lo = lo.min(v);
+            hi = hi.max(v);
+        }
     }
     if lo > hi {
         return Err(Error::InvalidArgument("the band has no valid value to compute percentages from".into()));
@@ -1586,44 +1664,293 @@ pub fn color_relief_vrt(
     })
 }
 
+/// A color map set up to color a DEM band as `gdaldem color-relief` does.
+struct Relief {
+    entries: Vec<ColorEntry>,
+    mode: ColorSelection,
+    nbands: usize,
+    data_type: DataType,
+    /// The colors of every value of Byte, Int16 and UInt16 bands, which are read as integers.
+    cache: Option<Vec<[i32; 4]>>,
+}
+
+impl Relief {
+    /// `ds` is only read for its metadata.
+    fn new(ds: &RasterDataset, colors: &ColorMap, o: &DemOptions) -> Result<Self> {
+        let r = &ds.raster;
+        if o.band == 0 || o.band > r.bands {
+            return Err(Error::InvalidArgument(format!("unable to fetch band #{}", o.band)));
+        }
+        let mut c = colors.entries.clone();
+        if c.is_empty() {
+            return Err(Error::InvalidArgument("the color map is empty".into()));
+        }
+        process_colors(&mut c, ds.nodata(), o.color_selection);
+        // Byte, Int16 and UInt16 are read as integers, the other types as Float32.
+        let exact = matches!(r.data_type, DataType::U8 | DataType::I16 | DataType::U16);
+        let cache: Option<Vec<[i32; 4]>> = exact.then(|| {
+            let offset = if r.data_type == DataType::I16 { 32768 } else { 0 };
+            let len = if r.data_type == DataType::U8 { 256 } else { 65536 };
+            (0..len).map(|i| rgba(&c, (i - offset) as f64, o.color_selection)).collect()
+        });
+        Ok(Self { entries: c, mode: o.color_selection, nbands: if o.alpha { 4 } else { 3 }, data_type: r.data_type, cache })
+    }
+
+    /// The colors of the values of a band, as Byte bands, band after band.
+    fn colors(&self, band: &super::BandView) -> RasterData {
+        self.colors_range(band, 0, band.len())
+    }
+
+    /// The colors of pixels `start..start + n` of a band, as Byte bands, band after band.
+    fn colors_range(&self, band: &super::BandView, start: usize, n: usize) -> RasterData {
+        let offset = if self.data_type == DataType::I16 { 32768 } else { 0 };
+        let color = |v: f64| match &self.cache {
+            Some(table) => table[(v as i64 + offset) as usize],
+            None => rgba(&self.entries, v as f32 as f64, self.mode),
+        };
+        let mut out = vec![0u8; n * self.nbands];
+        if n == 0 {
+            return RasterData::U8(out);
+        }
+        let (first, rest) = out.split_at_mut(n);
+        let mut planes: Vec<&mut [u8]> = vec![first];
+        let mut rest = rest;
+        for _ in 1..self.nbands {
+            let (p, r) = rest.split_at_mut(n);
+            planes.push(p);
+            rest = r;
+        }
+        // In chunks of pixels, in parallel: every band of a chunk at once.
+        let len = crate::par::chunk_len(n, 1 << 16);
+        let mut chunks: Vec<Vec<&mut [u8]>> = Vec::new();
+        let mut planes: Vec<std::slice::ChunksMut<'_, u8>> = planes.into_iter().map(|p| p.chunks_mut(len)).collect();
+        while let Some(first) = planes[0].next() {
+            let mut c = vec![first];
+            for p in planes.iter_mut().skip(1) {
+                c.extend(p.next());
+            }
+            chunks.push(c);
+        }
+        crate::par::for_each_owned(chunks, |k, mut bands| {
+            for i in 0..bands[0].len() {
+                let px = color(band.get(start + k * len + i));
+                for (b, out) in bands.iter_mut().enumerate() {
+                    out[i] = px[b] as u8;
+                }
+            }
+        });
+        RasterData::U8(out)
+    }
+}
+
 /// Colors a DEM band with a color map (`gdaldem color-relief`): three Byte bands (four with
 /// `alpha`), without nodata.
 pub fn color_relief(ds: &RasterDataset, colors: &ColorMap, o: &DemOptions) -> Result<RasterDataset> {
+    let relief = Relief::new(ds, colors, o)?;
     let r = &ds.raster;
-    if o.band == 0 || o.band > r.bands {
-        return Err(Error::InvalidArgument(format!("unable to fetch band #{}", o.band)));
+    super::north_up(&Grid::of(r))?;
+    let data = relief.colors(&super::BandView::of(r, o.band - 1));
+    super::build_raster_data(Grid::of(r), data, relief.nbands, None, &ds.crs())
+}
+
+/// Colors a DEM band with a color map as [`color_relief`] does and writes the result to `path`,
+/// reading the DEM and writing a GeoTIFF output a strip of rows at a time: neither is held whole
+/// (other formats are written whole). The values are those of [`color_relief`]. A DEM that is
+/// also the output is read whole first.
+///
+/// ```no_run
+/// use terrio::ops::dem::{ColorMap, DemOptions, color_relief_to_path};
+///
+/// let mut src = terrio::open_raster_lazy("dem.tif")?;
+/// let colors = ColorMap::parse_lazy("0 0 0 255\n1000 255 255 255\nnv 0 0 0 0", &mut src, 1, None)?;
+/// let o = DemOptions { alpha: true, ..Default::default() };
+/// color_relief_to_path(&mut src, &colors, &o, "relief.tif", &Default::default())?;
+/// # Ok::<(), terrio::Error>(())
+/// ```
+pub fn color_relief_to_path(
+    src: &mut crate::LazyRaster,
+    colors: &ColorMap,
+    o: &DemOptions,
+    path: &str,
+    options: &crate::RasterWriteOptions,
+) -> Result<()> {
+    o.validate()?;
+    if super::strips::overwrites(path, &src.input_paths()?) {
+        return crate::write_raster_dataset(&color_relief(&src.read()?, colors, o)?, path, options);
     }
-    let mut c = colors.entries.clone();
-    if c.is_empty() {
-        return Err(Error::InvalidArgument("the color map is empty".into()));
+    let rows = strip_rows(src, o, if o.alpha { 4 } else { 3 });
+    color_relief_in_strips(src, colors, o, path, options, rows)
+}
+
+/// [`color_relief_to_path`] in strips of `rows` rows.
+fn color_relief_in_strips(
+    src: &mut crate::LazyRaster,
+    colors: &ColorMap,
+    o: &DemOptions,
+    path: &str,
+    options: &crate::RasterWriteOptions,
+    rows: usize,
+) -> Result<()> {
+    let header = src.header();
+    let relief = Relief::new(&header, colors, o)?;
+    let grid = Grid::of(&header.raster);
+    super::north_up(&grid)?;
+    let out_header = super::raster_header(grid, DataType::U8, relief.nbands, None, &header.crs())?;
+    let mut out = super::strips::StripWriter::create(&out_header, path, options)?;
+    let (w, h) = (header.raster.cols, header.raster.rows);
+    let read = crate::WindowOptions { bands: vec![o.band], ..Default::default() };
+    super::strips::pipelined(
+        h.div_ceil(rows),
+        |i| {
+            let (y0, y1) = (i * rows, ((i + 1) * rows).min(h));
+            src.read_window(crate::Window::new(0, y0, w, y1 - y0), &read)
+        },
+        |_, strip| out.write(relief.colors(&super::BandView::of(&strip.raster, 0)), strip.raster.rows),
+    )?;
+    out.finish()
+}
+
+/// How [`shaded_relief`] darkens a color relief with a hillshade.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HillshadeBlend {
+    /// How much the hillshade darkens the colors, from 0 (not at all) to 1: each color component
+    /// is multiplied by `1 - strength * (1 - shade / 255)`.
+    pub strength: f64,
+}
+
+impl Default for HillshadeBlend {
+    fn default() -> Self {
+        Self { strength: 0.6 }
     }
-    process_colors(&mut c, ds.nodata(), o.color_selection);
-    // Byte, Int16 and UInt16 are read as integers, the other types as Float32.
-    let exact = matches!(r.data_type, DataType::U8 | DataType::I16 | DataType::U16);
-    let values = super::band_f64(r, o.band - 1);
-    let nbands = if o.alpha { 4 } else { 3 };
-    let mut bands = vec![Vec::with_capacity(values.len()); nbands];
-    let cache: Option<Vec<[i32; 4]>> = exact.then(|| {
-        let offset = if r.data_type == DataType::I16 { 32768 } else { 0 };
-        let len = if r.data_type == DataType::U8 { 256 } else { 65536 };
-        (0..len).map(|i| rgba(&c, (i - offset) as f64, o.color_selection)).collect()
-    });
-    for v in values {
-        let px = match &cache {
-            Some(table) => table[(v as i64 + if r.data_type == DataType::I16 { 32768 } else { 0 }) as usize],
-            None => rgba(&c, v as f32 as f64, o.color_selection),
-        };
-        for (b, out) in bands.iter_mut().enumerate() {
-            out.push((px[b] as u8) as f64);
+}
+
+impl HillshadeBlend {
+    fn validate(&self) -> Result<()> {
+        if !(0.0..=1.0).contains(&self.strength) {
+            return Err(Error::InvalidArgument(format!("invalid hillshade strength {} (0 to 1)", self.strength)));
         }
+        Ok(())
     }
-    build_raster(Grid::of(r), bands, DataType::U8, None, &ds.crs(), |v, _| v)
+
+    /// Darkens rows of a color relief (`relief`: Byte bands, band after band, the alpha band last
+    /// when `alpha`) with a hillshade of the same rows (`shade`: Byte, 0 for nodata). Pixels that
+    /// are transparent or without a hillshade keep their colors, so that the color carried under
+    /// alpha 0 (the color file's `nv` entry) is not darkened: averaged into overviews, a darkened
+    /// one would draw a dark fringe along the raster's edge. The arithmetic is in `f32`, the
+    /// product truncated to a byte, as NumPy computes
+    /// `(rgb.astype(float32) * (1 - s * (1 - shade / 255))).clip(0, 255).astype(uint8)`.
+    fn apply(&self, relief: &mut [u8], shade: &[u8], alpha: bool) {
+        let n = shade.len();
+        let s = self.strength as f32;
+        let (rgb, rest) = relief.split_at_mut(3 * n);
+        let a: Option<&[u8]> = alpha.then(|| &rest[..n]);
+        let factor = |i: usize| -> Option<f32> {
+            let shade = shade[i];
+            (shade > 0 && a.is_none_or(|a| a[i] > 0)).then(|| 1.0f32 - s * (1.0f32 - shade as f32 / 255.0f32))
+        };
+        let (r, gb) = rgb.split_at_mut(n);
+        let (g, b) = gb.split_at_mut(n);
+        let len = crate::par::chunk_len(n, 1 << 16).max(1);
+        let chunks: Vec<_> = r.chunks_mut(len).zip(g.chunks_mut(len).zip(b.chunks_mut(len))).collect();
+        crate::par::for_each_owned(chunks, |k, (r, (g, b))| {
+            for i in 0..r.len() {
+                if let Some(f) = factor(k * len + i) {
+                    for c in [&mut r[i], &mut g[i], &mut b[i]] {
+                        *c = (*c as f32 * f).clamp(0.0, 255.0) as u8;
+                    }
+                }
+            }
+        });
+    }
+}
+
+/// A color relief darkened by a hillshade, in one pass: the color relief of [`color_relief`]
+/// (three Byte bands, four with `o.alpha`) multiplied by the hillshade of [`hillshade`] with the
+/// same options (multidirectional, `z`, scales, `compute_edges`...), as [`HillshadeBlend`]
+/// describes. Transparent pixels and pixels without a hillshade keep their colors.
+pub fn shaded_relief(ds: &RasterDataset, colors: &ColorMap, o: &DemOptions, blend: &HillshadeBlend) -> Result<RasterDataset> {
+    blend.validate()?;
+    let mut relief = color_relief(ds, colors, o)?;
+    let shade = dem(ds, DemProduct::Hillshade, o)?;
+    let (RasterData::U8(rgb), RasterData::U8(s)) = (&mut relief.raster.data, &shade.raster.data) else {
+        return Err(Error::InvalidData("expected Byte bands".into()));
+    };
+    blend.apply(rgb, s, o.alpha);
+    Ok(relief)
+}
+
+/// [`shaded_relief`] of a DEM read by window, written to `path` a strip of rows at a time:
+/// neither the DEM nor the output is held whole (other formats than GeoTIFF are written whole).
+/// The values are those of [`shaded_relief`]. A DEM that is also the output is read whole first.
+pub fn shaded_relief_to_path(
+    src: &mut crate::LazyRaster,
+    colors: &ColorMap,
+    o: &DemOptions,
+    blend: &HillshadeBlend,
+    path: &str,
+    options: &crate::RasterWriteOptions,
+) -> Result<()> {
+    o.validate()?;
+    blend.validate()?;
+    if super::strips::overwrites(path, &src.input_paths()?) {
+        return crate::write_raster_dataset(&shaded_relief(&src.read()?, colors, o, blend)?, path, options);
+    }
+    let rows = strip_rows(src, o, if o.alpha { 5 } else { 4 });
+    shaded_relief_in_strips(src, colors, o, blend, path, options, rows)
+}
+
+/// [`shaded_relief_to_path`] in strips of `rows` rows.
+fn shaded_relief_in_strips(
+    src: &mut crate::LazyRaster,
+    colors: &ColorMap,
+    o: &DemOptions,
+    blend: &HillshadeBlend,
+    path: &str,
+    options: &crate::RasterWriteOptions,
+    rows: usize,
+) -> Result<()> {
+    let header = src.header();
+    let relief = Relief::new(&header, colors, o)?;
+    let t = Terrain::new(&header, DemProduct::Hillshade, o)?;
+    let grid = Grid::of(&header.raster);
+    super::north_up(&grid)?;
+    let out_header = super::raster_header(grid, DataType::U8, relief.nbands, None, &header.crs())?;
+    let mut out = super::strips::StripWriter::create(&out_header, path, options)?;
+    let (w, h) = (t.width, t.height);
+    let read = crate::WindowOptions { bands: vec![o.band], ..Default::default() };
+    // Rows `y0..y1` of strip `i`, read with a row more on each side, for the hillshade's window.
+    let span = |i: usize| {
+        let (y0, y1) = (i * rows, ((i + 1) * rows).min(h));
+        (y0, y1, y0.saturating_sub(1), (y1 + 1).min(h))
+    };
+    super::strips::pipelined(
+        h.div_ceil(rows),
+        |i| {
+            let (_, _, s0, s1) = span(i);
+            src.read_window(crate::Window::new(0, s0, w, s1 - s0), &read)
+        },
+        |i, strip| {
+            let (y0, y1, s0, s1) = span(i);
+            let RasterData::U8(shade) = t.compute(&read_band(&strip, 1)?, s0..s1, y0..y1) else {
+                return Err(Error::InvalidData("expected a Byte hillshade".into()));
+            };
+            // The strip's own rows, without the extra ones.
+            let n = w * (y1 - y0);
+            let view = super::BandView::of(&strip.raster, 0);
+            let colors = relief.colors_range(&view, (y0 - s0) * w, n);
+            let RasterData::U8(mut rgba) = colors else { return Err(Error::InvalidData("expected Byte colors".into())) };
+            blend.apply(&mut rgba, &shade, o.alpha);
+            out.write(RasterData::U8(rgba), y1 - y0)
+        },
+    )?;
+    out.finish()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::ops::Grid;
+    use crate::ops::build_raster;
 
     fn dem_ds(values: Vec<f64>, w: usize, h: usize, dt: DataType, nodata: Option<f64>, res: f64) -> RasterDataset {
         let grid = Grid { width: w, height: h, geo_transform: [0.0, res, 0.0, h as f64 * res, 0.0, -res] };
@@ -1663,6 +1990,166 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A color relief computed a few rows at a time, written as a GeoTIFF and in another format,
+    /// is the color relief of the whole band: band types read as integers (through the lookup
+    /// table) and as floats, nodata (`nv`) with alpha, percentages of the band's range read by
+    /// window, and every color selection.
+    #[test]
+    fn color_relief_strips_give_the_whole_band_colors() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut v: Vec<f64> = (0..17 * 13).map(|i| ((i * 37 % 101) as f64) * 3.5 - 40.0).collect();
+        v[20] = -9999.0;
+        v[17 * 12 + 4] = -9999.0;
+        let text = "-40 0 0 255
+50% 0 255 0 200
+100 255 0 0
+100% white
+nv 10 20 30 0
+";
+        for (dt, nodata) in [(DataType::F32, Some(-9999.0)), (DataType::I16, Some(-9999.0)), (DataType::F64, None), (DataType::U8, None)] {
+            let values: Vec<f64> = if dt == DataType::U8 { v.iter().map(|x| x.clamp(0.0, 255.0)).collect() } else { v.clone() };
+            let ds = dem_ds(values, 17, 13, dt, nodata, 10.0);
+            let input = dir.path().join("dem.tif");
+            crate::write_raster_dataset(&ds, input.to_str().unwrap(), &Default::default()).unwrap();
+            let map = ColorMap::parse(text, &ds, 1, None).unwrap();
+            let mut lazy = crate::open_raster_lazy(input.to_str().unwrap()).unwrap();
+            assert_eq!(ColorMap::parse_lazy(text, &mut lazy, 1, None).unwrap(), map, "{dt:?}");
+            for (alpha, mode) in [(true, ColorSelection::Interpolate), (false, ColorSelection::Nearest), (true, ColorSelection::Exact)] {
+                let o = DemOptions { alpha, color_selection: mode, ..Default::default() };
+                let whole = color_relief(&ds, &map, &o).unwrap();
+                for (rows, ext) in [(1, "tif"), (2, "tif"), (5, "tif"), (13, "tif"), (3, "png")] {
+                    let out = dir.path().join(format!("relief.{ext}"));
+                    let mut src = crate::open_raster_lazy(input.to_str().unwrap()).unwrap();
+                    color_relief_in_strips(&mut src, &map, &o, out.to_str().unwrap(), &Default::default(), rows).unwrap();
+                    let back = crate::open_raster(out.to_str().unwrap()).unwrap();
+                    assert_eq!(back.raster.bands, whole.raster.bands);
+                    assert_eq!(
+                        back.raster.data.to_f64_vec(),
+                        whole.raster.data.to_f64_vec(),
+                        "{dt:?} alpha {alpha} {mode:?} rows {rows} {ext}"
+                    );
+                    assert_eq!(back.geo_transform(), whole.geo_transform());
+                    assert_eq!(back.nodata(), whole.nodata());
+                }
+            }
+        }
+    }
+
+    /// A memory budget sets the strip height only: tiny budgets (a row per strip), and the
+    /// output written over the DEM it reads (read whole first) give the same values.
+    #[test]
+    fn memory_budgets_and_overwrites_keep_the_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let v: Vec<f64> = (0..40 * 30).map(|i| ((i * 53 % 211) as f64) * 1.5).collect();
+        let ds = dem_ds(v, 40, 30, DataType::F32, None, 5.0);
+        let input = dir.path().join("dem.tif");
+        let input = input.to_str().unwrap();
+        crate::write_raster_dataset(&ds, input, &Default::default()).unwrap();
+        let mut src = crate::open_raster_lazy(input).unwrap();
+        assert_eq!(strip_rows(&src, &DemOptions { max_memory_mib: Some(1e-9), ..Default::default() }, 4), 1);
+        assert!(strip_rows(&src, &DemOptions { max_memory_mib: Some(1.0), ..Default::default() }, 4) > 30);
+        assert!(
+            dem_to_path(
+                &mut src,
+                DemProduct::Slope,
+                &DemOptions { max_memory_mib: Some(0.0), ..Default::default() },
+                "x.tif",
+                &Default::default()
+            )
+            .is_err()
+        );
+        for budget in [None, Some(1e-9), Some(0.002)] {
+            let o = DemOptions {
+                compute_edges: true,
+                shading: Shading::MultiDirectional,
+                max_memory_mib: budget,
+                alpha: true,
+                ..Default::default()
+            };
+            let out = dir.path().join("out.tif");
+            let out = out.to_str().unwrap();
+            dem_to_path(&mut src, DemProduct::Hillshade, &o, out, &Default::default()).unwrap();
+            assert_eq!(
+                crate::open_raster(out).unwrap().raster.data.to_f64_vec(),
+                dem(&ds, DemProduct::Hillshade, &o).unwrap().raster.data.to_f64_vec(),
+                "{budget:?}"
+            );
+            let map = ColorMap::parse(
+                "0 0 0 0
+300 255 255 255",
+                &ds,
+                1,
+                None,
+            )
+            .unwrap();
+            color_relief_to_path(&mut src, &map, &o, out, &Default::default()).unwrap();
+            assert_eq!(
+                crate::open_raster(out).unwrap().raster.data.to_f64_vec(),
+                color_relief(&ds, &map, &o).unwrap().raster.data.to_f64_vec(),
+                "{budget:?}"
+            );
+        }
+        // Over its own input.
+        let copy = dir.path().join("copy.tif");
+        let copy = copy.to_str().unwrap();
+        std::fs::copy(input, copy).unwrap();
+        let mut src = crate::open_raster_lazy(copy).unwrap();
+        dem_to_path(&mut src, DemProduct::Slope, &DemOptions::default(), copy, &Default::default()).unwrap();
+        drop(src);
+        assert_eq!(
+            crate::open_raster(copy).unwrap().raster.data.to_f64_vec(),
+            dem(&ds, DemProduct::Slope, &DemOptions::default()).unwrap().raster.data.to_f64_vec()
+        );
+    }
+
+    /// The shaded relief is the color relief darkened by the hillshade as ras2cng's NumPy step
+    /// computes it (`rgb * (1 - s * (1 - shade / 255))` in float32, truncated, where alpha and the
+    /// hillshade are not 0); transparent pixels keep the `nv` color; strips give the same values.
+    #[test]
+    fn shaded_relief_is_the_blend_of_relief_and_hillshade() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut v: Vec<f64> = (0..23 * 19).map(|i| ((i * 37 % 101) as f64) * 3.5 + ((i / 23) as f64) * 9.0).collect();
+        for i in [0, 50, 51, 23 * 18 + 22, 200] {
+            v[i] = -9999.0;
+        }
+        let ds = dem_ds(v, 23, 19, DataType::F32, Some(-9999.0), 10.0);
+        let input = dir.path().join("dem.tif");
+        let input = input.to_str().unwrap();
+        crate::write_raster_dataset(&ds, input, &Default::default()).unwrap();
+        let map = ColorMap::parse("0 10 200 30\n300 250 120 20\n600 255 255 255\nnv 10 200 30 0", &ds, 1, None).unwrap();
+        for (alpha, edges, strength) in [(true, true, 0.6), (false, true, 1.0), (true, false, 0.25)] {
+            let o = DemOptions { alpha, compute_edges: edges, shading: Shading::MultiDirectional, ..Default::default() };
+            let blend = HillshadeBlend { strength };
+            let relief = color_relief(&ds, &map, &o).unwrap().raster.data.to_f64_vec();
+            let shade = dem(&ds, DemProduct::Hillshade, &o).unwrap().raster.data.to_f64_vec();
+            let n = shade.len();
+            let mut expected = relief.clone();
+            for i in 0..n {
+                let visible = !alpha || relief[3 * n + i] > 0.0;
+                if visible && shade[i] > 0.0 {
+                    let f = 1.0f32 - strength as f32 * (1.0f32 - shade[i] as f32 / 255.0f32);
+                    for b in 0..3 {
+                        expected[b * n + i] = (relief[b * n + i] as f32 * f).clamp(0.0, 255.0) as u8 as f64;
+                    }
+                }
+            }
+            let whole = shaded_relief(&ds, &map, &o, &blend).unwrap();
+            assert_eq!(whole.raster.data.to_f64_vec(), expected, "alpha {alpha} edges {edges}");
+            if alpha {
+                // A nodata pixel: transparent, with the `nv` color, not darkened.
+                assert_eq!([0, 1, 2, 3].map(|b| whole.raster.get(b, 0, 0)), [10.0, 200.0, 30.0, 0.0]);
+            }
+            for rows in [1, 2, 7, 19] {
+                let out = dir.path().join("shaded.tif");
+                let mut src = crate::open_raster_lazy(input).unwrap();
+                shaded_relief_in_strips(&mut src, &map, &o, &blend, out.to_str().unwrap(), &Default::default(), rows).unwrap();
+                let back = crate::open_raster(out.to_str().unwrap()).unwrap();
+                assert_eq!(back.raster.data.to_f64_vec(), expected, "alpha {alpha} edges {edges} rows {rows}");
+            }
+        }
+        assert!(shaded_relief(&ds, &map, &DemOptions::default(), &HillshadeBlend { strength: 1.5 }).is_err());
     }
 
     #[test]
