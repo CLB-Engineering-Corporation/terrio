@@ -292,7 +292,7 @@ fn read_ghost<R: Read + Seek>(f: &mut R, offset: u64) -> Result<Option<String>> 
 }
 
 /// Validates a Cloud Optimized GeoTIFF, local or remote (HTTP(S) or S3, read with range
-/// requests), as rio-cogeo's `cog_validate` does (see the [module](self) documentation).
+/// requests), as rio-cogeo's `cog_validate` does (see the `cog_validate` module documentation).
 /// `strict` makes warnings errors, as rio-cogeo's.
 ///
 /// A file that is not a TIFF is not valid (`"The file is not a GeoTIFF"`); a file that cannot be
