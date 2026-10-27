@@ -1698,7 +1698,11 @@ impl Relief {
 
     /// The colors of the values of a band, as Byte bands, band after band.
     fn colors(&self, band: &super::BandView) -> RasterData {
-        let n = band.len();
+        self.colors_range(band, 0, band.len())
+    }
+
+    /// The colors of pixels `start..start + n` of a band, as Byte bands, band after band.
+    fn colors_range(&self, band: &super::BandView, start: usize, n: usize) -> RasterData {
         let offset = if self.data_type == DataType::I16 { 32768 } else { 0 };
         let color = |v: f64| match &self.cache {
             Some(table) => table[(v as i64 + offset) as usize],
@@ -1729,7 +1733,7 @@ impl Relief {
         }
         crate::par::for_each_owned(chunks, |k, mut bands| {
             for i in 0..bands[0].len() {
-                let px = color(band.get(k * len + i));
+                let px = color(band.get(start + k * len + i));
                 for (b, out) in bands.iter_mut().enumerate() {
                     out[i] = px[b] as u8;
                 }
@@ -1802,6 +1806,142 @@ fn color_relief_in_strips(
             src.read_window(crate::Window::new(0, y0, w, y1 - y0), &read)
         },
         |_, strip| out.write(relief.colors(&super::BandView::of(&strip.raster, 0)), strip.raster.rows),
+    )?;
+    out.finish()
+}
+
+/// How [`shaded_relief`] darkens a color relief with a hillshade.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HillshadeBlend {
+    /// How much the hillshade darkens the colors, from 0 (not at all) to 1: each color component
+    /// is multiplied by `1 - strength * (1 - shade / 255)`.
+    pub strength: f64,
+}
+
+impl Default for HillshadeBlend {
+    fn default() -> Self {
+        Self { strength: 0.6 }
+    }
+}
+
+impl HillshadeBlend {
+    fn validate(&self) -> Result<()> {
+        if !(0.0..=1.0).contains(&self.strength) {
+            return Err(Error::InvalidArgument(format!("invalid hillshade strength {} (0 to 1)", self.strength)));
+        }
+        Ok(())
+    }
+
+    /// Darkens rows of a color relief (`relief`: Byte bands, band after band, the alpha band last
+    /// when `alpha`) with a hillshade of the same rows (`shade`: Byte, 0 for nodata). Pixels that
+    /// are transparent or without a hillshade keep their colors, so that the color carried under
+    /// alpha 0 (the color file's `nv` entry) is not darkened: averaged into overviews, a darkened
+    /// one would draw a dark fringe along the raster's edge. The arithmetic is in `f32`, the
+    /// product truncated to a byte, as NumPy computes
+    /// `(rgb.astype(float32) * (1 - s * (1 - shade / 255))).clip(0, 255).astype(uint8)`.
+    fn apply(&self, relief: &mut [u8], shade: &[u8], alpha: bool) {
+        let n = shade.len();
+        let s = self.strength as f32;
+        let (rgb, rest) = relief.split_at_mut(3 * n);
+        let a: Option<&[u8]> = alpha.then(|| &rest[..n]);
+        let factor = |i: usize| -> Option<f32> {
+            let shade = shade[i];
+            (shade > 0 && a.is_none_or(|a| a[i] > 0)).then(|| 1.0f32 - s * (1.0f32 - shade as f32 / 255.0f32))
+        };
+        let (r, gb) = rgb.split_at_mut(n);
+        let (g, b) = gb.split_at_mut(n);
+        let len = crate::par::chunk_len(n, 1 << 16).max(1);
+        let chunks: Vec<_> = r.chunks_mut(len).zip(g.chunks_mut(len).zip(b.chunks_mut(len))).collect();
+        crate::par::for_each_owned(chunks, |k, (r, (g, b))| {
+            for i in 0..r.len() {
+                if let Some(f) = factor(k * len + i) {
+                    for c in [&mut r[i], &mut g[i], &mut b[i]] {
+                        *c = (*c as f32 * f).clamp(0.0, 255.0) as u8;
+                    }
+                }
+            }
+        });
+    }
+}
+
+/// A color relief darkened by a hillshade, in one pass: the color relief of [`color_relief`]
+/// (three Byte bands, four with `o.alpha`) multiplied by the hillshade of [`hillshade`] with the
+/// same options (multidirectional, `z`, scales, `compute_edges`...), as [`HillshadeBlend`]
+/// describes. Transparent pixels and pixels without a hillshade keep their colors.
+pub fn shaded_relief(ds: &RasterDataset, colors: &ColorMap, o: &DemOptions, blend: &HillshadeBlend) -> Result<RasterDataset> {
+    blend.validate()?;
+    let mut relief = color_relief(ds, colors, o)?;
+    let shade = dem(ds, DemProduct::Hillshade, o)?;
+    let (RasterData::U8(rgb), RasterData::U8(s)) = (&mut relief.raster.data, &shade.raster.data) else {
+        return Err(Error::InvalidData("expected Byte bands".into()));
+    };
+    blend.apply(rgb, s, o.alpha);
+    Ok(relief)
+}
+
+/// [`shaded_relief`] of a DEM read by window, written to `path` a strip of rows at a time:
+/// neither the DEM nor the output is held whole (other formats than GeoTIFF are written whole).
+/// The values are those of [`shaded_relief`]. A DEM that is also the output is read whole first.
+pub fn shaded_relief_to_path(
+    src: &mut crate::LazyRaster,
+    colors: &ColorMap,
+    o: &DemOptions,
+    blend: &HillshadeBlend,
+    path: &str,
+    options: &crate::RasterWriteOptions,
+) -> Result<()> {
+    o.validate()?;
+    blend.validate()?;
+    if super::strips::overwrites(path, &src.input_paths()?) {
+        return crate::write_raster_dataset(&shaded_relief(&src.read()?, colors, o, blend)?, path, options);
+    }
+    let rows = strip_rows(src, o, if o.alpha { 5 } else { 4 });
+    shaded_relief_in_strips(src, colors, o, blend, path, options, rows)
+}
+
+/// [`shaded_relief_to_path`] in strips of `rows` rows.
+fn shaded_relief_in_strips(
+    src: &mut crate::LazyRaster,
+    colors: &ColorMap,
+    o: &DemOptions,
+    blend: &HillshadeBlend,
+    path: &str,
+    options: &crate::RasterWriteOptions,
+    rows: usize,
+) -> Result<()> {
+    let header = src.header();
+    let relief = Relief::new(&header, colors, o)?;
+    let t = Terrain::new(&header, DemProduct::Hillshade, o)?;
+    let grid = Grid::of(&header.raster);
+    super::north_up(&grid)?;
+    let out_header = super::raster_header(grid, DataType::U8, relief.nbands, None, &header.crs())?;
+    let mut out = super::strips::StripWriter::create(&out_header, path, options)?;
+    let (w, h) = (t.width, t.height);
+    let read = crate::WindowOptions { bands: vec![o.band], ..Default::default() };
+    // Rows `y0..y1` of strip `i`, read with a row more on each side, for the hillshade's window.
+    let span = |i: usize| {
+        let (y0, y1) = (i * rows, ((i + 1) * rows).min(h));
+        (y0, y1, y0.saturating_sub(1), (y1 + 1).min(h))
+    };
+    super::strips::pipelined(
+        h.div_ceil(rows),
+        |i| {
+            let (_, _, s0, s1) = span(i);
+            src.read_window(crate::Window::new(0, s0, w, s1 - s0), &read)
+        },
+        |i, strip| {
+            let (y0, y1, s0, s1) = span(i);
+            let RasterData::U8(shade) = t.compute(&read_band(&strip, 1)?, s0..s1, y0..y1) else {
+                return Err(Error::InvalidData("expected a Byte hillshade".into()));
+            };
+            // The strip's own rows, without the extra ones.
+            let n = w * (y1 - y0);
+            let view = super::BandView::of(&strip.raster, 0);
+            let colors = relief.colors_range(&view, (y0 - s0) * w, n);
+            let RasterData::U8(mut rgba) = colors else { return Err(Error::InvalidData("expected Byte colors".into())) };
+            blend.apply(&mut rgba, &shade, o.alpha);
+            out.write(RasterData::U8(rgba), y1 - y0)
+        },
     )?;
     out.finish()
 }
@@ -1962,6 +2102,54 @@ nv 10 20 30 0
             crate::open_raster(copy).unwrap().raster.data.to_f64_vec(),
             dem(&ds, DemProduct::Slope, &DemOptions::default()).unwrap().raster.data.to_f64_vec()
         );
+    }
+
+    /// The shaded relief is the color relief darkened by the hillshade as ras2cng's NumPy step
+    /// computes it (`rgb * (1 - s * (1 - shade / 255))` in float32, truncated, where alpha and the
+    /// hillshade are not 0); transparent pixels keep the `nv` color; strips give the same values.
+    #[test]
+    fn shaded_relief_is_the_blend_of_relief_and_hillshade() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut v: Vec<f64> = (0..23 * 19).map(|i| ((i * 37 % 101) as f64) * 3.5 + ((i / 23) as f64) * 9.0).collect();
+        for i in [0, 50, 51, 23 * 18 + 22, 200] {
+            v[i] = -9999.0;
+        }
+        let ds = dem_ds(v, 23, 19, DataType::F32, Some(-9999.0), 10.0);
+        let input = dir.path().join("dem.tif");
+        let input = input.to_str().unwrap();
+        crate::write_raster_dataset(&ds, input, &Default::default()).unwrap();
+        let map = ColorMap::parse("0 10 200 30\n300 250 120 20\n600 255 255 255\nnv 10 200 30 0", &ds, 1, None).unwrap();
+        for (alpha, edges, strength) in [(true, true, 0.6), (false, true, 1.0), (true, false, 0.25)] {
+            let o = DemOptions { alpha, compute_edges: edges, shading: Shading::MultiDirectional, ..Default::default() };
+            let blend = HillshadeBlend { strength };
+            let relief = color_relief(&ds, &map, &o).unwrap().raster.data.to_f64_vec();
+            let shade = dem(&ds, DemProduct::Hillshade, &o).unwrap().raster.data.to_f64_vec();
+            let n = shade.len();
+            let mut expected = relief.clone();
+            for i in 0..n {
+                let visible = !alpha || relief[3 * n + i] > 0.0;
+                if visible && shade[i] > 0.0 {
+                    let f = 1.0f32 - strength as f32 * (1.0f32 - shade[i] as f32 / 255.0f32);
+                    for b in 0..3 {
+                        expected[b * n + i] = (relief[b * n + i] as f32 * f).clamp(0.0, 255.0) as u8 as f64;
+                    }
+                }
+            }
+            let whole = shaded_relief(&ds, &map, &o, &blend).unwrap();
+            assert_eq!(whole.raster.data.to_f64_vec(), expected, "alpha {alpha} edges {edges}");
+            if alpha {
+                // A nodata pixel: transparent, with the `nv` color, not darkened.
+                assert_eq!([0, 1, 2, 3].map(|b| whole.raster.get(b, 0, 0)), [10.0, 200.0, 30.0, 0.0]);
+            }
+            for rows in [1, 2, 7, 19] {
+                let out = dir.path().join("shaded.tif");
+                let mut src = crate::open_raster_lazy(input).unwrap();
+                shaded_relief_in_strips(&mut src, &map, &o, &blend, out.to_str().unwrap(), &Default::default(), rows).unwrap();
+                let back = crate::open_raster(out.to_str().unwrap()).unwrap();
+                assert_eq!(back.raster.data.to_f64_vec(), expected, "alpha {alpha} edges {edges} rows {rows}");
+            }
+        }
+        assert!(shaded_relief(&ds, &map, &DemOptions::default(), &HillshadeBlend { strength: 1.5 }).is_err());
     }
 
     #[test]
