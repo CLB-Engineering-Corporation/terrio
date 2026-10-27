@@ -31,7 +31,7 @@ def test_area_matched_overviews_keep_the_wet_area(tmp_path):
     avg, am = tmp_path / "avg.tif", tmp_path / "am.tif"
     raster(a).write(str(avg), driver="COG", compress="DEFLATE")
     raster(a).write(str(am), driver="COG", compress="DEFLATE", overview_resampling="area_matched")
-    for i, (ov_avg, ov_am) in enumerate(zip(overviews(avg), overviews(am))):
+    for i, (ov_avg, ov_am) in enumerate(zip(overviews(avg), overviews(am), strict=True)):
         f = 2 ** (i + 1)
         assert int((ov_avg != -9999).sum()) * f * f / valid > 1.2
         assert int((ov_am != -9999).sum()) == round(valid / (f * f))
@@ -55,15 +55,20 @@ def test_supplied_overviews_round_trip(tmp_path):
         overviews=[levels[0], raster(levels[1])],
         metadata={"overview_method": "supplied"},
     )
-    for got, want in zip(overviews(out), levels):
+    for got, want in zip(overviews(out), levels, strict=True):
         np.testing.assert_array_equal(got, want)
     np.testing.assert_array_equal(np.asarray(terrio.open_raster(str(out)).read())[0], a)
     # The wrong size is refused, as is resampling supplied overviews.
     with pytest.raises(terrio.TerrioError):
-        raster(a).write(str(tmp_path / "b.tif"), driver="COG", overviews=[np.zeros((549, 650), "float32")])
+        raster(a).write(
+            str(tmp_path / "b.tif"), driver="COG", overviews=[np.zeros((549, 650), "float32")]
+        )
     with pytest.raises(terrio.TerrioError):
         raster(a).write(
-            str(tmp_path / "c.tif"), driver="COG", overviews=[levels[0]], overview_resampling="average"
+            str(tmp_path / "c.tif"),
+            driver="COG",
+            overviews=[levels[0]],
+            overview_resampling="average",
         )
 
 
@@ -72,7 +77,9 @@ def test_predictor_yes_follows_gdal_cog(tmp_path, dtype, expected):
     rasterio = pytest.importorskip("rasterio")
     a = (np.arange(64 * 48).reshape(48, 64) % 97).astype(dtype)
     out = tmp_path / "p.tif"
-    raster(a, nodata=0).write(str(out), driver="COG", compress="DEFLATE", options={"PREDICTOR": "YES"})
+    raster(a, nodata=0).write(
+        str(out), driver="COG", compress="DEFLATE", options={"PREDICTOR": "YES"}
+    )
     with rasterio.open(out) as src:
         assert src.tags(ns="IMAGE_STRUCTURE")["PREDICTOR"] == str(expected)
         np.testing.assert_array_equal(src.read(1), a)
