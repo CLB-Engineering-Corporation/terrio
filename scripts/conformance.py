@@ -78,6 +78,8 @@ SCRIPTS = ROOT / "scripts"
 IDENTICAL = "identical"
 TOLERANCE = "within tolerance"
 DIFFERS = "differs"
+# A case whose reference values could not be computed (no coordinates to compare), reported apart.
+NOT_COMPARED = "not compared"
 
 
 @dataclasses.dataclass
@@ -87,7 +89,7 @@ class Case:
     Attributes:
         group: The format or operation the case belongs to, as the report groups them.
         name: The case's name.
-        status: ``identical``, ``within tolerance`` or ``differs``.
+        status: ``identical``, ``within tolerance``, ``not compared`` or ``differs``.
         detail: What differs, or how close the case is, when it is not identical.
     """
 
@@ -1058,6 +1060,30 @@ def suite_projjson(ctx):
     return suite
 
 
+def suite_projjson_export(ctx):
+    """terrio's PROJJSON export against live PROJ's PROJJSON and GDAL reading it."""
+    suite = Suite("projjson-export", "PROJJSON export", "PROJ/GDAL",
+                  "`SpatialRef::to_projjson` of 52 CRSs compared with PROJ's PROJJSON by meaning and read by "
+                  "GDAL, which transforms points as from the original (vertical CRSs paired with WGS 84; "
+                  "no grids); every IAU_2015 CRS read by GDAL with its code's coordinates, per body; and "
+                  "7 misdescriptions refused for their reasons. Tolerance: 1e-8 degrees, 1 mm. Not compared: "
+                  "no point the original CRS transforms.")
+    if missing_modules("osgeo"):
+        suite.skipped = "needs GDAL Python bindings"
+        return suite
+    code, out, err = run([sys.executable, str(SCRIPTS / "compare_projjson_export_with_gdal.py"), "--json"])
+    try:
+        cases = json.loads(out)
+    except json.JSONDecodeError:
+        suite.error = tail(err or out)
+        return suite
+    for case in cases:
+        suite.cases.append(Case(case["group"], case["name"], case["status"], case["detail"]))
+    if code and not any(c.status == DIFFERS for c in suite.cases):
+        suite.error = tail(err or out)
+    return suite
+
+
 def suite_geocentric(ctx):
     """XYZ conversions, units, poles, datum shifts and projected composition."""
     suite = Suite("geocentric", "Geocentric XYZ endpoints", "GDAL/PROJ",
@@ -1769,6 +1795,7 @@ SUITES = OrderedDict(
         ("geocentric", suite_geocentric),
         ("perspective", suite_perspective),
         ("projjson", suite_projjson),
+        ("projjson-export", suite_projjson_export),
         ("iau", suite_iau),
         ("crs-grids", suite_crs_grids),
     ]
@@ -1782,12 +1809,13 @@ def tally(cases):
         cases: The cases.
 
     Returns:
-        A ``(total, identical, within tolerance, differing)`` tuple.
+        A ``(total, identical, within tolerance, not compared, differing)`` tuple.
     """
     n = len(cases)
     same = sum(1 for c in cases if c.status == IDENTICAL)
     tol = sum(1 for c in cases if c.status == TOLERANCE)
-    return n, same, tol, n - same - tol
+    unchecked = sum(1 for c in cases if c.status == NOT_COMPARED)
+    return n, same, tol, unchecked, n - same - tol - unchecked
 
 
 def versions(ctx):
@@ -1879,20 +1907,20 @@ def markdown(suites, ctx, vers):
         "",
         "## Summary",
         "",
-        "| Suite | Reference | Cases | Identical | Within tolerance | Differs |",
-        "|---|---|---:|---:|---:|---:|",
+        "| Suite | Reference | Cases | Identical | Within tolerance | Not compared | Differs |",
+        "|---|---|---:|---:|---:|---:|---:|",
     ]
-    totals = [0, 0, 0, 0]
+    totals = [0, 0, 0, 0, 0]
     for s in suites:
         link = f"[{s.title}](#{re.sub(r'[^a-z0-9 -]', '', s.title.lower()).replace(' ', '-')})"
         if s.skipped or s.error:
             note = f"skipped: {s.skipped}" if s.skipped else "could not run"
-            lines.append(f"| {link} | {s.reference} | {note} | | | |")
+            lines.append(f"| {link} | {s.reference} | {note} | | | | |")
             continue
-        n, same, tol, diff = tally(s.cases)
-        totals = [a + b for a, b in zip(totals, (n, same, tol, diff), strict=True)]
-        lines.append(f"| {link} | {s.reference} | {n:,} | {same:,} | {tol:,} | {diff:,} |")
-    lines.append(f"| **All** | | **{totals[0]:,}** | **{totals[1]:,}** | **{totals[2]:,}** | **{totals[3]:,}** |")
+        n, same, tol, unchecked, diff = tally(s.cases)
+        totals = [a + b for a, b in zip(totals, (n, same, tol, unchecked, diff), strict=True)]
+        lines.append(f"| {link} | {s.reference} | {n:,} | {same:,} | {tol:,} | {unchecked:,} | {diff:,} |")
+    lines.append("| **All** | | " + " | ".join(f"**{t:,}**" for t in totals) + " |")
     for s in suites:
         lines += ["", f"## {s.title}", "", s.criteria, ""]
         if s.skipped:
@@ -1901,13 +1929,13 @@ def markdown(suites, ctx, vers):
         if s.error:
             lines += ["The suite could not run:", "", "```text", s.error, "```"]
             continue
-        lines += ["| Format or operation | Cases | Identical | Within tolerance | Differs |", "|---|---:|---:|---:|---:|"]
+        lines += ["| Format or operation | Cases | Identical | Within tolerance | Not compared | Differs |", "|---|---:|---:|---:|---:|---:|"]
         groups = OrderedDict()
         for c in s.cases:
             groups.setdefault(c.group, []).append(c)
         for group, cases in groups.items():
-            n, same, tol, diff = tally(cases)
-            lines.append(f"| {md_escape(group)} | {n:,} | {same:,} | {tol:,} | {diff:,} |")
+            n, same, tol, unchecked, diff = tally(cases)
+            lines.append(f"| {md_escape(group)} | {n:,} | {same:,} | {tol:,} | {unchecked:,} | {diff:,} |")
         others = [c for c in s.cases if c.status != IDENTICAL]
         if others:
             limit = ctx.max_details
@@ -1971,11 +1999,11 @@ def main():
                 s = Suite(name, name, "", "")
                 s.error = f"{type(e).__name__}: {e}"
         s.seconds = (datetime.datetime.now() - start).total_seconds()
-        n, same, tol, diff = tally(s.cases)
+        n, same, tol, unchecked, diff = tally(s.cases)
         state = (
             f"skipped ({s.skipped})"
             if s.skipped
-            else ("ERROR" if s.error else f"{n} cases: {same} identical, {tol} within tolerance, {diff} differ")
+            else ("ERROR" if s.error else f"{n} cases: {same} identical, {tol} within tolerance, {unchecked} not compared, {diff} differ")
         )
         print(f"{name:<17} {state} [{s.seconds:.0f} s]", file=sys.stderr, flush=True)
         return s

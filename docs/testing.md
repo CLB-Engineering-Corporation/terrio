@@ -620,6 +620,13 @@ the original JSON definitions. Rust regressions also
 check file loading, malformed/unsupported definitions, wrong units/dimensions,
 and that a root authority ID cannot overwrite a caller's false easting.
 
+PROJJSON export (`SpatialRef::to_projjson`) has unit tests of each kind of CRS and refusal
+(`cargo test -p terrio-crs --test projjson_export`); `--only projjson-export` compares it with
+live PROJ's PROJJSON of 52 CRSs by meaning and has GDAL read those and every IAU_2015 CRS, whose
+coordinates must match the originals' (`scripts/compare_projjson_export_with_gdal.py`); a case
+with no point the original CRS transforms is reported as `not compared`, and a point only the
+original transforms as `differs`.
+
 ## IAU_2015 authority support (#271)
 
 `iau-source.json` records the registry version, PROJ source revision and

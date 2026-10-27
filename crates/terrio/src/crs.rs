@@ -123,6 +123,12 @@ impl SpatialRef {
         terrio_crs::SpatialRef::from_projjson(text).map(Into::into).map_err(Into::into)
     }
 
+    /// The CRS as PROJJSON v0.7 (see the standalone engine's `SpatialRef::to_projjson`).
+    pub fn to_projjson(&self) -> Result<String> {
+        initialize();
+        self.as_core().to_projjson().map_err(Into::into)
+    }
+
     /// Parses a user-supplied CRS: `EPSG:4326`, `4326`, `urn:ogc:def:crs:EPSG::4326`, an OGC URL,
     /// `OGC:CRS84`, `WGS84`, `ESRI:54009` (or `urn:ogc:def:crs:ESRI::54009`), a WKT definition,
     /// a PROJ string, or the path of a file holding one of these (such as a shapefile's `.prj`).

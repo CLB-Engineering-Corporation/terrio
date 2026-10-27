@@ -473,12 +473,46 @@ usage fields (`scope`, `area`, `bbox`, `usages`, `remarks`) are accepted without
 affecting coordinates.
 
 This is a reader for the documented subset, rather than a general JSON Schema
-validator or PROJJSON serializer. Unsupported semantic members and object types
+validator; [Writing PROJJSON](#writing-projjson) describes the writer. Unsupported semantic members and object types
 are errors: dynamic/derived/compound/vertical CRSs, Cartesian geocentric or 3D
 PROJJSON, polar axis meridians, grid/deformation operations and nested bound
 sources are not supported.
 Geocentric and 3D CRSs remain available through EPSG, PROJ and WKT definitions.
 This prevents silent loss of datum, axis, unit or operation information.
+
+### Writing PROJJSON
+
+`SpatialRef::to_projjson` writes PROJJSON v0.7 for geographic 2D and 3D, geocentric, projected,
+vertical, compound and bound (`+towgs84`) CRSs: `terrio crs CRS --projjson` (and MCP), Python
+`rio.CRS.to_projjson()` (and `to_dict(projjson=True)`), JavaScript `crsToProjjson(crs)`. PROJJSON
+is read wherever a CRS is (above). The `projjson-export` suite of `scripts/conformance.py`
+compares it with live PROJ's PROJJSON of 52 CRSs by meaning (identifiers, datums, ellipsoids,
+prime meridians, axes, methods and parameters by EPSG code) and has GDAL transform points with
+them and with the originals, through each CRS's geographic CRS (a vertical CRS paired with
+WGS 84; no grids), and does the same for every IAU_2015 CRS. Planetary CRSs are written as PROJ writes them: west-positive longitudes as west
+axes, planetocentric latitudes (`+geoc`, a spherical coordinate system) as a `GeodeticCRS` with a
+spherical coordinate system, IAU_2015 CRSs with their `IAU`/2015 identifier. Differences from
+PROJ's output:
+
+- no `scope`, `area`, `bbox` or `usages`;
+- the WGS 84 and ETRS89 ensembles are written as their datum, without members (so GDAL's
+  `IsSame` with the EPSG CRS is false; coordinates are the same);
+- parameters are in degrees and metres, whatever the CRS's units (EPSG:27572's in grads);
+- projection conversions are named `unknown`, except UTM zones (`UTM zone 32N`, EPSG:16032);
+- polar CSs have east and north axes rather than axes along meridians;
+- static datums have no `anchor_epoch`.
+
+Refused rather than written wrongly: dynamic CRSs (their frame epochs; by EPSG code or a WKT 2
+`DYNAMIC` node), projections without an
+EPSG method (`+proj=robin`), engineering CRSs, projections on an auxiliary sphere of an
+ellipsoid (`+R_C`, `+R_A`; 19 IAU_2015 CRSs), planetocentric latitudes with heights, a
+`+towgs84` of other than 3 or 7 values, a prime meridian it cannot read (`+pm=foo`), non-finite
+values, a Krovak projection with another `+alpha` than its default (PROJ ignores its `+lat_1` and
+`+lat_ts`, so they are not written), and any parameter of the PROJ definition the PROJJSON would
+not carry (named in the error), unless it has the value used when it is absent (`+lat_0=0`,
+`+k=1`...). A CRS made from an EPSG code is written unbound (its datum shift is EPSG's); a
+`+towgs84` or `TOWGS84` the definition gives makes a `BoundCRS`, to WGS 84's geographic 2D or 3D
+CRS, or to its geocentric CRS for a geocentric CRS, as PROJ writes them.
 
 
 ## IAU planetary coordinate systems

@@ -387,12 +387,14 @@ pub(crate) fn datum_key(name: &str) -> String {
 const ESRI_WRITTEN: u8 = 5;
 
 /// The datum names of the table by rank: those of ranks 0 to 4, and those ESRI writes.
-type DatumNames = (HashMap<String, (u8, Vec<u32>)>, HashMap<String, Vec<u32>>);
+/// The datums of each name, of each name GDAL writes, and the official name of each datum.
+type DatumNames = (HashMap<String, (u8, Vec<u32>)>, HashMap<String, Vec<u32>>, HashMap<u32, String>);
 
 fn datum_names() -> &'static DatumNames {
     static NAMES: OnceLock<DatumNames> = OnceLock::new();
     NAMES.get_or_init(|| {
         let (mut names, mut written) = (HashMap::<String, (u8, Vec<u32>)>::new(), HashMap::<String, Vec<u32>>::new());
+        let mut official = HashMap::<u32, String>::new();
         for line in decompress(DATUM_NAMES).lines().filter(|l| !l.starts_with('#')) {
             let mut f = line.splitn(3, '\t');
             let (Some(Ok(code)), Some(Ok(rank)), Some(name)) = (f.next().map(str::parse::<u32>), f.next().map(str::parse::<u8>), f.next())
@@ -402,6 +404,10 @@ fn datum_names() -> &'static DatumNames {
             if rank == ESRI_WRITTEN {
                 written.entry(datum_key(name)).or_default().push(code);
                 continue;
+            }
+            // Rank 0 holds the official name and GDAL's WKT 1 name (`WGS_1984`): the former.
+            if rank == 0 && official.get(&code).is_none_or(|n| n.contains('_') && !name.contains('_')) {
+                official.insert(code, name.to_string());
             }
             let e = names.entry(datum_key(name)).or_insert((rank, Vec::new()));
             if rank < e.0 {
@@ -415,7 +421,7 @@ fn datum_names() -> &'static DatumNames {
         written.values_mut().for_each(|c| c.sort_unstable());
         // Without it, every WKT without a datum code would be left without EPSG code.
         debug_assert!(!names.is_empty(), "the datum name table did not decompress");
-        (names, written)
+        (names, written, official)
     })
 }
 
@@ -424,6 +430,12 @@ fn datum_names() -> &'static DatumNames {
 /// or a former name of, in order of code.
 pub(crate) fn datums_named(name: &str) -> Vec<u32> {
     datum_names().0.get(&datum_key(name)).map(|(_, c)| c.clone()).unwrap_or_default()
+}
+
+/// The official name of an EPSG datum; of the WGS 84 and ETRS89 ensembles, without `ensemble`
+/// (they are written as datums).
+pub(crate) fn datum_name(code: u32) -> Option<String> {
+    datum_names().2.get(&code).map(|n| n.strip_suffix(" ensemble").unwrap_or(n).to_string())
 }
 
 /// The other EPSG datums whose CRSs ESRI writes with a datum name: ETRS89-NOR for

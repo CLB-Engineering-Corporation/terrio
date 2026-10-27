@@ -851,6 +851,12 @@ pub fn describe_crs(crs: &str) -> Result<JsValue, JsError> {
     }))
 }
 
+/// The PROJJSON v0.7 of a CRS; throws for a CRS it would describe wrongly.
+#[wasm_bindgen(js_name = crsToProjjson)]
+pub fn crs_to_projjson(crs: &str) -> Result<String, JsError> {
+    SpatialRef::parse(crs).and_then(|s| s.to_projjson()).map_err(js_err)
+}
+
 /// The formats terrio reads and writes: `[{ name, long_name, kind, extensions, read, write }]`.
 /// In WebAssembly, only the formats with in-memory codecs can be used (see the README).
 #[wasm_bindgen]

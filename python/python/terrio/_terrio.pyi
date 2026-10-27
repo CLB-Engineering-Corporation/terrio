@@ -85,6 +85,7 @@ __all__ = [
     "append_points",
     "tiff_tags",
     "crs_info",
+    "crs_to_projjson",
     "suggested_grid",
     "gcp_transform",
     "RpcTransformer",
@@ -1367,6 +1368,7 @@ def grid_points(
 
 def tiff_tags(path: str) -> list[dict[int, str | bytes | list[int] | list[float]]] | None: ...
 def crs_info(crs: str) -> dict[str, Any]: ...
+def crs_to_projjson(crs: str) -> str: ...
 def gcp_transform(
     gcps: Sequence[tuple[float, float, float, float, float]],
     xs: Sequence[float],

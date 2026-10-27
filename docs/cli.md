@@ -1250,7 +1250,7 @@ Unlike `gdalenhance`, Terrio does not save the histograms it computes in an
 ## crs
 
 ```sh
-terrio crs CRS [--wkt]
+terrio crs CRS [--wkt] [--projjson]
 terrio crs SRC --to DST [--s_coord_epoch YEAR] [--t_coord_epoch YEAR] X Y [X Y ...]
 echo "X Y [Z [T]]" | terrio crs SRC --to DST [--s_coord_epoch YEAR] [--t_coord_epoch YEAR]
 ```
@@ -1258,7 +1258,9 @@ echo "X Y [Z [T]]" | terrio crs SRC --to DST [--s_coord_epoch YEAR] [--t_coord_e
 As `gdaltransform`: lines of standard input with a height transform it too, with a time (a decimal
 year) use it for time-dependent transformations, and a point that cannot be transformed prints
 `transformation failed.`. Datum shift grids and geoid models are used when they can be found (see
-[Coordinate Systems](crs.md#datum-shift-grids)).
+[Coordinate Systems](crs.md#datum-shift-grids)). `--projjson` prints only the CRS as PROJJSON, so that
+`terrio crs CRS --projjson > crs.json` writes a PROJJSON file (see
+[Writing PROJJSON](crs.md#writing-projjson)); it cannot be combined with `--to` or `--wkt`.
 
 ## formats
 

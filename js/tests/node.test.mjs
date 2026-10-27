@@ -240,6 +240,8 @@ test("CRS transforms", () => {
   assert.ok(Math.abs(ys[0]) < 1e-6);
   const crs = terrio.describeCrs("EPSG:32633");
   assert.equal(crs.epsg, 32633);
+  assert.equal(JSON.parse(terrio.crsToProjjson("EPSG:32633")).conversion.name, "UTM zone 33N");
+  assert.throws(() => terrio.crsToProjjson("+proj=longlat +lon_0=10 +datum=WGS84"), /lon_0/);
   assert.match(crs.name, /UTM zone 33N/);
   assert.equal(crs.geographic, false);
   // PROJ 9.8.1 resolves the authority version separately from the EPSG code.

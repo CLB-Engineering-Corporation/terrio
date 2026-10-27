@@ -503,6 +503,10 @@ WebAssembly (the `terrio-js` npm package):
 - [x] PROJJSON v0.7 parsing for static 2D geographic, projected and bound CRSs,
       including units, GIS axis normalization and explicit Helmert operations.
       Rust/CLI/MCP/Python/JavaScript/WASM validation is tracked in #270.
+- [x] PROJJSON v0.7 writing (`SpatialRef::to_projjson`) of geographic, geocentric, projected,
+      vertical, compound, bound and IAU planetary CRSs, refusing what it would describe wrongly:
+      Rust, CLI and MCP (`terrio crs --projjson`), Python (`CRS.to_projjson()`) and JavaScript
+      (`crsToProjjson`), compared with live PROJ/GDAL by `scripts/conformance.py`.
 - IAU and additional projection capabilities remain scoped separately in #271–#272.
 
 ## ndarray interoperability (#298)

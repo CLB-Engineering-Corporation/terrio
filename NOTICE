@@ -264,7 +264,8 @@ crates/terrio-crs/data/epsg.tsv.zst and crates/terrio-crs/data/datums.tsv.zst ar
 Geodetic Parameter Dataset (https://epsg.org), copyright the International Association of Oil &
 Gas Producers (IOGP), through PROJ's database and GDAL. They are redistributed under the EPSG
 terms of use (https://epsg.org/terms-of-use.html), with this attribution. They are not the EPSG
-Dataset itself, and terrio is not endorsed by IOGP.
+Dataset itself, and terrio is not endorsed by IOGP. The EPSG method and parameter names and codes
+in crates/terrio-crs/src/projjson_write.rs come from the same dataset.
 
 -------------------------------------------------------------------------------
 Esri projection engine data

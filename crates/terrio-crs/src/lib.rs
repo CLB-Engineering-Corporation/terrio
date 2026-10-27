@@ -56,6 +56,7 @@ mod math;
 mod params;
 mod projections;
 mod projjson;
+mod projjson_write;
 mod rotation;
 mod route;
 mod wkt1;
@@ -339,6 +340,14 @@ impl SpatialRef {
             return Err(Error::Crs("IAU definition has an unsupported coordinate system".into()));
         }
         Ok(Self { proj4: Some(entry.proj.clone()), wkt: Some(entry.wkt.clone()), ..Default::default() })
+    }
+
+    /// The CRS as PROJJSON v0.7: geographic 2D and 3D, geocentric, projected, vertical, compound
+    /// and bound (`+towgs84`) CRSs, as PROJ writes them, with the differences listed in the CRS
+    /// documentation. Fails for CRSs it cannot write (dynamic CRSs, projections without an EPSG
+    /// method).
+    pub fn to_projjson(&self) -> Result<String> {
+        projjson_write::write(self)
     }
 
     /// Parses the supported PROJJSON v0.7 geographic, projected or bound CRS subset.
@@ -851,7 +860,7 @@ fn strip_authorities(wkt: &str) -> String {
 
 /// The EPSG code a WKT definition declares for itself: the `AUTHORITY["EPSG","4269"]` (WKT 1) or
 /// `ID["EPSG",4269]` (WKT 2) closing its outermost node, not those of its datum or units.
-fn declared_epsg(wkt: &str) -> Option<u32> {
+pub(crate) fn declared_epsg(wkt: &str) -> Option<u32> {
     declared_code(wkt, "EPSG")
 }
 
