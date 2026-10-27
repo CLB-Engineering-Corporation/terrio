@@ -461,10 +461,11 @@ pub struct ConvertOptions {
     /// Which points to read.
     pub read: PointReadOptions,
     /// Assign this CRS to the points, without reprojecting (when the file has none or a wrong
-    /// one).
+    /// one). It replaces the file's CRS, vertical CRS included: a CRS without heights assigned
+    /// keeps `z` as it is.
     pub assign_srs: Option<SpatialRef>,
     /// Reproject the points into this CRS: `x` and `y`, and `z` when this CRS and the points'
-    /// (with the vertical CRS the file declares) both have heights (see
+    /// (with the vertical CRS the file declares, unless a CRS is assigned) both have heights (see
     /// [`PointCloud::reproject`]).
     pub target_srs: Option<SpatialRef>,
     /// How to write point cloud outputs.
@@ -525,6 +526,9 @@ pub fn convert(src: &str, dst: &str, options: &ConvertOptions) -> Result<()> {
     let mut cloud = read_points(src, &options.read)?;
     if let Some(crs) = &options.assign_srs {
         cloud.crs = crs.clone();
+        // The file's CRS records (and the vertical CRS they declare) no longer apply.
+        cloud.header.vlrs.retain(|v| !crs::is_crs_vlr(v));
+        cloud.header.evlrs.retain(|v| !crs::is_crs_vlr(v));
     }
     if let Some(dst_srs) = &options.target_srs {
         cloud.reproject(dst_srs)?;
@@ -563,7 +567,12 @@ pub(crate) fn source_template(reader: &mut PointCloudReader, options: &ConvertOp
             if template.crs.is_unknown() {
                 return Err(crate::Error::Crs("the point cloud has no CRS to reproject from".into()));
             }
-            let t = Reprojection::new(&reader.crs_record().with_vertical(&template.crs), dst_srs)?;
+            // An assigned CRS replaces the file's, vertical CRS included.
+            let src = match options.assign_srs {
+                Some(_) => template.crs.clone(),
+                None => reader.crs_record().with_vertical(&template.crs),
+            };
+            let t = Reprojection::new(&src, dst_srs)?;
             // The new scale and offset, from the header's bounds reprojected.
             let h = &template.header;
             let min = t.transformer.transform_bounds((h.min[0], h.min[1], h.max[0], h.max[1])).ok().map(|b| [b.0, b.1]);

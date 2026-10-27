@@ -29,6 +29,16 @@ fn convert(src: &str, dst: &str, t_srs: &str) {
     pointcloud::convert(src, dst, &options).unwrap();
 }
 
+/// The CRS of a file in the compound CRS `compound`: GeoKeys (format 1) read as the compound CRS,
+/// a WKT record (format 6) as its horizontal CRS with the vertical CRS beside it.
+fn assert_crs(r: &pointcloud::PointCloudReader, format: u8, compound: &str, name: &str) {
+    if format == 6 {
+        assert_eq!(r.crs().epsg, Some(6588), "{name}: {:?}", r.crs());
+    } else {
+        assert!(r.crs().same_as(&SpatialRef::parse(compound).unwrap()), "{name}: {:?}", r.crs());
+    }
+}
+
 #[test]
 fn reprojection_converts_vertical_units_of_the_file_crs() {
     let dir = tempfile::tempdir().unwrap();
@@ -49,7 +59,7 @@ fn reprojection_converts_vertical_units_of_the_file_crs() {
         // WKT record as its horizontal CRS and the vertical CRS beside it.
         let r = pointcloud::open_points(src).unwrap();
         assert_eq!(r.vertical_crs().0, Some(6360), "{name}");
-        assert!(r.crs().epsg == Some(6588) || r.crs().same_as(&SpatialRef::parse("EPSG:6588+6360").unwrap()), "{name}: {:?}", r.crs());
+        assert_crs(&r, format, "EPSG:6588+6360", name);
 
         // To NAVD88 height in metres: 300 ftUS is 91.44018288036575 m (PROJ).
         let out = dir.path().join(format!("m_{name}"));
@@ -59,7 +69,7 @@ fn reprojection_converts_vertical_units_of_the_file_crs() {
         assert!((z[0] - 91.44018288036575).abs() < 1e-3 && (z[1] - -12.5 * 0.3048006096012192).abs() < 1e-3, "{name}: {z:?}");
         let r = pointcloud::open_points(out).unwrap();
         assert_eq!(r.vertical_crs().0, Some(5703), "{name}");
-        assert!(r.crs().epsg == Some(6588) || r.crs().same_as(&SpatialRef::parse("EPSG:6588+5703").unwrap()), "{name}: {:?}", r.crs());
+        assert_crs(&r, format, "EPSG:6588+5703", name);
 
         // To a CRS without heights, heights are kept (and so is their unit), as by PDAL.
         let flat = dir.path().join(format!("flat_{name}"));
@@ -95,6 +105,38 @@ fn chained_reprojections_follow_the_points_vertical_crs() {
         points.reproject(&SpatialRef::parse(dst).unwrap()).unwrap();
         let z = points.dim("z").unwrap().values.get_f64(0);
         assert!((z - 91.44018288036575).abs() < 1e-9, "{dst}: {z}");
+    }
+}
+
+#[test]
+fn an_assigned_crs_replaces_the_files_vertical_crs() {
+    // A 2D CRS assigned to a file in EPSG:6588+6360: z is kept, not converted from ftUS.
+    let dir = tempfile::tempdir().unwrap();
+    for (name, format) in [("ft.las", 1), ("ft14.laz", 6)] {
+        let src = dir.path().join(name);
+        let src = src.to_str().unwrap();
+        let write = PointWriteOptions {
+            point_format: Some(format),
+            minor_version: Some(if format == 6 { 4 } else { 2 }),
+            scale: Some(MM),
+            ..Default::default()
+        };
+        pointcloud::write_points(&cloud(&[(3000000.0, 13800000.0, 300.0)], "EPSG:6588+6360"), src, &write).unwrap();
+        let options = ConvertOptions {
+            assign_srs: Some(SpatialRef::parse("EPSG:6588").unwrap()),
+            target_srs: Some(SpatialRef::parse("EPSG:6588+5703").unwrap()),
+            ..Default::default()
+        };
+        // Streamed into a point cloud, and read whole into a vector layer.
+        let out = dir.path().join(format!("a_{name}"));
+        let out = out.to_str().unwrap();
+        pointcloud::convert(src, out, &options).unwrap();
+        assert!((zs(out)[0] - 300.0).abs() < 1e-9, "{name}");
+        let out = dir.path().join(format!("{name}.geojson"));
+        pointcloud::convert(src, out.to_str().unwrap(), &options).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
+        let z = json["features"][0]["geometry"]["coordinates"][2].as_f64().unwrap();
+        assert!((z - 300.0).abs() < 1e-9, "{name}.geojson: {z}");
     }
 }
 

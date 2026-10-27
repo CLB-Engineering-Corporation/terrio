@@ -84,7 +84,7 @@ fn wkt_crs(wkt: &str) -> LasCrs {
     let trimmed = wkt.trim();
     let vertical = ["VERT_CS[", "VERTCS[", "VERTCRS["].iter().find_map(|k| bracketed(trimmed, k));
     let (vertical_epsg, vertical_name) = match vertical {
-        Some(v) => (last_authority_code(v), quoted_name(v)),
+        Some(v) => (own_authority_code(v), quoted_name(v)),
         None => (None, None),
     };
     let horizontal = if trimmed.starts_with("COMPD_CS") || trimmed.starts_with("COMPOUNDCRS") {
@@ -117,11 +117,25 @@ fn bracketed<'a>(s: &'a str, keyword: &str) -> Option<&'a str> {
     None
 }
 
-/// The code of the last `AUTHORITY["EPSG","code"]` (or `ID["EPSG",code]`) of an element: the one
-/// of the element itself.
-fn last_authority_code(s: &str) -> Option<u32> {
-    let i = s.rfind("AUTHORITY[\"EPSG\"").or_else(|| s.rfind("ID[\"EPSG\""))?;
-    let rest = &s[i..];
+/// The code of the element's own `AUTHORITY["EPSG","code"]` (or `ID["EPSG",code]`): one directly
+/// inside it, not that of a datum or unit nested in it.
+fn own_authority_code(s: &str) -> Option<u32> {
+    let mut depth = 0;
+    let mut own = None;
+    for (i, c) in s.char_indices() {
+        match c {
+            '[' => depth += 1,
+            ']' => depth -= 1,
+            ',' if depth == 1 => {
+                let rest = s[i + 1..].trim_start();
+                if rest.starts_with("AUTHORITY[\"EPSG\"") || rest.starts_with("ID[\"EPSG\"") {
+                    own = Some(rest);
+                }
+            }
+            _ => {}
+        }
+    }
+    let rest = own?;
     let digits: String = rest.split(',').nth(1)?.chars().filter(|c| c.is_ascii_digit()).collect();
     digits.parse().ok()
 }
@@ -160,7 +174,7 @@ fn geokey_vlrs(crs: &SpatialRef) -> Option<Vec<Vlr>> {
     // VerticalCSTypeGeoKey, as GDAL writes them in GeoTIFF (GDAL 3.13 writes 3072 = 6588 and
     // 4096 = 6360 for EPSG:6588+6360). A vertical CRS without one is left out (with a warning), so
     // that the GeoKeys still describe the horizontal CRS rather than falling back to WKT.
-    let (crs, vertical) = match crs.to_wkt().filter(|w| w.trim_start().starts_with("COMPD_CS[")) {
+    let (horizontal, vertical) = match crs.to_wkt().filter(|w| w.trim_start().starts_with("COMPD_CS[")) {
         Some(w) => {
             let c = wkt_crs(&w);
             let vertical = c.vertical_epsg.and_then(|v| u16::try_from(v).ok());
@@ -174,18 +188,17 @@ fn geokey_vlrs(crs: &SpatialRef) -> Option<Vec<Vlr>> {
         }
         None => (crs.clone(), None),
     };
-    let crs = &crs;
     let mut v = crate::drivers::geokeys::GeoKeyValues::default();
-    let geographic = crs.is_geographic();
+    let geographic = horizontal.is_geographic();
     v.shorts.push((1025, 1));
-    match crs.epsg.and_then(|c| u16::try_from(c).ok()) {
+    match horizontal.epsg.and_then(|c| u16::try_from(c).ok()) {
         Some(code) => {
             v.shorts.push((1024, if geographic { 2 } else { 1 }));
             v.shorts.push((if geographic { 2048 } else { 3072 }, code));
         }
         None => {
-            let name = crs.name().unwrap_or_else(|| "unnamed".into());
-            let user = crate::drivers::geokeys::user_keys(crs, &name)?;
+            let name = horizontal.name().unwrap_or_else(|| "unnamed".into());
+            let user = crate::drivers::geokeys::user_keys(&horizontal, &name)?;
             v.shorts.extend(user.shorts);
             v.doubles.extend(user.doubles);
             v.ascii.extend(user.ascii);
@@ -255,6 +268,22 @@ mod tests {
         assert!(!wkt);
         let h = LasHeader { vlrs, version: (1, 2), ..Default::default() };
         assert_eq!(header_crs(&h).horizontal.epsg, Some(26915));
+    }
+
+    #[test]
+    fn vertical_crs_code_is_its_own_not_its_datums() {
+        let vertical = r#"VERT_CS["NAVD88 height",VERT_DATUM["North American Vertical Datum 1988",2005,AUTHORITY["EPSG","5103"]],UNIT["metre",1,AUTHORITY["EPSG","9001"]],AXIS["Up",UP]]"#;
+        let horizontal = SpatialRef::from_epsg(26915).unwrap().to_wkt().unwrap();
+        let c = wkt_crs(&format!("COMPD_CS[\"x\",{horizontal},{vertical}]"));
+        assert_eq!(c.vertical_epsg, None);
+        let named = vertical.replace(",AXIS[\"Up\",UP]]", r#",AXIS["Up",UP],AUTHORITY["EPSG","5703"]]"#);
+        assert_eq!(wkt_crs(&format!("COMPD_CS[\"x\",{horizontal},{named}]")).vertical_epsg, Some(5703));
+        // Written without key 4096, with a warning.
+        let crs = SpatialRef::from_wkt(&format!("COMPD_CS[\"x\",{horizontal},{vertical}]"));
+        let _ = crate::warnings::take();
+        let (vlrs, _) = crs_vlrs(&crs, false);
+        assert!(!shorts(&vlrs[0].data)[4..].as_chunks::<4>().0.iter().any(|k| k[0] == 4096));
+        assert!(!crate::warnings::take().is_empty());
     }
 
     #[test]

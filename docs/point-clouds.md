@@ -209,7 +209,8 @@ Reprojection transforms `z` too when the points' CRS and the target CRS both hav
 compound CRSs (`EPSG:6588+6360`, a horizontal CRS with NAVD88 height in US survey feet) and
 geographic 3D CRSs (`EPSG:4979`). Vertical units, geoid models and vertical datum transformations
 apply as in [CRS transformations](crs.md#heights-and-vertical-datums), and the vertical CRS a
-LAS file declares (in its WKT or its `VerticalCSTypeGeoKey`) counts as part of the points' CRS.
+LAS file declares (in its WKT or its `VerticalCSTypeGeoKey`) counts as part of the points' CRS,
+unless `--a-srs` assigns another CRS, which replaces it.
 When only one of the CRSs has heights, `z` is kept as it is, as PDAL keeps it. If the target has
 heights and the points have none, terrio issues a warning. LAS files written with GeoKeys record
 the vertical CRS of a compound CRS in `VerticalCSTypeGeoKey`.

@@ -43,7 +43,7 @@
   It previously transformed only `x` and `y`, so 300 ftUS in
   `EPSG:6588+6360` stayed 300 in `EPSG:6588+5703` (now 91.44018 m). The
   vertical CRS a LAS file declares is now part of the CRS reprojected from
-  (it was dropped), and LAS files written with GeoKeys record a compound CRS's
+  (it was dropped) unless a CRS is assigned with `--a-srs`, and LAS files written with GeoKeys record a compound CRS's
   vertical CRS in `VerticalCSTypeGeoKey`. When only the target has heights,
   `z` is kept and a warning says so.
 
