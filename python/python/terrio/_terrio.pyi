@@ -567,6 +567,18 @@ class PointCloud:
         nodata: float = ...,  # -9999.0
         ot: str | None = None,
     ) -> Raster: ...
+    def hexbin(
+        self,
+        edge_length: float | None = None,
+        *,
+        sample_size: int = 5000,
+        threshold: int = 15,
+        smooth: bool = True,
+        preserve_topology: bool = True,
+        hole_cull_area_tolerance: float | None = None,
+        origin: tuple[float, float] | None = None,
+        precision: int = 8,
+    ) -> dict[str, Any]: ...
     def to_layer(
         self, dimensions: Sequence[str] | None = None, name: str | None = None
     ) -> Layer: ...

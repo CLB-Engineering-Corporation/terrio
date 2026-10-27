@@ -581,6 +581,17 @@ test("PLY and E57 bytes, PDAL's filters and TIN gridding", { skip: needs("pointc
   assert.ok(pc.radialDensity(1).get("radial_density").every((v) => v > 0));
   assert.ok(pc.reciprocity().get("reciprocity").every((v) => v >= 0 && v <= 100));
   assert.ok(pc.miniball().get("miniball").every((v) => v >= 0 && v <= 1));
+  // PDAL's filters.hexbin: the boundary of the points on hexagons, and the hexagons.
+  const hex = pc.hexbin(1.4, { threshold: 3, smooth: false });
+  assert.deepEqual(hex.layerNames(), ["boundary", "hexagons"]);
+  const boundary = hex.toGeoJSON("boundary").features[0];
+  assert.equal(boundary.geometry.type, "MultiPolygon");
+  assert.equal(boundary.properties.point_count, n);
+  assert.ok(boundary.properties.area > 0 && hex.toGeoJSON("hexagons").features.length === boundary.properties.hex_count);
+  assert.throws(() => pc.hexbin(-1));
+  // An edge length of 0: estimated from the first points, as PDAL's.
+  const estimated = pc.hexbin(0, { sampleSize: 100 }).toGeoJSON("boundary").features[0].properties;
+  assert.ok(estimated.edge_length > 0 && estimated.point_count === n);
   assert.ok(pc.zsmooth("Smoothed", 1).get("smoothed").every((v) => v >= 100 && v < 108));
   const ground2 = pc.skewnessBalancing().get("z");
   assert.ok(ground2.every((v, i) => i === 0 || v >= ground2[i - 1]));
