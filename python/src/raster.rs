@@ -112,6 +112,25 @@ pub(crate) fn from_numpy(array: &Bound<'_, PyUntypedArray>) -> PyResult<RasterDa
     Err(invalid(format!("unsupported array dtype {dtype}: use an integer or float32/float64 array")))
 }
 
+/// A supplied overview: a `Raster` (read whole), or a `(rows, cols)` or `(bands, rows, cols)`
+/// array. Only its pixels are written, so an array needs no georeferencing.
+fn overview_raster(obj: &Bound<'_, PyAny>) -> PyResult<std::sync::Arc<terrio::Raster>> {
+    if let Ok(mut r) = obj.cast::<PyRaster>().map(|r| r.borrow_mut()) {
+        let raster = r.with_dataset(|ds| Ok(ds.raster.clone())).py()?;
+        return Ok(std::sync::Arc::new(raster));
+    }
+    let array = obj.cast::<PyUntypedArray>().map_err(|_| invalid("an overview is a Raster or a NumPy array (or every one a factor)"))?;
+    let (bands, rows, cols) = match array.shape()[..] {
+        [r, c] => (1, r, c),
+        [b, r, c] => (b, r, c),
+        _ => return Err(invalid("an overview array is 2-D (rows, cols) or 3-D (bands, rows, cols)")),
+    };
+    let data = from_numpy(array)?;
+    let cfg = terrio::RasterConfig { cols, rows, bands, data_type: data.data_type(), ..Default::default() };
+    let raster = terrio::Raster::from_data_native(cfg, data).map_err(terrio::Error::from).py()?;
+    Ok(std::sync::Arc::new(raster))
+}
+
 /// Parses a `band` argument: `None` (all bands), an int, or a sequence of ints. Returns the bands
 /// and whether a single band was asked for.
 fn parse_bands(band: Option<&Bound<'_, PyAny>>) -> PyResult<(Vec<usize>, bool)> {
@@ -430,21 +449,34 @@ impl PyRaster {
     ///         `"Red"`) and `items` (a mapping of metadata items).
     ///     colormap: The color table of a single-band Byte or UInt16 GeoTIFF: `(r, g, b, a)`
     ///         entries from index 0.
-    ///     overviews: GeoTIFF overviews to build, as decimation factors such as `[2, 4]`.
-    ///     overview_resampling: `"nearest"`, `"average"`, `"min"`, `"max"` or `"mode"`.
-    ///         Defaults to `"nearest"` for GeoTIFF and `"average"` for COG.
+    ///     overviews: GeoTIFF overviews to build, as decimation factors such as `[2, 4]`; or the
+    ///         overviews themselves (GeoTIFF or COG), written as they are instead of computed:
+    ///         `Raster`s or arrays (`(rows, cols)` or `(bands, rows, cols)`) of the raster's dtype,
+    ///         from the largest, at factors 2, 4, 8... (`ceil(width / f) x ceil(height / f)`).
+    ///     overview_resampling: `"nearest"`, `"average"`, `"min"`, `"max"` or `"mode"`; or
+    ///         `"area_matched"` (`"area_matched_mode"` for categorical rasters), whose levels keep
+    ///         the full-resolution valid area instead of growing it, with the mean (or mode) of the
+    ///         valid pixels (needs a nodata value). Defaults to `"nearest"` for GeoTIFF and
+    ///         `"average"` for COG, whose `OVERVIEW_RESAMPLING` option sets it too.
+    ///     metadata: Dataset metadata items (GDAL's default domain) to set over the raster's
+    ///         own: a mapping or `(key, value)` pairs.
     ///     gcps: GeoTIFF ground control points, in the raster's CRS: `(pixel, line, x, y, z)`
     ///         tuples, written as tie points instead of the geotransform.
     ///     mask: A per-dataset validity mask, a 2-D uint8 array (0 for invalid pixels), written
     ///         as GDAL's internal GeoTIFF mask.
     ///     rpc: The 92 rational polynomial coefficients of the GeoTIFF `RPCCoefficientTag`.
     ///
+    /// COG creation options are GDAL's COG driver's: one the writer would not act on (a
+    /// GeoTIFF-only option, or an overview compression unlike the image's) raises rather than
+    /// being ignored. `PREDICTOR=YES` is 3 for floating-point rasters and 2 for integers, as GDAL
+    /// resolves it. `OVERVIEWS=FORCE_USE_EXISTING` needs the overviews supplied; `NONE` writes none.
+    ///
     /// Raises:
     ///     TerrioError: If the raster cannot be written.
     #[pyo3(signature = (
         path, driver=None, compress=None, tile_size=None, bigtiff=false, options=None, *,
         band_metadata=None, colormap=None, overviews=None, overview_resampling=None, gcps=None,
-        mask=None, rpc=None
+        mask=None, rpc=None, metadata=None
     ))]
     #[allow(clippy::too_many_arguments)]
     fn write(
@@ -458,11 +490,12 @@ impl PyRaster {
         options: Option<std::collections::BTreeMap<String, String>>,
         band_metadata: Option<Vec<Bound<'_, PyDict>>>,
         colormap: Option<Vec<[u8; 4]>>,
-        overviews: Option<Vec<usize>>,
+        overviews: Option<Vec<Bound<'_, PyAny>>>,
         overview_resampling: Option<String>,
         gcps: Option<Vec<GcpTuple>>,
         mask: Option<numpy::PyReadonlyArray2<'_, u8>>,
         rpc: Option<Vec<f64>>,
+        metadata: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<()> {
         let mut options_ = write_options(driver, compress, tile_size, bigtiff)?;
         options_.gcps = parse_gcps(gcps);
@@ -483,8 +516,14 @@ impl PyRaster {
         options_.creation_options = options.unwrap_or_default().into_iter().collect();
         options_.band_metadata = band_metadata.unwrap_or_default().iter().map(parse_band_metadata).collect::<PyResult<_>>()?;
         options_.color_table = colormap.unwrap_or_default();
-        options_.overviews = overviews.unwrap_or_default();
+        let overviews = overviews.unwrap_or_default();
+        if overviews.iter().all(|o| o.extract::<usize>().is_ok()) {
+            options_.overviews = overviews.iter().map(|o| o.extract::<usize>()).collect::<PyResult<_>>()?;
+        } else {
+            options_.overview_data = overviews.iter().map(overview_raster).collect::<PyResult<_>>()?;
+        }
         options_.overview_resampling = overview_resampling;
+        options_.metadata = metadata.map(string_pairs).transpose()?.unwrap_or_default();
         let options = options_;
         // A raster read by window is written as a tile archive a tile row at a time.
         let driver = options.driver.or_else(|| terrio::formats::RasterDriver::for_extension(path));
