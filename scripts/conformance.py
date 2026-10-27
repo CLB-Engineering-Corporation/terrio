@@ -1046,6 +1046,30 @@ def suite_perspective(ctx):
     return suite
 
 
+def suite_igh(ctx):
+    """The interrupted Goode homolosine, as PROJ strings and as GDAL's WKT, and its inverse refusals."""
+    suite = Suite("igh", "Interrupted Goode homolosine", "GDAL/PROJ",
+                  "8 spherical/WGS84 configurations (central meridians, units and false offsets) and "
+                  "5,120 geographic samples over every zone, the sinusoidal/Mollweide boundary and each "
+                  "side of the interruptions, as PROJ strings, WKT2, WKT1 and ESRI WKT1; inverse refusals "
+                  "in the interruptions and past the poles. Projected allowance 1 mm; inverse 1e-8 "
+                  "degrees, longitude weighted by cos(latitude).")
+    if missing_modules("osgeo"):
+        suite.skipped = "needs GDAL Python bindings"
+        return suite
+    code, out, err = run([sys.executable, str(SCRIPTS / "compare_igh_with_gdal.py"), ctx.data, "--terrio", ctx.terrio, "--json"])
+    try:
+        cases = json.loads(out)
+    except json.JSONDecodeError:
+        suite.error = tail(err or out)
+        return suite
+    for case in cases:
+        suite.cases.append(Case("Interrupted Goode homolosine", case["name"], case["status"], case["detail"]))
+    if code and not any(c.status == DIFFERS for c in suite.cases):
+        suite.error = tail(err or out)
+    return suite
+
+
 def suite_projjson(ctx):
     """PROJJSON units, axes and bound transformations, with and without IDs."""
     suite = Suite("projjson", "PROJJSON CRS definitions", "GDAL/PROJ",
@@ -1801,6 +1825,7 @@ SUITES = OrderedDict(
         ("crs", suite_crs),
         ("geocentric", suite_geocentric),
         ("perspective", suite_perspective),
+        ("igh", suite_igh),
         ("projjson", suite_projjson),
         ("projjson-export", suite_projjson_export),
         ("iau", suite_iau),

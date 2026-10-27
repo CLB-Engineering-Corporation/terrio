@@ -100,6 +100,7 @@ pub(crate) fn build(name: &str, s: &mut Setup<'_>) -> Result<Option<Box<dyn Proj
         "geos" => Box::new(Geos::new(s)?),
         "robin" => Box::new(Robin),
         "moll" | "wag4" | "wag5" => Box::new(Moll::new(name)),
+        "igh" => Box::new(Igh::new()?),
         "wintri" => Box::new(Wintri::new(s)?),
         "wink1" => Box::new(Wink1 { cosphi1: s.p.angle("lat_ts").unwrap_or(0.0).cos() }),
         "wink2" => Box::new(Wink2 { cosphi1: s.p.angle("lat_1").unwrap_or(0.0).cos() }),
@@ -3016,6 +3017,116 @@ impl Proj for Moll {
         }
         let twice = 2.0 * theta;
         Some((lam, aasin_checked((twice + twice.sin()) / self.cp)?))
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Interrupted Goode Homolosine, ported from PROJ's igh.cpp: twelve zones, each a spherical
+// sinusoidal (between the equator and 40 degrees 44' 11.8") or Mollweide (poleward of it) projection
+// with its own central meridian, the Mollweide zones shifted to meet the sinusoidal ones.
+
+/// The latitude where the sinusoidal zones meet the Mollweide ones.
+const IGH_PHI_BOUNDARY: f64 = (40.0 + 44.0 / 60.0 + 11.8 / 3600.0) * PI / 180.0;
+
+/// PROJ's slack on the zones' edges.
+const IGH_EPSLN: f64 = 1e-10;
+
+#[derive(Debug)]
+struct Igh {
+    moll: Moll,
+    /// The offset of the northern Mollweide zones (the southern ones are shifted by -dy0).
+    dy0: f64,
+}
+
+impl Igh {
+    fn new() -> Result<Self> {
+        let moll = Moll::new("moll");
+        let (_, y1) = moll.fwd(0.0, IGH_PHI_BOUNDARY).ok_or_else(|| err("igh: Mollweide of the boundary"))?;
+        Ok(Self { moll, dy0: IGH_PHI_BOUNDARY - y1 })
+    }
+
+    /// The zone (1 to 12) of a longitude and latitude in radians (forward), or of an easting and
+    /// northing on the unit sphere, with the zones' offsets (inverse), as in PROJ. The same edges
+    /// serve both: each zone's easting spans its longitudes (its false easting is its central
+    /// meridian, and the zones' extents do not overlap), and the Mollweide zones' offsets put the
+    /// sinusoidal/Mollweide boundary at the northing IGH_PHI_BOUNDARY.
+    fn zone(x: f64, y: f64) -> usize {
+        if y >= IGH_PHI_BOUNDARY {
+            if x <= -40f64.to_radians() { 1 } else { 2 }
+        } else if y >= 0.0 {
+            if x <= -40f64.to_radians() { 3 } else { 4 }
+        } else {
+            let band = if y >= -IGH_PHI_BOUNDARY { 5 } else { 9 };
+            band + if x <= -100f64.to_radians() {
+                0
+            } else if x <= -20f64.to_radians() {
+                1
+            } else if x <= 80f64.to_radians() {
+                2
+            } else {
+                3
+            }
+        }
+    }
+
+    /// A zone's central meridian (also its false easting) and false northing.
+    fn origin(&self, z: usize) -> (f64, f64) {
+        let lam0: f64 = match z {
+            1 | 3 => -100.0,
+            2 | 4 => 30.0,
+            5 | 9 => -160.0,
+            6 | 10 => -60.0,
+            7 | 11 => 20.0,
+            _ => 140.0,
+        };
+        let y0 = match z {
+            1 | 2 => self.dy0,
+            9..=12 => -self.dy0,
+            _ => 0.0,
+        };
+        (lam0.to_radians(), y0)
+    }
+
+    fn mollweide(z: usize) -> bool {
+        !(3..=8).contains(&z)
+    }
+}
+
+impl Proj for Igh {
+    fn fwd(&self, lam: f64, phi: f64) -> Option<(f64, f64)> {
+        let z = Self::zone(lam, phi);
+        let (lam0, y0) = self.origin(z);
+        let lam = lam - lam0;
+        let (x, y) = if Self::mollweide(z) { self.moll.fwd(lam, phi)? } else { (lam * phi.cos(), phi) };
+        Some((x + lam0, y + y0))
+    }
+
+    fn inv(&self, x: f64, y: f64) -> Option<(f64, f64)> {
+        // PROJ's bounds. The southern bound is -y90 + EPSLN, where the northern is y90 + EPSLN, as
+        // in PROJ's igh.cpp: it refuses the south pole's own northing, -y90.
+        let y90 = self.dy0 + 2f64.sqrt(); // sqrt(2) is the Mollweide pole's northing.
+        if y > y90 + IGH_EPSLN || y < -y90 + IGH_EPSLN {
+            return None;
+        }
+        let z = Self::zone(x, y);
+        let (lam0, y0) = self.origin(z);
+        let (x, y) = (x - lam0, y - y0);
+        let (lam, phi) = if Self::mollweide(z) { self.moll.inv(x, y)? } else { (x / y.cos(), y) };
+        let lam = lam + lam0;
+        // The point must be in the zone's own longitudes (zones 1 and 2 also hold the lobes'
+        // polar caps that PROJ allows).
+        let within = |lo: f64, hi: f64| lam >= lo.to_radians() - IGH_EPSLN && lam <= hi.to_radians() + IGH_EPSLN;
+        let above = |lat: f64| phi >= lat.to_radians() - IGH_EPSLN && phi <= 90f64.to_radians() + IGH_EPSLN;
+        let ok = match z {
+            1 => within(-180.0, -40.0) || (within(-40.0, -10.0) && above(60.0)),
+            2 => within(-40.0, 180.0) || (within(-180.0, -160.0) && above(50.0)) || (within(-50.0, -40.0) && above(60.0)),
+            3 | 5 | 9 => within(-180.0, if z == 3 { -40.0 } else { -100.0 }),
+            4 => within(-40.0, 180.0),
+            6 | 10 => within(-100.0, -20.0),
+            7 | 11 => within(-20.0, 80.0),
+            _ => within(80.0, 180.0),
+        };
+        ok.then_some((lam, phi))
     }
 }
 

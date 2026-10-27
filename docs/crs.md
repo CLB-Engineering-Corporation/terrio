@@ -12,7 +12,7 @@ Everywhere a CRS is expected (`--t-srs`, `--a-srs`, `terrio crs`, the APIs), ter
 - `OGC:CRS84` and `WGS84`;
 - ESRI codes, the geographic and projected CRSs of PROJ's ESRI authority: `ESRI:54009` (World
   Mollweide), `esri:102003`, `urn:ogc:def:crs:ESRI::102003`. The few whose projection terrio
-  does not compute (Goode homolosine, Peirce quincuncial and others) are refused;
+  does not compute (Goode homolosine of the oceans, Peirce quincuncial and others) are refused;
 - WKT1 and WKT2 (2015 and 2019) definitions, including ESRI `.prj` WKT and WKT2 `BOUNDCRS`s
   (a CRS with its transformation to WGS 84, as `+towgs84`); an unknown WKT2 projection method
   or parameter is an error rather than ignored;
@@ -21,9 +21,9 @@ Everywhere a CRS is expected (`--t-srs`, `--a-srs`, `terrio crs`, the APIs), ter
   datum shift and geoid grids;
 - the path of a file holding one of these.
 
-Of PROJ's 117 projections, terrio computes 88 as PROJ does (within 1 mm, on a sphere and on WGS 84,
+Of PROJ's 117 projections, terrio computes 89 as PROJ does (within 1 mm, on a sphere and on WGS 84,
 as PROJ strings with typical parameters and as pyproj's WKT1 and WKT2 of them:
-`crates/terrio-crs/tests/proj_strings.rs`) and refuses the 29 others (`airy`, `bacon`, `igh`,
+`crates/terrio-crs/tests/proj_strings.rs`) and refuses the 28 others (`airy`, `bacon`, `goode`,
 `vandg2` and others) rather than computing something else. The known difference is
 Krovak off Bessel's ellipsoid, where PROJ's inverse is not the inverse of its forward.
 
@@ -639,3 +639,26 @@ domain boundaries, metres/kilometres/US survey feet, offsets and non-default
 origins/tilt/azimuth. Component allowances are 1 mm projected and 1e-8 degrees
 inverse, with longitude weighted by cos(latitude) at the poles. Other projection
 families in #272 remain tracked there.
+
+## Interrupted Goode homolosine
+
+`+proj=igh` is computed as PROJ 9.8.1 does (`igh.cpp`): twelve zones, spherical
+sinusoidal between the equator and 40 degrees 44' 11.8" and Mollweide poleward of it, each
+with its own central meridian, the Mollweide zones shifted north or south to meet
+the sinusoidal ones. It is a spherical projection: with an ellipsoid, the
+semi-major axis is the radius, as in PROJ. `+lon_0`, `+units`, `+x_0` and `+y_0`
+apply. The inverse refuses points in the interruptions, beyond the poles' northings
+and past 180 degrees from the central meridian, as PROJ's does, including PROJ's southern
+bound, which also refuses the south pole's own northing.
+
+GDAL's WKT1 `Interrupted_Goode_Homolosine`, ESRI's `Goode_Homolosine` with
+`Option` 1, and WKT2 `Interrupted Goode Homolosine` are read, and terrio writes
+the first, as GDAL does. ESRI's `Goode_Homolosine` without `Option` 1 and WKT2
+`Goode Homolosine` are PROJ's uninterrupted `goode` (or, with `Option` 2,
+`igh_o`), which terrio refuses; WKT2 `Goode Homolosine` was previously read as
+`igh`. PROJJSON export refuses `igh`, as for other projections without an EPSG
+method.
+
+The `seed-igh` fixture keeps its PROJ 9.9.0 oracle. A PROJ 9.8.1 corpus covers
+8 configurations and 5,120 samples (see Testing). Allowances are 1 mm projected
+and 1e-8 degrees inverse.

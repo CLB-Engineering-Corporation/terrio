@@ -516,7 +516,7 @@ fn proj_method(conv: &Node, method: &Node, ang: f64, to_meter: f64) -> Result<Op
 
 /// Pseudocylindrical and other world projections PROJ names without an EPSG method, which take a
 /// central meridian only.
-const WORLD: [(&str, &str); 26] = [
+const WORLD: [(&str, &str); 27] = [
     ("mollweide", "moll"),
     ("robinson", "robin"),
     ("sinusoidal", "sinu"),
@@ -530,7 +530,9 @@ const WORLD: [(&str, &str); 26] = [
     ("vandergrinten", "vandg"),
     ("naturalearth", "natearth"),
     ("quarticauthalic", "qua_aut"),
-    ("goodehomolosine", "igh"),
+    // PROJ's uninterrupted goode, which terrio refuses; it is not igh.
+    ("goodehomolosine", "goode"),
+    ("interruptedgoodehomolosine", "igh"),
     ("aitoff", "aitoff"),
     ("crasterparabolic", "crast"),
     ("naturalearthii", "natearth2"),
