@@ -37,6 +37,13 @@ use wbvector::{Coord, Feature, FieldDef, FieldType, FieldValue, Geometry, Geomet
 
 /// hexer's √3, with which it computes its columns' width.
 const HEXER_SQRT_3: f64 = 1.732050808;
+/// The farthest a point may be from the grid's origin, in hexagon heights along x or y: the
+/// columns and rows stay within 2⁴⁸ (hexer's are `int`s), so that their arithmetic cannot
+/// overflow and their corners' lattice coordinates are exact in `f64`.
+const MAX_OFFSET: f64 = (1u64 << 47) as f64;
+/// The decimals beyond which rounding is a no-op: every `f64` is a multiple of 2⁻¹⁰⁷⁴, whose
+/// decimal expansion has 1074 decimals.
+const MAX_DECIMALS: usize = 1074;
 
 /// How to bin points into hexagons (PDAL's `filters.hexbin`).
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -197,7 +204,13 @@ impl HexBinner {
             return Ok(());
         };
         let [x0, y0] = *self.origin.get_or_insert([x, y]);
-        let key = locate(x - x0, y - y0, height);
+        let (u, v) = (x - x0, y - y0);
+        if !(u.abs() <= MAX_OFFSET * height && v.abs() <= MAX_OFFSET * height) {
+            return Err(Error::InvalidArgument(format!(
+                "the point ({x}, {y}) is too far from the grid's origin ({x0}, {y0}) for hexagons of height {height}"
+            )));
+        }
+        let key = locate(u, v, height);
         *self.counts.entry(key).or_insert(0) += 1;
         Ok(())
     }
@@ -496,16 +509,31 @@ fn trace(dense: &HashSet<Lattice>) -> Vec<(Vec<Corner>, Vec<Vec<Corner>>)> {
     let lattice: Vec<Vec<Lattice>> = rings.iter().map(|r| r.iter().map(|c| c.0).collect()).collect();
     // Each ring's parent: the smallest ring around it (exteriors' parents are holes, islands' are
     // their holes).
-    let areas: Vec<i64> = lattice.iter().map(|r| lattice_area2(r).abs()).collect();
-    let boxes: Vec<[i64; 4]> = lattice.iter().map(|r| lattice_bounds(r)).collect();
+    // The rings never touch, so the rings around a ring are nested, of different areas, and the
+    // smallest is its parent. Their candidates are the rings whose bounding box holds its first
+    // vertex, found in an R-tree of the boxes (the lattice coordinates, within 2⁵⁰, are exact
+    // in f64).
+    let areas: Vec<i128> = lattice.iter().map(|r| lattice_area2(r).abs()).collect();
+    let boxes = rstar::RTree::bulk_load(
+        lattice
+            .iter()
+            .enumerate()
+            .map(|(k, r)| {
+                let b = lattice_bounds(r);
+                rstar::primitives::GeomWithData::new(
+                    rstar::primitives::Rectangle::from_corners([b[0] as f64, b[1] as f64], [b[2] as f64, b[3] as f64]),
+                    k,
+                )
+            })
+            .collect(),
+    );
     let parent: Vec<Option<usize>> = (0..rings.len())
         .map(|i| {
             let p = lattice[i][0];
-            (0..rings.len())
-                .filter(|&k| {
-                    let b = boxes[k];
-                    k != i && areas[k] > areas[i] && b[0] <= p.0 && p.0 <= b[2] && b[1] <= p.1 && p.1 <= b[3] && inside(p, &lattice[k])
-                })
+            boxes
+                .locate_all_at_point(&[p.0 as f64, p.1 as f64])
+                .map(|b| b.data)
+                .filter(|&k| k != i && areas[k] > areas[i] && inside(p, &lattice[k]))
                 .min_by_key(|&k| areas[k])
         })
         .collect();
@@ -532,11 +560,14 @@ fn trace(dense: &HashSet<Lattice>) -> Vec<(Vec<Corner>, Vec<Vec<Corner>>)> {
     out
 }
 
-/// Twice the signed area of a lattice ring (positive counter-clockwise).
-fn lattice_area2(r: &[Lattice]) -> i64 {
+/// Twice the signed area of a lattice ring (positive counter-clockwise), about its first vertex
+/// and in `i128`, so that neither the products nor the sum overflow far from the origin.
+fn lattice_area2(r: &[Lattice]) -> i128 {
+    let Some(&(x0, y0)) = r.first() else { return 0 };
+    let d = |p: Lattice| ((p.0 - x0) as i128, (p.1 - y0) as i128);
     (0..r.len())
         .map(|i| {
-            let (a, b) = (r[i], r[(i + 1) % r.len()]);
+            let (a, b) = (d(r[i]), d(r[(i + 1) % r.len()]));
             a.0 * b.1 - b.0 * a.1
         })
         .sum()
@@ -584,6 +615,7 @@ fn ring_area(r: &Ring) -> f64 {
 /// The polygons with their coordinates rounded to `decimals` decimals, as hexer writes them for
 /// PDAL to read back.
 fn round_coords(g: Geometry, decimals: usize) -> Geometry {
+    let decimals = decimals.min(MAX_DECIMALS);
     let fixed = |v: f64| format!("{v:.decimals$}").parse().unwrap_or(v);
     let round = |r: Ring| Ring(r.0.into_iter().map(|c| Coord::xy(fixed(c.x), fixed(c.y))).collect());
     match g {
@@ -862,6 +894,88 @@ mod tests {
         let d = r.density_layer(Some("density"));
         assert_eq!(d.name, "density");
         assert_eq!(d.features.len(), 2);
+    }
+
+    #[test]
+    fn nests_many_isolated_rings() {
+        // An annulus of hexagons (columns and rows -20..=20, 3 thick) around a hole with 121
+        // isolated hexagons, and 273 isolated hexagons outside it: 396 rings.
+        let origin = HexbinOptions { origin: Some([0.0, 0.0]), ..raw(1.0, 1) };
+        let mut cells: Vec<(i64, i64)> = Vec::new();
+        for c in -20..=20i64 {
+            for r in -20..=20i64 {
+                if c.abs() >= 18 || r.abs() >= 18 || (c % 3 == 0 && r % 3 == 0 && c.abs() <= 15 && r.abs() <= 15) {
+                    cells.push((c, r));
+                }
+            }
+        }
+        cells.extend((24..=60).step_by(3).flat_map(|c| (-30..=30).step_by(3).map(move |r| (c, r))));
+        let pts: Vec<(f64, f64)> = cells.iter().map(|&(c, r)| centre_xy(c, r, 1.0)).collect();
+        let r = hexbin(&cloud(&pts), &origin).unwrap();
+        assert_eq!(r.hexagons.len(), cells.len());
+        let ps = polygons(&r.boundary);
+        assert_eq!(ps.len(), 1 + 121 + 273);
+        let annulus = ps.iter().position(|(_, hs)| !hs.is_empty()).unwrap();
+        assert_eq!(ps.iter().map(|(_, hs)| hs.len()).sum::<usize>(), 1);
+        // The islands in the hole follow the annulus, as hexer orders them.
+        let hole = &ps[annulus].1[0];
+        let (lo, hi) = hole.0.iter().fold((f64::MAX, f64::MIN), |(lo, hi), c| (lo.min(c.x), hi.max(c.x)));
+        for (e, _) in &ps[annulus + 1..annulus + 122] {
+            assert!(e.0.iter().all(|c| lo < c.x && c.x < hi));
+        }
+        assert!(ps[annulus + 122..].iter().chain(&ps[..annulus]).all(|(e, _)| e.0.iter().all(|c| c.x > 30.0)));
+        assert!((r.area - cells.len() as f64 * HEX_AREA).abs() < 1e-6);
+    }
+
+    #[test]
+    fn nests_rings_far_from_the_origin() {
+        // Six hexagons around an empty one about 1e8 from the origin, with an edge of 0.02: the
+        // corners' lattice coordinates (about 9e9 and 6e9) overflow an i64 area.
+        let e = 0.02;
+        let (c, r) = (3_000_000_000i64, 3_000_000_000i64);
+        let (u, v) = center(c, r);
+        // The neighbours' centres, with hexer's arithmetic (its √3 is not exact: 3e9 columns out,
+        // the true centres are a third of a column off).
+        let pts: Vec<(f64, f64)> = NEIGHBOURS
+            .iter()
+            .map(|&(du, dv)| {
+                let column = (u + du - 1).div_euclid(3);
+                let row = (v + dv - 1 - column.rem_euclid(2)).div_euclid(2);
+                let cs: Vec<Coord> = (0..6).map(|k| vertex([0.0, 0.0], e * 3f64.sqrt(), (column, row), k)).collect();
+                (cs.iter().map(|c| c.x).sum::<f64>() / 6.0, cs.iter().map(|c| c.y).sum::<f64>() / 6.0)
+            })
+            .collect();
+        let far: Lattice = (u, v);
+        let ring: Vec<Lattice> = CORNERS.iter().map(|&(a, b)| (far.0 + a, far.1 + b)).collect();
+        assert_eq!(lattice_area2(&ring), lattice_area2(&CORNERS));
+        let o = HexbinOptions { origin: Some([0.0, 0.0]), ..raw(e, 1) };
+        let r = hexbin(&cloud(&pts), &o).unwrap();
+        assert_eq!(r.hexagons.len(), 6);
+        let ps = polygons(&r.boundary);
+        assert_eq!(ps.len(), 1);
+        assert_eq!(ps[0].1.len(), 1);
+        assert!((r.area - 6.0 * HEX_AREA * e * e).abs() < 1e-3 * HEX_AREA * e * e, "{}", r.area);
+    }
+
+    #[test]
+    fn rejects_points_too_far_from_the_origin() {
+        for far in [(1e300, 0.0), (0.0, -1e300), (f64::MAX, 0.0)] {
+            let err = hexbin(&cloud(&[(-f64::MAX, 0.0), far]), &raw(1.0, 1)).unwrap_err();
+            assert!(err.to_string().contains("too far"), "{err}");
+        }
+    }
+
+    #[test]
+    fn rounds_to_at_most_the_decimals_of_an_f64() {
+        // Rounding to more decimals than an f64 has is a no-op, and does not allocate them.
+        let ring = Ring(vec![Coord::xy(1e-300, 0.1), Coord::xy(123_456.789, 5e-324), Coord::xy(-0.3, 7.0)]);
+        let g = Geometry::MultiPolygon(vec![(ring, Vec::new())]);
+        assert_eq!(round_coords(g.clone(), usize::MAX), g);
+        assert_eq!(round_coords(g.clone(), MAX_DECIMALS), g);
+        let pts = [(10.3, 20.7), (0.0, 0.0)];
+        let huge = hexbin(&cloud(&pts), &HexbinOptions { precision: usize::MAX, ..raw(1.0, 1) }).unwrap();
+        let exact = hexbin(&cloud(&pts), &HexbinOptions { precision: MAX_DECIMALS, ..raw(1.0, 1) }).unwrap();
+        assert_eq!(huge.boundary, exact.boundary);
     }
 
     fn signed(r: &Ring) -> f64 {

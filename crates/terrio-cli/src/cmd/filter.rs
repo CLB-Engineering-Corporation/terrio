@@ -710,7 +710,8 @@ enum Filter {
         /// vector dataset (PDAL's density).
         #[arg(long, value_name = "OUTPUT")]
         density: Option<String>,
-        /// The output format's short name. By default, chosen from the output's extension.
+        /// The output format's short name, for the boundary and --density. By default, chosen
+        /// from each output's extension.
         #[arg(short = 'f', long = "format")]
         format: Option<String>,
         /// The points read at a time (about a million by default).
@@ -1190,7 +1191,7 @@ pub fn run(a: Args) -> terrio::Result<()> {
             let write = terrio::VectorWriteOptions { driver, ..Default::default() };
             terrio::write_vector(&[result.boundary_layer(None)], &output, &write)?;
             if let Some(path) = density {
-                terrio::write_vector(&[result.density_layer(None)], &path, &terrio::VectorWriteOptions::default())?;
+                terrio::write_vector(&[result.density_layer(None)], &path, &write)?;
             }
             Ok(())
         }
@@ -1324,6 +1325,16 @@ mod tests {
         // hexer's height: 3 × (380 steps of 0.5 and 19 row jumps) / 400 points.
         let height = 3.0 * (380.0 * 0.5 + 19.0 * (9.5f64 * 9.5 + 0.25).sqrt()) / 400.0;
         assert!(matches!(edge, terrio::FieldValue::Float(e) if (*e - height / 3f64.sqrt()).abs() < 1e-9), "{edge:?}");
+        // --format applies to both outputs, whose extensions do not name a format.
+        let (boundary, density) = (path("boundary.out"), path("hexagons.out"));
+        let argv =
+            ["terrio", "hexbin", &input, &boundary, "--edge-size", "1.4", "--threshold", "3", "-f", "GeoJSON", "--density", &density];
+        run(Cli::try_parse_from(argv).unwrap().args).unwrap();
+        for (out, features) in [(&boundary, 1), (&density, d.layers[0].features.len())] {
+            let json: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(out).unwrap()).unwrap();
+            assert_eq!(json["type"], "FeatureCollection", "{out}");
+            assert_eq!(json["features"].as_array().unwrap().len(), features, "{out}");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
