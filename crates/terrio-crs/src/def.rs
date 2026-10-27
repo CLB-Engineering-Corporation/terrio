@@ -81,19 +81,21 @@ impl Vertical {
     pub fn from_epsg(code: u32) -> Option<Self> {
         let v = epsg::vertical(code)?;
         // The table does not name geoid models: `WGS 84 to EGM96 height`, as PROJ names them
-        // without the EPSG index (`(1)`).
-        let named = |g: u32, ops: Vec<Arc<datum::Op>>| -> Vec<Arc<datum::Op>> {
+        // without the EPSG index (`(1)`), after the vertical CRS they are defined to (`NAD83(2011)
+        // to NAVD88 height` for NAVD88 height (ftUS), which uses NAVD88 height's).
+        let named = |g: u32, vc: u32, ops: Vec<Arc<datum::Op>>| -> Vec<Arc<datum::Op>> {
             let Some(geog) = epsg::get(g) else { return ops };
+            let Some(to) = epsg::vertical(vc) else { return ops };
             ops.into_iter()
                 .map(|op| {
                     if !op.name.is_empty() || op.steps.is_empty() {
                         return op;
                     }
-                    Arc::new(datum::Op { name: format!("{} to {}", geog.name, v.name), ..(*op).clone() })
+                    Arc::new(datum::Op { name: format!("{} to {}", geog.name, to.name), ..(*op).clone() })
                 })
                 .collect()
         };
-        let models = epsg::geoid_models(code).into_iter().map(|(g, ops)| (Some(g), named(g, ops))).collect();
+        let models = epsg::geoid_models(code).into_iter().map(|(g, vc, ops)| (Some(g), named(g, vc, ops))).collect();
         Some(Self { code: Some(code), to_meter: v.to_meter, down: v.down, models, ballpark: true })
     }
 

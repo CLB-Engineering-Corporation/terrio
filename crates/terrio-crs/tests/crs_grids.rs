@@ -128,6 +128,47 @@ fn geoid_models_match_gdal() {
 }
 
 #[test]
+fn geoid_models_of_the_vertical_datum_match_proj() {
+    if grids().is_none() {
+        return;
+    }
+    // PROJ 9.9.0 (pyproj 3.8.0, always_xy, us_noaa_g2018u0.tif): vertical CRSs of NAVD88 without
+    // geoid models of their own (feet, US survey feet, depths) use NAVD88 height's GEOID18, the
+    // unit and direction converted. 100 m at 30 N, 97 W is 73.40740013115874 m above the
+    // NAD83(2011) ellipsoid.
+    let ftus = 0.3048006096012192;
+    let h = 73.40740013115874;
+    let run =
+        |src: &str, dst: &str, p: (f64, f64, f64)| Transformer::new(&crs(src), &crs(dst)).unwrap().transform_3d(p.0, p.1, p.2).unwrap();
+    for (src, z) in [
+        ("EPSG:6318+5703", 100.0),
+        ("EPSG:6318+6360", 100.0 / ftus),
+        ("EPSG:6318+8228", 100.0 / 0.3048),
+        ("EPSG:6318+6357", -100.0),
+        ("EPSG:6318+6358", -100.0 / ftus),
+    ] {
+        let (x, y, r) = run(src, "EPSG:6319", (-97.0, 30.0, z));
+        assert!((x + 97.0).abs() < 1e-12 && (y - 30.0).abs() < 1e-12 && (r - h).abs() < 1e-8, "{src} to EPSG:6319: {x} {y} {r}, PROJ {h}");
+        // The same as NAVD88 height in metres to a WGS 84 3D CRS too.
+        let a = run(src, "EPSG:4979", (-97.0, 30.0, z));
+        let b = run("EPSG:6318+5703", "EPSG:4979", (-97.0, 30.0, 100.0));
+        assert!((a.2 - b.2).abs() < 1e-8, "{src} to EPSG:4979: {a:?}, from NAVD88 height {b:?}");
+    }
+    // The inverse, to US survey feet and feet: PROJ's 328.08333333333337 ftUS and 328.0839895013123 ft.
+    for (dst, expected) in [("EPSG:6318+6360", 328.08333333333337), ("EPSG:6318+8228", 328.0839895013123), ("EPSG:6318+5703", 100.0)] {
+        let (_, _, z) = run("EPSG:6319", dst, (-97.0, 30.0, h));
+        assert!((z - expected).abs() < 1e-8, "EPSG:6319 to {dst}: {z}, PROJ {expected}");
+    }
+    // A Texas state plane CRS in US survey feet with NAVD88 height (ftUS), as lidar is delivered.
+    check("EPSG:6588+6360", "EPSG:6319", (3000000.0, 13800000.0, 300.0), (-95.7518511397452, 29.654931459584517, 64.03956291621587), 1e-10);
+    // The operation is GEOID18, named after NAVD88 height as PROJ names it.
+    let t = Transformer::new(&crs("EPSG:6318+6360"), &crs("EPSG:6319")).unwrap();
+    let op = t.operation_at(-97.0, 30.0, 100.0 / ftus).unwrap().unwrap();
+    assert!(op.grids.iter().any(|g| g == "us_noaa_g2018u0.tif") && !op.ballpark, "{op:?}");
+    assert!(op.name.contains("NAVD88 height"), "{op:?}");
+}
+
+#[test]
 fn coordinate_epochs_match_gdal() {
     // Time-dependent Helmert transformations need no grid.
     let opts =

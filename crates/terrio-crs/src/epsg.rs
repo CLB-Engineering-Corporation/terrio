@@ -636,17 +636,31 @@ pub(crate) fn compound(code: u32) -> Option<&'static Compound> {
 }
 
 /// The geoid models (transformations from geographic 3D CRSs) of a vertical CRS, with the
-/// code of their geographic 3D CRS, as GDAL uses them given the grids available.
-pub(crate) fn geoid_models(vertical: u32) -> Vec<(u32, Vec<Arc<Op>>)> {
+/// code of their geographic 3D CRS and of the vertical CRS they are defined to, as GDAL uses them
+/// given the grids available.
+///
+/// A vertical CRS with none of its own (NAVD88 height (ftUS), NAVD88 depth) uses those of the
+/// vertical CRSs of its datum (NAVD88 height's GEOID18), as PROJ chains them after a conversion
+/// between the two: the models give heights in metres, up, which [`Vertical`]'s unit and
+/// direction convert.
+pub(crate) fn geoid_models(vertical: u32) -> Vec<(u32, u32, Vec<Arc<Op>>)> {
     let t = table();
-    let Some(list) = t.geoids.get(&vertical) else { return Vec::new() };
-    list.iter()
-        .map(|(g, lazy)| {
-            let (ops, grid_ops) = lazy.get(&t.text, |ids| t.lists(ids));
-            (*g, usable(ops, grid_ops))
-        })
-        .filter(|(_, ops)| !ops.is_empty())
-        .collect()
+    let models = |v: u32, list: &[(u32, Lazy<OpLists>)]| -> Vec<(u32, u32, Vec<Arc<Op>>)> {
+        list.iter()
+            .map(|(g, lazy)| {
+                let (ops, grid_ops) = lazy.get(&t.text, |ids| t.lists(ids));
+                (*g, v, usable(ops, grid_ops))
+            })
+            .filter(|(_, _, ops)| !ops.is_empty())
+            .collect()
+    };
+    if let Some(list) = t.geoids.get(&vertical) {
+        return models(vertical, list);
+    }
+    let Some(datum) = self::vertical(vertical).map(|v| v.datum).filter(|d| *d != 0) else { return Vec::new() };
+    let mut same: Vec<u32> = t.geoids.keys().copied().filter(|&c| self::vertical(c).is_some_and(|v| v.datum == datum)).collect();
+    same.sort_unstable();
+    same.into_iter().flat_map(|v| models(v, &t.geoids[&v])).collect()
 }
 
 /// The transformations from a vertical CRS to another that PROJ lists (vertical offsets, offsets

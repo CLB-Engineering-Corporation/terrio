@@ -53,6 +53,30 @@ fn strict_policy_allows_vertical_unit_conversion() {
 }
 
 #[test]
+fn vertical_crs_in_feet_refuses_a_missing_geoid_grid_as_in_metres() {
+    // No installed or downloadable grids in this test executable.
+    terrio_crs::set_grid_search_paths(Some(vec![]));
+    terrio_crs::set_network_enabled(Some(false));
+    // NAVD88 height (ftUS) uses NAVD88 height's GEOID18: without its grid, the same refusals as
+    // NAVD88 height in metres, and by default heights kept (PROJ's ballpark), the unit converted.
+    let only_best = TransformOptions { only_best: true, ..Default::default() };
+    let no_ballpark = TransformOptions { allow_ballpark: Some(false), ..Default::default() };
+    let dst = SpatialRef::parse("EPSG:6319").unwrap();
+    for (src, z) in [("EPSG:6318+5703", 100.0), ("EPSG:6318+6360", 100.0 / 0.3048006096012192), ("EPSG:6318+8228", 100.0 / 0.3048)] {
+        let src = SpatialRef::parse(src).unwrap();
+        let t = Transformer::with_options(&src, &dst, &only_best).unwrap();
+        assert!(matches!(t.transform_3d(-97.0, 30.0, z), Err(Error::MissingGrid(_))), "{src:?}");
+        let t = Transformer::with_options(&src, &dst, &no_ballpark).unwrap();
+        assert!(matches!(t.transform_3d(-97.0, 30.0, z), Err(Error::NoOperation(_))), "{src:?}");
+        let t = Transformer::new(&src, &dst).unwrap();
+        let (_, _, h) = t.transform_3d(-97.0, 30.0, z).unwrap();
+        assert!((h - 100.0).abs() < 1e-9, "{h}");
+        let op = t.operation_at(-97.0, 30.0, z).unwrap().unwrap();
+        assert!(op.ballpark && op.name == "Ballpark vertical transformation", "{op:?}");
+    }
+}
+
+#[test]
 fn global_latitude_of_origin_validation_matches_proj() {
     // GDAL 3.12.2 / PROJ 9.8.1 rejects these during CRS creation even
     // when the particular projection does not use an origin latitude.

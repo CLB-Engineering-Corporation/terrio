@@ -35,3 +35,11 @@
   previously treated as ordinary east/north coordinates. This matches GDAL's
   traditional GIS axis strategy; ordinary north/east Earth axes still use
   longitude, latitude order.
+- Vertical CRSs without geoid models of their own now use those of the vertical
+  CRSs of their datum, as PROJ does. NAVD88 height in US survey feet
+  (EPSG:6360) or feet (EPSG:8228) and NAVD88 depth (EPSG:6357, EPSG:6358) go
+  through GEOID18 like NAVD88 height (EPSG:5703), in both directions, with the
+  unit and direction converted. They previously only converted the unit,
+  an error of the geoid undulation (about 27 m in Texas):
+  `EPSG:6318+6360` to `EPSG:6319` at 30 N, 97 W turns 328.0833 ftUS
+  (100 m) into 73.4074 m, as PROJ 9.9.0, instead of 100 m.
