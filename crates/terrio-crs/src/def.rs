@@ -81,8 +81,8 @@ impl Vertical {
     pub fn from_epsg(code: u32) -> Option<Self> {
         let v = epsg::vertical(code)?;
         // The table does not name geoid models: `WGS 84 to EGM96 height`, as PROJ names them
-        // without the EPSG index (`(1)`), after the vertical CRS they are defined to (`NAD83(2011)
-        // to NAVD88 height` for NAVD88 height (ftUS), which uses NAVD88 height's).
+        // without the EPSG index (`(1)`). A model borrowed from another vertical CRS of the datum
+        // is named after that CRS: NAVD88 height (ftUS) uses `NAD83(2011) to NAVD88 height`.
         let named = |g: u32, vc: u32, ops: Vec<Arc<datum::Op>>| -> Vec<Arc<datum::Op>> {
             let Some(geog) = epsg::get(g) else { return ops };
             let Some(to) = epsg::vertical(vc) else { return ops };

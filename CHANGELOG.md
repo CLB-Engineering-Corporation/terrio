@@ -62,7 +62,7 @@
   (EPSG:6360) or feet (EPSG:8228) and NAVD88 depth (EPSG:6357, EPSG:6358) go
   through GEOID18 like NAVD88 height (EPSG:5703), in both directions, with the
   unit and direction converted. They previously only converted the unit,
-  an error of the geoid undulation (about 27 m in Texas):
+  an error of the geoid undulation (about 21 to 28 m across Texas):
   `EPSG:6318+6360` to `EPSG:6319` at 30 N, 97 W turns 328.0833 ftUS
   (100 m) into 73.4074 m, as PROJ 9.9.0, instead of 100 m.
 

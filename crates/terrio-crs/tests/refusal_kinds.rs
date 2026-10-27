@@ -77,6 +77,30 @@ fn vertical_crs_in_feet_refuses_a_missing_geoid_grid_as_in_metres() {
 }
 
 #[test]
+fn geoid_model_without_a_grid_free_operation_refuses_a_missing_grid_as_proj() {
+    // No installed or downloadable grids in this test executable.
+    terrio_crs::set_grid_search_paths(Some(vec![]));
+    terrio_crs::set_network_enabled(Some(false));
+    // DKMSL(2022) depth (EPSG:10547) has one geoid model, ETRS89 to DKMSL(2022) depth
+    // (dk_sdfi_dkmsl_2022.tif), and no operation without a grid. PROJ 9.9.0 (cs2cs, network off,
+    // no grids) refuses it with --only-best (`Grid dk_sdfi_dkmsl_2022.tif is not available`) and
+    // --no-ballpark, and by default keeps the height: depth 10 m at 56 N, 10.5 E is -10 m above
+    // the ETRS89 ellipsoid, and back.
+    let only_best = TransformOptions { only_best: true, ..Default::default() };
+    let no_ballpark = TransformOptions { allow_ballpark: Some(false), ..Default::default() };
+    for (a, b) in [("EPSG:4258+10547", "EPSG:4937"), ("EPSG:4937", "EPSG:4258+10547")] {
+        let (src, dst) = (SpatialRef::parse(a).unwrap(), SpatialRef::parse(b).unwrap());
+        let t = Transformer::with_options(&src, &dst, &only_best).unwrap();
+        let r = t.transform_3d(10.5, 56.0, 10.0);
+        assert!(matches!(r, Err(Error::MissingGrid(_))), "{a} to {b}: {r:?}");
+        let r = Transformer::with_options(&src, &dst, &no_ballpark).and_then(|t| t.transform_3d(10.5, 56.0, 10.0));
+        assert!(matches!(r, Err(Error::NoOperation(_))), "{a} to {b}: {r:?}");
+        let (_, _, h) = Transformer::new(&src, &dst).unwrap().transform_3d(10.5, 56.0, 10.0).unwrap();
+        assert!((h + 10.0).abs() < 1e-9, "{a} to {b}: {h}, PROJ -10");
+    }
+}
+
+#[test]
 fn global_latitude_of_origin_validation_matches_proj() {
     // GDAL 3.12.2 / PROJ 9.8.1 rejects these during CRS creation even
     // when the particular projection does not use an origin latitude.

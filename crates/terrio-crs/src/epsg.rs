@@ -653,9 +653,12 @@ pub(crate) fn geoid_models(vertical: u32) -> Vec<(u32, u32, Vec<Arc<Op>>)> {
             })
             .collect()
     };
+    // Its own models when it has any, even when none is usable with the grids available.
     if let Some(list) = t.geoids.get(&vertical) {
         return models(vertical, list);
     }
+    // One vertical CRS of the datum has models in the table (`datum_fallbacks_have_one_source`),
+    // so PROJ's choice does not depend on an order among them.
     let Some(datum) = self::vertical(vertical).map(|v| v.datum).filter(|d| *d != 0) else { return Vec::new() };
     let mut same: Vec<u32> = t.geoids.keys().copied().filter(|&c| self::vertical(c).is_some_and(|v| v.datum == datum)).collect();
     same.sort_unstable();
@@ -709,6 +712,43 @@ mod tests {
             let t = crate::Transformer::new(&crs, &crs).unwrap();
             assert_eq!(t.transform_3d(1.0, 2.0, 3.0).unwrap(), (1.0, 2.0, 3.0));
         }
+    }
+
+    /// The vertical CRSs that use the geoid models of another vertical CRS of their datum, with
+    /// it. Each datum has one vertical CRS with models, so the models used are those PROJ chains
+    /// (PROJ 9.9.0, checked for each). Another would need ordering as PROJ does.
+    #[test]
+    fn datum_fallbacks_have_one_source() {
+        let t = table();
+        let mut fallbacks: Vec<(u32, u32)> = Vec::new();
+        for &code in t.verticals.keys() {
+            if t.geoids.contains_key(&code) {
+                continue;
+            }
+            let models = geoid_models(code);
+            let mut sources: Vec<u32> = models.iter().map(|(_, v, _)| *v).collect();
+            sources.dedup();
+            assert!(sources.len() <= 1, "EPSG:{code} uses the models of {sources:?}");
+            if let Some(&v) = sources.first() {
+                fallbacks.push((code, v));
+            }
+        }
+        fallbacks.sort_unstable();
+        let expected = [
+            (5715, 5714),
+            (6357, 5703),
+            (6358, 5703),
+            (6360, 5703),
+            (8050, 5714),
+            (8051, 5714),
+            (8052, 5714),
+            (8053, 5714),
+            (8228, 5703),
+            (8358, 8357),
+            (10364, 5780),
+            (10919, 10918),
+        ];
+        assert_eq!(fallbacks, expected);
     }
 
     #[test]

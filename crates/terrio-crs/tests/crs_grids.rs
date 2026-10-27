@@ -168,6 +168,20 @@ fn geoid_models_of_the_vertical_datum_match_proj() {
     let op = t.operation_at(-97.0, 30.0, 100.0 / ftus).unwrap().unwrap();
     assert!(op.grids.iter().any(|g| g == "us_noaa_g2018u0.tif") && !op.ballpark, "{op:?}");
     assert!(op.name.contains("NAVD88 height"), "{op:?}");
+    // Another datum: COH88 2025 (NAVD88) height (ftUS) (EPSG:10919) uses COH88 2025 (NAVD88)
+    // height's model (EPSG:10918, us_noaa_g2018u0.tif on CSRN epoch 2025.0). PROJ 9.9.0 at
+    // 121.5 W, 38.5 N: 328.0833 ftUS (100 m) is 69.06119918824336 m above NAD83(2011), as from
+    // 100 m in EPSG:10918 (69.06119918824339), and back.
+    let h = 69.06119918824336;
+    for (src, z) in [("EPSG:6318+10918", 100.0), ("EPSG:6318+10919", 100.0 / ftus)] {
+        let (_, _, r) = run(src, "EPSG:6319", (-121.5, 38.5, z));
+        assert!((r - h).abs() < 1e-8, "{src} to EPSG:6319: {r}, PROJ {h}");
+    }
+    let (_, _, z) = run("EPSG:6319", "EPSG:6318+10919", (-121.5, 38.5, h));
+    assert!((z - 100.0 / ftus).abs() < 1e-8, "EPSG:6319 to EPSG:6318+10919: {z}, PROJ {}", 100.0 / ftus);
+    let t = Transformer::new(&crs("EPSG:6318+10919"), &crs("EPSG:6319")).unwrap();
+    let op = t.operation_at(-121.5, 38.5, 100.0 / ftus).unwrap().unwrap();
+    assert!(op.grids.iter().any(|g| g == "us_noaa_g2018u0.tif") && op.name.contains("COH88 2025 (NAVD88) height"), "{op:?}");
 }
 
 #[test]
