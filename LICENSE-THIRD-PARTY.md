@@ -6524,6 +6524,7 @@ Used by:
 - [r-efi 6.0.0](https://github.com/r-efi/r-efi)
 - [rand 0.10.3](https://github.com/rust-random/rand)
 - [rstar 0.12.2](https://github.com/georust/rstar)
+- [rstar 0.13.0](https://github.com/georust/rstar)
 - [rustc-hash 2.1.3](https://github.com/rust-lang/rustc-hash)
 - [ryu 1.0.23](https://github.com/dtolnay/ryu)
 - [seq-macro 0.3.6](https://github.com/dtolnay/seq-macro)
