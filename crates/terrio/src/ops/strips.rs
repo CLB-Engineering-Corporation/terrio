@@ -35,8 +35,9 @@ fn rows_of(bytes: usize, width: usize, bands: usize, value_size: usize, block: O
 }
 
 /// Whether writing `output` would overwrite one of `inputs` (the same file, under any name, and on
-/// Unix a hard link to it): those inputs are read whole before the output is written. Off Unix, a
-/// hard link to an input is not detected (see `is_same_file`).
+/// Unix a hard link to it): those inputs are read whole before the output is written. Callers
+/// that would otherwise stream them take no memory budget, so a large input is held in full.
+/// Off Unix, a hard link to an input is not detected (see `is_same_file`).
 pub(crate) fn overwrites(output: &str, inputs: &[String]) -> bool {
     let output_path = std::path::Path::new(output);
     let out = std::fs::canonicalize(output_path).or_else(|error| {
