@@ -134,6 +134,12 @@ enum Command {
     Warp(cmd::warp::Args),
     /// Read an indexed raster catalog, selecting tiles spatially and compositing in z-order.
     Catalog(cmd::catalog::Args),
+    /// Create a raster footprint index, with optional GTI metadata.
+    RasterIndex(cmd::tile_index::RasterArgs),
+    /// Create a raster footprint catalog with GTI virtual-raster metadata.
+    GtiCreate(cmd::tile_index::RasterArgs),
+    /// Create a vector envelope index of vector dataset layers.
+    VectorIndex(cmd::tile_index::VectorArgs),
     /// Mosaic rasters into one, or into a virtual raster (like gdalbuildvrt and gdal_merge).
     Mosaic(cmd::mosaic::Args),
     /// Terrain analysis: hillshade, slope, aspect, color relief, TRI, TPI, roughness (like gdaldem).
@@ -164,6 +170,8 @@ enum Command {
     FillNodata(cmd::fill_nodata::Args),
     /// Apply band scales and offsets to get physical values (like gdal raster unscale).
     Unscale(cmd::pixel::UnscaleArgs),
+    /// Blend two Byte images with alpha and opacity.
+    Blend(cmd::pixel::BlendArgs),
     /// Replace nodata values with an alpha band (like gdal raster nodata-to-alpha).
     NodataToAlpha(cmd::pixel::NodataToAlphaArgs),
     /// Map values or ranges of values to new values (like gdal raster reclassify).
@@ -293,6 +301,8 @@ fn run_on_this_thread(args: Vec<OsString>, terrio: Option<Vec<OsString>>) -> i32
         Command::Translate(a) => cmd::translate::run(a),
         Command::Warp(a) => cmd::warp::run(a),
         Command::Catalog(a) => cmd::catalog::run(a),
+        Command::RasterIndex(a) | Command::GtiCreate(a) => cmd::tile_index::raster(a),
+        Command::VectorIndex(a) => cmd::tile_index::vector(a),
         Command::Mosaic(a) => cmd::mosaic::run(a),
         Command::Dem(a) => cmd::dem::run(a),
         Command::Calc(a) => cmd::calc::run(a),
@@ -306,6 +316,7 @@ fn run_on_this_thread(args: Vec<OsString>, terrio: Option<Vec<OsString>>) -> i32
         Command::Sieve(a) => cmd::sieve::run(a),
         Command::FillNodata(a) => cmd::fill_nodata::run(a),
         Command::Unscale(a) => cmd::pixel::unscale(a),
+        Command::Blend(a) => cmd::pixel::blend(a),
         Command::NodataToAlpha(a) => cmd::pixel::nodata_to_alpha(a),
         Command::Reclassify(a) => cmd::pixel::reclassify(a),
         Command::AsFeatures(a) => cmd::pixel::as_features(a),

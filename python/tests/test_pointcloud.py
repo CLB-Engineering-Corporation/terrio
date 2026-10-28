@@ -104,6 +104,39 @@ def test_reproject_and_layer():
     assert set(fc["features"][0]["properties"]) == {"z", "classification"}
 
 
+@pytest.mark.parametrize("ext", ["las", "laz"])
+def test_reproject_heights(tmp_path, ext):
+    # NAVD88 height (ftUS) to NAVD88 height: PROJ 9.9.0 turns 300 ftUS into 91.44018288036575 m.
+    pc = terrio.PointCloud.from_dict(
+        {
+            "x": np.array([3000000.0, 3000100.0]),
+            "y": np.array([13800000.0, 13800100.0]),
+            "z": np.array([300.0, -12.5]),
+        },
+        crs="EPSG:6588+6360",
+    )
+    src, out = tmp_path / f"ft.{ext}", tmp_path / f"m.{ext}"
+    pc.write(str(src), scale=(0.01, 0.01, 0.001))
+    terrio.convert_points(str(src), str(out), t_srs="EPSG:6588+5703")
+    np.testing.assert_allclose(
+        terrio.read_points(str(out))["z"],
+        [91.44018288036575, -12.5 * 0.3048006096012192],
+        atol=1e-3,
+    )
+    np.testing.assert_allclose(
+        pc.reproject("EPSG:6588+5703")["z"], [91.44018288036575, -3.81000762001524], atol=1e-9
+    )
+    # Without heights in the target, z is kept; without heights in the source, it is kept too
+    # and a warning says so.
+    assert terrio.read_points(str(src)).reproject("EPSG:6588")["z"][0] == pytest.approx(300.0)
+    flat = terrio.PointCloud.from_dict(
+        {"x": np.array([3000000.0]), "y": np.array([13800000.0]), "z": np.array([300.0])},
+        crs="EPSG:6588",
+    )
+    with pytest.warns(UserWarning, match="no vertical CRS"):
+        assert flat.reproject("EPSG:6588+5703")["z"][0] == 300.0
+
+
 def laspy_or_skip():
     return pytest.importorskip("laspy")
 

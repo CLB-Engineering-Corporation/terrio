@@ -140,21 +140,28 @@ fn pixel_tools_are_discoverable_and_execute() {
     let (unscaled, alpha, classes, pixels) = (path("unscaled.tif"), path("alpha.tif"), path("classes.tif"), path("pixels.csv"));
     let input = input.to_str().unwrap();
     let at_mapping = format!("@{}", mapping.to_str().unwrap());
+    let image = path("byte.tif");
+    let blended = path("blended.tif");
+    let cfg = terrio::RasterConfig { cols: 3, rows: 1, data_type: terrio::DataType::U8, ..Default::default() };
+    let raster = terrio::RasterDataset::new(terrio::Raster::from_data(cfg, vec![30., 80., 170.]).unwrap(), false);
+    terrio::write_raster_dataset(&raster, &image, &Default::default()).unwrap();
     let replies = session(&[
         json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}),
         call(2, "unscale", &[input, &unscaled, "--ot", "Float64"]),
         call(3, "nodata-to-alpha", &[input, &alpha]),
         call(4, "reclassify", &[input, &classes, "-m", &at_mapping]),
         call(5, "as-features", &[input, &pixels, "--skip-nodata", "--include-row-col"]),
+        call(6, "blend", &[&image, &image, &blended, "--operator", "multiply"]),
     ]);
     let tools = replies[&1]["result"]["tools"].as_array().unwrap();
-    for name in ["unscale", "nodata-to-alpha", "reclassify", "as-features"] {
+    for name in ["unscale", "nodata-to-alpha", "reclassify", "as-features", "blend"] {
         assert!(tools.iter().any(|t| t["name"] == name), "{name}");
     }
-    for id in 2..=5 {
+    for id in 2..=6 {
         assert_eq!(replies[&id]["result"]["isError"], false, "{:?}", replies[&id]);
     }
     assert_eq!(terrio::open_raster(&unscaled).unwrap().raster.data_type, terrio::DataType::F64);
+    assert_eq!(terrio::open_raster(&blended).unwrap().raster.data.get_f64(0), 4.);
     let a = terrio::open_raster(&alpha).unwrap();
     assert_eq!((a.raster.bands, a.raster.get(1, 0, 1), a.raster.get(1, 0, 2)), (2, 0.0, 255.0));
     let c = terrio::open_raster(&classes).unwrap();
@@ -328,6 +335,42 @@ fn tilted_perspective_coordinates_and_backside_refusal_through_mcp() {
 }
 
 #[test]
+fn interrupted_goode_homolosine_coordinates_and_refusal_through_mcp() {
+    // rust-proj-capability's seed-igh fixture (PROJ 9.9.0), and a point in the interruption
+    // between the northern lobes, which PROJ's inverse refuses.
+    let target = "+proj=igh +datum=WGS84 +units=m +no_defs";
+    let replies = session(&[
+        call(1, "crs", &["OGC:CRS84", "--to", target, "147", "-42"]),
+        call(2, "crs", &[target, "--to", "OGC:CRS84", "-4110000", "7840000"]),
+    ]);
+    assert_eq!(replies[&1]["result"]["isError"], false);
+    let values: Vec<f64> =
+        replies[&1]["result"]["content"][0]["text"].as_str().unwrap().split_whitespace().filter_map(|v| v.parse().ok()).collect();
+    assert_eq!(values.len(), 2);
+    assert!((values[0] - 16168031.516279552).abs() < 0.001);
+    assert!((values[1] + 4674913.235357148).abs() < 0.001);
+    assert_eq!(replies[&2]["result"]["isError"], true);
+}
+
+#[test]
+fn oblique_mollweide_coordinates_and_refusal_through_mcp() {
+    // rust-proj-capability's seed-ob_tran-moll fixture (PROJ 9.9.0), and a point beyond the
+    // rotated Mollweide's ellipse, which PROJ's inverse refuses.
+    let target = "+proj=ob_tran +o_proj=moll +o_lon_p=0 +o_lat_p=45 +lon_0=147 +datum=WGS84 +units=m +no_defs";
+    let replies = session(&[
+        call(1, "crs", &["OGC:CRS84", "--to", target, "147", "-42"]),
+        call(2, "crs", &[target, "--to", "OGC:CRS84", "40000000", "0"]),
+    ]);
+    assert_eq!(replies[&1]["result"]["isError"], false);
+    let values: Vec<f64> =
+        replies[&1]["result"]["content"][0]["text"].as_str().unwrap().split_whitespace().filter_map(|v| v.parse().ok()).collect();
+    assert_eq!(values.len(), 2);
+    assert!(values[0].abs() < 0.001);
+    assert!((values[1] + 8921410.650523769).abs() < 0.001);
+    assert_eq!(replies[&2]["result"]["isError"], true);
+}
+
+#[test]
 fn vector_geometry_tools_are_discoverable_and_execute() {
     let dir = tempfile::tempdir().unwrap();
     let input = dir.path().join("line.geojson");
@@ -474,7 +517,7 @@ fn file_lists_are_refused_without_reading_the_file() {
     let tools = replies[&2]["result"]["tools"].as_array().unwrap();
     let description = |name: &str| tools.iter().find(|t| t["name"] == name).unwrap()["description"].as_str().unwrap().to_string();
     // `filter merge` is reached through the `filter` tool, whose description lists subcommands.
-    for name in ["mosaic", "warp", "concat", "filter"] {
+    for name in ["mosaic", "warp", "concat", "filter", "raster-index", "vector-index", "gti-create"] {
         let d = description(name);
         assert!(d.ends_with("Over MCP, `@FILE` lists are refused: pass each input as an item of `args`."), "{name}: {d}");
     }
@@ -491,4 +534,22 @@ fn file_lists_are_refused_without_reading_the_file() {
     let text = result["content"][0]["text"].as_str().unwrap();
     assert!(text.contains("@FILE lists are not read in MCP tool calls"), "{text}");
     assert!(!text.contains("line-that-must-not-leak"), "{text}");
+}
+
+#[test]
+fn index_tools_are_discoverable_and_execute() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("roads.geojson");
+    let output = dir.path().join("index.gpkg");
+    std::fs::write(&input, r#"{"type":"FeatureCollection","features":[{"type":"Feature","properties":{},"geometry":{"type":"LineString","coordinates":[[0,0],[2,3]]}}]}"#).unwrap();
+    let replies = session(&[
+        json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}),
+        call(2, "vector-index", &[input.to_str().unwrap(), output.to_str().unwrap()]),
+    ]);
+    let tools = replies[&1]["result"]["tools"].as_array().unwrap();
+    for name in ["raster-index", "vector-index", "gti-create"] {
+        assert!(tools.iter().any(|t| t["name"] == name), "missing {name}");
+    }
+    assert_eq!(replies[&2]["result"]["isError"], false);
+    assert_eq!(terrio::open_vector(output.to_str().unwrap(), &Default::default()).unwrap().layers[0].len(), 1);
 }

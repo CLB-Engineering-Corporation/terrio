@@ -13,6 +13,8 @@ are ported from PROJ (https://proj.org).
 The Mollweide and Wagner IV/V formulas follow src/projections/moll.cpp at PROJ commit
 5fa31c29f0a806568ed7bc76c1a557604db4a804.
 The near-sided and tilted perspective formulas follow src/projections/nsper.cpp in PROJ 9.8.1.
+The interrupted Goode homolosine follows src/projections/igh.cpp in PROJ 9.8.1.
+The general oblique transformation follows src/projections/ob_tran.cpp in PROJ 9.8.1.
 The normalized Cartesian inverse follows src/conversions/cart.cpp in PROJ 9.7.0.
   Copyright (c) 2016, Thomas Knudsen / SDFE
 
@@ -57,7 +59,8 @@ crates/terrio-crs/data/epsg.tsv.zst and crates/terrio-crs/data/datums.tsv.zst ar
 Geodetic Parameter Dataset (https://epsg.org), copyright the International Association of Oil &
 Gas Producers (IOGP), through PROJ's database and GDAL. They are redistributed under the EPSG
 terms of use (https://epsg.org/terms-of-use.html), with this attribution. They are not the EPSG
-Dataset itself, and terrio is not endorsed by IOGP.
+Dataset itself, and terrio is not endorsed by IOGP. The EPSG method and parameter names and codes
+in crates/terrio-crs/src/projjson_write.rs come from the same dataset.
 
 -------------------------------------------------------------------------------
 Esri projection engine data
@@ -85,8 +88,8 @@ under PROJ's MIT terms reproduced above.
 
 CRS benchmark reference data
 ----------------------------
-The pair-4979-4978, pair-mars-iau, form-27700-projjson, seed-tpers and edge-tpers-back
-numeric fixtures are from Michael Sumner's rust-proj-capability
+The pair-4979-4978, pair-mars-iau, form-27700-projjson, seed-tpers, edge-tpers-back,
+seed-igh and seed-ob_tran-moll numeric fixtures are from Michael Sumner's rust-proj-capability
 (https://github.com/mdsumner/rust-proj-capability), revision
 ddd9fac70ec370acd9651ebb8b46035207347ad5, generated with PROJ 9.9.0.
 The CRS-study oracle version is retained separately from projection-suite data.

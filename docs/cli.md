@@ -16,6 +16,9 @@ terrio <COMMAND>
   update          Update or append vector features by key or FID (like gdal vector update)
   translate       Subset, resize, rescale or change the type of a raster (like gdal_translate)
   warp            Reproject and resample rasters (like gdalwarp)
+  raster-index    Create raster footprint indexes
+  vector-index    Create vector layer-envelope indexes
+  gti-create      Create GTI-compatible catalogs (raster-index options)
   catalog         Read an indexed raster mosaic from GeoPackage or FlatGeobuf footprints
   mosaic          Mosaic rasters into one, or into a virtual raster (like gdalbuildvrt and gdal_merge)
   rasterize       Burn vector geometries into a raster
@@ -52,6 +55,7 @@ terrio <COMMAND>
 
   viewshed        Single-observer visibility or minimum visible height (like gdal_viewshed)
   sieve           Merge raster areas smaller than a threshold into their largest neighbour (like gdal_sieve.py)
+  blend           Compose Byte images with ten operators, alpha and opacity (like gdal raster blend)
   unscale         Apply band scales and offsets to get physical values (like gdal raster unscale)
   nodata-to-alpha Replace nodata values with an alpha band (like gdal raster nodata-to-alpha)
   reclassify      Map values or ranges of values to new values (like gdal raster reclassify)
@@ -1250,7 +1254,7 @@ Unlike `gdalenhance`, Terrio does not save the histograms it computes in an
 ## crs
 
 ```sh
-terrio crs CRS [--wkt]
+terrio crs CRS [--wkt] [--projjson]
 terrio crs SRC --to DST [--s_coord_epoch YEAR] [--t_coord_epoch YEAR] X Y [X Y ...]
 echo "X Y [Z [T]]" | terrio crs SRC --to DST [--s_coord_epoch YEAR] [--t_coord_epoch YEAR]
 ```
@@ -1258,7 +1262,9 @@ echo "X Y [Z [T]]" | terrio crs SRC --to DST [--s_coord_epoch YEAR] [--t_coord_e
 As `gdaltransform`: lines of standard input with a height transform it too, with a time (a decimal
 year) use it for time-dependent transformations, and a point that cannot be transformed prints
 `transformation failed.`. Datum shift grids and geoid models are used when they can be found (see
-[Coordinate Systems](crs.md#datum-shift-grids)).
+[Coordinate Systems](crs.md#datum-shift-grids)). `--projjson` prints only the CRS as PROJJSON, so that
+`terrio crs CRS --projjson > crs.json` writes a PROJJSON file (see
+[Writing PROJJSON](crs.md#writing-projjson)); it cannot be combined with `--to` or `--wkt`.
 
 ## formats
 
@@ -1515,26 +1521,57 @@ an empty directory; `--skip-errors` records the refusal in its error report.
 
 Bucket/container roots are synthetic directories across S3, GCS and Azure URL forms;
 `stat` does not verify their existence or access. Listing performs that verification.
-Recursive deletes stop at the first failure and can leave a partially deleted tree or prefix;
+Recursive deletes stop at the first failure (on S3, after the first failing batch of up to
+1,000 keys, all of which were attempted) and can leave a partially deleted tree or prefix;
 the error does not include a partial deletion count. Inspect the remaining entries before retrying.
-An untyped HTTP file copy currently uses three requests: a bounded 4096-byte index sniff,
-a one-byte size probe, and the payload GET. A server may send additional bytes before the
-sniff connection closes; `--stats` counts bytes consumed by Terrio, not packets on the wire.
+A plain HTTP URL is first requested for one byte when it is copied, synchronized or described
+without a trailing `/`: a response typed other than HTML is a file, so a copy uses two
+requests (that probe and the payload GET), also from servers that ignore `Range`. An HTML or
+untyped response, or a missing one, is then probed as an index page (a bounded 4096-byte sniff
+of `URL/`), so an untyped file copy uses three requests; a directory named without its `/`
+costs that one extra request. Listings, and URLs ending with `/`, fetch the index page first.
+On a server that has both an object `dir` typed other than HTML and an index page at `dir/`
+(possible with object-store-backed HTTP), `dir` names the object, as in GDAL; `dir/` names
+the directory.
+A server may send additional bytes before the sniff connection closes; `--stats` counts bytes
+consumed by Terrio, not packets on the wire. The requests of one command share connections
+(and TLS sessions) to a host, and a remote archive's members are read through one reader and
+its block cache.
 Credential-bearing URL queries are redacted in diagnostics and listing names.
 VSI mutation/listing operations require complete object-store listings; capped
 read-only subdirectory discovery retains its existing warning and partial results
 for readers such as Zarr.
 
-Recursive object-store listings include directories implied by keys; GDAL omits those
-implied directory entries. `--skip-errors` continues copying but exits nonzero when
-any files fail. Signed S3 file uploads read the source once to calculate its SHA-256 and once
-to send the body (twice the file size in local reads); ETag sync can add a separate MD5 pass.
-Payload hashes are retained for compatibility with signed endpoints that require them.
+Recursive object-store listings include directories implied by keys; GDAL omits those implied
+directory entries. `--skip-errors` continues copying but exits nonzero when any files fail.
+Signed S3 uploads of local files up to 8 MiB read them once, into memory, to calculate their
+SHA-256 and send them, with the payload hash signed. Larger local files sent over HTTPS are
+signed with `x-amz-content-sha256: UNSIGNED-PAYLOAD`, as the AWS SDKs sign S3 uploads over
+HTTPS, and read once, streaming the body (a retried, redirected or re-routed request sends it
+again): the signature then covers the request's headers but not its body, which TLS protects in
+transit (no extra checksum header is sent, since one would need another pass over the file).
+Without a payload hash, the service cannot tell that a file changed while it was sent, so its
+size and modification time are compared before and after the upload, which fails if they
+differ. This is best effort: a same-size change within the file system's timestamp resolution
+is not detected. An S3-compatible service that refuses `UNSIGNED-PAYLOAD` rejects these
+uploads; send them over HTTP to keep the payload signed, only over a trusted connection: plain
+HTTP does not encrypt the request body or headers, including `x-amz-security-token` for
+temporary credentials. Over plain HTTP (`AWS_HTTPS=NO`, or an
+`http://` `AWS_S3_ENDPOINT`; an endpoint given with `https://` keeps HTTPS whatever `AWS_HTTPS`
+says), larger files keep a signed payload hash and are read once to calculate it and once to
+send the body (twice the file size in local reads). Uploads staged through a temporary file
+(from remote, in-memory or archive sources) are hashed as they are staged, read once and signed
+over their payload. ETag sync can add a separate MD5 pass.
+Recursive S3 deletion sends up to 1,000 keys per `DeleteObjects` request, directory markers
+only once the objects are deleted, reporting the first key the service could not delete; a
+service that answers that it does not implement it (405, 501, or 400 `NotImplemented`) is sent
+one `DELETE` per key, as are keys with control characters, which XML cannot carry, between the
+batches around them. Azure blobs are deleted one request each.
 
 Differences from GDAL (checked with 3.13.3): entries are sorted (GDAL prints local directories in the order
 the file system returns them); dates are UTC (a zip member's date is its stored DOS time, as
 GDAL prints it); HTTP index names stay percent-encoded, as GDAL keeps them. Not supported:
-`sync -j/--num-threads` (requests are sequential, including one S3 delete request per key), multipart uploads (objects over 5 GiB), Azure
+`sync -j/--num-threads` (requests are sequential), multipart uploads (objects over 5 GiB), Azure
 shared-key authentication, writing to Google Cloud Storage's own API, empty directory
 creation on destinations that cannot represent them (local directories are supported; S3 uses marker keys), progress bars, and the virtual file
 systems `/vsigzip/`, `/vsi7z/`, `/vsirar/`, `/vsiswift/`, `/vsioss/`, `/vsiadls/`, `/vsihdfs/`
@@ -1826,7 +1863,10 @@ on stderr and in MCP tool result text. Heights follow GDAL too: between CRSs wit
 heights, keeping a vertical CRS's heights as they are (PROJ's ballpark vertical
 transformation) fails with `ALLOW_BALLPARK=NO`, and with `ONLY_BEST=YES` when a
 geoid model or vertical transformation exists but does not apply (its grid is
-missing, or the point is outside it).
+missing, or the point is outside it). With default options, heights not converted
+because a geoid model covering the point did not apply (its grid is missing, could not
+be read or downloaded, or has no value at the point) are reported by a warning, as a
+missing horizontal grid is.
 `PROMOTE_TO_3D=YES` takes the heights of 2D CRSs as ellipsoidal heights, so that
 datum transformations change them, as GDAL does after `PromoteTo3D` on both CRSs
 (`terrio crs EPSG:28992 --to EPSG:4979 --dim 3 85000 447000 0 --ct-opt PROMOTE_TO_3D=YES`).
@@ -1914,9 +1954,147 @@ attributes. The containing directory must be writable. The TIFF is committed bef
 its histogram or external-overview sidecar: a later sidecar error can leave the TIFF
 updated with an unchanged sidecar.
 
-Building overviews reads the whole full-resolution image, and its mask, into memory
-once, shared by every level computed from it: memory grows with the raster. Partial
-refreshes (`--refresh --bbox`) keep window reads. Overview and raster-update
+Building or wholly refreshing overviews reads the full-resolution sources the levels need
+(the image, its mask, or both) once, forward, in full-width strips of whole blocks (about
+64 MB of values at a time, and at least a row of blocks, which on very wide tiled rasters is
+larger). Every level computed from full resolution is computed in that
+pass: in GDAL's chunks of rows (`GDALRegenerateOverviewsEx`, 5 to 10 MB of values per
+band), or in strips holding every source window (`GDALRegenerateOverviewsMultiBand`'s
+schedule), with the pixels of a whole read. A level computed from the previous one reads
+that level, held in memory. Memory is therefore bounded by a read strip, a chunk and the
+levels: the first level (a quarter of the pixels for factor 2) and the one being computed,
+or every level at once (about a third of the pixels for 2, 4, 8...) when GDAL computes
+each from full resolution. That is the case for nearest overviews, and overviews of rasters
+with a mask, which GDAL computes band by band: planar images, and uncompressed external
+overviews of images without an alpha band. A striped TIFF is read in whole strips, so a
+raster stored as a single strip is read whole. On a 16384x16384 Float32 DEM, five internal
+levels peaked at 478 MiB instead of 4.1 GiB. Partial refreshes (`--refresh --bbox`,
+`--like`) read the full-width rows over their region, and the whole image once when the
+region spans its height. Overview and raster-update
 arithmetic uses Float64 and warns for Int64/UInt64: values above 2^53 may lose precision,
 including nearest/mode overviews. Raster update holds the warped window and the full
 width of the destination rows it rewrites in memory.
+
+### blend
+
+`terrio blend COLOR OVERLAY OUTPUT --operator multiply --opacity 75` composes
+same-sized Byte images by pixel position. CLI/MCP `blend`, Rust
+`ops::blend::blend`, Python `terrio.blend(src, overlay, dst=None, operator=..., opacity=...)`
+and JavaScript `blend(src, overlay, {operator, opacity})` share the implementation.
+
+Operators are `src-over` (default), `hsv-value`, `multiply`, `screen`, `overlay`,
+`hard-light`, `darken`, `lighten`, `color-dodge` and `color-burn`. Opacity is an integer
+percentage from 0 to 100 (default 100). One/two bands mean gray/gray-alpha;
+three/four mean RGB/RGBA, independently of color interpretation tags. GeoTIFF and
+PNG indexed images expand their palettes to RGBA. HSV requires RGB/RGBA color
+input; darken/lighten require equal color channel counts. Other types and complex
+images are refused. No alignment or reprojection is performed: prepare matching
+inputs with `warp` first. Transparency uses alpha; nodata and separate masks do
+not affect composition, matching GDAL. Palette expansion uses palette transparency
+and makes the palette nodata entry transparent.
+
+Output band count follows the color input, except multiply/screen/overlay/hard-light
+swap inputs when the overlay has more bands, as GDAL does. Output CRS and transform
+follow that effective color input. Outputs have color interpretations but no nodata,
+packing scales or descriptive metadata. Inputs and output are materialized in memory;
+this command does not offer GDAL's lazy GDALG pipeline output or append-as-subdataset
+mode. Standard raster format/compression/creation options apply.
+
+GDAL 3.13.3 has unsafe optimized paths when a non-swapping operator receives more
+overlay bands than color bands, and treats gray-alpha channels inconsistently in
+`src-over`. Terrio uses explicit gray/alpha semantics for these inputs. Conformance
+expands those reference inputs to RGBA and selects the corresponding output channels;
+it does not compare against GDAL's corrupted or misinterpreted output. GDAL's HSV
+fast path can repeat the first alpha row; Terrio retains the complete base alpha.
+Reference source-over and HSV reads use individual bands of a lazy GDALG
+pipeline to avoid those fast paths. The other operators use whole-dataset
+reference kernels: GDAL 3.13.3's generic per-band kernels process only the first
+sample.
+
+
+## Raster/vector indexes and GTI creation
+
+```sh
+terrio raster-index tiles/ catalog.gpkg --recursive --filename-filter '*.tif' --absolute-path
+terrio gti-create tiles/ catalog.fgb --filename-filter '*.tif' --absolute-path \
+  --output-crs EPSG:4326 --resolution 0.001,0.001 --band-count 1 --ot Float32 \
+  --nodata=-9999 --color-interpretation gray
+terrio vector-index roads.gpkg counties.geojson index.gpkg --accept-different-schemas \
+  --source-crs-field-name source_crs --output-crs EPSG:4326
+```
+
+`raster-index` writes affine corners when retaining the source CRS, and the
+suggested warped-grid envelope when changing CRS; `gti-create` uses the same
+operation with optional GTI virtual-raster metadata. `vector-index` writes one
+layer-envelope polygon with `filename,layer_index` locations; `--dataset-name-only`
+omits the suffix. `--source-layer-name` and zero-based `--source-layer-index` are
+repeatable and select their union across all inputs without renumbering layers.
+A selector absent from one input is allowed; absence from every input is an error. Different
+vector schemas/CRSs are skipped with warnings unless accepted with the corresponding
+flags; an explicit `--output-crs` reprojects corners. Empty vector layers are skipped.
+
+Inputs can be files, local directories, explicitly slash-terminated VSI directories,
+or `@FILE` lists. Directory scanning supports `--recursive` and repeatable case-sensitive
+`--filename-filter` patterns (`*` and `?`). `--absolute-path` stores absolute local paths. Otherwise, relative native path
+inputs are resolved relative to the written index directory, even when it differs
+from the working directory. In-memory source mappings keep their explicit stored
+locations verbatim; supply locations appropriate for the eventual catalog directory.
+Remote locations keep their query parameters, which can include access credentials;
+a warning is emitted without printing them. Use credential-free references and
+environment credentials when sharing catalogs. Signed-source open/list errors
+also omit query-bearing driver diagnostics.
+Raster `--skip-errors` skips unreadable inputs with a warning. Invalid options
+and typed-metadata conversion failures remain errors. Scanning without
+a filename filter is strict, as in GDAL: unrelated files and sidecars can fail
+the run. Use a filter or raster `--skip-errors` for mixed-content directories. Lazy-capable raster
+readers only inspect headers. Local GeoPackage/FlatGeobuf vector inputs use cached
+bounds when present; these cached bounds are trusted, so stale source extents must
+be refreshed before indexing. Other paths, including remote datasets, scan features in chunks where supported.
+
+Both index commands support `--location-name`, `--output-layer`, `--output-crs`,
+`--source-crs-field-name`, `--source-crs-format auto|WKT|EPSG|PROJ`, `--format`
+and repeatable `--metadata KEY=VALUE`. Raster layer names default to the output
+basename; vector layer names default to `tileindex`. These defaults also apply to Python
+and JavaScript serialization; before a raster index is given an output filename,
+its in-memory layer uses the placeholder `tileindex`. Explicit names are retained. Without an explicit target CRS, raster indexes skip incompatible source CRSs
+unless a source-CRS field is requested; with that field, they retain original
+coordinates and warn, matching GDAL. Supply a target CRS for a usable mixed-CRS catalog. Raster reprojection indexes the suggested warped-grid envelope, as GDAL 3.13
+does. Accepted mixed-CRS vector inputs retain original coordinates and warn;
+request a source-CRS field to retain their identity, or an output CRS to reproject.
+Consumers of mixed native-coordinate footprints must honor the per-feature CRS;
+the layer CRS alone does not describe every footprint. Vector reprojection transforms envelope corners without densification. Both
+require known source CRSs. For nonlinear transformations, vector corner envelopes
+can underestimate curved edges and miss features in spatial queries. Keep the
+source CRS, or construct densified footprints, when full edge coverage is required.
+
+Raster pixel-size filters use `sqrt(envelope_area / source_pixel_count)` after
+reprojection, including rotated rasters. The area uses the suggested warped-grid
+envelope, while the pixel count remains the original source width times height. Repeatable `--fetch-metadata KEY,FIELD,TYPE` copies header
+metadata as String, Integer or Real; the reserved GDAL key `{PIXEL_SIZE}` selects the computed size.
+Missing metadata becomes null; invalid numeric metadata is rejected. Integer
+`{PIXEL_SIZE}` fields truncate toward zero, matching GDAL. Non-finite Real metadata
+follows the output driver's representation; GeoPackage stores NaN as null, as GDAL does.
+GTI options
+include `--resolution x,y`, `--bbox xmin,ymin,xmax,ymax`, `--ot`, `--band-count`,
+repeatable/comma-separated `--nodata`, `--color-interpretation` and `--mask`.
+Nodata/color lists must contain one value or one per output band, inferred from
+the first source when `--band-count` is omitted. With explicit GTI characteristics,
+included sources must provide at least that many bands; a smaller explicit output
+count selects the leading bands. Ordinary footprint inventories retain heterogeneous
+band counts with a warning, as GDAL does; they may require `--band-count` for GTI
+pixel reads. Palette-to-RGB band expansion is not performed by the index writer. GeoPackage/FlatGeobuf preserve GTI metadata; open them with GDAL as `GTI:catalog.gpkg`
+or `GTI:catalog.fgb`. For relative tile references in GDAL 3.13.3, use
+`gdal raster info --if GTI catalog.gpkg` (or `gdal.OpenEx(..., allowed_drivers=["GTI"])`):
+that version has a `GTI:` prefix resolution bug during pixel reads. Terrio resolves
+these references directly against the index directory. Custom raster location fields are recorded in `LOCATION_FIELD`.
+
+This release creates new indexes and atomically replaces single-file outputs with
+`--overwrite`. Indexed source paths and aliases cannot be replaced, including
+files opened through Python mapping values whose stored labels differ from their
+paths. Unreadable inputs skipped by `--skip-errors` remain protected too.
+Shapefile outputs
+publish all components from staging and require a new basename even with `--overwrite`;
+`.shp.zip` writes an archive. GTI/custom metadata require GeoPackage or FlatGeobuf.
+Append/update, layer replacement, STAC-GeoParquet profiles, XML companion output and
+GDAL-specific creation options are outside this supported subset. Shapefile field
+width/type limits still apply. The three commands are also exposed as MCP tools.

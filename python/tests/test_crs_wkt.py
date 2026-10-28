@@ -229,6 +229,23 @@ def test_coordinate_operation_policy_and_warnings():
         terrio.set_network_enabled(None)
 
 
+def test_crs_to_projjson():
+    crs = trio.CRS.from_epsg(32632)
+    assert json.loads(crs.to_projjson())["conversion"]["name"] == "UTM zone 32N"
+    assert crs.to_dict(projjson=True)["type"] == "ProjectedCRS"
+    # Refused rather than written wrongly.
+    with pytest.raises(trio.errors.CRSError, match="lon_0"):
+        trio.CRS.from_user_input("+proj=longlat +lon_0=10 +datum=WGS84").to_projjson()
+
+
+def test_crs_to_projjson_exports_the_file_read_at_construction(tmp_path):
+    prj = tmp_path / "crs.prj"
+    prj.write_text(trio.CRS.from_epsg(32632).to_wkt())
+    crs = trio.CRS.from_user_input(str(prj))
+    prj.unlink()
+    assert json.loads(crs.to_projjson())["conversion"]["name"] == "UTM zone 32N"
+
+
 def test_transform_points_promotes_2d_crss_to_3d():
     # RD New to WGS 84 3D: the height is kept unless the 2D CRS is promoted (GDAL's PromoteTo3D).
     args = ([85000.0], [447000.0], "EPSG:28992", "EPSG:4979", [0.0])
