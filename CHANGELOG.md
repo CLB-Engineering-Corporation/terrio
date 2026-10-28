@@ -9,7 +9,7 @@
   (Rust: `color_relief_to_path`, and `ColorMap::parse_lazy` for color files with percentages).
   A path-to-path `terrio.dem` now returns the result opened lazily from `dst` instead of in
   memory; the pixels are unchanged. On a 15,000 x 12,000 Float32 DEM, a color relief with alpha
-  peaks at about 170 MiB instead of 7,569 MiB.
+  peaks at about 560 MiB (160 MiB with `max_memory_mib=256`) instead of 7,569 MiB.
 - `--max-memory` (CLI), `max_memory_mib` (Python) and `DemOptions::max_memory_mib` set the strip
   height from a memory budget, like `gdalwarp -wm` (by default, strips of about 64 MiB of input
   values, as before). The values do not depend on it.

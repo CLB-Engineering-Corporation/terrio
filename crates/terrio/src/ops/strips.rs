@@ -45,9 +45,9 @@ pub(crate) fn overwrites(output: &str, inputs: &[String]) -> bool {
         std::fs::canonicalize(parent).map(|parent| parent.join(name))
     });
     let Ok(out) = out else { return false };
-    inputs.iter().any(|p| {
-        is_same_file(output_path, p) || std::fs::canonicalize(p).is_ok_and(|p| p == out || (p.is_dir() && out.starts_with(&p)))
-    })
+    inputs
+        .iter()
+        .any(|p| is_same_file(output_path, p) || std::fs::canonicalize(p).is_ok_and(|p| p == out || (p.is_dir() && out.starts_with(&p))))
 }
 
 /// Whether `a` and `b` are the same file: the same device and inode on Unix, which a hard link
