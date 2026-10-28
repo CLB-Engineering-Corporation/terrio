@@ -9,6 +9,12 @@
   (`N37W120.hgt`), `.hgt.zip` archives, and the NASADEM and water body variants.
   Tiles are written as Int16 with -32768 for nodata; a grid of another size is
   refused.
+- GeoTIFF and COG: LERC masks the padding of partial edge tiles of
+  floating-point bands (one band, or `INTERLEAVE=BAND`), as GDAL does, whatever
+  the nodata value. The padding was stored as valid zeros: on a 6705 x 4852
+  flood-depth COG, LERC with `MAX_Z_ERROR=0.01` shrinks by 3.5% (NaN nodata)
+  to 13% (-9999 nodata). Integer and pixel-interleaved LERC tiles, and the
+  other codecs, keep GDAL's zeros. Pixels inside the raster are unchanged.
 
 ### Breaking changes
 
