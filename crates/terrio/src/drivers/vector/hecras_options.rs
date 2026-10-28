@@ -7,6 +7,8 @@ use crate::{Error, Result};
 pub(crate) const CELL_ATTRIBUTES: &[&str] = &["MINIMUM_ELEVATION", "MANNINGS_N"];
 /// The face attributes `FACE_ATTRIBUTES` accepts.
 pub(crate) const FACE_ATTRIBUTES: &[&str] = &["MINIMUM_ELEVATION", "NORMAL_AND_LENGTH", "CELLS"];
+/// The stored cross-section tables `XS_GEOMETRY` accepts.
+pub(crate) const XS_GEOMETRY: &[&str] = &["STATION_ELEVATION", "MANNINGS_N", "INEFFECTIVE_AREAS"];
 
 /// How to read HEC-RAS geometry (`.g##.hdf`) and plan (`.p##.hdf`) files: which 2D flow areas,
 /// and which stored values to join to the layers. Every joined value is a stored number, joined
@@ -65,6 +67,9 @@ pub struct HecRasOpenOptions {
     pub xs_results: Vec<String>,
     /// `XS_PROFILE`: the steady profile index (zero-based) of `XS_RESULTS`.
     pub xs_profile: Option<u64>,
+    /// `XS_GEOMETRY`: stored per-section tables joined to `cross_sections` as JSON fields
+    /// (`STATION_ELEVATION`, `MANNINGS_N`, `INEFFECTIVE_AREAS`).
+    pub xs_geometry: Vec<String>,
     /// `STRUCTURE_SERIES`: stored structure series joined to `structures` at `TIME_STEP`
     /// (`Structure Variables`, ...).
     pub structure_series: Vec<String>,
@@ -121,6 +126,7 @@ impl HecRasOpenOptions {
             "XS_SUMMARIES" => self.xs_summaries = list(),
             "XS_RESULTS" => self.xs_results = list(),
             "XS_PROFILE" => self.xs_profile = Some(number("XS_PROFILE")?),
+            "XS_GEOMETRY" => self.xs_geometry = names(XS_GEOMETRY, "XS_GEOMETRY value")?,
             "STRUCTURE_SERIES" => self.structure_series = list(),
             "BC_SERIES" => self.bc_series = crate::tiles::parse_bool(value)?,
             "REFERENCE_LINE_SERIES" => self.reference_line_series = list(),

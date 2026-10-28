@@ -1,6 +1,7 @@
 //! Line, polygon and point families stored under `Geometry/`: 1D cross-section cut lines, river
-//! lines, storage areas, structure centerlines, river junctions and pump stations, and the 2D
-//! boundary-condition lines, breaklines, refinement regions, reference lines and points.
+//! lines, storage areas, structure centerlines, river junctions and pump stations, the 2D
+//! boundary-condition lines, breaklines, refinement regions, reference lines and points, and
+//! pipe-network conduits and nodes.
 //!
 //! The engine reads each family exactly (attribute table, Info/Parts/Points, one source
 //! identity per feature). This module only builds terrio features from them:
@@ -18,7 +19,7 @@ use crate::vector::{Coord, Ring};
 use crate::{Feature, FieldDef, FieldType, FieldValue, Geometry, GeometryType, Layer};
 use ras_commander_fast_hdf::hdf::AttributeType;
 use ras_commander_fast_hdf::hdf::lines::GeometryFamily;
-use ras_commander_fast_hdf::hdf::metadata::{CompoundTable, MetadataValue};
+use ras_commander_fast_hdf::hdf::metadata::{CompoundColumn, CompoundTable, MetadataValue};
 use ras_commander_fast_hdf::hdf::xs_geometry::{OneDLineFamily, OneDPointData};
 use ras_commander_fast_hdf::hdf::{DEFAULT_MAX_BYTES, Identity, NumericArray, NumericValues};
 use ras_commander_fast_hdf::{Capability, Reported};
@@ -39,6 +40,7 @@ pub(crate) enum Family {
 pub(crate) enum PointFamily {
     Junctions,
     PumpStations,
+    PipeNodes,
 }
 
 impl PointFamily {
@@ -46,6 +48,7 @@ impl PointFamily {
         match self {
             PointFamily::Junctions => "Geometry/Junctions",
             PointFamily::PumpStations => "Geometry/Pump Stations",
+            PointFamily::PipeNodes => "Geometry/Pipe Nodes",
         }
     }
 }
@@ -72,6 +75,8 @@ pub(crate) const FAMILY_LAYERS: &[(&str, Family)] = &[
     ("reference_points", Family::ReferencePoints),
     ("river_junctions", Family::Points(PointFamily::Junctions)),
     ("pump_stations", Family::Points(PointFamily::PumpStations)),
+    ("pipe_conduits", Family::OneD(OneDLineFamily::PipeConduits, Shape::Line)),
+    ("pipe_nodes", Family::Points(PointFamily::PipeNodes)),
 ];
 
 /// `Reported` engine data as a value or an error. Unavailable (the family is not stored) is a
@@ -164,6 +169,7 @@ impl HecRasHdf {
         match family {
             PointFamily::Junctions => self.session.river_junctions(DEFAULT_MAX_BYTES),
             PointFamily::PumpStations => self.session.pump_stations(DEFAULT_MAX_BYTES),
+            PointFamily::PipeNodes => self.session.pipe_nodes(DEFAULT_MAX_BYTES),
         }
     }
 }
@@ -185,28 +191,7 @@ impl Builder {
     fn declare(&mut self, table: Option<&CompoundTable>, geom: GeometryType) -> crate::Result<()> {
         self.layer.geom_type = Some(geom);
         self.layer.add_field(id_field("source_row", FieldType::Integer));
-        for column in table.map(|t| t.columns.as_slice()).unwrap_or_default() {
-            let kind = match (&column.value, &column.attribute_type) {
-                (MetadataValue::Strings(_), _) => FieldType::Text,
-                (MetadataValue::Signed(_) | MetadataValue::Unsigned(_), _) => FieldType::Integer,
-                (MetadataValue::Float(_), _) => FieldType::Float,
-                (MetadataValue::Bitfield(_), AttributeType::Bitfield { .. }) => FieldType::Blob,
-                (MetadataValue::Unsupported { .. } | MetadataValue::Corrupt { .. }, _) => {
-                    error::require(&column_capability(&column.value), &format!("{} column {:?}", self.layer.name, column.name))?;
-                    unreachable!("require refuses unsupported and corrupt columns")
-                }
-                _ => return Err(crate::Error::Unsupported(format!("{} column {:?}: unmapped value type", self.layer.name, column.name))),
-            };
-            let name = field_name(&column.name);
-            if name.is_empty() || self.layer.schema.fields().iter().any(|f| f.name == name) {
-                return Err(crate::Error::Unsupported(format!(
-                    "{} column {:?} gives an empty or repeated field name {name:?}",
-                    self.layer.name, column.name
-                )));
-            }
-            self.layer.add_field(FieldDef::new(name, kind));
-        }
-        Ok(())
+        declare_columns(&mut self.layer, table.map(|t| t.columns.as_slice()).unwrap_or_default())
     }
 
     fn push(&mut self, id: &Identity, geometry: Geometry, table: Option<&CompoundTable>) -> crate::Result<()> {
@@ -214,21 +199,7 @@ impl Builder {
         let mut attributes =
             vec![FieldValue::Integer(i64::try_from(id.row).map_err(|_| crate::Error::InvalidData("row overflow".into()))?)];
         for column in table.map(|t| t.columns.as_slice()).unwrap_or_default() {
-            let missing = || crate::Error::InvalidData(format!("{} column {:?}: no row {row}", self.layer.name, column.name));
-            attributes.push(match (&column.value, &column.attribute_type) {
-                (MetadataValue::Strings(v), _) => FieldValue::Text(v.get(row).ok_or_else(missing)?.clone()),
-                (MetadataValue::Signed(v), _) => FieldValue::Integer(*v.get(row).ok_or_else(missing)?),
-                (MetadataValue::Unsigned(v), _) => FieldValue::Integer(
-                    i64::try_from(*v.get(row).ok_or_else(missing)?)
-                        .map_err(|_| crate::Error::Unsupported(format!("{} column {:?}: value above i64", self.layer.name, column.name)))?,
-                ),
-                (MetadataValue::Float(v), _) => FieldValue::Float(*v.get(row).ok_or_else(missing)?),
-                (MetadataValue::Bitfield(v), AttributeType::Bitfield { size, .. }) => {
-                    let size = *size;
-                    FieldValue::Blob(v.get(row * size..(row + 1) * size).ok_or_else(missing)?.to_vec())
-                }
-                _ => return Err(crate::Error::Unsupported(format!("{} column {:?}: unmapped value type", self.layer.name, column.name))),
-            });
+            attributes.push(column_value(column, row, &self.layer.name)?);
         }
         let mut feature = Feature::new();
         feature.fid = self.layer.features.len() as u64;
@@ -241,6 +212,53 @@ impl Builder {
 
 fn column_capability(value: &MetadataValue) -> Capability {
     value.capability()
+}
+
+/// Adds one field per stored attribute-table column, named after the column (snake case), with
+/// its stored value type (text, integer, float; bitfields as bytes). Unsupported or corrupt
+/// columns, and names that collide, are errors.
+pub(crate) fn declare_columns(layer: &mut Layer, columns: &[CompoundColumn]) -> crate::Result<()> {
+    for column in columns {
+        let kind = match (&column.value, &column.attribute_type) {
+            (MetadataValue::Strings(_), _) => FieldType::Text,
+            (MetadataValue::Signed(_) | MetadataValue::Unsigned(_), _) => FieldType::Integer,
+            (MetadataValue::Float(_), _) => FieldType::Float,
+            (MetadataValue::Bitfield(_), AttributeType::Bitfield { .. }) => FieldType::Blob,
+            (MetadataValue::Unsupported { .. } | MetadataValue::Corrupt { .. }, _) => {
+                error::require(&column_capability(&column.value), &format!("{} column {:?}", layer.name, column.name))?;
+                unreachable!("require refuses unsupported and corrupt columns")
+            }
+            _ => return Err(crate::Error::Unsupported(format!("{} column {:?}: unmapped value type", layer.name, column.name))),
+        };
+        let name = field_name(&column.name);
+        if name.is_empty() || layer.schema.fields().iter().any(|f| f.name == name) {
+            return Err(crate::Error::Unsupported(format!(
+                "{} column {:?} gives an empty or repeated field name {name:?}",
+                layer.name, column.name
+            )));
+        }
+        layer.add_field(FieldDef::new(name, kind));
+    }
+    Ok(())
+}
+
+/// The stored value of `column` at `row`, as [`declare_columns`] typed it.
+pub(crate) fn column_value(column: &CompoundColumn, row: usize, layer: &str) -> crate::Result<FieldValue> {
+    let missing = || crate::Error::InvalidData(format!("{layer} column {:?}: no row {row}", column.name));
+    Ok(match (&column.value, &column.attribute_type) {
+        (MetadataValue::Strings(v), _) => FieldValue::Text(v.get(row).ok_or_else(missing)?.clone()),
+        (MetadataValue::Signed(v), _) => FieldValue::Integer(*v.get(row).ok_or_else(missing)?),
+        (MetadataValue::Unsigned(v), _) => FieldValue::Integer(
+            i64::try_from(*v.get(row).ok_or_else(missing)?)
+                .map_err(|_| crate::Error::Unsupported(format!("{layer} column {:?}: value above i64", column.name)))?,
+        ),
+        (MetadataValue::Float(v), _) => FieldValue::Float(*v.get(row).ok_or_else(missing)?),
+        (MetadataValue::Bitfield(v), AttributeType::Bitfield { size, .. }) => {
+            let size = *size;
+            FieldValue::Blob(v.get(row * size..(row + 1) * size).ok_or_else(missing)?.to_vec())
+        }
+        _ => return Err(crate::Error::Unsupported(format!("{layer} column {:?}: unmapped value type", column.name))),
+    })
 }
 
 /// Rows of a stored `(n, 2)` float Points array (f32 widened exactly).

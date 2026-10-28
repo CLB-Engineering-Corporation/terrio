@@ -1,7 +1,7 @@
 //! HEC-RAS geometry (`.g##.hdf`) and plan (`.p##.hdf`) HDF files as terrio vector layers.
 //!
-//! This crate is a thin adapter: it opens the file with the
-//! [`ras-commander-rust`](https://github.com/gpt-cmdr/ras-commander-fast-hdf) engine (the one
+//! This module is a thin adapter: it opens the file with the
+//! [`ras-commander-fast-hdf`](https://crates.io/crates/ras-commander-fast-hdf) engine (the one
 //! ras-commander uses) and translates what the engine returns into terrio's [`Layer`],
 //! [`crate::FieldDef`] and [`crate::Error`] types. It holds no HEC-RAS rule of its own:
 //!
@@ -9,9 +9,14 @@
 //!   first listed face), face polylines, stored perimeters and family parts. Closing vertices are
 //!   dropped because terrio rings store none. Cells the engine omits (ghost cells, cells with
 //!   fewer than three faces) are reported in [`MeshLayer::omitted`], never invented.
-//! - **Identities** are the engine's: `mesh_name` (the exact 2D flow area name) with `cell_id` or
-//!   `face_id` (stored indices that repeat across meshes), and `source_row` (the stored
-//!   attribute-table row) with the stored attribute columns for the other families.
+//! - **Identities** are the engine's: `mesh_name` (the exact 2D flow area name) with `cell_id`,
+//!   `face_id` or `face_point_id` (stored indices that repeat across meshes), and `source_row`
+//!   (the stored attribute-table row) with the stored attribute columns for the other families.
+//! - **Attributes** are the stored ones, read without h5py: every column of the stored
+//!   attribute tables (compound `Attributes` datasets, fixed-length strings decoded as h5py
+//!   decodes them), the 2D flow area table on `mesh_perimeters`, cross-section station-elevation,
+//!   Manning's n and ineffective areas as JSON fields ([`CrossSectionOptions::geometry`]), and the
+//!   root file attributes ([`HecRasHdf::file_attributes`]).
 //! - **CRS** is the stored `Projection` text, attached as WKT. No EPSG code is guessed. A file
 //!   without one gives layers without a CRS; conflicting, malformed, unsupported or corrupt
 //!   projection evidence is an error ([`HecRasHdf::crs`]).
@@ -46,7 +51,7 @@ mod series;
 pub use mesh::{
     Extreme, JoinedField, MeshAttribute, MeshCellLayer, MeshCellOptions, MeshLayer, MeshOptions, OmittedCell, SummaryField, TimeStep,
 };
-pub use one_d::{CrossSectionField, CrossSectionLayer, CrossSectionOptions};
+pub use one_d::{CrossSectionField, CrossSectionLayer, CrossSectionOptions, CrossSectionTable};
 pub use ras_commander_fast_hdf::hdf::ResultMode;
 pub use ras_commander_fast_hdf::mesh::{GeometryPolicy, OmissionKind};
 pub use series::{FeatureSeriesOptions, SeriesField, SeriesLayer};
@@ -71,15 +76,18 @@ pub const MESH_CELLS: &str = "mesh_cells";
 pub const MESH_CELL_POINTS: &str = "mesh_cell_points";
 /// The 2D mesh face line layer ([`HecRasHdf::mesh_faces`]).
 pub const MESH_FACES: &str = "mesh_faces";
+/// The 2D mesh face point (corner) layer ([`HecRasHdf::mesh_face_points`]).
+pub const MESH_FACE_POINTS: &str = "mesh_face_points";
 /// The 2D flow area perimeter polygon layer ([`HecRasHdf::mesh_perimeters`]).
 pub const MESH_PERIMETERS: &str = "mesh_perimeters";
 /// The mesh layers, in listing order.
-pub const MESH_LAYERS: &[&str] = &[MESH_CELLS, MESH_CELL_POINTS, MESH_FACES, MESH_PERIMETERS];
+pub const MESH_LAYERS: &[&str] = &[MESH_CELLS, MESH_CELL_POINTS, MESH_FACES, MESH_FACE_POINTS, MESH_PERIMETERS];
 
 /// The names of the geometry family layers ([`HecRasHdf::read_layer`]): `cross_sections`,
 /// `river_centerlines`, `river_bank_lines`, `river_edge_lines`, `river_flow_paths`,
 /// `storage_areas`, `structures`, `bc_lines`, `breaklines`, `refinement_regions`,
-/// `reference_lines`, `reference_points`, `river_junctions` and `pump_stations`.
+/// `reference_lines`, `reference_points`, `river_junctions`, `pump_stations`, `pipe_conduits`
+/// and `pipe_nodes`.
 pub fn family_layer_names() -> impl Iterator<Item = &'static str> {
     families::FAMILY_LAYERS.iter().map(|(name, _)| *name)
 }
@@ -187,7 +195,7 @@ impl HecRasHdf {
     pub fn layer_names(&self) -> crate::Result<Vec<String>> {
         let mut names = Vec::new();
         if self.has_meshes()? {
-            names.extend([MESH_CELLS, MESH_CELL_POINTS, MESH_FACES].iter().map(|n| n.to_string()));
+            names.extend([MESH_CELLS, MESH_CELL_POINTS, MESH_FACES, MESH_FACE_POINTS].iter().map(|n| n.to_string()));
             if self.perimeters_stored()? {
                 names.push(MESH_PERIMETERS.to_string());
             }
@@ -210,6 +218,7 @@ impl HecRasHdf {
                 MESH_CELLS => return Ok(self.mesh_cells(&options)?.layer),
                 MESH_CELL_POINTS => return Ok(self.mesh_cell_points(&options)?.layer),
                 MESH_FACES => return Ok(self.mesh_faces(&options)?.layer),
+                MESH_FACE_POINTS => return Ok(self.mesh_face_points(&options)?.layer),
                 MESH_PERIMETERS => return Ok(self.mesh_perimeters(&options)?.layer),
                 _ => {}
             }
@@ -228,7 +237,13 @@ impl HecRasHdf {
     }
 
     fn perimeters_stored(&self) -> crate::Result<bool> {
-        for mesh in self.mesh_names()? {
+        let meshes = match self.mesh_names() {
+            Ok(meshes) => meshes,
+            // A mesh inventory the engine refuses: listed, so that reading it shows why.
+            Err(crate::Error::Unsupported(_)) => return Ok(true),
+            Err(e) => return Err(e),
+        };
+        for mesh in meshes {
             match self.session.read_mesh_perimeter(&mesh, ras_commander_fast_hdf::hdf::DEFAULT_READ_MAX_BYTES) {
                 Ok(_) => {}
                 Err(e) if e.kind == ras_commander_fast_hdf::ErrorKind::NotFound => return Ok(false),
@@ -244,6 +259,9 @@ impl HecRasHdf {
         match self.session.mesh_names() {
             Ok(names) => Ok(!names.is_empty()),
             Err(e) if e.kind == ras_commander_fast_hdf::ErrorKind::NotFound => Ok(false),
+            // Stored but refused (for example 2D flow areas stored as outlines only, with no
+            // computed mesh): listed, so that reading the mesh layers shows the refusal.
+            Err(e) if e.kind == ras_commander_fast_hdf::ErrorKind::Unsupported => Ok(true),
             Err(e) => Err(error::from_engine(e)),
         }
     }
@@ -267,6 +285,41 @@ impl HecRasHdf {
                 Ok(()) => "HEC-RAS stored Projection is not usable".to_string(),
             })),
         }
+    }
+
+    /// The root attributes of the file (`File Type`, `File Version`, `Units System`,
+    /// `Projection`, ...), in the engine's order (not necessarily h5py's), each as its stored text: a string attribute as h5py
+    /// decodes it, numbers in their shortest exact decimal form, several values joined by `, `.
+    /// An attribute the engine cannot decode is an error, never skipped.
+    ///
+    /// ```no_run
+    /// let hdf = terrio::hecras::HecRasHdf::open("Muncie.p04.hdf")?;
+    /// for (name, value) in hdf.file_attributes()? {
+    ///     println!("{name}: {value}");
+    /// }
+    /// # Ok::<(), terrio::Error>(())
+    /// ```
+    pub fn file_attributes(&self) -> crate::Result<Vec<(String, String)>> {
+        use ras_commander_fast_hdf::hdf::metadata::MetadataValue as M;
+        let attributes = self.session.typed_group_attributes("/").map_err(error::from_engine)?;
+        attributes
+            .into_iter()
+            .map(|a| {
+                let join = |v: Vec<String>| v.join(", ");
+                let text = match a.value {
+                    M::Strings(v) => join(v),
+                    M::Signed(v) => join(v.iter().map(i64::to_string).collect()),
+                    M::Unsigned(v) => join(v.iter().map(u64::to_string).collect()),
+                    M::Float(v) => join(v.iter().map(f64::to_string).collect()),
+                    M::Bitfield(v) => join(v.iter().map(|b| format!("0x{b:02x}")).collect()),
+                    other => {
+                        error::require(&other.capability(), &format!("root attribute {:?}", a.name))?;
+                        return Err(crate::Error::Unsupported(format!("root attribute {:?}: unmapped value type", a.name)));
+                    }
+                };
+                Ok((a.name, text))
+            })
+            .collect()
     }
 
     /// The stored hydraulic unit system text (the root `Units System` attribute, for example

@@ -54,8 +54,11 @@ CRS evidence, units and refusals. The driver translates its values into terrio l
 and errors.
 
 **Detection.** A file is a HEC-RAS file when it has an HDF5 signature and a root `File Type`
-attribute of `HEC-RAS Geometry` or `HEC-RAS Results`. The extension does not decide: HEC-RAS
-files share `.hdf` and `.h5` with other HDF5 files, which stay with the HDF5 raster driver.
+attribute of `HEC-RAS Geometry` or `HEC-RAS Results`, as the engine classifies it
+(`hec_ras_file_type`). The extension does not decide: HEC-RAS files share `.hdf` and `.h5` with
+other HDF5 files, which stay with the HDF5 and NetCDF drivers. That includes NetCDF-4 files,
+HDF5 files without a `File Type`, and HEC's terrain and land-cover files (`HEC Terrain`,
+`HEC Land Cover`).
 `File Type` only says that the file is HEC-RAS's, not which kind it is (plans before 6.4 can
 say `HEC-RAS Geometry`, and 6.4 and later geometry files say `HEC-RAS Results`), so the layers
 come from what the file stores. `terrio::open`, `open_vector`, `terrio info` and
@@ -74,7 +77,8 @@ files) is left out with a warning; damaged data and I/O errors fail the open. A 
 | `mesh_cells` | Polygon | `mesh_name`, `cell_id`, joined cell values |
 | `mesh_cell_points` | Point | `mesh_name`, `cell_id`, `is_ghost`, joined cell values |
 | `mesh_faces` | LineString | `mesh_name`, `face_id`, joined face values |
-| `mesh_perimeters` | Polygon | `mesh_name` (listed when every 2D flow area stores a `Perimeter`) |
+| `mesh_face_points` | Point | `mesh_name`, `face_point_id`, `is_perimeter` (the stored `FacePoints Is Perimeter` integer: -1 on the perimeter, 0 inside), `elevation` (the stored `FacePoints Elevation`; null when not stored) |
+| `mesh_perimeters` | Polygon | `mesh_name`, then the stored 2D flow area table (`name`, `locked`, `mann`, `cell_count`, spacing and tolerances, ...); listed when every 2D flow area stores a `Perimeter` |
 | `cross_sections` | LineString | `source_row`, stored columns (`river`, `reach`, `rs`, `name`, bank stations, ...), joined 1D results |
 | `river_centerlines`, `river_bank_lines`, `river_edge_lines`, `river_flow_paths` | LineString | `source_row`, stored columns |
 | `storage_areas` | Polygon | `source_row`, stored columns |
@@ -83,6 +87,8 @@ files) is left out with a warning; damaged data and I/O errors fail the open. A 
 | `refinement_regions` | Polygon | `source_row`, stored columns |
 | `reference_points` | Point | `source_row`, stored columns, joined series |
 | `river_junctions`, `pump_stations` | Point | `source_row`, stored columns (`name`, ...) |
+| `pipe_conduits` | LineString | `source_row`, stored columns (`name`, `us_node`, `ds_node`, `shape`, `rise`, `span`, `manning_s_n`, ...) |
+| `pipe_nodes` | Point | `source_row`, stored columns (`name`, `node_type`, `invert_elevation`, ...) |
 
 - Mesh features are identified by `mesh_name` with `cell_id` or `face_id`, the stored indices,
   which repeat across meshes. Other features are identified by `source_row`, the stored
@@ -92,10 +98,31 @@ files) is left out with a warning; damaged data and I/O errors fail the open. A 
   engine does not draw (fewer than three faces, such as ghost cells) are left out. A family line
   with several parts is a MultiLineString; a polygon family feature with several parts is
   refused, because which parts are holes is not a proven layout.
+- Attributes are read without h5py, by the engine: compound `Attributes` tables column by
+  column with their stored types (text, integers, floats; `f32` widened exactly), fixed-length
+  strings decoded as h5py decodes them (padding removed, nothing else trimmed), and the root
+  attributes (`File Type`, `File Version`, `Units System`, `Projection`, ...) through
+  `HecRasHdf::file_attributes`.
 - The CRS is the stored `Projection` text, attached as WKT. No EPSG code is guessed and none is
   identified from the text. A file without a projection gives layers without a CRS (assign one
   with `--a_srs`). Malformed, conflicting, unsupported or corrupt projection evidence is an
   error.
+
+### Not read
+
+These HEC-RAS datasets are left out on purpose:
+
+- Structures stored without a centerline (an attribute row with no `Centerline` datasets, such
+  as some lateral structures): there is no geometry to draw.
+- 2D flow areas stored as outlines only, with no computed mesh (`Polygon Info`/`Parts`/`Points`
+  under `Geometry/2D Flow Areas`): the engine refuses them, so the mesh layers are listed but
+  refused.
+- Calibration regions (`Geometry/2D Flow Area Calibration Regions`): no tested file stores one.
+- Pipe network cells (`Geometry/Pipe Networks`), cross-section interpolation surfaces, bridge
+  and culvert profile and coefficient tables, and hydraulic property tables: they are model
+  tables, not feature layers.
+- Values HEC-RAS does not store (depth where only water surface is stored, maxima of structure
+  series): the driver joins stored values only and computes none.
 
 ## Open options
 
@@ -116,6 +143,7 @@ layers that are not read are ignored. Lists are comma-separated stored names.
 | `XS_SUMMARIES` | stored `Summary Output/Cross Sections` variables to `cross_sections` | `<variable>`, `<variable>_time`, `<variable>_<row label>` |
 | `XS_RESULTS` (with `TIME_STEP` or `XS_PROFILE`) | stored cross-section results at an unsteady row or a steady profile | `<variable>` |
 | `XS_PROFILE` | the steady profile (zero-based) of `XS_RESULTS` | |
+| `XS_GEOMETRY` | `STATION_ELEVATION`, `MANNINGS_N`, `INEFFECTIVE_AREAS`: the stored per-section tables of `Geometry/Cross Sections` to `cross_sections` | `station_elevation` (`[[station, elevation], ...]`), `mannings_n` (`[[station, n], ...]`), `ineffective_areas` (`[{"Left Sta": .., "Right Sta": .., "Elevation": .., "Permanent": ..}, ...]`), JSON fields; a NaN, which JSON cannot hold, is `null` |
 | `STRUCTURE_SERIES` (with `TIME_STEP`) | stored structure series (`Structure Variables`, ...) to `structures` | `<series>_<column label>` |
 | `BC_SERIES=YES` (with `TIME_STEP`) | each 2D boundary-condition line's stored series to `bc_lines` | one field per stored column label (`stage`, `flow`, ...) |
 | `REFERENCE_LINE_SERIES`, `REFERENCE_POINT_SERIES` (with `TIME_STEP`) | stored reference-line and reference-point variables | `<variable>` |

@@ -1825,7 +1825,7 @@ checksum = "6a5b15d63a5ff39e378daed0e1340d3a5964703ea9712eb09a0dc66fade996f4"
 dependencies = [
  "libc",
  "ndarray",
- "num-complex 0.4.6",
+ "num-complex 0.2.4",
  "num-integer",
  "num-traits",
  "pyo3",
@@ -2278,9 +2278,8 @@ dependencies = [
 
 [[package]]
 name = "ras-commander-fast-hdf"
-version = "0.2.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a9b0ea7877f925f4a4bcada95cf8f3bd3d247003007978a3ca9eba8d1b227f10"
+version = "0.2.3"
+source = "git+https://github.com/gpt-cmdr/ras-commander-fast-hdf?rev=816e3cb#816e3cb33803d5d3712eeeea837471adf94d4157"
 dependencies = [
  "flate2",
  "libc",

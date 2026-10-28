@@ -23,7 +23,7 @@ fn engine_contract_is_api_10_or_later() {
 fn good_mesh_becomes_polygons_with_identities_and_omissions() {
     let hdf = open("coverage_mesh.h5");
     // No `mesh_perimeters`: not every mesh of the fixture stores a Perimeter.
-    assert_eq!(hdf.layer_names().unwrap(), MESH_LAYERS[..3].iter().map(|s| s.to_string()).collect::<Vec<_>>());
+    assert_eq!(hdf.layer_names().unwrap(), MESH_LAYERS[..4].iter().map(|s| s.to_string()).collect::<Vec<_>>());
     let cells = hdf.mesh_cells(&MeshCellOptions::default().with_meshes(["Good"])).unwrap();
     let layer = &cells.layer;
     assert_eq!(layer.name, "mesh_cells");

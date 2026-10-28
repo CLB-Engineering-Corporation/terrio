@@ -1,11 +1,12 @@
-//! 2D mesh layers: cell polygons, cell centre points, face lines and area perimeters, with
+//! 2D mesh layers: cell polygons, cell centre points, face lines, face points and area perimeters, with
 //! optional stored values joined by cell or face: summary results, static mesh arrays, time-step
 //! values and the engine's reductions of stored time series.
 
-use super::{HecRasHdf, MESH_CELL_POINTS, MESH_CELLS, MESH_FACES, MESH_PERIMETERS, error, id_field};
+use super::{HecRasHdf, MESH_CELL_POINTS, MESH_CELLS, MESH_FACE_POINTS, MESH_FACES, MESH_PERIMETERS, error, id_field};
 use crate::vector::{Coord, Ring};
 use crate::{Feature, FieldDef, FieldType, FieldValue, Geometry, GeometryType, Layer};
 use ras_commander_fast_hdf::hdf::mesh_geometry::MeshGeometryField;
+use ras_commander_fast_hdf::hdf::metadata::{CompoundTable, MetadataValue};
 use ras_commander_fast_hdf::hdf::{DEFAULT_MAX_BYTES, DEFAULT_READ_MAX_BYTES, NumericValues};
 use ras_commander_fast_hdf::mesh::{GeometryPolicy, OmissionKind};
 
@@ -442,23 +443,105 @@ impl HecRasHdf {
         })
     }
 
+    /// Reads every stored face point (mesh corner) as the [`MESH_FACE_POINTS`] layer:
+    /// `mesh_name`, `face_point_id` (the stored row of `FacePoints Coordinate`), `is_perimeter`
+    /// (the stored `FacePoints Is Perimeter` integer, unconverted: HEC-RAS writes -1 on the
+    /// perimeter and 0 inside) and `elevation` (the stored `FacePoints Elevation`, f32 widened
+    /// exactly; null for a mesh that stores none).
+    pub fn mesh_face_points(&self, options: &MeshOptions) -> crate::Result<MeshLayer> {
+        use ras_commander_fast_hdf::hdf::corner_elevations::CornerElevationLayout;
+        let meshes = self.mesh_list(options)?;
+        if options.has_joins() {
+            return Err(crate::Error::InvalidArgument("values join to cell and face layers, not face points".into()));
+        }
+        let mut layer = self.new_layer(MESH_FACE_POINTS, GeometryType::Point, Some("face_point_id"))?;
+        layer.add_field(FieldDef::new("is_perimeter", FieldType::Integer));
+        layer.add_field(FieldDef::new("elevation", FieldType::Float));
+        let s = &self.session;
+        for mesh in &meshes {
+            let geometry = s.mesh_geometry(mesh, options.metadata_max_bytes).map_err(error::from_engine)?;
+            let coordinates = s
+                .read_mesh_geometry_cached(&geometry, MeshGeometryField::FacePoints, None, options.max_bytes)
+                .map_err(error::from_engine)?;
+            let xy = xy_rows(coordinates.shape.as_slice(), coordinates.values, mesh, "FacePoints Coordinate")?;
+            let perimeter = s
+                .read_mesh_geometry_cached(&geometry, MeshGeometryField::FacePointIsPerimeter, None, options.max_bytes)
+                .map_err(error::from_engine)?;
+            if perimeter.shape.as_slice() != [xy.len() as u64] {
+                return Err(crate::Error::InvalidData(format!(
+                    "{mesh} FacePoints Is Perimeter: shape {:?} for {} face points",
+                    perimeter.shape,
+                    xy.len()
+                )));
+            }
+            let perimeter = super::numbers(perimeter.values, "FacePoints Is Perimeter")?;
+            if super::kind_of(&perimeter) != FieldType::Integer {
+                return Err(crate::Error::Unsupported(format!("{mesh} FacePoints Is Perimeter: not integers")));
+            }
+            let reported =
+                s.mesh_corner_elevations(mesh, CornerElevationLayout::Geometry, None, options.max_bytes).map_err(error::from_engine)?;
+            let elevation = if reported.is_unavailable() {
+                None
+            } else {
+                let corners = reported.value().filter(|_| reported.is_supported()).ok_or_else(|| {
+                    error::require(reported.capability(), &format!("{mesh} FacePoints Elevation"))
+                        .err()
+                        .unwrap_or_else(|| crate::Error::InvalidData(format!("{mesh} FacePoints Elevation: supported without a value")))
+                })?;
+                // The engine checks the length against `FacePoints Coordinate`.
+                Some(corners.values.clone())
+            };
+            for (i, ([x, y], is_perimeter)) in xy.into_iter().zip(perimeter).enumerate() {
+                let mut feature = Feature::new();
+                feature.fid = layer.features.len() as u64;
+                feature.geometry = Some(Geometry::Point(Coord::xy(x, y)));
+                let z = elevation.as_ref().and_then(|e| e.get(i)).map_or(FieldValue::Null, |&v| FieldValue::Float(f64::from(v)));
+                feature.attributes = vec![FieldValue::Text(mesh.clone()), FieldValue::Integer(i as i64), is_perimeter, z];
+                layer.push(feature);
+            }
+        }
+        Ok(MeshLayer { layer, omitted: Vec::new(), summaries: Vec::new(), joined: Vec::new(), time_step: None })
+    }
+
     /// Reads each 2D flow area's stored perimeter as the [`MESH_PERIMETERS`] layer: one polygon
-    /// per mesh with `mesh_name`. An area without a stored `Perimeter` dataset is an error.
+    /// per mesh with `mesh_name`, then every column of the stored 2D flow area table
+    /// (`Geometry/2D Flow Areas/Attributes`: `name`, `mann`, `cell_count`, spacing and
+    /// tolerances, ...), joined by the stored `Name`. Files without that table (HEC-RAS 5.0) give
+    /// `mesh_name` only. An area without a stored `Perimeter` dataset is an error.
     pub fn mesh_perimeters(&self, options: &MeshOptions) -> crate::Result<MeshLayer> {
         let meshes = self.mesh_list(options)?;
         if options.has_joins() {
             return Err(crate::Error::InvalidArgument("values join to cell and face layers, not perimeters".into()));
         }
         let mut layer = self.new_layer(MESH_PERIMETERS, GeometryType::Polygon, None)?;
+        let table = self.flow_area_table(options)?;
+        let columns = table.as_ref().map(|t| t.columns.as_slice()).unwrap_or_default();
+        super::families::declare_columns(&mut layer, columns)?;
         for mesh in &meshes {
             let p = self.session.read_mesh_perimeter(mesh, options.max_bytes).map_err(error::from_engine)?;
             let mut feature = Feature::new();
             feature.fid = layer.features.len() as u64;
             feature.geometry = Some(polygon(&p.ring, mesh, "perimeter", 0)?);
             feature.attributes = vec![FieldValue::Text(mesh.clone())];
+            if let Some(table) = &table {
+                let row = flow_area_row(table, mesh)?;
+                for column in columns {
+                    feature.attributes.push(super::families::column_value(column, row, MESH_PERIMETERS)?);
+                }
+            }
             layer.push(feature);
         }
         Ok(MeshLayer { layer, omitted: Vec::new(), summaries: Vec::new(), joined: Vec::new(), time_step: None })
+    }
+
+    /// The stored `Geometry/2D Flow Areas/Attributes` table, or `None` when the file has none.
+    fn flow_area_table(&self, options: &MeshOptions) -> crate::Result<Option<CompoundTable>> {
+        const PATH: &str = "Geometry/2D Flow Areas/Attributes";
+        match self.session.simple_compound(PATH, options.metadata_max_bytes) {
+            Ok(table) => Ok(Some(table)),
+            Err(e) if e.kind == ras_commander_fast_hdf::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(error::from_engine(e)),
+        }
     }
 }
 
@@ -559,6 +642,21 @@ fn polygon(ring: &[[f64; 2]], mesh: &str, what: &str, id: i64) -> crate::Result<
             Ok(Geometry::Polygon { exterior: Ring::new(coords), interiors: Vec::new() })
         }
         _ => Err(crate::Error::InvalidData(format!("HEC-RAS engine {what} {id} of {mesh}: not a closed ring of at least three vertices"))),
+    }
+}
+
+/// The row of `mesh` in the stored 2D flow area table: the one row whose stored `Name` is
+/// exactly the mesh name. No row, or several, is an error.
+fn flow_area_row(table: &CompoundTable, mesh: &str) -> crate::Result<usize> {
+    let names = match table.columns.iter().find(|c| c.name == "Name").map(|c| &c.value) {
+        Some(MetadataValue::Strings(v)) => v,
+        _ => return Err(crate::Error::Unsupported("Geometry/2D Flow Areas/Attributes: no text Name column".into())),
+    };
+    let mut rows = names.iter().enumerate().filter(|(_, n)| n.as_str() == mesh).map(|(i, _)| i);
+    match (rows.next(), rows.next()) {
+        (Some(row), None) => Ok(row),
+        (None, _) => Err(crate::Error::InvalidData(format!("Geometry/2D Flow Areas/Attributes: no row named {mesh:?}"))),
+        (Some(_), Some(_)) => Err(crate::Error::InvalidData(format!("Geometry/2D Flow Areas/Attributes: several rows named {mesh:?}"))),
     }
 }
 

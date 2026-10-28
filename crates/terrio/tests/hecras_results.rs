@@ -218,3 +218,80 @@ fn reference_lines_join_only_when_the_engine_links_them() {
         Err(e) => assert!(matches!(&e, terrio::Error::Unsupported(m) if m.starts_with("HEC-RAS unsupported(identity_layout)")), "{e}"),
     }
 }
+
+#[test]
+fn face_points_carry_the_stored_perimeter_flag_and_elevation() {
+    let hdf = open();
+    assert!(hdf.layer_names().unwrap().contains(&"mesh_face_points".to_string()));
+    let l = hdf.mesh_face_points(&MeshOptions::default()).unwrap().layer;
+    assert_eq!(fields(&l), ["mesh_name", "face_point_id", "is_perimeter", "elevation"]);
+    let n = l.len();
+    assert!(n > 0);
+    assert_eq!(column(&l, "face_point_id"), ints(&(0..n as i64).collect::<Vec<_>>()));
+    // The stored integers, unconverted (the fixture alternates -1 and 0).
+    assert_eq!(column(&l, "is_perimeter"), ints(&(0..n).map(|k| if k % 2 == 0 { -1 } else { 0 }).collect::<Vec<_>>()));
+    assert_eq!(column(&l, "elevation"), floats(&(0..n).map(|k| f64::from(10.0f32 + 0.25 * k as f32)).collect::<Vec<_>>()));
+    assert!(l.crs.as_ref().and_then(|c| c.wkt.as_deref()).is_some_and(|w| w.starts_with("PROJCS[\"Synthetic\"")));
+    // Values join to cell and face layers only.
+    assert!(hdf.mesh_face_points(&MeshOptions::default().with_summary("Maximum Water Surface")).is_err());
+}
+
+#[test]
+fn cross_section_tables_join_as_json() {
+    use terrio::hecras::CrossSectionTable as T;
+    let hdf = open();
+    let options = CrossSectionOptions::default().with_table(T::StationElevation).with_table(T::ManningsN).with_table(T::IneffectiveAreas);
+    let l = hdf.cross_sections(&options).unwrap().layer;
+    let kinds: Vec<_> = l.schema.fields().iter().rev().take(3).map(|f| (f.name.as_str(), f.field_type)).collect();
+    assert_eq!(
+        kinds,
+        [
+            ("ineffective_areas", terrio::FieldType::Json),
+            ("mannings_n", terrio::FieldType::Json),
+            ("station_elevation", terrio::FieldType::Json)
+        ]
+    );
+    let text = |field: &str| -> Vec<String> {
+        column(&l, field)
+            .into_iter()
+            .map(|v| match v {
+                FieldValue::Text(t) => t,
+                other => panic!("{other:?}"),
+            })
+            .collect()
+    };
+    assert_eq!(
+        text("station_elevation"),
+        ["[[0.0,12.5],[10.0,10.25],[20.0,12.0]]", "[[0.0,11.0],[15.0,11.5]]", "[[0.0,9.0],[5.0,8.5],[10.0,8.0],[15.0,9.5]]"]
+    );
+    // float32 values widened exactly, in their shortest exact decimal form.
+    let n = |x: f32| f64::from(x).to_string();
+    assert_eq!(
+        text("mannings_n"),
+        [format!("[[0.0,{}]]", n(0.035)), format!("[[0.0,{}],[10.0,{}]]", n(0.04), n(0.03)), format!("[[0.0,{}]]", n(0.05))]
+    );
+    assert_eq!(
+        text("ineffective_areas"),
+        [
+            "[]".to_string(),
+            r#"[{"Left Sta":0.0,"Right Sta":5.0,"Elevation":11.25,"Permanent":0},{"Left Sta":10.0,"Right Sta":15.0,"Elevation":11.5,"Permanent":1}]"#.to_string(),
+            "[]".to_string()
+        ]
+    );
+    // The same through the open option.
+    let mut o = terrio::VectorOpenOptions { layers: vec!["cross_sections".into()], ..Default::default() };
+    o.hecras.set("XS_GEOMETRY", "station_elevation, INEFFECTIVE_AREAS").unwrap();
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data/hecras/results_mesh_xs.h5");
+    let ds = terrio::open_vector(&path.to_string_lossy(), &o).unwrap();
+    assert_eq!(column(&ds.layers[0], "station_elevation"), column(&l, "station_elevation"));
+    assert!(o.hecras.set("XS_GEOMETRY", "LEVEES").is_err());
+}
+
+#[test]
+fn root_attributes_are_read_as_stored() {
+    let attributes = open().file_attributes().unwrap();
+    let names: Vec<_> = attributes.iter().map(|(n, _)| n.as_str()).collect();
+    assert_eq!(names, ["File Type", "File Version", "Projection", "Units System"]);
+    assert_eq!(attributes[0].1, "HEC-RAS Results");
+    assert_eq!(attributes[3].1, "US Customary");
+}

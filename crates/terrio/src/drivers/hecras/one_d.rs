@@ -1,5 +1,7 @@
-//! 1D results joined to the `cross_sections` layer: stored `Summary Output/Cross Sections`
-//! variables, and stored steady or unsteady cross-section results at one profile or time row.
+//! 1D values joined to the `cross_sections` layer: stored `Summary Output/Cross Sections`
+//! variables, stored steady or unsteady cross-section results at one profile or time row, and
+//! the stored per-section geometry tables (station-elevation, Manning's n, ineffective areas) as
+//! JSON fields.
 //!
 //! The engine validates which result column belongs to which cross section (River, Reach and
 //! RS against `Geometry/Cross Sections/Attributes`) and reports each column's geometry
@@ -10,7 +12,7 @@ use super::families::{Family, Shape};
 use super::{HecRasHdf, error, field_name, kind_of, numbers};
 use crate::{FieldDef, FieldType, FieldValue, Layer};
 use ras_commander_fast_hdf::hdf::one_d_summary::OneDElementDomain;
-use ras_commander_fast_hdf::hdf::xs_geometry::OneDLineFamily;
+use ras_commander_fast_hdf::hdf::xs_geometry::{OneDLineFamily, XsGeometryField, XsGeometryValues};
 use ras_commander_fast_hdf::hdf::xs_results::XsResultDomain;
 use ras_commander_fast_hdf::hdf::{DEFAULT_MAX_BYTES, DEFAULT_READ_MAX_BYTES, Identity, ResultMode, Slice};
 use std::collections::HashMap;
@@ -35,6 +37,8 @@ pub struct CrossSectionOptions {
     /// The stored row of [`CrossSectionOptions::results`]: an unsteady output row or a steady
     /// profile index (zero-based). Required with `results`, and only allowed with them.
     pub row: Option<u64>,
+    /// Stored per-section geometry tables to join as JSON fields ([`CrossSectionTable`]).
+    pub geometry: Vec<CrossSectionTable>,
     /// Byte limit for each metadata object the engine consults.
     pub metadata_max_bytes: usize,
     /// Byte limit for each array read.
@@ -48,6 +52,7 @@ impl Default for CrossSectionOptions {
             results: Vec::new(),
             mode: ResultMode::Unsteady,
             row: None,
+            geometry: Vec::new(),
             metadata_max_bytes: DEFAULT_MAX_BYTES,
             max_bytes: DEFAULT_READ_MAX_BYTES,
         }
@@ -69,12 +74,54 @@ impl CrossSectionOptions {
         self
     }
 
+    /// Joins a stored per-section geometry table as a JSON field.
+    pub fn with_table(mut self, table: CrossSectionTable) -> Self {
+        self.geometry.push(table);
+        self
+    }
+
     /// Joins a stored steady result variable at profile index `profile`.
     pub fn with_steady(mut self, variable: impl Into<String>, profile: u64) -> Self {
         self.results.push(variable.into());
         self.mode = ResultMode::Steady;
         self.row = Some(profile);
         self
+    }
+}
+
+/// A stored per-section table of `Geometry/Cross Sections`, joined to `cross_sections` as one
+/// JSON field per section (stored rows in stored order; `[]` for a section without rows).
+/// Numbers are the stored values (`f32` widened exactly) in their shortest exact decimal form;
+/// a non-finite number, which JSON cannot hold, is `null`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum CrossSectionTable {
+    /// `station_elevation`: `Station Elevation Info`/`Values`, `[[station, elevation], ...]`.
+    StationElevation,
+    /// `mannings_n`: `Manning's n Info`/`Values`, `[[station, n], ...]`.
+    ManningsN,
+    /// `ineffective_areas`: `Ineffective Info`/`Ineffective Blocks`, one object per stored block
+    /// with its stored columns (`{"Left Sta": .., "Right Sta": .., "Elevation": ..,
+    /// "Permanent": ..}`).
+    IneffectiveAreas,
+}
+
+impl CrossSectionTable {
+    fn engine(self) -> XsGeometryField {
+        match self {
+            Self::StationElevation => XsGeometryField::StationElevation,
+            Self::ManningsN => XsGeometryField::ManningsN,
+            Self::IneffectiveAreas => XsGeometryField::IneffectiveAreas,
+        }
+    }
+
+    /// The field name.
+    pub fn field(self) -> &'static str {
+        match self {
+            Self::StationElevation => "station_elevation",
+            Self::ManningsN => "mannings_n",
+            Self::IneffectiveAreas => "ineffective_areas",
+        }
     }
 }
 
@@ -141,7 +188,65 @@ impl HecRasHdf {
                 fields.push(join(&mut layer, &row_index, variable, &dataset, &ids, columns)?);
             }
         }
+        for &table in &options.geometry {
+            let (ids, columns, dataset) = self.xs_table(table, options)?;
+            fields.push(join(&mut layer, &row_index, table.field(), &dataset, &ids, columns)?);
+        }
         Ok(CrossSectionLayer { layer, fields, row_label })
+    }
+
+    /// One stored per-section table as one JSON value per record (a cross-section row).
+    fn xs_table(&self, table: CrossSectionTable, options: &CrossSectionOptions) -> crate::Result<(Vec<Identity>, Vec<Column>, String)> {
+        use serde_json::Value;
+        let selection = self
+            .session
+            .read_xs_geometry(table.engine(), None, options.metadata_max_bytes, options.max_bytes)
+            .map_err(error::from_engine)?;
+        let dataset = selection.values_path.clone();
+        let bad = |m: String| crate::Error::InvalidData(format!("{dataset}: {m}"));
+        let number = |v: &FieldValue| match v {
+            FieldValue::Float(x) => serde_json::Number::from_f64(*x).map_or(Value::Null, Value::Number),
+            FieldValue::Integer(i) => Value::from(*i),
+            FieldValue::Text(t) => Value::from(t.as_str()),
+            FieldValue::Blob(b) => Value::from(b.clone()),
+            _ => Value::Null,
+        };
+        // Per stored Values row: a JSON array of numbers, or an object of stored columns.
+        let rows: Vec<Value> = match &selection.values {
+            XsGeometryValues::Numeric(array) => {
+                let width = match array.shape.as_slice() {
+                    [_, c] if *c > 0 => *c as usize,
+                    [0] => 1,
+                    shape => return Err(bad(format!("shape {shape:?}, not (rows, columns)"))),
+                };
+                numbers(array.values.clone(), &dataset)?.chunks(width).map(|r| Value::Array(r.iter().map(number).collect())).collect()
+            }
+            XsGeometryValues::Compound(compound) => {
+                let t = &compound.table;
+                let n = t.shape.first().copied().unwrap_or(0) as usize;
+                let mut out = Vec::with_capacity(n);
+                for row in 0..n {
+                    let mut object = serde_json::Map::new();
+                    for column in &t.columns {
+                        object.insert(column.name.clone(), number(&super::families::column_value(column, row, &dataset)?));
+                    }
+                    out.push(Value::Object(object));
+                }
+                out
+            }
+            _ => return Err(crate::Error::Unsupported(format!("{dataset}: unmapped value layout"))),
+        };
+        let mut ids = Vec::with_capacity(selection.records.len());
+        let mut values = Vec::with_capacity(selection.records.len());
+        for record in &selection.records {
+            let count = record.stored_rows.end.checked_sub(record.stored_rows.start).ok_or_else(|| bad("reversed record rows".into()))?;
+            let start = usize::try_from(record.offset).map_err(|_| bad("record offset".into()))?;
+            let end = start.checked_add(count as usize).filter(|&e| e <= rows.len()).ok_or_else(|| bad("record outside Values".into()))?;
+            ids.push(record.id.clone());
+            values.push(FieldValue::Text(Value::Array(rows[start..end].to_vec()).to_string()));
+        }
+        let column = Column { field: table.field().to_string(), label: None, unit: None, kind: FieldType::Json, values };
+        Ok((ids, vec![column], dataset))
     }
 
     fn xs_summary(&self, variable: &str, options: &CrossSectionOptions) -> crate::Result<(Vec<Identity>, Vec<Column>, String)> {

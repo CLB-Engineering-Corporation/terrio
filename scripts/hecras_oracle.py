@@ -10,7 +10,11 @@ indexes), of Water Surface / Face Velocity at one stored output row and of Water
 maximum over all rows (value at the first maximum, and its row); the count and identity digest
 of the 1D cross sections, river reaches, storage areas, structures and 2D boundary-condition
 lines; and per-row digests of the 1D cross-section summaries and of the cross-section results
-at one stored row (unsteady) or profile (steady), in geometry attribute-row order. Usage:
+at one stored row (unsteady) or profile (steady), in geometry attribute-row order; and the
+stored attributes terrio reads without h5py: every column of every family attribute table
+(field type and values), the 2D flow area table, face points, pipe conduits and nodes, the
+cross-section station-elevation, Manning's n and ineffective-area tables, and the root
+attributes. Usage:
 
     python -I oracle_public_models.py <test-data-dir> <out.json> <relative file>...
 
@@ -175,6 +179,137 @@ def summary(ds, columns):
     }
 
 
+# Stored attribute tables of the family layers, by terrio layer name, with the geometry dataset
+# a feature needs (a table without its geometry, such as the attribute row of a structure
+# without a stored centerline, gives no layer). Every column of each is compared: its field type
+# and every value, in attribute-row (`source_row`) order.
+ATTRIBUTE_TABLES = [
+    ("cross_sections", "Geometry/Cross Sections/Attributes", "Polyline Info"),
+    ("river_centerlines", "Geometry/River Centerlines/Attributes", "Polyline Info"),
+    ("river_bank_lines", "Geometry/River Bank Lines/Attributes", "Polyline Info"),
+    ("river_edge_lines", "Geometry/River Edge Lines/Attributes", "Polyline Info"),
+    ("river_flow_paths", "Geometry/River Flow Paths/Attributes", "Flow Path Lines Info"),
+    ("storage_areas", "Geometry/Storage Areas/Attributes", "Polygon Info"),
+    ("structures", "Geometry/Structures/Attributes", "Centerline Info"),
+    ("bc_lines", "Geometry/Boundary Condition Lines/Attributes", "Polyline Info"),
+    ("breaklines", "Geometry/2D Flow Area Break Lines/Attributes", "Polyline Info"),
+    ("refinement_regions", "Geometry/2D Flow Area Refinement Regions/Attributes", "Polygon Info"),
+    ("reference_lines", "Geometry/Reference Lines/Attributes", "Polyline Info"),
+    ("reference_points", "Geometry/Reference Points/Attributes", "Points"),
+    ("river_junctions", "Geometry/Junctions/Attributes", "Points"),
+    ("pump_stations", "Geometry/Pump Stations/Attributes", "Points"),
+    ("pipe_conduits", "Geometry/Pipe Conduits/Attributes", "Polyline Info"),
+    ("pipe_nodes", "Geometry/Pipe Nodes/Attributes", "Points"),
+]
+# Per-section tables of `Geometry/Cross Sections`: (key, Info, Values).
+XS_TABLES = [
+    ("station_elevation", "Station Elevation Info", "Station Elevation Values"),
+    ("mannings_n", "Manning's n Info", "Manning's n Values"),
+    ("ineffective_areas", "Ineffective Info", "Ineffective Blocks"),
+]
+
+
+def kind_of(dtype):
+    """The terrio field type a stored member maps to: text, int or float (other kinds: bytes)."""
+    return {"S": "text", "U": "text", "O": "text", "i": "int", "u": "int", "b": "int", "f": "float"}.get(dtype.kind, "bytes")
+
+
+def values_digest(values, kind):
+    """The digest of one column: text joined by newlines (decoded as h5py gives the bytes, never
+    stripped), integers as little-endian i64, floats as little-endian f64 (f32 widened exactly)."""
+    if kind == "text":
+        return hashlib.sha256("\n".join(text(v) for v in values).encode()).hexdigest()
+    if kind == "int":
+        return int_digest(np.asarray(values).astype("<i8"))
+    if kind == "float":
+        return digest(np.asarray(values).astype("<f8"))
+    return hashlib.sha256(np.ascontiguousarray(values).tobytes()).hexdigest()
+
+
+def canonical_nan(values):
+    """Floats with every NaN as NumPy's NaN: terrio carries the per-section tables as JSON, which
+    holds a NaN as null, so the stored NaN bit pattern is not compared there."""
+    v = np.asarray(values)
+    return np.where(np.isnan(v), np.nan, v.astype("<f8")) if v.dtype.kind == "f" else v
+
+
+def compound_columns(rows, nan=False):
+    out = []
+    for k in rows.dtype.names:
+        kind = kind_of(rows.dtype[k])
+        v = canonical_nan(rows[k]) if nan else rows[k]
+        out.append({"name": k, "kind": kind, "sha256": values_digest(v, kind)})
+    return out
+
+
+def packed_lines(f, group, prefix):
+    """Every stored part of every feature of a packed Info/Parts/Points family, in stored order.
+    Part offsets are local to the feature (HEC-RAS 6+ layout)."""
+    info = f[f"{group}/{prefix} Info"][()]
+    parts = f[f"{group}/{prefix} Parts"][()]
+    points = f[f"{group}/{prefix} Points"][()]
+    lines = []
+    for pt_start, _pt_count, part_start, part_count in info:
+        for offset, count in parts[part_start:part_start + part_count]:
+            lines.append([tuple(p[:2]) for p in points[pt_start + offset:pt_start + offset + count]])
+    return lines
+
+
+def root_attribute(v):
+    """A root attribute as the oracle compares it: ("text", str) or ("number", [floats])."""
+    if isinstance(v, (bytes, np.bytes_, str)):
+        return ["text", text(v)]
+    a = np.asarray(v)
+    if a.dtype.kind in "SUO":
+        return ["text", ", ".join(text(x) for x in a.ravel())]
+    return ["number", [float(x) for x in a.ravel()]]
+
+
+def stored(f, mesh_names):
+    """The stored attributes terrio reads without h5py, read here with h5py."""
+    out = {"file_attributes": [[k, *root_attribute(f.attrs[k])] for k in f.attrs], "tables": {}}
+    for layer, path, geometry in ATTRIBUTE_TABLES:
+        if path in f and path.replace("Attributes", geometry) in f:
+            rows = f[path][()]
+            out["tables"][layer] = {"path": path, "rows": int(len(rows)), "columns": compound_columns(rows)}
+    if "Geometry/Pipe Conduits/Polyline Info" in f:
+        out["pipe_conduits_lines_sha256"] = lines_digest(packed_lines(f, "Geometry/Pipe Conduits", "Polyline"))
+    if "Geometry/Pipe Nodes/Points" in f:
+        out["pipe_nodes_points_sha256"] = digest(f["Geometry/Pipe Nodes/Points"][()])
+    areas = f.get("Geometry/2D Flow Areas")
+    if areas is not None and "Attributes" in areas:
+        rows = areas["Attributes"][()]
+        by_name = {text(r["Name"]): r for r in rows}
+        out["flow_areas"] = {
+            name: [[k, kind_of(rows.dtype[k]), values_digest(np.asarray([by_name[name][k]]), kind_of(rows.dtype[k]))] for k in rows.dtype.names]
+            for name in mesh_names if name in by_name
+        }
+    face_points = {}
+    for name in mesh_names:
+        g = areas[name]
+        fp = {"count": int(len(g["FacePoints Coordinate"])), "xy_sha256": digest(g["FacePoints Coordinate"][()])}
+        fp["is_perimeter_sha256"] = int_digest(g["FacePoints Is Perimeter"][()]) if "FacePoints Is Perimeter" in g else None
+        fp["elevation_sha256"] = digest(g["FacePoints Elevation"][()]) if "FacePoints Elevation" in g else None
+        face_points[name] = fp
+    out["face_points"] = face_points
+    xs = f.get("Geometry/Cross Sections")
+    xs_tables = {}
+    for key, info_name, values_name in XS_TABLES:
+        if xs is None or info_name not in xs or values_name not in xs:
+            continue
+        info = xs[info_name][()]
+        values = xs[values_name][()]
+        picked = np.concatenate([values[s:s + c] for s, c in info[:, :2]]) if len(info) else values[:0]
+        entry = {"sections": int(len(info)), "counts_sha256": int_digest(info[:, 1])}
+        if values.dtype.names:
+            entry["columns"] = compound_columns(picked, nan=True)
+        else:
+            entry["values_sha256"] = digest(canonical_nan(picked.reshape(-1)))
+        xs_tables[key] = entry
+    out["xs_tables"] = xs_tables
+    return out
+
+
 def main(root, out, files):
     report = {}
     for rel in files:
@@ -303,6 +438,7 @@ def main(root, out, files):
             entry["bc_lines"] = bc_rows(f, row)
             entry["reference_lines"] = reference_rows(f, row, "Reference Lines", "SA-2D")
             entry["reference_points"] = reference_rows(f, row, "Reference Points", "SA/2D")
+            entry["stored"] = stored(f, list(entry["meshes"]))
         report[rel] = entry
     Path(out).write_text(json.dumps(report, indent=2))
 

@@ -36,6 +36,7 @@ fn hec_ras_plans_open_as_vectors_by_content() {
             "mesh_cells",
             "mesh_cell_points",
             "mesh_faces",
+            "mesh_face_points",
             // No `mesh_perimeters`: the synthetic mesh stores no Perimeter dataset.
             "cross_sections",
             "bc_lines",
@@ -155,4 +156,64 @@ fn hec_ras_files_open_from_bytes() {
     // Bytes that are not HDF5 are refused by the engine with the given name.
     let Err(e) = terrio::hecras::HecRasHdf::from_bytes(b"not HDF5".to_vec(), "x.hdf") else { panic!("opened") };
     assert!(matches!(e, terrio::Error::InvalidData(_)), "{e}");
+}
+
+#[test]
+fn other_hdf5_and_netcdf_files_are_not_claimed() {
+    let tests = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data");
+    // An HDF5 file without a root File Type, another HDF5 table, a NetCDF-4 file (HDF5 inside),
+    // and an HDF5 file whose File Type is HEC's but not a geometry or plan file (`HEC Terrain`).
+    for path in [
+        tests.join("hecras/coverage_mesh.h5"),
+        tests.join("hdf5_v1_compound_table.h5"),
+        tests.join("netcdf_bands/axes.nc"),
+        tests.join("hecras/terrain.h5"),
+    ] {
+        let path = path.to_string_lossy().into_owned();
+        let claimed = |d: &terrio::Result<Dataset>| matches!(d, Ok(Dataset::Vector(v)) if v.driver == VectorDriver::HECRAS);
+        assert!(!claimed(&terrio::open(&path)), "{path}: claimed by HECRAS");
+        let vector = terrio::open_vector(&path, &VectorOpenOptions::default());
+        assert!(!matches!(&vector, Ok(v) if v.driver == VectorDriver::HECRAS), "{path}: open_vector gave HECRAS");
+        let bytes = std::fs::read(&path).unwrap();
+        let name = std::path::Path::new(&path).file_name().unwrap().to_string_lossy().into_owned();
+        assert!(!claimed(&terrio::memory::open_bytes(bytes.clone(), &name)), "{path}: claimed from bytes");
+        let vector = terrio::memory::open_vector_bytes(bytes, &name, &VectorOpenOptions::default());
+        assert!(!matches!(&vector, Ok(v) if v.driver == VectorDriver::HECRAS), "{path}: open_vector_bytes gave HECRAS");
+    }
+    // The NetCDF file keeps opening as before (a raster through the NetCDF driver).
+    assert!(matches!(terrio::open(&tests.join("netcdf_bands/axes.nc").to_string_lossy()), Ok(Dataset::Raster(_))));
+    // A HEC-RAS geometry file (`File Type` = `HEC-RAS Geometry`) is claimed, from a path and from bytes.
+    let geometry = data("pipes.h5");
+    assert!(matches!(terrio::open(&geometry), Ok(Dataset::Vector(v)) if v.driver == VectorDriver::HECRAS));
+    let bytes = std::fs::read(&geometry).unwrap();
+    assert!(matches!(terrio::memory::open_bytes(bytes, "pipes.g01.hdf"), Ok(Dataset::Vector(v)) if v.driver == VectorDriver::HECRAS));
+}
+
+#[test]
+fn pipe_networks_are_line_and_point_layers() {
+    let ds = terrio::open_vector(&data("pipes.h5"), &VectorOpenOptions::default()).unwrap();
+    let names: Vec<_> = ds.layers.iter().map(|l| l.name.as_str()).collect();
+    assert_eq!(names, ["pipe_conduits", "pipe_nodes"]);
+    let conduits = &ds.layers[0];
+    assert_eq!(conduits.geom_type, Some(terrio::GeometryType::LineString));
+    let fields: Vec<_> = conduits.schema.fields().iter().map(|f| f.name.as_str()).collect();
+    assert_eq!(
+        fields,
+        ["source_row", "name", "system_name", "us_node", "ds_node", "conduit_length", "rise", "manning_s_n", "ds_flap_gate"]
+    );
+    assert_eq!(field(conduits, "name"), [&FieldValue::Text("C1".into()), &FieldValue::Text("C2".into())]);
+    assert_eq!(field(conduits, "conduit_length"), [&FieldValue::Float(120.5), &FieldValue::Float(80.25)]);
+    // float32 widened exactly; uint8 as an integer.
+    assert_eq!(field(conduits, "manning_s_n"), [&FieldValue::Float(f64::from(0.013f32)), &FieldValue::Float(f64::from(0.015f32))]);
+    assert_eq!(field(conduits, "ds_flap_gate"), [&FieldValue::Integer(1), &FieldValue::Integer(0)]);
+    let Some(terrio::Geometry::LineString(line)) = &conduits.features[1].geometry else { panic!() };
+    assert_eq!(line.iter().map(|c| (c.x, c.y)).collect::<Vec<_>>(), [(10.0, 0.0), (15.0, 5.0), (20.0, 5.0)]);
+    let nodes = &ds.layers[1];
+    assert_eq!(nodes.geom_type, Some(terrio::GeometryType::Point));
+    assert_eq!(field(nodes, "node_type").len(), 3);
+    assert_eq!(field(nodes, "invert_elevation")[2], &FieldValue::Float(34.25));
+    let Some(terrio::Geometry::Point(p)) = &nodes.features[2].geometry else { panic!() };
+    assert_eq!((p.x, p.y), (20.0, 5.0));
+    // Geometry files store no CRS here: no CRS is invented.
+    assert!(conduits.crs.is_none());
 }

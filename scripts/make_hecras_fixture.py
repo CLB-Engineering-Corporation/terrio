@@ -13,7 +13,9 @@ writes (as seen in HEC's public example plans), so the engine qualifies them as 
   Water Surface` (value, flow and time rows) and unsteady `Water Surface`;
 - two boundary-condition lines on the mesh, each with its own (Stage, Flow) series;
 - two reference points and one reference line, with Name-axis results (Water Surface, Flow);
-- one river junction (`Geometry/Junctions` attributes and point).
+- one river junction (`Geometry/Junctions` attributes and point);
+- the cross sections' station-elevation, Manning's n and ineffective-area tables, and the mesh's
+  `FacePoints Is Perimeter` and `FacePoints Elevation`.
 
 Usage: python -I make_hecras_fixture.py <coverage_mesh.h5> <out.h5>
 """
@@ -174,6 +176,37 @@ def main(source, out):
                              data=np.stack([xs_wse.max(axis=0), flow, times[xs_at]]).astype("<f4"))
         d.attrs["Variable_Unit"] = np.array([[b"Max WSEL", b"ft"], [b"Flow at Max WSEL", b"cfs"], [b"Time at Max WSEL", b"days"]], dtype="S32")
 
+        # Per-section tables of the three cross sections and the face point arrays, as HEC-RAS
+        # 7.0 stores them (dtypes and Column/Row attributes); the values are made up.
+        xs = f["Geometry/Cross Sections"]
+
+        def packed(name, info, values, columns, row):
+            i = xs.create_dataset(f"{name} Info", data=np.array(info, dtype="<i4"))
+            i.attrs["Column"] = np.array([b"Starting Index", b"Count"], dtype="S14")
+            i.attrs["Row"] = np.bytes_(b"Feature")
+            v = xs.create_dataset(f"{name} Values", data=np.array(values, dtype="<f4"))
+            v.attrs["Column"] = np.array(columns, dtype=f"S{max(len(c) for c in columns)}")
+            v.attrs["Row"] = np.bytes_(row)
+
+        packed("Station Elevation", [[0, 3], [3, 2], [5, 4]],
+               [[0, 12.5], [10, 10.25], [20, 12], [0, 11], [15, 11.5], [0, 9], [5, 8.5], [10, 8], [15, 9.5]],
+               [b"Station", b"Elevation"], b"Points")
+        packed("Manning's n", [[0, 1], [1, 2], [3, 1]], [[0, 0.035], [0, 0.04], [10, 0.03], [0, 0.05]],
+               [b"Station", b"Mann n"], b"Values")
+        i = xs.create_dataset("Ineffective Info", data=np.array([[0, 0], [0, 2], [2, 0]], dtype="<i4"))
+        i.attrs["Column"] = np.array([b"Starting Index", b"Count"], dtype="S14")
+        i.attrs["Row"] = np.bytes_(b"Feature")
+        blocks = np.array([(0.0, 5.0, 11.25, 0), (10.0, 15.0, 11.5, 1)],
+                          dtype=[("Left Sta", "<f4"), ("Right Sta", "<f4"), ("Elevation", "<f4"), ("Permanent", "u1")])
+        xs.create_dataset("Ineffective Blocks", data=blocks)
+        g = f[f"Geometry/2D Flow Areas/{MESH}"]
+        n = len(g["FacePoints Coordinate"])
+        p = g.create_dataset("FacePoints Is Perimeter", data=np.array([-1 if k % 2 == 0 else 0 for k in range(n)], dtype="<i4"))
+        p.attrs["Can Plot"] = np.bytes_(b"False")
+        p.attrs["Column"] = np.array([b"Is On Perimeter"], dtype="S15")
+        p.attrs["Row"] = np.bytes_(b"Face Point")
+        e = g.create_dataset("FacePoints Elevation", data=(10.0 + 0.25 * np.arange(n)).astype("<f4"))
+        e.attrs["Can Plot"] = np.bytes_(b"False")
 
 if __name__ == "__main__":
     main(sys.argv[1], sys.argv[2])
