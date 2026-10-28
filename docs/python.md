@@ -163,7 +163,7 @@ terrio.mosaic(["n40w106.tif", "n40w107.tif"], "mosaic.tif")
 terrio.rasterize("counties.gpkg", "pop.tif", attribute="POPULATION", tr=(0.01, 0.01), ot="Int32")
 polygons = terrio.polygonize("landcover.tif", connectedness=8)
 shade = terrio.dem("dem.tif", "hillshade", z=2, multidirectional=True)  # like gdaldem
-terrio.dem("dem.tif", "color-relief", "relief.tif", color_file="colors.txt", alpha=True)
+terrio.dem("dem.tif", "color-relief", "relief.tif", color_file="colors.txt", alpha=True)  # by strips, lazy result
 ndvi = terrio.calc("(B - A * 1.0) / (B + A * 1.0)", A="landsat.tif", A_band=3, B="landsat.tif", B_band=4,
                    type="Float32")  # like gdal_calc.py, with NumPy's typing rules
 dist = terrio.proximity("roads.tif", values=[1], distunits="GEO")
@@ -348,6 +348,17 @@ The `terrio vsi` commands as functions: entries are dictionaries (`name`, `type`
 copy, sync, move and delete functions return a report (`copied`, `bytes`, `unchanged`,
 `deleted`, `errors`). `/vsimem/` files last as long as the process. Locations, semantics and the
 refusals of dangerous deletions are those of [vsi](cli.md#vsi).
+
+## COG validation
+
+```python
+ok, errors, warnings = terrio.validate_cog("dem.tif")  # rio_cogeo.cog_validate's result
+terrio.validate_cog("https://example.com/dem.tif", strict=True)  # warnings fail too
+```
+
+The checks and messages of `rio_cogeo.cogeo.cog_validate`, read from the file's structure without
+GDAL, for local files (a `str` or `os.PathLike`), URLs and S3 objects (range requests). See
+[Rust](rust.md#reading-windows-lazily).
 
 ## Typing
 

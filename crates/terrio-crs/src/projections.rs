@@ -100,7 +100,10 @@ pub(crate) fn build(name: &str, s: &mut Setup<'_>) -> Result<Option<Box<dyn Proj
         "geos" => Box::new(Geos::new(s)?),
         "robin" => Box::new(Robin),
         "moll" | "wag4" | "wag5" => Box::new(Moll::new(name)),
+        "healpix" => Box::new(Healpix::new(s, false)?),
+        "rhealpix" => Box::new(Healpix::new(s, true)?),
         "igh" => Box::new(Igh::new()?),
+        "qsc" => Box::new(Qsc::new(s)),
         "wintri" => Box::new(Wintri::new(s)?),
         "wink1" => Box::new(Wink1 { cosphi1: s.p.angle("lat_ts").unwrap_or(0.0).cos() }),
         "wink2" => Box::new(Wink2 { cosphi1: s.p.angle("lat_1").unwrap_or(0.0).cos() }),
@@ -3021,6 +3024,321 @@ impl Proj for Moll {
 }
 
 // ---------------------------------------------------------------------------------------------
+// HEALPix and rHEALPix, ported from PROJ's healpix.cpp (Raichev and Speth): the equal-area HEALPix
+// projection, cylindrical equal-area between the latitudes +-asin(2/3) and in four interrupted
+// polar caps beyond them, and rHEALPix, which combines each pole's caps into one square. On an
+// ellipsoid, as in PROJ, the latitude is the authalic one and the sphere has the authalic radius.
+
+/// PROJ's slack on the edges of the image.
+const HEALPIX_EPS: f64 = 1e-15;
+
+/// The rotations PROJ indexes by -3 to 3 (counterclockwise by that many right angles).
+fn healpix_rotation(index: i32) -> [[f64; 2]; 2] {
+    match index.rem_euclid(4) {
+        1 => [[0.0, -1.0], [1.0, 0.0]],
+        2 => [[-1.0, 0.0], [0.0, -1.0]],
+        3 => [[0.0, 1.0], [-1.0, 0.0]],
+        _ => [[1.0, 0.0], [0.0, 1.0]],
+    }
+}
+
+/// PROJ's `sign`: 1, -1 or 0.
+fn healpix_sign(v: f64) -> f64 {
+    if v > 0.0 {
+        1.0
+    } else if v < 0.0 {
+        -1.0
+    } else {
+        0.0
+    }
+}
+
+/// PROJ's `rotate`.
+fn healpix_rotate((x, y): (f64, f64), angle: f64) -> (f64, f64) {
+    (x * angle.cos() - y * angle.sin(), y * angle.cos() + x * angle.sin())
+}
+
+/// PROJ's `pnpoly`: whether the point is inside the polygon (or one of its vertices). As in
+/// PROJ, the edge from the last vertex back to the first is not counted.
+fn healpix_pnpoly(vert: &[(f64, f64)], x: f64, y: f64) -> bool {
+    if vert.iter().any(|&(vx, vy)| x == vx && y == vy) {
+        return true;
+    }
+    let mut counter = 0;
+    let mut p1 = vert[0];
+    for &p2 in &vert[1..] {
+        if y > p1.1.min(p2.1) && y <= p1.1.max(p2.1) && x <= p1.0.max(p2.0) && p1.1 != p2.1 {
+            let xinters = (y - p1.1) * (p2.0 - p1.0) / (p2.1 - p1.1) + p1.0;
+            if p1.0 == p2.0 || x <= xinters {
+                counter += 1;
+            }
+        }
+        p1 = p2;
+    }
+    counter % 2 == 1
+}
+
+/// PROJ's `healpix_sphere`: HEALPix on the unit sphere.
+fn healpix_sphere(lam: f64, phi: f64) -> (f64, f64) {
+    let phi0 = (2.0f64 / 3.0).asin();
+    if phi.abs() <= phi0 {
+        (lam, 3.0 * PI / 8.0 * phi.sin())
+    } else {
+        let sigma = (3.0 * (1.0 - phi.sin().abs())).sqrt();
+        let cn = (2.0 * lam / PI + 2.0).floor().min(3.0);
+        let lamc = -3.0 * FORTPI + HALFPI * cn;
+        (lamc + (lam - lamc) * sigma, healpix_sign(phi) * FORTPI * (2.0 - sigma))
+    }
+}
+
+/// PROJ's inverse of `healpix_sphere`.
+fn healpix_sphere_inverse(x: f64, y: f64) -> (f64, f64) {
+    if y.abs() <= FORTPI {
+        (x, (8.0 * y / (3.0 * PI)).asin())
+    } else if y.abs() < HALFPI {
+        let cn = (2.0 * x / PI + 2.0).floor().min(3.0);
+        let xc = -3.0 * FORTPI + HALFPI * cn;
+        let tau = 2.0 - 4.0 * y.abs() / PI;
+        (xc + (x - xc) / tau, healpix_sign(y) * (1.0 - tau * tau / 3.0).asin())
+    } else {
+        (-PI, healpix_sign(y) * HALFPI)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum HealpixRegion {
+    North,
+    South,
+    Equatorial,
+}
+
+/// The authalic latitude as PROJ 9.8.1 computes it on an ellipsoid.
+#[derive(Debug)]
+struct HealpixAuthalic {
+    /// Geodetic to authalic (`C[xi,phi]`), used when |n| < 0.01.
+    forward: Option<[f64; 6]>,
+    /// Authalic to geodetic (`C[phi,xi]`).
+    apa: [f64; 6],
+    e: f64,
+    one_es: f64,
+    qp: f64,
+}
+
+impl HealpixAuthalic {
+    /// PROJ's `pj_authalic_lat`.
+    fn forward(&self, phi: f64) -> f64 {
+        match &self.forward {
+            Some(c) => authlat(phi, c),
+            None => (qsfn(phi.sin(), self.e, self.one_es) / self.qp).clamp(-1.0, 1.0).asin(),
+        }
+    }
+
+    /// PROJ's `pj_authalic_lat_inverse`.
+    fn inverse(&self, beta: f64) -> f64 {
+        authlat_inverse(beta, &self.apa, self.e, self.one_es, self.qp)
+    }
+}
+
+#[derive(Debug)]
+struct Healpix {
+    /// rHEALPix's north and south polar square positions (0 to 3); `None` for HEALPix.
+    squares: Option<(i32, i32)>,
+    /// HEALPix's rotation of the image (`+rot_xy`), in radians.
+    rot_xy: f64,
+    /// `None` on a sphere.
+    authalic: Option<HealpixAuthalic>,
+    /// The authalic radius on the unit semi-major axis (1 on a sphere).
+    scale: f64,
+}
+
+impl Healpix {
+    fn new(s: &Setup<'_>, rhealpix: bool) -> Result<Self> {
+        let squares = if rhealpix {
+            // pj_param's integer: digits only (else an invalid value), then atoi, which reads a
+            // C long (saturating) and casts it to int.
+            let int = |key: &str| -> Result<i32> {
+                let v = s.p.str(key).unwrap_or("");
+                if !v.bytes().all(|b| b.is_ascii_digit()) {
+                    return Err(err(&format!("rhealpix: invalid {key}, it should be an integer")));
+                }
+                Ok(if v.is_empty() { 0 } else { v.parse::<i64>().unwrap_or(i64::MAX) as i32 })
+            };
+            let (north, south) = (int("north_square")?, int("south_square")?);
+            if !(0..=3).contains(&north) {
+                return Err(err("rhealpix: invalid north_square, it should be in [0,3]"));
+            }
+            if !(0..=3).contains(&south) {
+                return Err(err("rhealpix: invalid south_square, it should be in [0,3]"));
+            }
+            Some((north, south))
+        } else {
+            None
+        };
+        let rot_xy = if rhealpix { 0.0 } else { s.p.angle("rot_xy").unwrap_or(0.0) };
+        let (authalic, scale) = if s.ell.es != 0.0 {
+            let (e, one_es) = (s.ell.e, s.ell.one_es);
+            let b = one_es.sqrt();
+            let n = (1.0 - b) / (1.0 + b);
+            let qp = qsfn(1.0, e, one_es);
+            let forward = (n.abs() < 0.01).then(|| authset_forward(s.ell.es));
+            (Some(HealpixAuthalic { forward, apa: authset(s.ell.es), e, one_es, qp }), (0.5 * qp).sqrt())
+        } else {
+            (None, 1.0)
+        };
+        Ok(Self { squares, rot_xy, authalic, scale })
+    }
+
+    /// PROJ's `in_image`.
+    fn in_image(&self, x: f64, y: f64) -> bool {
+        let e = HEALPIX_EPS;
+        match self.squares {
+            None => {
+                let verts = [
+                    (-PI - e, FORTPI),
+                    (-3.0 * FORTPI, HALFPI + e),
+                    (-HALFPI, FORTPI + e),
+                    (-FORTPI, HALFPI + e),
+                    (0.0, FORTPI + e),
+                    (FORTPI, HALFPI + e),
+                    (HALFPI, FORTPI + e),
+                    (3.0 * FORTPI, HALFPI + e),
+                    (PI + e, FORTPI),
+                    (PI + e, -FORTPI),
+                    (3.0 * FORTPI, -HALFPI - e),
+                    (HALFPI, -FORTPI - e),
+                    (FORTPI, -HALFPI - e),
+                    (0.0, -FORTPI - e),
+                    (-FORTPI, -HALFPI - e),
+                    (-HALFPI, -FORTPI - e),
+                    (-3.0 * FORTPI, -HALFPI - e),
+                    (-PI - e, -FORTPI),
+                    (-PI - e, FORTPI),
+                ];
+                healpix_pnpoly(&verts, x, y)
+            }
+            Some((north, south)) => {
+                let (north, south) = (north as f64, south as f64);
+                let verts = [
+                    (-PI - e, FORTPI + e),
+                    (-PI + north * HALFPI - e, FORTPI + e),
+                    (-PI + north * HALFPI - e, 3.0 * FORTPI + e),
+                    (-PI + (north + 1.0) * HALFPI + e, 3.0 * FORTPI + e),
+                    (-PI + (north + 1.0) * HALFPI + e, FORTPI + e),
+                    (PI + e, FORTPI + e),
+                    (PI + e, -FORTPI - e),
+                    (-PI + (south + 1.0) * HALFPI + e, -FORTPI - e),
+                    (-PI + (south + 1.0) * HALFPI + e, -3.0 * FORTPI - e),
+                    (-PI + south * HALFPI - e, -3.0 * FORTPI - e),
+                    (-PI + south * HALFPI - e, -FORTPI - e),
+                    (-PI - e, -FORTPI - e),
+                ];
+                healpix_pnpoly(&verts, x, y)
+            }
+        }
+    }
+
+    /// PROJ's `get_cap`: the polar cap's number, its tip and the region of a point of the HEALPix
+    /// image (forward), or of the rHEALPix image (inverse).
+    fn cap(x: f64, y: f64, north: i32, south: i32, inverse: bool) -> (i32, f64, f64, HealpixRegion) {
+        let e = HEALPIX_EPS;
+        if !inverse {
+            let (region, c) = if y > FORTPI {
+                (HealpixRegion::North, HALFPI)
+            } else if y < -FORTPI {
+                (HealpixRegion::South, -HALFPI)
+            } else {
+                return (0, x, y, HealpixRegion::Equatorial);
+            };
+            let (cn, cx) = if x < -HALFPI {
+                (0, -3.0 * FORTPI)
+            } else if x < 0.0 {
+                (1, -FORTPI)
+            } else if x < HALFPI {
+                (2, FORTPI)
+            } else {
+                (3, 3.0 * FORTPI)
+            };
+            (cn, cx, c, region)
+        } else if y > FORTPI {
+            let cx = -3.0 * FORTPI + north as f64 * HALFPI;
+            let x = x - north as f64 * HALFPI;
+            // The HEALPix cap that the point moves to when the polar square is taken apart.
+            let cn = if y >= -x - FORTPI - e && y < x + 5.0 * FORTPI - e {
+                (north + 1) % 4
+            } else if y > -x - FORTPI + e && y >= x + 5.0 * FORTPI - e {
+                (north + 2) % 4
+            } else if y <= -x - FORTPI + e && y > x + 5.0 * FORTPI + e {
+                (north + 3) % 4
+            } else {
+                north
+            };
+            (cn, cx, HALFPI, HealpixRegion::North)
+        } else if y < -FORTPI {
+            let cx = -3.0 * FORTPI + south as f64 * HALFPI;
+            let x = x - south as f64 * HALFPI;
+            let cn = if y <= x + FORTPI + e && y > -x - 5.0 * FORTPI + e {
+                (south + 1) % 4
+            } else if y < x + FORTPI - e && y <= -x - 5.0 * FORTPI + e {
+                (south + 2) % 4
+            } else if y >= x + FORTPI - e && y < -x - 5.0 * FORTPI - e {
+                (south + 3) % 4
+            } else {
+                south
+            };
+            (cn, cx, -HALFPI, HealpixRegion::South)
+        } else {
+            (0, x, y, HealpixRegion::Equatorial)
+        }
+    }
+
+    /// PROJ's `combine_caps`: HEALPix to rHEALPix (forward) or back (inverse).
+    fn combine_caps(x: f64, y: f64, north: i32, south: i32, inverse: bool) -> (f64, f64) {
+        let (cn, cx, cy, region) = Self::cap(x, y, north, south, inverse);
+        if region == HealpixRegion::Equatorial {
+            return (cx, cy);
+        }
+        let pole = if region == HealpixRegion::North { north } else { south };
+        // Forward, rotate about the cap's tip and move it to the polar square; inverse, undo it.
+        let turn = if (region == HealpixRegion::North) != inverse { cn - pole } else { -(cn - pole) };
+        let r = healpix_rotation(turn);
+        let (vx, vy) = (x - cx, y - cy);
+        let (dx, dy) = (r[0][0] * vx + r[0][1] * vy, r[1][0] * vx + r[1][1] * vy);
+        let ax = -3.0 * FORTPI + (if inverse { cn } else { pole }) as f64 * HALFPI;
+        let ay = if region == HealpixRegion::North { HALFPI } else { -HALFPI };
+        (dx + ax, dy + ay)
+    }
+}
+
+impl Proj for Healpix {
+    fn fwd(&self, lam: f64, phi: f64) -> Option<(f64, f64)> {
+        let phi = self.authalic.as_ref().map_or(phi, |a| a.forward(phi));
+        let (x, y) = healpix_sphere(lam, phi);
+        let (x, y) = match self.squares {
+            None => healpix_rotate((x, y), -self.rot_xy),
+            Some((north, south)) => Self::combine_caps(x, y, north, south, false),
+        };
+        Some((x * self.scale, y * self.scale))
+    }
+
+    fn inv(&self, x: f64, y: f64) -> Option<(f64, f64)> {
+        let (x, y) = (x / self.scale, y / self.scale);
+        let (x, y) = match self.squares {
+            None => healpix_rotate((x, y), self.rot_xy),
+            Some(_) => (x, y),
+        };
+        if !self.in_image(x, y) {
+            return None;
+        }
+        let (x, y) = match self.squares {
+            None => (x, y),
+            Some((north, south)) => Self::combine_caps(x, y, north, south, true),
+        };
+        let (lam, phi) = healpix_sphere_inverse(x, y);
+        Some((lam, self.authalic.as_ref().map_or(phi, |a| a.inverse(phi))))
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
 // Interrupted Goode Homolosine, ported from PROJ's igh.cpp: twelve zones, each a spherical
 // sinusoidal (between the equator and 40 degrees 44' 11.8") or Mollweide (poleward of it) projection
 // with its own central meridian, the Mollweide zones shifted to meet the sinusoidal ones.
@@ -3127,6 +3445,242 @@ impl Proj for Igh {
             _ => within(80.0, 180.0),
         };
         ok.then_some((lam, phi))
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Quadrilateralized spherical cube, as PROJ's qsc.cpp: one of the six cube faces, chosen by the
+// projection centre, with the ellipsoid shifted to the sphere by geocentric latitude.
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum QscFace {
+    Front,
+    Right,
+    Back,
+    Left,
+    Top,
+    Bottom,
+}
+
+#[derive(Debug)]
+struct Qsc {
+    face: QscFace,
+    /// The semi-minor axis on the unit semi-major axis; 1 on a sphere.
+    b: f64,
+    es: f64,
+}
+
+/// The four areas of a cube face, counterclockwise from the area of definition.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum QscArea {
+    A0,
+    A1,
+    A2,
+    A3,
+}
+
+/// The theta angle and area of a point on an equatorial face (PROJ's qsc_fwd_equat_face_theta).
+fn qsc_equat_face_theta(colat: f64, y: f64, x: f64) -> (f64, QscArea) {
+    if colat < 1e-10 {
+        return (0.0, QscArea::A0);
+    }
+    let theta = y.atan2(x);
+    if theta.abs() <= FORTPI {
+        (theta, QscArea::A0)
+    } else if theta > FORTPI && theta <= HALFPI + FORTPI {
+        (theta - HALFPI, QscArea::A1)
+    } else if theta > HALFPI + FORTPI || theta <= -(HALFPI + FORTPI) {
+        (if theta >= 0.0 { theta - PI } else { theta + PI }, QscArea::A2)
+    } else {
+        (theta + HALFPI, QscArea::A3)
+    }
+}
+
+/// PROJ's qsc_shift_longitude_origin.
+fn qsc_shift_longitude(longitude: f64, offset: f64) -> f64 {
+    let slon = longitude + offset;
+    if slon < -PI {
+        slon + 2.0 * PI
+    } else if slon > PI {
+        slon - 2.0 * PI
+    } else {
+        slon
+    }
+}
+
+impl Qsc {
+    fn new(s: &Setup<'_>) -> Self {
+        let face = if s.phi0 >= HALFPI - FORTPI / 2.0 {
+            QscFace::Top
+        } else if s.phi0 <= -(HALFPI - FORTPI / 2.0) {
+            QscFace::Bottom
+        } else if s.lam0.abs() <= FORTPI {
+            QscFace::Front
+        } else if s.lam0.abs() <= HALFPI + FORTPI {
+            if s.lam0 > 0.0 { QscFace::Right } else { QscFace::Left }
+        } else {
+            QscFace::Back
+        };
+        Self { face, b: (1.0 - s.ell.es).sqrt(), es: s.ell.es }
+    }
+}
+
+impl Proj for Qsc {
+    fn fwd(&self, lam: f64, phi: f64) -> Option<(f64, f64)> {
+        // The geodetic latitude as a geocentric latitude: the shift from the ellipsoid to the
+        // sphere. b is also 1 - f on the unit semi-major axis.
+        let lat = if self.es != 0.0 { (self.b * self.b * phi.tan()).atan() } else { phi };
+        let mut longitude = lam;
+        // colat is PROJ's phi: the angle from the face centre.
+        let (theta, colat, area);
+        match self.face {
+            QscFace::Top => {
+                colat = HALFPI - lat;
+                (theta, area) = if (FORTPI..=HALFPI + FORTPI).contains(&longitude) {
+                    (longitude - HALFPI, QscArea::A0)
+                } else if longitude > HALFPI + FORTPI || longitude <= -(HALFPI + FORTPI) {
+                    (if longitude > 0.0 { longitude - PI } else { longitude + PI }, QscArea::A1)
+                } else if longitude > -(HALFPI + FORTPI) && longitude <= -FORTPI {
+                    (longitude + HALFPI, QscArea::A2)
+                } else {
+                    (longitude, QscArea::A3)
+                };
+            }
+            QscFace::Bottom => {
+                colat = HALFPI + lat;
+                (theta, area) = if (FORTPI..=HALFPI + FORTPI).contains(&longitude) {
+                    (-longitude + HALFPI, QscArea::A0)
+                } else if (-FORTPI..FORTPI).contains(&longitude) {
+                    (-longitude, QscArea::A1)
+                } else if (-(HALFPI + FORTPI)..-FORTPI).contains(&longitude) {
+                    (-longitude - HALFPI, QscArea::A2)
+                } else {
+                    (if longitude > 0.0 { -longitude + PI } else { -longitude - PI }, QscArea::A3)
+                };
+            }
+            face => {
+                longitude = match face {
+                    QscFace::Right => qsc_shift_longitude(longitude, HALFPI),
+                    QscFace::Back => qsc_shift_longitude(longitude, PI),
+                    QscFace::Left => qsc_shift_longitude(longitude, -HALFPI),
+                    _ => longitude,
+                };
+                let (sinlat, coslat) = lat.sin_cos();
+                let (sinlon, coslon) = longitude.sin_cos();
+                let (q, r, s) = (coslat * coslon, coslat * sinlon, sinlat);
+                let (p, y, x) = match face {
+                    QscFace::Front => (q.acos(), s, r),
+                    QscFace::Right => (r.acos(), s, -q),
+                    QscFace::Back => ((-q).acos(), s, -r),
+                    _ => ((-r).acos(), s, q),
+                };
+                colat = p;
+                (theta, area) = qsc_equat_face_theta(colat, y, x);
+            }
+        }
+        // mu and nu for the area of definition: Eq. (3-21) of O'Neill and Laubscher (1976), with
+        // its typos corrected against Eq. (3-14), and t = tan(nu) from Eq. (3-38).
+        let mut mu = ((12.0 / PI) * (theta + (theta.sin() * FORTPI.cos()).acos() - HALFPI)).atan();
+        let t = ((1.0 - colat.cos()) / (mu.cos() * mu.cos()) / (1.0 - (1.0 / theta.cos()).atan().cos())).sqrt();
+        mu += match area {
+            QscArea::A1 => HALFPI,
+            QscArea::A2 => PI,
+            QscArea::A3 => PI + HALFPI,
+            _ => 0.0,
+        };
+        Some((t * mu.cos(), t * mu.sin()))
+    }
+
+    fn inv(&self, x: f64, y: f64) -> Option<(f64, f64)> {
+        let nu = x.hypot(y).atan();
+        let mut mu = y.atan2(x);
+        let area = if x >= 0.0 && x >= y.abs() {
+            QscArea::A0
+        } else if y >= 0.0 && y >= x.abs() {
+            mu -= HALFPI;
+            QscArea::A1
+        } else if x < 0.0 && -x >= y.abs() {
+            mu = if mu < 0.0 { mu + PI } else { mu - PI };
+            QscArea::A2
+        } else {
+            mu += HALFPI;
+            QscArea::A3
+        };
+        // phi and theta for the area of definition.
+        let t = (PI / 12.0) * mu.tan();
+        let theta = (t.sin() / (t.cos() - 1.0 / 2f64.sqrt())).atan();
+        let cosmu = mu.cos();
+        let tannu = nu.tan();
+        let cosphi = (1.0 - cosmu * cosmu * tannu * tannu * (1.0 - (1.0 / theta.cos()).atan().cos())).clamp(-1.0, 1.0);
+        let (lam, mut lat) = match self.face {
+            QscFace::Top => {
+                let lam = match area {
+                    QscArea::A0 => theta + HALFPI,
+                    QscArea::A1 => {
+                        if theta < 0.0 {
+                            theta + PI
+                        } else {
+                            theta - PI
+                        }
+                    }
+                    QscArea::A2 => theta - HALFPI,
+                    _ => theta,
+                };
+                (lam, HALFPI - cosphi.acos())
+            }
+            QscFace::Bottom => {
+                let lam = match area {
+                    QscArea::A0 => -theta + HALFPI,
+                    QscArea::A1 => -theta,
+                    QscArea::A2 => -theta - HALFPI,
+                    _ => {
+                        if theta < 0.0 {
+                            -theta - PI
+                        } else {
+                            -theta + PI
+                        }
+                    }
+                };
+                (lam, cosphi.acos() - HALFPI)
+            }
+            face => {
+                // Through cartesian coordinates on the unit sphere.
+                let mut q = cosphi;
+                let mut u = q * q;
+                let mut s = if u >= 1.0 { 0.0 } else { (1.0 - u).sqrt() * theta.sin() };
+                u += s * s;
+                let mut r = if u >= 1.0 { 0.0 } else { (1.0 - u).sqrt() };
+                // Into the area, then into the cube face.
+                match area {
+                    QscArea::A1 => (r, s) = (-s, r),
+                    QscArea::A2 => (r, s) = (-r, -s),
+                    QscArea::A3 => (r, s) = (s, -r),
+                    _ => {}
+                }
+                match face {
+                    QscFace::Right => (q, r) = (-r, q),
+                    QscFace::Back => (q, r) = (-q, -r),
+                    QscFace::Left => (q, r) = (r, -q),
+                    _ => {}
+                }
+                let lam = r.atan2(q);
+                let lam = match face {
+                    QscFace::Right => qsc_shift_longitude(lam, -HALFPI),
+                    QscFace::Back => qsc_shift_longitude(lam, -PI),
+                    QscFace::Left => qsc_shift_longitude(lam, HALFPI),
+                    _ => lam,
+                };
+                (lam, (-s).acos() - HALFPI)
+            }
+        };
+        // The shift from the sphere back to the ellipsoid.
+        if self.es != 0.0 {
+            let tanphi = lat.tan();
+            let xa = self.b / (tanphi * tanphi + self.b * self.b).sqrt();
+            let phi = ((1.0 - xa * xa).sqrt() / (self.b * xa)).atan();
+            lat = if lat < 0.0 { -phi } else { phi };
+        }
+        Some((lam, lat))
     }
 }
 

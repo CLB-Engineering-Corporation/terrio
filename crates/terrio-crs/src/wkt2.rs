@@ -318,6 +318,10 @@ pub(crate) fn to_proj(root: &Node) -> Result<Converted> {
         push("lat_1", p.get(SP1));
         push("lat_2", p.get(SP2));
         "eqdc"
+    } else if is(&["quadrilateralizedsphericalcube"], &[]) {
+        push("lat_0", lat_0());
+        push("lon_0", lon_0());
+        "qsc"
     } else if is(&["gnomonic"], &[]) {
         push("lat_0", lat_0());
         push("lon_0", lon_0());
@@ -484,9 +488,13 @@ type ProjMethod = (String, Vec<(String, f64)>);
 /// other methods.
 fn proj_method(conv: &Node, method: &Node, ang: f64, to_meter: f64) -> Result<Option<ProjMethod>> {
     let Some(name) = method.name().and_then(|n| n.strip_prefix("PROJ ")) else { return Ok(None) };
-    if name.is_empty() || !name.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_') {
-        return Ok(None);
-    }
+    let word = |w: &str| !w.is_empty() && w.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_');
+    // PROJ's `ob_tran` names the rotated projection in the method: `PROJ ob_tran o_proj=moll`.
+    let name = match name.strip_prefix("ob_tran o_proj=") {
+        Some(o_proj) if word(o_proj) => format!("ob_tran +o_proj={o_proj}"),
+        _ if word(name) => name.to_string(),
+        _ => return Ok(None),
+    };
     let mut params = Vec::new();
     for n in conv.children("PARAMETER") {
         let key = n.name().unwrap_or("");
@@ -500,7 +508,9 @@ fn proj_method(conv: &Node, method: &Node, ang: f64, to_meter: f64) -> Result<Op
             v * u
         } else if n.child("SCALEUNIT").is_some() {
             v
-        } else if key.starts_with("lat") || key.starts_with("lon") || matches!(key, "alpha" | "gamma" | "azi" | "theta" | "tilt") {
+        } else if ["lat", "lon", "o_lat", "o_lon"].iter().any(|k| key.starts_with(k))
+            || matches!(key, "alpha" | "gamma" | "azi" | "theta" | "tilt" | "o_alpha")
+        {
             // Without a unit: angles in the CRS's angular unit, lengths in its linear unit, and
             // the others (scale factors, shape parameters) as they are.
             v * ang
@@ -511,7 +521,7 @@ fn proj_method(conv: &Node, method: &Node, ang: f64, to_meter: f64) -> Result<Op
         };
         params.push((key.to_string(), v));
     }
-    Ok(Some((name.to_string(), params)))
+    Ok(Some((name, params)))
 }
 
 /// Pseudocylindrical and other world projections PROJ names without an EPSG method, which take a
