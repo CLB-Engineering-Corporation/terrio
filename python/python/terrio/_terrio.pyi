@@ -982,6 +982,7 @@ def calc(
     compress: str | None = None,
     tile_size: int | None = None,
     bigtiff: bool = False,
+    max_memory_mib: float | None = None,
     **inputs: _RasterSource | int,
 ) -> Raster: ...
 def vector_grid(

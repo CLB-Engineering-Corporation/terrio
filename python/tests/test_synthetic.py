@@ -529,6 +529,39 @@ def test_shaded_relief_matches_the_numpy_blend(tmp_path):
         terrio.dem(str(src), "color-relief", color_file=str(colors), hillshade_strength=0.5)
 
 
+@pytest.mark.parametrize("extent", ["ignore", "union", "intersect"])
+def test_calc_paths_to_path_are_streamed(tmp_path, extent):
+    """Input paths computed to a path are read and written a strip at a time, lazily returned,
+    with the values of the calculation in memory, for each extent rule and mixed types."""
+    rows, cols = np.mgrid[0:700, 0:500]
+    a = ((rows * 7 + cols * 13) % 251).astype("float32") - 20.5
+    a[100:103, 50:400] = -9999
+    b = ((rows * 3 + cols) % 200).astype("int16")
+    b[300, :] = -1
+    shift = 0.0 if extent == "ignore" else 37.0
+    ta = TRANSFORM
+    tb = (TRANSFORM[0] + shift, TRANSFORM[1], 0.0, TRANSFORM[3] - shift, 0.0, TRANSFORM[5])
+    pa, pb = str(tmp_path / "a.tif"), str(tmp_path / "b.tif")
+    terrio.Raster.from_array(a, ta, crs="EPSG:32610", nodata=-9999).write(pa)
+    terrio.Raster.from_array(b, tb, crs="EPSG:32610", nodata=-1).write(pb)
+    expr = "where(A > B, A * 2, B) + (B % 3)"
+    ref = terrio.calc(expr, A=terrio.open_raster(pa), B=terrio.open_raster(pb), extent=extent)
+    out = terrio.calc(
+        expr, str(tmp_path / f"c_{extent}.tif"), A=pa, B=pb, extent=extent, max_memory_mib=0.5
+    )
+    assert out.is_lazy
+    x, y = np.asarray(out.read()), np.asarray(ref.read())
+    assert x.dtype == y.dtype and x.shape == y.shape and x.tobytes() == y.tobytes()
+    assert out.transform == ref.transform and out.nodata == ref.nodata
+    # `os.PathLike` inputs are paths too.
+    out = terrio.calc(
+        expr, str(tmp_path / "p.tif"), A=tmp_path / "a.tif", B=tmp_path / "b.tif", extent=extent
+    )
+    assert out.is_lazy and np.asarray(out.read()).tobytes() == y.tobytes()
+    with pytest.raises(terrio.InvalidArgumentError):
+        terrio.calc(expr, A=terrio.open_raster(pa), B=pb, max_memory_mib=1)
+
+
 def test_calc_numpy_typing():
     """Checks that calc follows NumPy's typing rules, as gdal_calc.py does."""
     a = np.array([[200, 3], [0, 100]], dtype="uint8")
