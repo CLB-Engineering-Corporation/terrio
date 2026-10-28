@@ -1134,6 +1134,14 @@ numbers adapt to the array's type. A repeated `--calc` gives one band each. Opti
 `--allBands NAME`, `--projectionCheck`, and the output format options. Any input pixel equal to
 its nodata value gives an output nodata pixel.
 
+The inputs are read by window and the output written a strip of rows at a time, with the values of
+the calculation in memory: each strip holds whole evaluation chunks (rows of about 256 K pixels),
+and inputs of other extents (`--extent union|intersect`, `--projwin`) are aligned on the output's
+grid with the rounding of the whole read. `--max-memory MIB` (default 256) sets about how much
+memory the strips in flight and the evaluation threads take; the output does not depend on it. An
+output that is also an input is computed whole first. Python's `terrio.calc(expr, dst, A=path,
+..., max_memory_mib=...)` does the same when every input is a path.
+
 ## proximity
 
 ```sh
