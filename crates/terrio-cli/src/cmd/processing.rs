@@ -262,7 +262,7 @@ pub struct SampleArgs {
     input: VectorInput,
     #[command(flatten)]
     output: VectorOutput,
-    /// An input raster (repeat for multiple rasters). Each raster is loaded into memory.
+    /// An input raster (repeat for multiple rasters).
     #[arg(long = "raster", required = true, value_name = "PATH")]
     rasters: Vec<String>,
     /// Bands from every raster, from 1, comma-separated. By default, band 1.
@@ -280,7 +280,29 @@ pub struct SampleArgs {
     decimal_places: Option<u8>,
 }
 
-pub fn sample(a: SampleArgs) -> Result<()> {
+#[derive(clap::Args)]
+pub struct PointSampleArgs {
+    #[command(flatten)]
+    sources: SampleArgs,
+    /// Read full-resolution point windows instead of loading rasters into memory.
+    #[arg(long)]
+    lazy: bool,
+    /// Add a text status field per sample, named SAMPLE_FIELD + suffix. Requires --lazy.
+    #[arg(long, requires = "lazy", value_name = "SUFFIX")]
+    status_suffix: Option<String>,
+    /// Fail if any point cannot be transformed into a raster CRS. Requires --lazy.
+    #[arg(long, requires = "lazy")]
+    strict_transform_errors: bool,
+    /// Maximum returned window width and height. Decoder chunks have separate limits.
+    #[arg(long, requires = "lazy", default_value = "512")]
+    sample_window_size: usize,
+}
+
+pub fn sample(args: PointSampleArgs) -> Result<()> {
+    if args.lazy {
+        return sample_lazy(args);
+    }
+    let a = args.sources;
     let options =
         SampleOptions { dst_srs: a.t_srs.as_deref().map(terrio::crs::SpatialRef::parse).transpose()?, decimal_places: a.decimal_places };
     let (rasters, prefixes) = sample_sources(&a)?;
@@ -295,21 +317,53 @@ pub fn sample(a: SampleArgs) -> Result<()> {
     a.output.write(layers)
 }
 
+fn sample_lazy(args: PointSampleArgs) -> Result<()> {
+    use terrio::ops::sample::{LazySampleInput, LazySampleOptions};
+    let a = args.sources;
+    let prefixes = sample_prefixes(&a)?;
+    let mut rasters = a.rasters.iter().map(|p| super::quiet(|| terrio::open_raster_lazy(p))).collect::<Result<Vec<_>>>()?;
+    let options = LazySampleOptions {
+        output: SampleOptions { decimal_places: a.decimal_places, dst_srs: None },
+        status_suffix: args.status_suffix,
+        strict_transform_errors: args.strict_transform_errors,
+        window_size: args.sample_window_size,
+    };
+    let mut layers = a.input.open()?;
+    for layer in &mut layers {
+        for (raster, prefix) in rasters.iter_mut().zip(&prefixes) {
+            for &band in &a.bands {
+                let mut inputs = [LazySampleInput { field_name: format!("{prefix}_b{band}"), raster, band }];
+                *layer = terrio::ops::sample::sample_lazy(layer, &mut inputs, &options)?;
+            }
+        }
+        // Output reprojection must not change the pixels selected in later rasters.
+        if let Some(crs) = &a.t_srs {
+            *layer = terrio::vector::reproject_layer(layer, &terrio::crs::SpatialRef::parse(crs)?)?;
+        }
+    }
+    a.output.write(layers)
+}
+
 fn sample_sources(a: &SampleArgs) -> Result<(Vec<terrio::RasterDataset>, Vec<String>)> {
+    let prefixes = sample_prefixes(a)?;
+    let rasters = a.rasters.iter().map(|p| super::quiet(|| terrio::open_raster(p))).collect::<Result<Vec<_>>>()?;
+    Ok((rasters, prefixes))
+}
+
+fn sample_prefixes(a: &SampleArgs) -> Result<Vec<String>> {
     if !a.prefixes.is_empty() && a.prefixes.len() != a.rasters.len() {
         return Err(Error::InvalidArgument("give one --prefix per --raster, or omit all prefixes".into()));
     }
     if a.prefixes.iter().any(|p| p.trim().is_empty()) {
         return Err(Error::InvalidArgument("raster field prefixes cannot be empty".into()));
     }
-    let rasters = a.rasters.iter().map(|p| super::quiet(|| terrio::open_raster(p))).collect::<Result<Vec<_>>>()?;
     let mut prefixes = Vec::new();
     for (i, path) in a.rasters.iter().enumerate() {
         let stem = std::path::Path::new(path).file_stem().and_then(|s| s.to_str()).unwrap_or("raster");
         let prefix = a.prefixes.get(i).map_or(stem, String::as_str);
         prefixes.push(prefix.to_string());
     }
-    Ok((rasters, prefixes))
+    Ok(prefixes)
 }
 
 #[derive(clap::Args)]

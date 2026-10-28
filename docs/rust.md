@@ -217,6 +217,7 @@ raster, a band and an output field. It transforms points into each raster's CRS 
 retains their original geometries, and records missing samples as nulls.
 `sample_with_options` additionally accepts `SampleOptions { dst_srs, decimal_places }` to
 reproject output geometries after sampling and round only newly sampled numeric fields.
+For bounded windows and inspectable missing-value statuses, see [Bounded point sampling](#bounded-point-sampling).
 `sample` keeps its existing behavior. These operations are
 available in the core crate, including WebAssembly builds, without additional features.
 
@@ -294,6 +295,38 @@ let o = translate::TranslateOptions { src_win: Some((0.0, 0.0, 512.0, 512.0)), .
 let corner = translate::translate(&utm, &o)?;
 # Ok::<(), terrio::Error>(())
 ```
+
+### Bounded point sampling
+
+`ops::sample::sample_lazy` accepts mutable `LazyRaster` handles and samples the containing
+full-resolution pixel. It groups points by native blocks capped to `window_size` in each
+axis (512 by default), releases each returned window, and restores original point order,
+IDs, attributes and geometry. Rotated and south-up affine grids are supported. Right and
+bottom edges lie outside the grid. Point coordinates use traditional GIS XY axis order.
+
+```rust,no_run
+use terrio::ops::sample::{sample_lazy, LazySampleInput, LazySampleOptions};
+let sites = terrio::open_vector("sites.gpkg", &Default::default())?;
+let mut raster = terrio::open_raster_lazy("elevation.tif")?;
+let mut inputs = [LazySampleInput { field_name: "elevation".into(), raster: &mut raster, band: 1 }];
+let options = LazySampleOptions { status_suffix: Some("_status".into()), ..Default::default() };
+let sampled = sample_lazy(&sites.layers[0], &mut inputs, &options)?;
+# Ok::<(), terrio::Error>(())
+```
+
+The optional status field distinguishes `valid`, `nodata` (also masks and non-finite pixels),
+`outside`, `transform-error` and `no-geometry`. Status names append the suffix to the final
+sample field name; both names resolve collisions with `_2`, `_3`, etc. Missing values remain
+null. `strict_transform_errors` makes a per-point projection error fatal; CRS construction,
+decoder and mask I/O errors always fail. Per-band nodata comparisons use the band's precision.
+Output rounding and reprojection are configured through `LazySampleOptions::output` and occur
+after sampling. The existing eager `sample` and `SampleOptions` APIs retain their behavior.
+
+Returned pixel windows have bounded dimensions; point indexing/output memory grows with the
+number of points. Source decoders may allocate a whole tile or strip, subject to their own
+limits, and network/driver caches are separate. Blocks larger than the configured window cap
+can be decoded repeatedly. Formats without a lazy reader may materialize pixels when opened.
+
 
 ### Pansharpening
 

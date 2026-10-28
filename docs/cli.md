@@ -346,6 +346,24 @@ are accepted only when both the points and the raster lack a CRS, using coordina
 Complex bands and geolocation arrays are unsupported. Rasters are loaded into memory, and
 sample values are represented as 64-bit floats (integers above 2⁵³ may lose precision).
 
+Use `--lazy` to read only full-resolution windows containing the points:
+
+```sh
+terrio sample sites.gpkg samples.gpkg --raster elevation.tif --lazy \
+  --status-suffix _status --strict-transform-errors
+```
+
+Lazy sampling respects internal and external dataset masks and per-band nodata. The optional
+Text status fields distinguish `valid`, `nodata` (including masks and non-finite pixels),
+`outside`, `transform-error` and `no-geometry`. Their names append the suffix to the final
+sample field name and resolve collisions in the same way. `--strict-transform-errors` fails
+on a per-point projection error; invalid CRS construction and pixel/mask I/O always fail.
+`--sample-window-size N` caps returned window width and height (default 512); native block
+sizes are used when smaller. Indexing/output memory grows with point count. Decoder chunks
+and caches have separate limits; large blocks can be decoded repeatedly and formats without
+a lazy reader may already be held in memory. These options require `--lazy`; the eager default
+is unchanged. Sampling always precedes `--t-srs` output reprojection.
+
 ## contour
 
 ```sh

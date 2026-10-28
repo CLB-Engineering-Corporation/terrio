@@ -27,6 +27,7 @@ Suites:
     vector-ops        ogr2ogr options, rasterize, polygonize (compare_vector_ops_with_gdal.py)
     analysis-output   zonal/point-sampling output reprojection and decimal rounding
     footprint         raster footprints, source/custom fields and singleparts vs GDAL
+    sample            eager/lazy point samples, rotated grids and internal/external masks vs GDAL
     vsi               terrio vsi list/copy/sync/move/delete vs gdal vsi, locally, in archives and on S3
                       (compare_vsi_with_gdal.py)
     topology          buffer, polygon overlay/dissolve, validity, repair and cleanup vs GEOS
@@ -1648,6 +1649,28 @@ def suite_analysis_output(ctx):
     return suite
 
 
+def suite_sample(ctx):
+    """Eager/lazy full-resolution samples and explicit masks on the real COG fixture."""
+    suite = Suite(
+        "sample", "Point sampling", "GDAL coordinate transforms and mask bands",
+        "Containing pixels on the public COG and rotated subsets with internal/external masks; "
+        "values, nulls, status fields, point order, attributes and XY are exact.",
+    )
+    if missing_modules("osgeo"):
+        suite.skipped = "needs osgeo"
+        return suite
+    code, out, err = run([
+        sys.executable, str(SCRIPTS / "compare_processing_with_gdal.py"), ctx.data,
+        "--terrio", ctx.terrio, "--only-sample",
+    ])
+    for line in out.splitlines():
+        if line.startswith("PASS "):
+            suite.cases.append(Case("sample", line[5:].split(":", 1)[0], IDENTICAL, line.split(":", 1)[1].strip()))
+    if code != 0 or len(suite.cases) != 4:
+        suite.error = tail(err or out)
+    return suite
+
+
 def suite_footprint(ctx):
     """Source attributes and multipart/singlepart footprints on real rasters."""
     suite = Suite(
@@ -1893,6 +1916,7 @@ SUITES = OrderedDict(
         ("vector-geom", suite_vector_geom),
         ("vector-dataset", suite_vector_dataset),
         ("footprint", suite_footprint),
+        ("sample", suite_sample),
         ("analysis-output", suite_analysis_output),
         ("arrow", suite_arrow),
         ("gpkg", suite_gpkg),

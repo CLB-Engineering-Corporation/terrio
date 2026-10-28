@@ -1032,3 +1032,23 @@ and `USGS_1_n40w106.tif` each used one GET and 65,536 served body bytes, matchin
 ordinary lazy info opens. Raster index construction never called the pixel source in
 its panic-on-read unit fixture. These observations apply to lazy-capable readers;
 formats whose reader lacks a metadata-only path may materialize the input.
+
+## Lazy point sampling
+
+The `sample` conformance suite compares the eager and lazy CLI paths on the public
+`cog.tif` fixture, then lazy sampling on rotated subsets with internal and external
+explicit masks. GDAL supplies coordinate transformations, inverse affine transforms,
+mask bands and full-resolution reference values. Values, nulls, status strings,
+attributes, order and XY are compared exactly.
+
+```sh
+python scripts/conformance.py ../terrio-data --only sample --strict
+cargo test -p terrio --lib lazy_tests
+cargo test -p terrio --test processing
+cargo test -p terrio-cli --test processing
+```
+
+The bounded-source unit fixture describes 100 million pixels without allocating their
+buffer. Interleaved and repeated points occupy two native 4 by 2 blocks: two reads return
+16 pixels total, at full resolution, and the output retains input order. This verifies
+window grouping and returned-buffer bounds, independently of codec chunk and cache limits.

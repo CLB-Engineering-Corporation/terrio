@@ -62,7 +62,7 @@ enum Command {
     Xyz(cmd::xyz::Args),
     /// Sample one or more raster bands at points, transforming coordinates for each raster.
     #[command(visible_alias = "point-sample")]
-    Sample(cmd::processing::SampleArgs),
+    Sample(cmd::processing::PointSampleArgs),
     /// Contour lines from a raster band, with interval or fixed elevation levels.
     #[command(visible_alias = "contours")]
     Contour(cmd::processing::ContourArgs),
