@@ -33,8 +33,10 @@ use std::io::{Read, Seek, SeekFrom};
 
 /// The most image directories read.
 const MAX_IFDS: usize = 1024;
-/// The largest chunk offset or byte count array read, in values.
-const MAX_CHUNKS: u64 = 1 << 24;
+/// The largest tag value array read (chunk offsets or byte counts), in values: 4 Mi blocks per
+/// image, such as about 1.1 trillion pixels in 512 x 512 tiles. Arrays must also lie within the
+/// file, which bounds what a crafted file can make the validator allocate or fetch.
+const MAX_CHUNKS: u64 = 1 << 22;
 
 /// The outcome of [`validate_cog`].
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -96,22 +98,30 @@ impl Ifd {
         (self.width.div_ceil(bw.max(1)), self.height.div_ceil(bh.max(1)))
     }
 
-    /// GDAL's `BLOCK_OFFSET_x_y` of the first band: the block's offset when it is stored.
-    fn block_offset(&self, x: u64, y: u64) -> Option<u64> {
+    /// The offset of the first stored block of the first band in row order, among the first
+    /// `columns` columns and `rows` rows of the block grid (all of it when `None`). A block is
+    /// stored when its offset and byte count are not zero, as GDAL's `BLOCK_OFFSET_x_y` reports.
+    ///
+    /// The search walks the stored offsets, whose index order is row order, so that its cost is
+    /// bounded by the offset array rather than by the grid the image's size tags declare.
+    fn first_stored_block(&self, columns: Option<u64>, rows: Option<u64>) -> Option<u64> {
         let (across, down) = self.grid();
-        if x >= across || y >= down {
-            return None;
-        }
-        let i = (y * across + x) as usize;
-        let count = self.byte_counts.get(i).copied().unwrap_or(0);
-        self.offsets.get(i).copied().filter(|o| *o != 0 && count != 0)
+        let across = across.max(1);
+        let columns = columns.map_or(across, |c| c.min(across));
+        let rows = rows.map_or(down, |r| r.min(down));
+        self.offsets
+            .iter()
+            .zip(&self.byte_counts)
+            .enumerate()
+            .map(|(i, (&o, &c))| (i as u64 % across, i as u64 / across, o, c))
+            .take_while(|&(_, y, _, _)| y < rows)
+            .find_map(|(x, _, o, c)| (x < columns && o != 0 && c != 0).then_some(o))
     }
 
     /// The offset of the first stored block, in row order: GDAL's validation script's
     /// `get_block_offset`.
     fn first_block_offset(&self) -> Option<u64> {
-        let (across, down) = self.grid();
-        (0..down).flat_map(|y| (0..across).map(move |x| (x, y))).find_map(|(x, y)| self.block_offset(x, y))
+        self.first_stored_block(None, None)
     }
 }
 
@@ -188,6 +198,8 @@ fn read_tiff<R: Read + Seek>(f: &mut R) -> Result<Option<Tiff>> {
         e.u32(&header[4..8]) as u64
     };
     let ghost = read_ghost(f, if big { 16 } else { 8 })?;
+    // Value arrays must lie within the stream, checked before they are allocated or fetched.
+    let stream_len = f.seek(SeekFrom::End(0))?;
     let (entry_len, count_len, inline) = if big { (20usize, 8usize, 8usize) } else { (12, 2, 4) };
     let mut ifds: Vec<Ifd> = Vec::new();
     while next != 0 && ifds.len() < MAX_IFDS {
@@ -205,7 +217,9 @@ fn read_tiff<R: Read + Seek>(f: &mut R) -> Result<Option<Tiff>> {
         f.read_exact(&mut entries)?;
         let mut ifd = Ifd { offset: next, samples: 1, planar: 1, rows_per_strip: u64::MAX, ..Default::default() };
         let mut tile = (None, None);
-        let mut values: Vec<(u16, u16, u64, Vec<u8>)> = Vec::new();
+        // (tag, type, offset, length) of each array stored outside its entry, and the inline values.
+        let mut stored: Vec<(u16, u16, u64, usize)> = Vec::new();
+        let mut values: Vec<(u16, u16, Vec<u8>)> = Vec::new();
         for entry in entries.chunks_exact(entry_len) {
             let tag = e.u16(&entry[0..2]);
             if !matches!(tag, 254 | 256 | 257 | 273 | 277 | 278 | 279 | 284 | 322 | 323 | 324 | 325) {
@@ -224,24 +238,26 @@ fn read_tiff<R: Read + Seek>(f: &mut R) -> Result<Option<Tiff>> {
                 return Err(invalid(format!("TIFF tag {tag} has {n} values")));
             }
             let len = (n * size) as usize;
-            let data = if len <= inline {
-                value[..len].to_vec()
+            if len <= inline {
+                values.push((tag, typ, value[..len].to_vec()));
             } else {
                 let off = if big { e.u64(value) } else { e.u32(value) as u64 };
-                values.push((tag, typ, off, Vec::new()));
-                let last = values.len() - 1;
-                values[last].3 = vec![0; len];
-                continue;
-            };
-            values.push((tag, typ, u64::MAX, data));
+                if off.checked_add(len as u64).is_none_or(|end| end > stream_len) {
+                    return Err(invalid(format!("TIFF tag {tag}'s {n} values run past the end of the file")));
+                }
+                stored.push((tag, typ, off, len));
+            }
         }
         f.read_exact(&mut b[..if big { 8 } else { 4 }])?;
         next = if big { e.u64(&b) } else { e.u32(&b) as u64 };
-        for (tag, typ, off, mut data) in values {
-            if off != u64::MAX {
-                f.seek(SeekFrom::Start(off))?;
-                f.read_exact(&mut data)?;
-            }
+        let stored = stored.into_iter().map(|(tag, typ, off, len)| -> Result<_> {
+            let mut data = vec![0; len];
+            f.seek(SeekFrom::Start(off))?;
+            f.read_exact(&mut data)?;
+            Ok((tag, typ, data))
+        });
+        for item in values.into_iter().map(Ok).chain(stored) {
+            let (tag, typ, data) = item?;
             let v = e.ints(typ, &data);
             let first = v.first().copied().unwrap_or(0);
             match tag {
@@ -409,7 +425,7 @@ fn validate(tiff: Option<Tiff>, sidecar: Option<Tiff>, strict: bool) -> CogValid
     let scan = |ifd: &Ifd, width: u64, height: u64| -> Option<u64> {
         let yblocks = height.div_ceil(block_w.max(1));
         let xblocks = width.div_ceil(block_h.max(1));
-        (0..yblocks).flat_map(|y| (0..xblocks).map(move |x| (x, y))).find_map(|(x, y)| ifd.block_offset(x, y))
+        ifd.first_stored_block(Some(xblocks), Some(yblocks))
     };
     if let Some(off) = scan(main, main.width, main.height) {
         v.data_offsets.push(off);
@@ -455,8 +471,15 @@ fn validate(tiff: Option<Tiff>, sidecar: Option<Tiff>, strict: bool) -> CogValid
     // Masks, as GDAL's COG driver lays them out (beyond rio-cogeo): IFDs before any image data,
     // and each mask's data before the data of the image it masks.
     let first_data = ifds.iter().filter_map(|i| i.first_block_offset()).min();
-    for (k, m) in masks.iter().enumerate() {
-        let which = if m.is_reduced() { format!("mask of overview {k}") } else { "mask of the main image".into() };
+    for m in &masks {
+        // An overview's mask has the overview's size.
+        let which = if !m.is_reduced() {
+            "mask of the main image".to_string()
+        } else if let Some(ix) = overviews.iter().position(|o| (o.width, o.height) == (m.width, m.height)) {
+            format!("mask of overview {ix}")
+        } else {
+            "mask of an overview".to_string()
+        };
         if first_data.is_some_and(|d| m.offset > d) {
             v.layout_notes.push(format!("The IFD of the {which} is at byte {}, after image data", m.offset));
         }
@@ -569,6 +592,93 @@ mod tests {
         let v = validate_cog(&p, true).unwrap();
         // terrio's GeoTIFF writer puts IFDs first: nothing to note.
         assert!(v.layout_notes.is_empty(), "{v:?}");
+    }
+
+    /// A little-endian classic TIFF with one IFD at byte 8 of `(tag, type, count, value)`
+    /// entries, followed by `data`, which starts at byte `10 + 12 * entries + 4`.
+    fn crafted(entries: &[(u16, u16, u32, u32)], data: &[u8]) -> Vec<u8> {
+        let mut b = b"II* ".to_vec();
+        b.extend(8u32.to_le_bytes());
+        b.extend((entries.len() as u16).to_le_bytes());
+        for (tag, typ, count, value) in entries {
+            b.extend(tag.to_le_bytes());
+            b.extend(typ.to_le_bytes());
+            b.extend(count.to_le_bytes());
+            b.extend(value.to_le_bytes());
+        }
+        b.extend(0u32.to_le_bytes());
+        b.extend(data);
+        b
+    }
+
+    fn validate_bytes(bytes: &[u8]) -> Result<CogValidation> {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("crafted.tif");
+        std::fs::write(&p, bytes).unwrap();
+        validate_cog(p.to_str().unwrap(), false)
+    }
+
+    #[test]
+    fn crafted_grids_are_searched_by_their_stored_offsets() {
+        // A 2^31 x 2^31 image of 1 x 1 tiles (about 2^62 blocks) with four offsets: the search
+        // walks the four offsets, not the grid.
+        let data_at = 10 + 12 * 6 + 4;
+        let entries = |offsets: [u32; 4]| {
+            let mut data: Vec<u8> = offsets.iter().flat_map(|o| o.to_le_bytes()).collect();
+            data.extend([1u32; 4].iter().flat_map(|c| c.to_le_bytes()));
+            let e = [
+                (256, 4, 1, 1 << 31),
+                (257, 4, 1, 1 << 31),
+                (322, 3, 1, 1),
+                (323, 3, 1, 1),
+                (324, 4, 4, data_at),
+                (325, 4, 4, data_at + 16),
+            ];
+            crafted(&e, &data)
+        };
+        let v = validate_bytes(&entries([0; 4])).unwrap();
+        assert!(v.data_offsets.is_empty(), "{v:?}");
+        // The first stored block in row order: (2, 0).
+        let v = validate_bytes(&entries([0, 0, 500, 400])).unwrap();
+        assert_eq!(v.data_offsets, vec![500]);
+    }
+
+    #[test]
+    fn tag_arrays_past_the_end_are_rejected_before_reading() {
+        // 4 Mi offsets claimed at byte 1,000,000 of a file of about a hundred bytes.
+        let e = [(256, 4, 1, 1024), (257, 4, 1, 1024), (322, 3, 1, 256), (323, 3, 1, 256), (324, 4, 1 << 22, 1_000_000)];
+        let err = validate_bytes(&crafted(&e, &[])).unwrap_err();
+        assert!(err.to_string().contains("past the end of the file"), "{err}");
+        // More values than any image needs.
+        let e = [(256, 4, 1, 1024), (324, 4, (1 << 22) + 1, 100)];
+        assert!(validate_bytes(&crafted(&e, &[])).is_err());
+    }
+
+    #[test]
+    fn mask_notes_name_the_image_they_mask() {
+        let image = |offset, width, subfile_type, data| Ifd {
+            offset,
+            width,
+            height: width,
+            subfile_type,
+            samples: 1,
+            planar: 1,
+            tile: Some((256, 256)),
+            rows_per_strip: u64::MAX,
+            offsets: vec![data; (width as usize).div_ceil(256).pow(2)],
+            byte_counts: vec![1; (width as usize).div_ceil(256).pow(2)],
+        };
+        // IFDs of the main image and its overview, then image data, then the masks' IFDs: the
+        // main image's mask first, as GDAL orders them.
+        let ifds = vec![image(16, 1024, 0, 9000), image(200, 512, 1, 8000), image(10_000, 1024, 4, 7500), image(10_200, 512, 5, 7000)];
+        let v = validate(Some(Tiff { ifds, ghost: None }), None, false);
+        assert_eq!(
+            v.layout_notes,
+            vec![
+                "The IFD of the mask of the main image is at byte 10000, after image data".to_string(),
+                "The IFD of the mask of overview 0 is at byte 10200, after image data".to_string(),
+            ]
+        );
     }
 
     #[test]

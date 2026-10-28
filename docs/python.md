@@ -357,7 +357,8 @@ terrio.validate_cog("https://example.com/dem.tif", strict=True)  # warnings fail
 ```
 
 The checks and messages of `rio_cogeo.cogeo.cog_validate`, read from the file's structure without
-GDAL, for local files, URLs and S3 objects (range requests). See [Rust](rust.md#reading-windows-lazily).
+GDAL, for local files (a `str` or `os.PathLike`), URLs and S3 objects (range requests). See
+[Rust](rust.md#reading-windows-lazily).
 
 ## Typing
 

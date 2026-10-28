@@ -25,7 +25,8 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
 /// The result, errors and warnings are rio-cogeo's, messages included.
 ///
 /// Args:
-///     path: A local path, HTTP(S) URL or S3 URI (read with range requests).
+///     path: A local path (`str` or `os.PathLike`), HTTP(S) URL or S3 URI (read with range
+///         requests).
 ///     strict: Treat warnings as errors.
 ///
 /// Returns:
@@ -36,8 +37,9 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
 ///     TerrioError: If the file cannot be read.
 #[pyfunction]
 #[pyo3(signature = (path, *, strict=false))]
-fn validate_cog(py: Python<'_>, path: &str, strict: bool) -> PyResult<(bool, Vec<String>, Vec<String>)> {
-    let v = with_warnings(py, || terrio::validate_cog(path, strict))?;
+fn validate_cog(py: Python<'_>, path: &Bound<'_, PyAny>, strict: bool) -> PyResult<(bool, Vec<String>, Vec<String>)> {
+    let path = raster_path(path)?.ok_or_else(|| invalid("validate_cog takes a path, not a terrio.Raster"))?;
+    let v = with_warnings(py, || terrio::validate_cog(&path, strict))?;
     Ok((v.is_valid, v.errors, v.warnings))
 }
 
