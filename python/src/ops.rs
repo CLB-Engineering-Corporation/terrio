@@ -1114,15 +1114,21 @@ fn translate(
 ///         `pixel_offset`, `line_offset`, `pixel_step`, `line_step`, `pixel_center`.
 ///     wo: Warp options, as `gdalwarp -wo`: `SOURCE_EXTRA` and `SAMPLE_STEPS` (`ALL`); others
 ///         are ignored.
+///     max_memory_mib: The memory of a chunk of the warp, in MiB, as `gdalwarp -wm` (default
+///         64): the output is warped in chunks of about this many bytes of source and output
+///         pixels. As with gdalwarp, another chunk size can change a few pixels, since each
+///         chunk has its own source window and approximate transformer.
 ///
 /// Returns:
-///     Raster: The result, in memory.
+///     Raster: The result. A single source path warped to a `dst` path is read by window and
+///     written a chunk of rows at a time (neither is held whole), and the result is returned
+///     opened lazily from `dst`; otherwise it is in memory.
 #[pyfunction]
 #[pyo3(signature = (
     src, dst=None, *, s_srs=None, t_srs=None, tr=None, te=None, te_srs=None, ts=None, dst_transform=None, tap=false,
     resampling="near", overview=None, srcnodata=None, dstnodata=None, ot=None, cutline=None, crop_to_cutline=false, et=0.125,
     format=None, compress=None, tile_size=None, bigtiff=false, gcps=None, order=0, gcp_method="auto",
-    rpc=None, to=None, wo=None, geoloc=false, geolocation=None, kernel_version="3.12"
+    rpc=None, to=None, wo=None, geoloc=false, geolocation=None, kernel_version="3.12", max_memory_mib=None
 ))]
 #[allow(clippy::too_many_arguments)]
 fn warp(
@@ -1158,7 +1164,11 @@ fn warp(
     geoloc: bool,
     geolocation: Option<&Bound<'_, pyo3::types::PyDict>>,
     kernel_version: &str,
+    max_memory_mib: Option<f64>,
 ) -> PyResult<PyRaster> {
+    if max_memory_mib.is_some_and(|m| m.is_nan() || m <= 0.0) {
+        return Err(invalid("max_memory_mib must be positive"));
+    }
     if tap && tr.is_none() {
         return Err(invalid("tap needs tr"));
     }
@@ -1213,6 +1223,9 @@ fn warp(
             "SAMPLE_STEPS" => o.sample_steps_all = v.eq_ignore_ascii_case("ALL"),
             _ => {}
         }
+    }
+    if let Some(mib) = max_memory_mib {
+        o.memory_limit = mib * 1024.0 * 1024.0;
     }
     enum Input {
         File(Box<terrio::LazyRaster>),
@@ -1284,6 +1297,16 @@ fn warp(
         let options = write_options(format, compress, tile_size, bigtiff)?;
         py.detach(|| terrio::ops::warp::warp_to_path(&[source], &o, path, &options)).py()?;
         return Ok(PyRaster { inner: py.detach(|| terrio::open_raster_lazy(path)).py()? });
+    }
+    // A source path to a path: read by window and written a chunk of rows at a time.
+    if let (Some(path), [Arg::Path(source)], None) = (dst, args.as_slice(), geolocation) {
+        let options = write_options(format, compress, tile_size, bigtiff)?;
+        let source = source.clone();
+        let out = crate::with_warnings(py, || {
+            terrio::ops::warp::warp_to_path(std::slice::from_ref(&source), &o, path, &options)?;
+            terrio::open_raster_lazy(path)
+        })?;
+        return Ok(PyRaster { inner: out });
     }
     let first_path = match &args[0] {
         Arg::Path(path) => Some(path.clone()),
@@ -1374,7 +1397,10 @@ fn warp(
 ///     bigtiff: Write a BigTIFF, for `dst`.
 ///
 /// Returns:
-///     Raster | None: The mosaic, in memory; `None` when a `.vrt` was written.
+///     Raster | None: The mosaic; `None` when a `.vrt` was written. Source paths mosaicked to a
+///     `dst` path are written with `mosaic_to_path` (read by window and written a strip at a time
+///     when every source is copied pixel for pixel), and the mosaic is returned opened lazily from
+///     `dst`; otherwise it is in memory.
 #[pyfunction]
 #[pyo3(signature = (
     srcs, dst=None, *, resolution="average", tr=None, te=None, tap=false, separate=false, bands=None, nodata=None,
@@ -1425,6 +1451,20 @@ fn mosaic(
         resampling: Resampling::parse(resampling).py()?,
         dst_srs: srs(t_srs)?,
     };
+    // Source paths to a path (but a VRT): read by window where the sources allow.
+    let paths: Option<Vec<String>> = match srcs.extract::<String>() {
+        Ok(p) => Some(vec![p]),
+        Err(_) if srcs.cast::<PyRaster>().is_ok() => None,
+        Err(_) => srcs.extract::<Vec<String>>().ok(),
+    };
+    if let (Some(path), Some(paths)) = (dst.filter(|d| !d.to_ascii_lowercase().ends_with(".vrt")), paths.filter(|p| !p.is_empty())) {
+        let options = write_options(format, compress, tile_size, bigtiff)?;
+        let out = crate::with_warnings(py, || {
+            terrio::ops::mosaic::mosaic_to_path(&paths, &o, path, &options)?;
+            terrio::open_raster_lazy(path)
+        })?;
+        return Ok(Some(PyRaster { inner: out }));
+    }
     let inputs = input_rasters(py, srcs)?;
     if let Some(path) = dst.filter(|d| d.to_ascii_lowercase().ends_with(".vrt")) {
         if inputs.iter().any(|(p, _)| p.starts_with(MEMORY_PREFIX)) {
