@@ -1850,6 +1850,16 @@ class DatasetWriter(DatasetReader):
                 out["PHOTOMETRIC"] = "RGB"
                 if self._count == 4:
                     out.setdefault("ALPHA", "YES")
+        elif self._out_driver.upper() == "COG":
+            # GDAL's COG driver warns about GeoTIFF block options and ignores them (its tiles are
+            # BLOCKSIZE); terrio's COG writer refuses options it would not act on.
+            for key in ("BLOCKXSIZE", "BLOCKYSIZE"):
+                if out.pop(key, None) is not None:
+                    warnings.warn(
+                        f"driver COG does not support creation option {key}",
+                        RuntimeWarning,
+                        stacklevel=4,
+                    )
         return out
 
     def _new_structure(self) -> _tiff.Structure:
@@ -1894,8 +1904,15 @@ class DatasetWriter(DatasetReader):
             ns = {"INTERLEAVE": s.interleave}
             if s.compression:
                 ns["COMPRESSION"] = s.compression
-                if o.get("PREDICTOR", "1") not in ("1", "NO", "NONE"):
-                    ns["PREDICTOR"] = {"YES": "2"}.get(o["PREDICTOR"].upper(), o["PREDICTOR"])
+                if o.get("PREDICTOR", "1").upper() not in ("1", "NO", "NONE", "FALSE", "OFF"):
+                    predictor = o["PREDICTOR"].upper()
+                    if self._out_driver.upper() == "COG" and predictor in ("YES", "ON", "TRUE"):
+                        # GDAL's COG driver: 3 for floating-point data, 2 for integers.
+                        floating = np.dtype(self._dtype).kind == "f"
+                        predictor = "3" if floating else "2"
+                    ns["PREDICTOR"] = {"YES": "2", "STANDARD": "2", "FLOATING_POINT": "3"}.get(
+                        predictor, predictor
+                    )
             s.namespaces["IMAGE_STRUCTURE"] = ns
             s.tags = {"AREA_OR_POINT": "Area"}
         return s
