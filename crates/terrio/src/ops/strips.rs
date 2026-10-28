@@ -34,8 +34,9 @@ fn rows_of(bytes: usize, width: usize, bands: usize, value_size: usize, block: O
     (bytes / row / block).max(1) * block
 }
 
-/// Whether writing `output` would overwrite one of `inputs` (the same file, under any name, a hard
-/// link included): those inputs are read whole before the output is written.
+/// Whether writing `output` would overwrite one of `inputs` (the same file, under any name, and on
+/// Unix a hard link to it): those inputs are read whole before the output is written. Off Unix, a
+/// hard link to an input is not detected (see `is_same_file`).
 pub(crate) fn overwrites(output: &str, inputs: &[String]) -> bool {
     let output_path = std::path::Path::new(output);
     let out = std::fs::canonicalize(output_path).or_else(|error| {
@@ -405,6 +406,11 @@ pub(crate) fn read_ahead<R: Send>(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use crate::crs::SpatialRef;
+    use crate::ops::{Grid, raster_header};
+    use wbraster::DataType;
+
     #[test]
     fn overwrite_guard_includes_directory_store_members() {
         let dir = tempfile::tempdir().unwrap();
@@ -434,10 +440,6 @@ mod tests {
         assert!(super::overwrites(link.to_str().unwrap(), &inputs));
         assert!(!super::overwrites(dir.path().join("other.tif").to_str().unwrap(), &inputs));
     }
-    use super::*;
-    use crate::crs::SpatialRef;
-    use crate::ops::{Grid, raster_header};
-    use wbraster::DataType;
 
     fn header(data_type: DataType) -> RasterDataset {
         let grid = Grid { width: 4, height: 6, geo_transform: [0.0, 1.0, 0.0, 6.0, 0.0, -1.0] };
