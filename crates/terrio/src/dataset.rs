@@ -637,10 +637,26 @@ pub struct RasterWriteOptions {
     /// GeoTIFF overviews to build, as decimation factors such as `[2, 4, 8]`.
     pub overviews: Vec<usize>,
     /// Overview resampling: `nearest`, `average`, `min`, `max` or `mode`. Defaults to `nearest`
-    /// for GeoTIFF and `average` for COG. COG levels reduce full-resolution blocks independently:
+    /// for GeoTIFF and `average` for COG (whose `OVERVIEW_RESAMPLING` or `RESAMPLING` creation
+    /// option sets it too). COG levels reduce full-resolution blocks independently:
     /// nearest takes their center sample; averages skip nodata and weight colors by alpha when
     /// `ALPHA=YES` (alpha itself is averaged without that weight).
+    ///
+    /// `area_matched` (or `area_matched_mode` for categorical rasters) builds levels whose valid
+    /// area matches the full-resolution image's, where `average` grows it at every level: each
+    /// level keeps as many cells as the valid pixels fill, the most covered first, with the mean
+    /// (or the mode) of their valid pixels. It needs a nodata value.
     pub overview_resampling: Option<String>,
+    /// COG (or GeoTIFF) overviews supplied by the caller, written as they are instead of being
+    /// computed: from the largest, the overviews of factors 2, 4, 8... Each has the raster's bands
+    /// and data type and the size the writer gives that level, `ceil(cols / f) x ceil(rows / f)`
+    /// (halved and floored from level to level with `COG_OVERVIEW_POLICY=GDAL_3_13`). As GDAL's
+    /// COG driver with `OVERVIEWS=FORCE_USE_EXISTING`; fewer levels than the writer would build
+    /// are written as they are.
+    pub overview_data: Vec<std::sync::Arc<Raster>>,
+    /// Dataset metadata items (GDAL's default domain) set over the raster's own: GeoTIFFs store
+    /// them in the `GDAL_METADATA` tag.
+    pub metadata: Vec<(String, String)>,
     /// The geotransform to write in place of the raster's own: a rotated or south-up one, which
     /// GeoTIFFs store in a `ModelTransformationTag`, as GDAL writes them.
     /// [`write_raster_dataset`] sets it from [`RasterDataset::affine`].

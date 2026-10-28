@@ -18,6 +18,23 @@
 - `dem_to_path` and `color_relief_to_path` read a DEM that is also the output whole first,
   instead of truncating it while it is read.
 
+
+### Cloud Optimized GeoTIFF
+
+- COG: `OVERVIEWS` (`AUTO`, `IGNORE_EXISTING`, `FORCE_USE_EXISTING`, `NONE`) and `LEVEL`
+  (DEFLATE, ZSTD, and either over LERC) are honoured; `PREDICTOR=STANDARD|FLOATING_POINT`,
+  `NUM_THREADS` and `SPARSE_OK` are accepted, and `BIGTIFF` values are checked. A COG's
+  `GDAL_METADATA` carries `OVERVIEW_RESAMPLING`, and LERC's `MAX_Z_ERROR` or
+  `COMPRESSION_REVERSIBILITY=LOSSLESS`, in `IMAGE_STRUCTURE`, as GDAL writes them.
+- Overviews supplied by the caller are written as they are (GDAL's
+  `OVERVIEWS=FORCE_USE_EXISTING`): `RasterWriteOptions::overview_data`, Python
+  `Raster.write(overviews=[arrays or Rasters])`. Their sizes, bands and types are checked.
+- Area-matched overviews, `OVERVIEW_RESAMPLING=AREA_MATCHED` (`AREA_MATCHED_MODE` for categorical
+  rasters): each level keeps as many valid cells as the full-resolution valid pixels fill, where
+  `average` grows a thin or ragged extent at every level. Needs a nodata value.
+- `RasterWriteOptions::metadata` (Python `Raster.write(metadata=...)`) sets dataset metadata items.
+- LERC is written too; `docs/formats.md` said it was read only.
+
 ### Formats
 
 - SRTM HGT tiles are read and written (the `SRTMHGT` driver), as GDAL's SRTMHGT
@@ -70,6 +87,16 @@
   `./@name.tif`.
 - WKT2 `Goode Homolosine` (PROJ's uninterrupted `goode`) is refused; it was read
   as `igh`.
+- COG creation options that the writer would not act on are refused instead of ignored, as tile
+  archives already refuse unknown options: an unknown key or a GeoTIFF-only option (`TILED`,
+  `BLOCKXSIZE`...), `OVERVIEW_COMPRESS`, `OVERVIEW_PREDICTOR`, `OVERVIEW_QUALITY` or
+  `MAX_Z_ERROR_OVERVIEW` unlike the image's, `TILING_SCHEME` or `GEOTIFF_VERSION` other than
+  their defaults. `terrio.rio` drops `BLOCKXSIZE`/`BLOCKYSIZE` for COG with GDAL's warning.
+- A COG's `OVERVIEW_RESAMPLING` (else `RESAMPLING`) creation option is honoured with the default
+  overview policy too (it was ignored there), so a method the COG writer does not implement,
+  such as `CUBIC`, is refused.
+- A COG's `PREDICTOR=YES` is 3 for floating-point rasters and 2 for integers, as GDAL's COG driver
+  resolves it (it was 2).
 
 ### Command line
 

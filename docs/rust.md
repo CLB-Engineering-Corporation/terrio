@@ -66,6 +66,49 @@ O(levels × source pixels) work, more than recursively reducing already-rounded 
 Mode counts native sample values with hash tables, retaining the first value to reach the
 highest count when frequencies tie; floating-point signed zeros count as the same value.
 
+COG creation options are those of GDAL's COG driver, and the writer refuses an option it would
+not act on rather than ignoring it: a GeoTIFF option (`TILED`, `BLOCKXSIZE`), an unknown key, an
+`OVERVIEW_COMPRESS`, `OVERVIEW_PREDICTOR`, `OVERVIEW_QUALITY` or `MAX_Z_ERROR_OVERVIEW` unlike the
+image's (overviews are written as the full-resolution image), or `TILING_SCHEME`/`GEOTIFF_VERSION`
+other than their defaults. `NUM_THREADS` and `SPARSE_OK` are accepted (every tile is written).
+`PREDICTOR=YES` is resolved as GDAL's COG driver resolves it: 3 for floating-point rasters and 2
+for integers (`STANDARD` is 2, `FLOATING_POINT` 3); a GeoTIFF's `YES` stays 2. `LEVEL` sets the
+DEFLATE (1 to 9) or ZSTD (1 to 22) level, also over LERC. `OVERVIEW_RESAMPLING`, else
+`RESAMPLING`, sets the overview method, and `OVERVIEWS` is `AUTO`, `IGNORE_EXISTING`
+(computed), `FORCE_USE_EXISTING` (the overviews supplied) or `NONE`. As GDAL, a COG's
+`GDAL_METADATA` carries `OVERVIEW_RESAMPLING` and LERC's `MAX_Z_ERROR` (or
+`COMPRESSION_REVERSIBILITY=LOSSLESS`) in the `IMAGE_STRUCTURE` domain.
+
+`overview_resampling = "area_matched"` (`"area_matched_mode"` for categorical rasters) builds
+overviews whose valid area matches the full resolution's: `average` marks a coarse pixel valid when
+any of its pixels is, so a thin or ragged extent (a flood depth grid, a river mask) grows at
+every level, and `nearest` speckles its margin. Each level keeps `round(valid / f²)` cells, the most
+covered first, solving a threshold on the coverage histogram and breaking ties by the number of
+kept neighbours then a deterministic hash, and holds the mean of their valid pixels (the mode for
+categorical rasters, the lowest value on ties). It needs a nodata value, and is refused with
+masks, alpha bands and complex data. The algorithm is ported from ras2cng by its author, under terrio's license.
+
+Overviews computed elsewhere are written as they are with `RasterWriteOptions::overview_data`
+(GDAL's `OVERVIEWS=FORCE_USE_EXISTING`): the levels of factors 2, 4, 8…, each of the raster's
+bands and data type and `ceil(cols / f) x ceil(rows / f)` pixels.
+
+```rust,no_run
+use std::sync::Arc;
+
+let ds = terrio::open_raster("depth.tif")?;
+# let (level2, level4) = (ds.raster.clone(), ds.raster.clone());
+let options = terrio::RasterWriteOptions {
+    driver: Some(terrio::formats::RasterDriver::Cog),
+    compression: Some("DEFLATE".into()),
+    creation_options: vec![("PREDICTOR".into(), "YES".into()), ("OVERVIEWS".into(), "FORCE_USE_EXISTING".into())],
+    overview_data: vec![Arc::new(level2), Arc::new(level4)],
+    metadata: vec![("overview_method".into(), "area_matched_mean".into())],
+    ..Default::default()
+};
+terrio::write_raster_dataset(&ds, "depth_cog.tif", &options)?;
+# Ok::<(), terrio::Error>(())
+```
+
 Set the creation option `COG_OVERVIEW_POLICY=GDAL_3_13` to recursively reduce
 previously rounded levels and truncate halved dimensions as GDAL 3.13 does. This
 profile supports nearest and average, with nodata, without alpha bands or explicit
