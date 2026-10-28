@@ -945,6 +945,7 @@ impl WindowSource for Mosaic {
                     valid: valid.as_deref(),
                     width: sw,
                     height: sh,
+                    row0: 0,
                     src_type: sub.raster.data_type,
                     src_rect: [-(sx0 as f64), -(sy0 as f64), item.width as f64, item.height as f64],
                     dst_rect: [dxo - w.x as f64, dyo - w.y as f64, dxs, dys],

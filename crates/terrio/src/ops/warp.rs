@@ -1771,114 +1771,274 @@ pub fn warp_to_path(paths: &[String], o: &WarpOptions, path: &str, options: &cra
     if paths.is_empty() {
         return Err(Error::InvalidArgument("no source rasters".into()));
     }
-    if paths.len() != 1 || o.cutline.is_some() || super::strips::overwrites(path, paths) {
+    if o.cutline.is_some() || super::strips::overwrites(path, paths) {
         return crate::write_raster_dataset(&warp_paths(paths, o)?, path, options);
     }
-    let mut src = crate::open_raster_lazy(&paths[0])?;
-    let header = src.header();
+    let mut lazy = paths.iter().map(|p| crate::open_raster_lazy(p)).collect::<Result<Vec<_>>>()?;
+    let header = lazy[0].header();
     let o = &*with_file_gcps(o, &paths[0], &header)?;
-    let mut p = Plan::new(&[&header], o)?;
-    let overview = p.select_overview(0, &src.overviews(), o)?;
-    let (grid, bands, out_type) = (p.grid, p.bands, p.out_type);
-    let w = grid.width;
-    let t = p.transformer(0)?;
-    let (ctx, chunks, sink) = p.context(0, &t, o);
-    t.check_policy()?;
-    let nodata = p.src_nodata(0, o);
-    let unified = o.unified_src_nodata.unwrap_or(matches!(o.src_nodata, Nodata::Values(_))) && bands > 1;
-    let fill = p.fill();
-    let (stored, gt) = stored_grid(grid);
-    let mut header = super::raster_header(stored, out_type, bands, p.dst_nodata, &p.dst_srs)?;
-    header.raster.metadata = p.srcs[0].ds.raster.metadata.iter().filter(|(k, _)| k == "AREA_OR_POINT").cloned().collect();
-    header.band_nodata = p.dst_nodata_all.clone();
-    if let Some(gt) = gt {
-        header.set_geo_transform(gt);
-    }
-    let mut out = super::strips::StripWriter::create(&header, path, options)?;
-
-    // The last chunk (in order) writing each row: rows are written once it is warped.
-    let mut last: Vec<Option<usize>> = vec![None; grid.height];
-    for (i, c) in chunks.iter().enumerate() {
-        last[c.dy..c.dy + c.dh].iter_mut().for_each(|l| *l = Some(i));
-    }
-    // The rows warped but not yet written, from row `base`, band after band, in the output type.
-    let mut rows = RasterData::new_filled(out_type, 0, 0.0);
-    let mut base = 0;
-    // Adds rows of the initial value up to row `upto`.
-    let grow = |rows: &mut RasterData, base: usize, upto: usize| {
-        let (old, new) = (rows.len() / bands / w, upto.saturating_sub(base));
-        if new > old {
-            crate::pixel::with_data!(rows, v => {
-                let mut grown = Vec::with_capacity(new * w * bands);
-                for b in 0..bands {
-                    grown.extend_from_slice(&v[b * old * w..(b + 1) * old * w]);
-                    grown.resize((b + 1) * new * w, fill[b] as _);
-                }
-                *v = grown;
-            });
-        }
-    };
-    let mut write_done = |rows: &mut RasterData, base: &mut usize, upto: usize| -> Result<()> {
-        if upto <= *base {
-            return Ok(());
-        }
-        grow(rows, *base, upto);
-        let (n, total) = ((upto - *base) * w, rows.len() / bands);
-        let data = crate::pixel::map_data!(&*rows, v => (0..bands).flat_map(|b| v[b * total..b * total + n].iter().copied()).collect());
-        crate::pixel::with_data!(rows, v => {
-            *v = (0..bands).flat_map(|b| v[b * total + n..(b + 1) * total].iter().copied()).collect();
-        });
-        *base = upto;
-        out.write(data, n / w)
-    };
-    // Rows no chunk writes, at the top.
-    let first_row = |from: usize, done: usize| (from..grid.height).find(|r| last[*r].is_some_and(|l| l > done)).unwrap_or(grid.height);
-    if chunks.is_empty() {
-        write_done(&mut rows, &mut base, grid.height)?;
-    }
-    super::strips::pipelined(
-        chunks.len(),
-        |i| {
-            let c = &chunks[i];
-            src.read_window(crate::Window::new(c.sx, c.sy, c.sw, c.sh), &crate::WindowOptions { overview, bands: Vec::new() })
-        },
-        |i, window| {
-            let c = &chunks[i];
-            // The chunk's part of the output, as `f64`: the output's initial value (the chunks of
-            // a source don't overlap), warped.
-            let mut staged: Vec<Vec<f64>> = fill.iter().map(|fill| vec![*fill; c.dw * c.dh]).collect();
-            let src_bands: Vec<super::BandView> = (0..bands).map(|b| super::BandView::of(&window.raster, b)).collect();
-            let valid = validity(&src_bands, &nodata, unified, None);
-            let sn = c.sw * c.sh;
-            crate::pixel::with_data!(&window.raster.data, v => {
-                let typed: Vec<&[_]> = (0..bands).map(|b| &v[b * sn..(b + 1) * sn]).collect();
-                let data = SrcData { bands: &typed, valid: &valid, width: c.sw, origin: (c.sx, c.sy) };
-                ctx.warp_chunk(c, &data, &sink, chunk_rows(&mut staged, c.dw, &Chunk { dx: 0, dy: 0, ..*c }));
-            });
-            // Stored in the pending rows, rounded to the output type.
-            grow(&mut rows, base, c.dy + c.dh);
-            let total = rows.len() / bands;
-            crate::pixel::with_data!(&mut rows, v => {
-                for (b, part) in staged.iter().enumerate() {
-                    for (r, line) in part.chunks(c.dw).enumerate() {
-                        let at = b * total + (c.dy + r - base) * w + c.dx;
-                        for (o, x) in v[at..at + c.dw].iter_mut().zip(line) {
-                            *o = warp_round(*x, out_type) as _;
-                        }
-                    }
-                }
-            });
-            let upto = first_row(base, i);
-            write_done(&mut rows, &mut base, upto)
-        },
-    )?;
-    write_done(&mut rows, &mut base, grid.height)?;
-    drop(write_done);
-    t.check_policy()?;
-    out.finish()
+    let mut sources: Vec<&mut (dyn WarpSource + Send)> = lazy.iter_mut().map(|s| s as &mut (dyn WarpSource + Send)).collect();
+    warp_sources_to_path(&mut sources, o, true, path, options)
 }
 
-/// Plan a virtual warp without reading source pixels.
+/// Warps window-readable sources as [`warp_sources`] does (with `overviews`, each source's stored
+/// overview selected as it selects them; without, full resolution, as [`warp`] reads rasters in
+/// memory) and writes the output to `path` as its rows are done ([`RowWarp`]). Without a
+/// cutline.
+pub(crate) fn warp_sources_to_path(
+    sources: &mut [&mut (dyn WarpSource + Send)],
+    o: &WarpOptions,
+    overviews: bool,
+    path: &str,
+    options: &crate::RasterWriteOptions,
+) -> Result<()> {
+    with_row_warp(sources, o, overviews, |rows| {
+        let mut out = super::strips::StripWriter::create(&rows.header()?, path, options)?;
+        rows.advance(rows.height(), &mut |data, n| out.write(data, n))?;
+        // A transformation refused on the way leaves no output.
+        rows.check_policy()?;
+        out.finish()
+    })
+}
+
+/// A warp computed a chunk at a time, its rows handed out from the top as soon as every chunk
+/// writing them is done, with the values [`warp`] gives the whole output.
+///
+/// The output is warped in the chunks [`warp`] warps it in, each chunk reading only its source
+/// window. With several sources, each pixel takes its sources in order, as when they are warped
+/// one after the other over the whole output: a chunk is warped onto the rows held for it (the
+/// output's initial values, or what earlier sources' chunks left there), and only once every
+/// chunk of an earlier source overlapping it is done. Of the chunks that may run, the topmost
+/// runs first, so the rows held are about as tall as the chunks that span them.
+pub(crate) struct RowWarp<'a, 's> {
+    p: &'a Plan<'a>,
+    /// Each source's transformer.
+    ts: &'a [GenImgProj],
+    /// Each source's warp, chunks and sink ([`Plan::context`]).
+    ctxs: &'a [(WarpContext<'a>, Vec<Chunk>, Sink)],
+    nodata: Vec<Vec<Option<f64>>>,
+    unified: bool,
+    overviews: Vec<Option<usize>>,
+    sources: &'a mut [&'s mut (dyn WarpSource + Send)],
+    /// The chunks, `(source, chunk)`, in the order they are warped.
+    order: Vec<(usize, usize)>,
+    /// The position in `order` of the last chunk writing each row.
+    last: Vec<Option<usize>>,
+    /// How many chunks of `order` are done.
+    done: usize,
+    /// The rows held, from row `base`, band after band, in the output type.
+    rows: RasterData,
+    base: usize,
+}
+
+/// Plans the warp of `sources` as [`warp_sources`] does (see [`warp_sources_to_path`] for
+/// `overviews`) and runs `f` with a [`RowWarp`] of it. Without a cutline.
+pub(crate) fn with_row_warp<R>(
+    sources: &mut [&mut (dyn WarpSource + Send)],
+    o: &WarpOptions,
+    overviews: bool,
+    f: impl FnOnce(&mut RowWarp<'_, '_>) -> Result<R>,
+) -> Result<R> {
+    if o.cutline.is_some() {
+        return Err(Error::Unsupported("a warp read a chunk at a time cannot use a cutline".into()));
+    }
+    let info = sources.iter_mut().map(|s| s.info()).collect::<Result<Vec<_>>>()?;
+    let refs: Vec<&RasterDataset> = info.iter().map(|s| &s.raster).collect();
+    let mut p = Plan::new(&refs, o)?;
+    let levels = (0..sources.len())
+        .map(|k| p.select_overview(k, if overviews { &info[k].overviews } else { &[] }, o))
+        .collect::<Result<Vec<_>>>()?;
+    let ts = (0..sources.len()).map(|k| p.transformer(k)).collect::<Result<Vec<_>>>()?;
+    let ctxs: Vec<_> = ts.iter().enumerate().map(|(k, t)| p.context(k, t, o)).collect();
+    for t in &ts {
+        t.check_policy()?;
+    }
+    let order = chunk_order(&ctxs.iter().map(|c| c.1.as_slice()).collect::<Vec<_>>());
+    let mut last: Vec<Option<usize>> = vec![None; p.grid.height];
+    for (i, &(k, j)) in order.iter().enumerate() {
+        let c = &ctxs[k].1[j];
+        last[c.dy..c.dy + c.dh].iter_mut().for_each(|l| *l = Some(i));
+    }
+    let mut rows = RowWarp {
+        p: &p,
+        ts: &ts,
+        ctxs: &ctxs,
+        nodata: (0..sources.len()).map(|k| p.src_nodata(k, o)).collect(),
+        unified: o.unified_src_nodata.unwrap_or(matches!(o.src_nodata, Nodata::Values(_))) && p.bands > 1,
+        overviews: levels,
+        sources,
+        order,
+        last,
+        done: 0,
+        rows: RasterData::new_filled(p.out_type, 0, 0.0),
+        base: 0,
+    };
+    let r = f(&mut rows)?;
+    rows.check_policy()?;
+    Ok(r)
+}
+
+/// The order chunks of several sources are warped in: a chunk after every chunk of an earlier
+/// source it overlaps (so each output pixel takes its sources in order), and of the chunks that
+/// may run, the topmost (then the earliest source, then the leftmost).
+fn chunk_order(chunks: &[&[Chunk]]) -> Vec<(usize, usize)> {
+    let overlap = |a: &Chunk, b: &Chunk| a.dx < b.dx + b.dw && b.dx < a.dx + a.dw && a.dy < b.dy + b.dh && b.dy < a.dy + a.dh;
+    // For each chunk, the chunks of earlier sources it overlaps, not yet done.
+    let mut waiting: Vec<Vec<usize>> = chunks
+        .iter()
+        .enumerate()
+        .map(|(k, cs)| cs.iter().map(|c| chunks[..k].iter().flat_map(|e| e.iter()).filter(|e| overlap(c, e)).count()).collect())
+        .collect();
+    let mut left: Vec<(usize, usize)> = chunks.iter().enumerate().flat_map(|(k, cs)| (0..cs.len()).map(move |j| (k, j))).collect();
+    left.sort_by_key(|&(k, j)| (chunks[k][j].dy, k, chunks[k][j].dx));
+    let mut order = Vec::with_capacity(left.len());
+    while !left.is_empty() {
+        // The chunks of the earliest source left wait for none, so one is always ready.
+        let at = left.iter().position(|&(k, j)| waiting[k][j] == 0).expect("a chunk is ready");
+        let (k, j) = left.remove(at);
+        let c = &chunks[k][j];
+        for (later, cs) in chunks.iter().enumerate().skip(k + 1) {
+            for (i, e) in cs.iter().enumerate() {
+                if overlap(c, e) {
+                    waiting[later][i] -= 1;
+                }
+            }
+        }
+        order.push((k, j));
+    }
+    order
+}
+
+impl RowWarp<'_, '_> {
+    /// The output's height.
+    pub(crate) fn height(&self) -> usize {
+        self.p.grid.height
+    }
+
+    /// Fails when a transformation the warp made so far was refused by the transformer's policy
+    /// (as [`warp`] fails after warping).
+    pub(crate) fn check_policy(&self) -> Result<()> {
+        self.ts.iter().try_for_each(|t| t.check_policy())
+    }
+
+    /// How many rows, from the top, were handed out.
+    pub(crate) fn done_rows(&self) -> usize {
+        self.base
+    }
+
+    /// The output's header (no pixels), georeferenced as [`warp`] georeferences its output.
+    pub(crate) fn header(&self) -> Result<RasterDataset> {
+        let p = self.p;
+        let (stored, gt) = stored_grid(p.grid);
+        let mut header = super::raster_header(stored, p.out_type, p.bands, p.dst_nodata, &p.dst_srs)?;
+        header.raster.metadata = p.srcs[0].ds.raster.metadata.iter().filter(|(k, _)| k == "AREA_OR_POINT").cloned().collect();
+        header.band_nodata = p.dst_nodata_all.clone();
+        if let Some(gt) = gt {
+            header.set_geo_transform(gt);
+        }
+        Ok(header)
+    }
+
+    /// Warps chunks until the rows above `upto` are done, giving `emit` the rows done (band after
+    /// band, in the output type) and their number, from the top, as they are done.
+    pub(crate) fn advance(&mut self, upto: usize, emit: &mut dyn FnMut(RasterData, usize) -> Result<()>) -> Result<()> {
+        let upto = upto.min(self.p.grid.height);
+        let need = (self.base..upto).filter_map(|r| self.last[r]).max().map_or(self.done, |l| self.done.max(l + 1));
+        let start = self.done;
+        let windows: Vec<(usize, crate::Window, Option<usize>)> = self.order[start..need]
+            .iter()
+            .map(|&(k, j)| {
+                let c = &self.ctxs[k].1[j];
+                (k, crate::Window::new(c.sx, c.sy, c.sw, c.sh), self.overviews[k])
+            })
+            .collect();
+        let RowWarp { p, ctxs, nodata, unified, sources, order, last, done, rows, base, .. } = self;
+        let (w, bands, out_type, fill) = (p.grid.width, p.bands, p.out_type, p.fill());
+        // Adds rows of the initial value up to row `upto`.
+        let grow = |rows: &mut RasterData, base: usize, upto: usize| {
+            let (old, new) = (rows.len() / bands / w.max(1), upto.saturating_sub(base));
+            if new > old {
+                crate::pixel::with_data!(rows, v => {
+                    let mut grown = Vec::with_capacity(new * w * bands);
+                    for b in 0..bands {
+                        grown.extend_from_slice(&v[b * old * w..(b + 1) * old * w]);
+                        grown.resize((b + 1) * new * w, fill[b] as _);
+                    }
+                    *v = grown;
+                });
+            }
+        };
+        // Emits the rows done from `base`: those no chunk left to warp writes.
+        let mut flush = |rows: &mut RasterData, base: &mut usize, done: usize| -> Result<()> {
+            let upto = (*base..p.grid.height).find(|r| last[*r].is_some_and(|l| l >= done)).unwrap_or(p.grid.height);
+            if upto <= *base || w == 0 {
+                *base = upto.max(*base);
+                return Ok(());
+            }
+            grow(rows, *base, upto);
+            let (n, total) = ((upto - *base) * w, rows.len() / bands);
+            let data = crate::pixel::map_data!(&*rows, v => (0..bands).flat_map(|b| v[b * total..b * total + n].iter().copied()).collect());
+            crate::pixel::with_data!(rows, v => {
+                *v = (0..bands).flat_map(|b| v[b * total + n..(b + 1) * total].iter().copied()).collect();
+            });
+            *base = upto;
+            emit(data, n / w)
+        };
+        super::strips::pipelined(
+            windows.len(),
+            |i| {
+                let (k, window, overview) = windows[i];
+                sources[k].read_window(window, &crate::WindowOptions { overview, bands: Vec::new() })
+            },
+            |i, window| {
+                let (k, j) = order[start + i];
+                let (ctx, chunks, sink) = &ctxs[k];
+                let c = &chunks[j];
+                grow(rows, *base, c.dy + c.dh);
+                let total = rows.len() / bands;
+                // The chunk's part of the output, as `f64`: the initial value for the first source
+                // (whose chunks don't overlap), else what earlier sources left there.
+                let mut staged: Vec<Vec<f64>> = fill.iter().map(|fill| vec![*fill; c.dw * c.dh]).collect();
+                if k > 0 {
+                    crate::pixel::with_data!(&*rows, v => {
+                        for (b, part) in staged.iter_mut().enumerate() {
+                            for (r, line) in part.chunks_mut(c.dw).enumerate() {
+                                let at = b * total + (c.dy + r - *base) * w + c.dx;
+                                for (o, x) in line.iter_mut().zip(&v[at..at + c.dw]) {
+                                    *o = crate::pixel::Pixel::to_f64(*x);
+                                }
+                            }
+                        }
+                    });
+                }
+                let src_bands: Vec<super::BandView> = (0..bands).map(|b| super::BandView::of(&window.raster, b)).collect();
+                let valid = validity(&src_bands, &nodata[k], *unified, None);
+                let sn = c.sw * c.sh;
+                crate::pixel::with_data!(&window.raster.data, v => {
+                    let typed: Vec<&[_]> = (0..bands).map(|b| &v[b * sn..(b + 1) * sn]).collect();
+                    let data = SrcData { bands: &typed, valid: &valid, width: c.sw, origin: (c.sx, c.sy) };
+                    ctx.warp_chunk(c, &data, sink, chunk_rows(&mut staged, c.dw, &Chunk { dx: 0, dy: 0, ..*c }));
+                });
+                // Stored in the rows held, rounded to the output type.
+                crate::pixel::with_data!(rows, v => {
+                    for (b, part) in staged.iter().enumerate() {
+                        for (r, line) in part.chunks(c.dw).enumerate() {
+                            let at = b * total + (c.dy + r - *base) * w + c.dx;
+                            for (o, x) in v[at..at + c.dw].iter_mut().zip(line) {
+                                *o = warp_round(*x, out_type) as _;
+                            }
+                        }
+                    }
+                });
+                *done = start + i + 1;
+                flush(rows, base, *done)
+            },
+        )?;
+        flush(rows, base, *done)
+    }
+}
+
+// Plan a virtual warp without reading source pixels.
 pub(crate) fn virtual_header(source: &RasterDataset, o: &WarpOptions) -> Result<RasterDataset> {
     let p = Plan::new(&[source], o)?;
     // As GDAL's VRT authoring path: explicit destination nodata is adjusted to
@@ -3224,6 +3384,90 @@ mod tests {
                 assert_eq!(a.raster.data.to_f64_vec(), b.raster.data.to_f64_vec(), "{resampling:?} {memory_limit} {ext}");
             }
         }
+    }
+
+    /// Overlapping sources (one in another CRS, at another resolution, with nodata holes) warped
+    /// a chunk at a time, read by windows and written as their rows are done, are the warp of the
+    /// whole sources, bit for bit: each pixel takes its sources in order across chunk edges.
+    #[test]
+    fn several_sources_streamed_give_the_whole_warp() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = raster(37, 29, [500000.0, 30.0, 0.0, 4000000.0, 0.0, -30.0], 32610, |c, r| ((c * 7 + r * 13) % 50) as f64 + 0.25);
+        a.has_nodata = true;
+        a.raster.set(0, 5, 6, -9999.0).unwrap();
+        let mut b = raster(23, 31, [500371.0, 41.0, 0.0, 3999611.0, 0.0, -41.0], 32610, |c, r| 100.0 + ((c * 3 + r * 5) % 17) as f64);
+        b.has_nodata = true;
+        for (r, c) in [(0, 0), (4, 9), (4, 10), (20, 3)] {
+            b.raster.set(0, r, c, -9999.0).unwrap();
+        }
+        // In geographic coordinates, over both.
+        let mut seed = raster(19, 17, [500100.0, 50.0, 0.0, 3999900.0, 0.0, -50.0], 32610, |c, r| 300.0 + (c * r % 23) as f64);
+        seed.has_nodata = true;
+        seed.raster.set(0, 8, 8, -9999.0).unwrap();
+        let geo = SpatialRef::parse("EPSG:4326").unwrap();
+        let g = warp(&[&seed], &WarpOptions { dst_srs: Some(geo), ..Default::default() }).unwrap();
+        let paths: Vec<String> = [&a, &b, &g]
+            .iter()
+            .enumerate()
+            .map(|(i, ds)| {
+                let p = dir.path().join(format!("s{i}.tif")).to_str().unwrap().to_string();
+                crate::write_raster_dataset(ds, &p, &Default::default()).unwrap();
+                p
+            })
+            .collect();
+        let read: Vec<RasterDataset> = paths.iter().map(|p| crate::open_raster(p).unwrap()).collect();
+        let refs: Vec<&RasterDataset> = read.iter().collect();
+        let utm11 = SpatialRef::parse("EPSG:32611").unwrap();
+        let mut checked = 0;
+        for dst_srs in [None, Some(utm11)] {
+            for resampling in [Resampling::Nearest, Resampling::Bilinear, Resampling::Cubic, Resampling::Average] {
+                for memory_limit in [64.0 * 1024.0 * 1024.0, 3000.0, 700.0] {
+                    let o = WarpOptions { dst_srs: dst_srs.clone(), resampling, memory_limit, ..Default::default() };
+                    let whole = warp(&refs, &o).unwrap();
+                    let out = dir.path().join("out.tif");
+                    warp_to_path(&paths, &o, out.to_str().unwrap(), &Default::default()).unwrap();
+                    let back = crate::open_raster(out.to_str().unwrap()).unwrap();
+                    let bits = |ds: &RasterDataset| ds.raster.data.to_f64_vec().iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+                    let what = format!("{:?} {resampling:?} {memory_limit}", dst_srs.as_ref().map(|s| s.epsg));
+                    assert_eq!(
+                        (back.raster.cols, back.raster.rows, back.geo_transform()),
+                        (whole.raster.cols, whole.raster.rows, whole.geo_transform())
+                    );
+                    assert_eq!(bits(&back), bits(&whole), "{what}");
+                    assert_eq!((back.nodata(), back.raster.data_type), (whole.nodata(), whole.raster.data_type));
+                    // The path read whole before.
+                    assert_eq!(bits(&back), bits(&warp_paths(&paths, &o).unwrap()), "{what}, read whole");
+                    checked += 1;
+                }
+            }
+        }
+        assert_eq!(checked, 24);
+        // The order matters: the sources reversed give another output, also the whole warp's.
+        let o = WarpOptions { memory_limit: 700.0, ..Default::default() };
+        let reversed: Vec<String> = paths.iter().rev().cloned().collect();
+        let out = dir.path().join("rev.tif");
+        warp_to_path(&reversed, &o, out.to_str().unwrap(), &Default::default()).unwrap();
+        let back = crate::open_raster(out.to_str().unwrap()).unwrap().raster.data.to_f64_vec();
+        let rev_refs: Vec<&RasterDataset> = refs.iter().rev().copied().collect();
+        assert_eq!(back, warp(&rev_refs, &o).unwrap().raster.data.to_f64_vec());
+        assert_ne!(back, warp(&refs, &o).unwrap().raster.data.to_f64_vec());
+    }
+
+    /// The chunks of later sources wait for the chunks of earlier sources they overlap; of the
+    /// chunks that may run, the topmost runs first.
+    #[test]
+    fn chunks_are_ordered_source_by_source_where_they_overlap() {
+        let chunk = |dx, dy, dw, dh| Chunk { dx, dy, dw, dh, sx: 0, sy: 0, sw: 1, sh: 1, raw_w: 1.0, raw_h: 1.0 };
+        // Source 0 in two tall halves, source 1 in four rows, source 2 one chunk over the bottom.
+        let s0 = [chunk(0, 0, 5, 20), chunk(5, 0, 5, 20)];
+        let s1 = [chunk(0, 0, 10, 5), chunk(0, 5, 10, 5), chunk(0, 10, 10, 5), chunk(0, 15, 10, 5)];
+        let s2 = [chunk(2, 12, 3, 8)];
+        let order = chunk_order(&[&s0, &s1, &s2]);
+        assert_eq!(order, vec![(0, 0), (0, 1), (1, 0), (1, 1), (1, 2), (1, 3), (2, 0)]);
+        // A later source's chunk above an earlier one's runs first when they don't overlap.
+        let t0 = [chunk(0, 10, 10, 10)];
+        let t1 = [chunk(0, 0, 10, 10), chunk(0, 10, 10, 10)];
+        assert_eq!(chunk_order(&[&t0, &t1]), vec![(1, 0), (0, 0), (1, 1)]);
     }
 
     #[test]
