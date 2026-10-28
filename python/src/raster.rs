@@ -449,8 +449,11 @@ impl PyRaster {
     ///         `"Red"`) and `items` (a mapping of metadata items).
     ///     colormap: The color table of a single-band Byte or UInt16 GeoTIFF: `(r, g, b, a)`
     ///         entries from index 0.
-    ///     overviews: GeoTIFF overviews to build, as decimation factors such as `[2, 4]`; or the
-    ///         overviews themselves (GeoTIFF or COG), written as they are instead of computed:
+    ///     overviews: Overviews to build, as decimation factors such as `[2, 4]`: for a COG, the
+    ///         levels written instead of halving until one fits in a tile, as GDAL's COG driver
+    ///         reuses its source's overviews (`OVERVIEWS=NONE` or `IGNORE_EXISTING` with factors
+    ///         raises); or the overviews themselves (GeoTIFF or COG), written as they are instead
+    ///         of computed:
     ///         `Raster`s or arrays (`(rows, cols)` or `(bands, rows, cols)`) of the raster's dtype,
     ///         from the largest, at factors 2, 4, 8... (`ceil(width / f) x ceil(height / f)`).
     ///     overview_resampling: `"nearest"`, `"average"`, `"min"`, `"max"` or `"mode"`; or

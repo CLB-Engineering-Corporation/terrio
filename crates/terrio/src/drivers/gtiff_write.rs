@@ -624,22 +624,33 @@ impl TiffOptions {
             return Err(Error::Unsupported("area-matched overviews are built with COG_OVERVIEW_POLICY=SOURCE only".into()));
         }
         let supplied_overviews = options.overview_data.clone();
+        // A COG's overview factors stand for the source's existing overviews, as GDAL's COG driver
+        // reuses those of its source (built at these factors with `gdaladdo`).
+        let factors = cog && !options.overviews.is_empty();
+        if factors && options.overviews.iter().any(|f| *f < 2) {
+            return Err(Error::InvalidArgument(format!("overview factors are 2 or more, not {:?}", options.overviews)));
+        }
+        let existing = !supplied_overviews.is_empty() || factors;
         let mut no_overviews = false;
         if cog {
             match co("OVERVIEWS").map(str::to_ascii_uppercase).as_deref() {
                 None | Some("AUTO") => {}
-                Some("IGNORE_EXISTING") if supplied_overviews.is_empty() => {}
+                Some("IGNORE_EXISTING") if !existing => {}
                 Some("IGNORE_EXISTING") => {
-                    return Err(Error::InvalidArgument("OVERVIEWS=IGNORE_EXISTING contradicts the overviews supplied".into()));
-                }
-                Some("FORCE_USE_EXISTING") if supplied_overviews.is_empty() => {
                     return Err(Error::InvalidArgument(
-                        "OVERVIEWS=FORCE_USE_EXISTING needs existing overviews: supply them (overview_data)".into(),
+                        "OVERVIEWS=IGNORE_EXISTING contradicts the overviews supplied (or their factors)".into(),
+                    ));
+                }
+                Some("FORCE_USE_EXISTING") if !existing => {
+                    return Err(Error::InvalidArgument(
+                        "OVERVIEWS=FORCE_USE_EXISTING needs existing overviews: supply them (overview_data) or their factors".into(),
                     ));
                 }
                 Some("FORCE_USE_EXISTING") => {}
-                Some("NONE") if supplied_overviews.is_empty() => no_overviews = true,
-                Some("NONE") => return Err(Error::InvalidArgument("OVERVIEWS=NONE contradicts the overviews supplied".into())),
+                Some("NONE") if !existing => no_overviews = true,
+                Some("NONE") => {
+                    return Err(Error::InvalidArgument("OVERVIEWS=NONE contradicts the overviews supplied (or their factors)".into()));
+                }
                 Some(other) => {
                     return Err(Error::InvalidArgument(format!(
                         "invalid OVERVIEWS '{other}' (AUTO, IGNORE_EXISTING, FORCE_USE_EXISTING, NONE)"
@@ -650,7 +661,7 @@ impl TiffOptions {
         if !supplied_overviews.is_empty() && method.is_some() {
             return Err(Error::InvalidArgument("overviews are either supplied or resampled, not both".into()));
         }
-        if !supplied_overviews.is_empty() && !cog && !options.overviews.is_empty() {
+        if !supplied_overviews.is_empty() && !options.overviews.is_empty() {
             return Err(Error::InvalidArgument("overviews are either supplied or given as factors, not both".into()));
         }
         let bigtiff = match co("BIGTIFF").map(str::to_ascii_uppercase).as_deref() {
@@ -692,8 +703,8 @@ impl TiffOptions {
             } else if options.tile_size.is_none() {
                 o.rows_per_strip = by;
             }
-            o.overviews = options.overviews.clone();
         }
+        o.overviews = options.overviews.clone();
         if let Some(i) = co("INTERLEAVE") {
             o.planar = match i.to_ascii_uppercase().as_str() {
                 "BAND" => true,
@@ -1020,7 +1031,7 @@ fn plan_with(raster: &Raster, opts: &TiffOptions, measured: &[DomainItem]) -> Re
     if let (true, Some((t, _))) = (opts.cog, tile) {
         // As GDAL's COG driver: the method of the overviews it computes, and LERC's loss.
         let computed = opts.supplied_overviews.is_empty() && !opts.no_overviews;
-        if computed && (raster.cols > t as usize || raster.rows > t as usize) {
+        if computed && (raster.cols > t as usize || raster.rows > t as usize || !opts.overviews.is_empty()) {
             let name = match opts.area_matched {
                 Some(false) => "AREA_MATCHED",
                 Some(true) => "AREA_MATCHED_MODE",
@@ -1115,7 +1126,7 @@ fn prepare(raster: &Raster, opts: &TiffOptions) -> Result<Prepared> {
     } else if let Some(categorical) = opts.area_matched {
         let count = match (opts.cog, tile) {
             (true, _) if opts.no_overviews => 0,
-            (true, Some((t, _))) => cog_overview_count(raster.cols, raster.rows, t as usize),
+            (true, Some((t, _))) if opts.overviews.is_empty() => cog_overview_count(raster.cols, raster.rows, t as usize),
             _ => {
                 let mut factors: Vec<usize> = opts.overviews.iter().copied().filter(|f| *f > 1).collect();
                 factors.sort_unstable();
@@ -1137,7 +1148,7 @@ fn prepare(raster: &Raster, opts: &TiffOptions) -> Result<Prepared> {
             report = Some(m);
         }
     } else if opts.no_overviews {
-    } else if let (true, Some((t, _))) = (opts.cog, tile) {
+    } else if let (true, Some((t, _)), true) = (opts.cog, tile, opts.overviews.is_empty()) {
         let t = t as usize;
         if opts.gdal_overviews {
             while levels.last().is_some_and(|level| level.cols > t || level.rows > t) {
@@ -1166,7 +1177,9 @@ fn prepare(raster: &Raster, opts: &TiffOptions) -> Result<Prepared> {
                 }
             }));
         }
-    } else if !opts.cog {
+    } else {
+        // GeoTIFF overview factors, or a COG's: the overviews `gdaladdo` builds, which GDAL's COG
+        // driver then reuses (`OVERVIEWS=AUTO` or `FORCE_USE_EXISTING`).
         let mut factors: Vec<usize> = opts.overviews.iter().copied().filter(|f| *f > 1).collect();
         factors.sort_unstable();
         factors.dedup();
@@ -2800,8 +2813,10 @@ impl CogWriter {
         if !opts.cog || opts.mask.is_some() {
             return Err(Error::Unsupported("COGs are written in rows without a mask only".into()));
         }
-        if !opts.supplied_overviews.is_empty() || opts.area_matched.is_some() {
-            return Err(Error::Unsupported("COGs with supplied or area-matched overviews are written whole, not in rows".into()));
+        if !opts.supplied_overviews.is_empty() || opts.area_matched.is_some() || !opts.overviews.is_empty() {
+            return Err(Error::Unsupported(
+                "COGs with supplied or area-matched overviews, or overviews at given factors, are written whole, not in rows".into(),
+            ));
         }
         let Plan { tile, layout, geo, color_map } = plan(raster, opts)?;
         let tile = tile.map_or(512, |(t, _)| t as usize);
@@ -4627,6 +4642,97 @@ mod cog_option_tests {
         let o = TiffOptions { area_matched: Some(false), cog: true, compression: Compression::Deflate, ..Default::default() };
         let dir = tempfile::tempdir().unwrap();
         assert!(write(&r, dir.path().join("x.tif").to_str().unwrap(), &o).is_err());
+    }
+
+    /// The overview levels of a file, as read back.
+    fn levels(p: &std::path::Path) -> Vec<(usize, usize, (DataType, Vec<u64>))> {
+        let mut lazy = crate::open_raster_lazy(p.to_str().unwrap()).unwrap();
+        let sizes = lazy.overviews();
+        sizes
+            .iter()
+            .enumerate()
+            .map(|(i, (w, h))| {
+                let ds = lazy.read_window(crate::Window::full(*w, *h), &crate::WindowOptions { bands: vec![], overview: Some(i) }).unwrap();
+                (*w, *h, bits(&ds.raster.data))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn cog_overview_factors_are_the_existing_overviews() {
+        let r = grid(1300, 1100, DataType::F32, |x, y| if (x + y) % 17 == 0 { -9999.0 } else { (x as f64 * 0.37).sin() + y as f64 });
+        let geotiff = |factors: Vec<usize>, method: &str| crate::RasterWriteOptions {
+            driver: Some(crate::formats::RasterDriver::GTiff),
+            overviews: factors,
+            overview_resampling: Some(method.into()),
+            ..Default::default()
+        };
+        for (factors, method) in
+            [(vec![2, 4, 8], "average"), (vec![4, 2], "nearest"), (vec![3, 9], "average"), (vec![2, 4], "area_matched")]
+        {
+            let mut cog = cog_options(&[]);
+            cog.overviews = factors.clone();
+            cog.overview_resampling = Some(method.into());
+            let (_d, c) = write_cog(&r, &cog).unwrap();
+            let (_d2, g) = write_cog(&r, &geotiff(factors.clone(), method)).unwrap();
+            // The levels asked for, not the automatic pyramid (2 and 4 here), as GeoTIFF builds them.
+            let (lc, lg) = (levels(&c), levels(&g));
+            let mut sorted = factors.clone();
+            sorted.sort_unstable();
+            assert_eq!(
+                lc.iter().map(|l| (l.0, l.1)).collect::<Vec<_>>(),
+                sorted.iter().map(|f| (1300usize.div_ceil(*f), 1100usize.div_ceil(*f))).collect::<Vec<_>>()
+            );
+            assert!(lc == lg, "{factors:?} {method}: COG levels differ from GeoTIFF's");
+            let name = if method == "area_matched" { "AREA_MATCHED".to_string() } else { method.to_ascii_uppercase() };
+            assert!(gdal_metadata(&c).contains(&format!(r#"<Item name="OVERVIEW_RESAMPLING" domain="IMAGE_STRUCTURE">{name}</Item>"#)));
+            // FORCE_USE_EXISTING uses them too.
+            let mut force = cog_options(&[("OVERVIEWS", "FORCE_USE_EXISTING")]);
+            force.overviews = factors.clone();
+            force.overview_resampling = Some(method.into());
+            let (_d3, f) = write_cog(&r, &force).unwrap();
+            assert!(levels(&f) == lc);
+        }
+        // A raster that fits in a tile gets the levels asked for.
+        let small = grid(300, 200, DataType::I16, |x, y| (x * y % 100) as f64);
+        let mut o = cog_options(&[]);
+        o.overviews = vec![2];
+        let (_d, p) = write_cog(&small, &o).unwrap();
+        assert_eq!(levels(&p).iter().map(|l| (l.0, l.1)).collect::<Vec<_>>(), vec![(150, 100)]);
+        // Without factors, the automatic pyramid as before.
+        let (_d, p) = write_cog(&r, &cog_options(&[])).unwrap();
+        assert_eq!(levels(&p).iter().map(|l| (l.0, l.1)).collect::<Vec<_>>(), vec![(650, 550), (325, 275)]);
+    }
+
+    #[test]
+    fn cog_overview_factors_refuse_contradictions() {
+        let r = grid(600, 520, DataType::F32, |x, y| (x + y) as f64);
+        let with = |co: &[(&str, &str)], factors: Vec<usize>| {
+            let mut o = cog_options(co);
+            o.overviews = factors;
+            o
+        };
+        for (co, factors) in [
+            (vec![("OVERVIEWS", "NONE")], vec![2, 4]),
+            (vec![("OVERVIEWS", "IGNORE_EXISTING")], vec![2]),
+            (vec![], vec![1, 2]),
+            (vec![], vec![0]),
+        ] {
+            assert!(write_cog(&r, &with(&co, factors.clone())).is_err(), "{co:?} {factors:?}");
+        }
+        // Supplied levels and factors.
+        let mut o = with(&[], vec![2]);
+        o.overview_data = vec![Arc::new(grid(300, 260, DataType::F32, |_, _| 1.0))];
+        assert!(write_cog(&r, &o).is_err());
+        // Area-matched levels are at factors 2, 4, 8...
+        let mut o = with(&[], vec![2, 8]);
+        o.overview_resampling = Some("area_matched".into());
+        assert!(write_cog(&r, &o).is_err());
+        // The row writer cannot build them.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("rows.tif");
+        let o = TiffOptions::from_write_options(&with(&[], vec![2]), true, Some(-9999.0)).unwrap().unwrap();
+        assert!(CogWriter::create(p.to_str().unwrap(), &r, &o).is_err());
     }
 
     #[test]

@@ -52,7 +52,11 @@ terrio::write_raster_dataset(&ds, "dem_cog.tif", &options)?;
 
 `RasterWriteOptions::overview_resampling` accepts `nearest`, `average`, `min`, `max` or
 `mode` for GeoTIFF and COG. The defaults are `nearest` for GeoTIFF and `average` for COG.
-COGs build factors 2, 4, 8, … until the image fits in one tile. Each level reduces the original
+COGs build factors 2, 4, 8, … until the image fits in one tile, unless
+`RasterWriteOptions::overviews` gives the factors: those levels are then built as for a GeoTIFF
+(each from the previous one, `ceil(cols / f) x ceil(rows / f)`) and written as the COG's, as
+GDAL's COG driver reuses overviews built on its source by `gdaladdo` (`OVERVIEWS=AUTO` or
+`FORCE_USE_EXISTING`; `NONE` or `IGNORE_EXISTING` with factors is refused rather than ignored). Each level reduces the original
 source blocks independently: `nearest` samples the block center (clamped at image edges), and
 `average` skips nodata and rounds only the final result. Categorical methods retain native
 sample precision, including UInt64 values above 2⁵³. With `ALPHA=YES`, color averages are

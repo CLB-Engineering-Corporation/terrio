@@ -21,6 +21,12 @@
   as a dict (`None` otherwise, as before), and the file carries it in the `OVERVIEW_REPORT`
   metadata domain, which GDAL and rasterio read and `terrio info` shows (`overview_report` in
   the JSON).
+- COG: overview factors (`RasterWriteOptions::overviews`, Python `Raster.write(overviews=[2, 4])`)
+  are written as the COG's overviews, as GDAL's COG driver reuses overviews `gdaladdo` built on
+  its source; they were ignored and the automatic pyramid built. Levels are `ceil(size / f)`,
+  each from the previous one, as for GeoTIFF, and other factors than powers of two work. Factors
+  with `OVERVIEWS=NONE` or `IGNORE_EXISTING`, factors below 2, and factors with supplied levels
+  are refused.
 - Streaming writers (`terrio convert`, `dem`, `warp`... to a COG) gather the image and write it
   whole when area-matched or supplied overviews are asked for, instead of refusing them.
 - `RasterWriteOptions::metadata` (Python `Raster.write(metadata=...)`) sets dataset metadata items.
@@ -56,6 +62,8 @@
   such as `CUBIC`, is refused.
 - A COG's `PREDICTOR=YES` is 3 for floating-point rasters and 2 for integers, as GDAL's COG driver
   resolves it (it was 2).
+- A COG written with overview factors gets exactly those levels: `overviews=[2]` gave the
+  automatic pyramid and now gives one level.
 
 ### Command line
 
