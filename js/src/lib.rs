@@ -23,6 +23,7 @@ mod query;
 mod remote;
 #[cfg(feature = "threads")]
 mod threads;
+mod tile_index;
 mod vector_dataset;
 mod vsi;
 
@@ -849,6 +850,12 @@ pub fn describe_crs(crs: &str) -> Result<JsValue, JsError> {
         "geocentric": s.is_geocentric(),
         "wkt": s.to_wkt(),
     }))
+}
+
+/// The PROJJSON v0.7 of a CRS; throws for a CRS it would describe wrongly.
+#[wasm_bindgen(js_name = crsToProjjson)]
+pub fn crs_to_projjson(crs: &str) -> Result<String, JsError> {
+    SpatialRef::parse(crs).and_then(|s| s.to_projjson()).map_err(js_err)
 }
 
 /// The formats terrio reads and writes: `[{ name, long_name, kind, extensions, read, write }]`.

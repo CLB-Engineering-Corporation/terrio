@@ -191,7 +191,8 @@ pub(crate) fn read_points_bytes(py: Python<'_>, data: Vec<u8>) -> PyResult<PyPoi
 ///     resolution: COPC inputs: read the levels needed for this point spacing.
 ///     max_points: At most about this many points.
 ///     a_srs: Assign this CRS to the input, without reprojecting.
-///     t_srs: Reproject `x` and `y` into this CRS.
+///     t_srs: Reproject into this CRS: `x` and `y`, and `z` when this CRS and the points' (with
+///         the vertical CRS the file declares) both have heights.
 ///     point_format: The output point format (0 to 10).
 ///     minor_version: The output LAS minor version (0 to 4).
 ///     scale: The output scale `(x, y, z)`.
@@ -260,7 +261,7 @@ pub(crate) fn convert_points(
         chunk_points,
         append,
     };
-    py.detach(|| pointcloud::convert(src, dst, &options)).py()
+    crate::with_warnings(py, || pointcloud::convert(src, dst, &options))
 }
 
 /// Appends the points of point clouds to an existing EPT dataset, in place, as Entwine does
@@ -283,7 +284,8 @@ pub(crate) fn convert_points(
 ///     classes: Add the points of these classifications only.
 ///     returns: Add these returns only: `"first"`, `"last"`, `"intermediate"`, `"only"`.
 ///     a_srs: Assign this CRS to the inputs, without reprojecting.
-///     t_srs: Reproject the inputs' `x` and `y` into this CRS (the dataset's).
+///     t_srs: Reproject the inputs into this CRS (the dataset's): `x` and `y`, and `z` when
+///         both CRSs have heights.
 ///     chunk_points: The points read at a time (about a million by default).
 ///     leaf_points: The most points of a leaf node before it is split (100 000 by default).
 ///     memory_points: The most points held in memory at a time (4 000 000 by default).
@@ -821,7 +823,8 @@ impl PyPointCloud {
         Ok(Self { inner: self.inner.filter(&o.filter) })
     }
 
-    /// Reprojects `x` and `y` into another CRS.
+    /// Reprojects the points into another CRS: `x` and `y`, and `z` when both CRSs have heights
+    /// (compound CRSs, geographic 3D CRSs), as PDAL's `filters.reprojection` does.
     ///
     /// Args:
     ///     crs: The target CRS.
@@ -831,7 +834,7 @@ impl PyPointCloud {
     fn reproject(&self, py: Python<'_>, crs: &str) -> PyResult<Self> {
         let dst = SpatialRef::parse(crs).py()?;
         let mut inner = self.inner.clone();
-        py.detach(|| inner.reproject(&dst)).py()?;
+        crate::with_warnings(py, || inner.reproject(&dst))?;
         Ok(Self { inner })
     }
 

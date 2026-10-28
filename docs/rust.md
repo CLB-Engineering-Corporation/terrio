@@ -52,7 +52,11 @@ terrio::write_raster_dataset(&ds, "dem_cog.tif", &options)?;
 
 `RasterWriteOptions::overview_resampling` accepts `nearest`, `average`, `min`, `max` or
 `mode` for GeoTIFF and COG. The defaults are `nearest` for GeoTIFF and `average` for COG.
-COGs build factors 2, 4, 8, … until the image fits in one tile. Each level reduces the original
+COGs build factors 2, 4, 8, … until the image fits in one tile, unless
+`RasterWriteOptions::overviews` gives the factors: those levels are then built as for a GeoTIFF
+(each from the previous one, `ceil(cols / f) x ceil(rows / f)`) and written as the COG's, as
+GDAL's COG driver reuses overviews built on its source by `gdaladdo` (`OVERVIEWS=AUTO` or
+`FORCE_USE_EXISTING`; `NONE` or `IGNORE_EXISTING` with factors is refused rather than ignored). Each level reduces the original
 source blocks independently: `nearest` samples the block center (clamped at image edges), and
 `average` skips nodata and rounds only the final result. Categorical methods retain native
 sample precision, including UInt64 values above 2⁵³. With `ALPHA=YES`, color averages are
@@ -87,6 +91,13 @@ covered first, solving a threshold on the coverage histogram and breaking ties b
 kept neighbours then a deterministic hash, and holds the mean of their valid pixels (the mode for
 categorical rasters, the lowest value on ties). It needs a nodata value. The algorithm and its
 output are ras2cng's `build_area_matched_overviews`.
+
+`write_raster_dataset_with_report` returns what was measured while building them, an
+`OverviewReport`: per band, the valid area each level keeps (kept cells × f² over the valid
+full-resolution pixels, ras2cng's `overview_area_ratios`) and the valid pixel count. The file
+carries the same values in the `OVERVIEW_REPORT` metadata domain (`OVERVIEW_METHOD`,
+`OVERVIEW_FACTORS`, `OVERVIEW_AREA_RATIOS`, `OVERVIEW_BASE_VALID_PIXELS`), which GDAL and rasterio
+read (`tags(ns="OVERVIEW_REPORT")`); Python's `Raster.write` returns the report as a dict.
 
 Overviews computed elsewhere are written as they are with `RasterWriteOptions::overview_data`
 (GDAL's `OVERVIEWS=FORCE_USE_EXISTING`): the levels of factors 2, 4, 8…, each of the raster's

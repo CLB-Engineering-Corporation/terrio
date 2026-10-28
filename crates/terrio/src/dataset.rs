@@ -23,6 +23,8 @@ pub struct RasterDataset {
     pub band_nodata: Vec<Option<f64>>,
     /// Descriptive band properties, in band order; empty entries use driver defaults.
     pub band_metadata: Vec<BandMetadata>,
+    /// RGBA palette entries of a single-band indexed image, empty for direct colors.
+    pub color_table: Vec<[u8; 4]>,
     /// Ground control points in the raster CRS, retained instead of inventing an affine grid.
     pub gcps: Vec<Gcp>,
     /// The geotransform of a rotated or south-up raster, which the raster's origin and cell sizes
@@ -155,6 +157,7 @@ impl RasterDataset {
             has_nodata,
             band_nodata: Vec::new(),
             band_metadata: Vec::new(),
+            color_table: Vec::new(),
             gcps: Vec::new(),
             affine: None,
             complex: false,
@@ -608,6 +611,8 @@ pub(crate) fn fix_layer(mut layer: Layer, path: &str, driver: VectorDriver) -> L
     layer
 }
 
+pub use crate::drivers::gtiff_write::{OVERVIEW_REPORT_DOMAIN, OverviewReport};
+
 /// Options for writing rasters.
 #[derive(Debug, Clone, Default)]
 pub struct RasterWriteOptions {
@@ -631,7 +636,11 @@ pub struct RasterWriteOptions {
     /// A color table for a single-band Byte or UInt16 GeoTIFF: `(red, green, blue, alpha)`
     /// entries from index 0. Empty for none.
     pub color_table: Vec<[u8; 4]>,
-    /// GeoTIFF overviews to build, as decimation factors such as `[2, 4, 8]`.
+    /// Overviews to build, as decimation factors such as `[2, 4, 8]` (each level
+    /// `ceil(cols / f) x ceil(rows / f)`, reduced from the previous one). For a COG they are the
+    /// levels written instead of the automatic pyramid (halving until a level fits in a tile), as
+    /// GDAL's COG driver reuses the overviews `gdaladdo` built on its source with `OVERVIEWS=AUTO`
+    /// or `FORCE_USE_EXISTING`; `OVERVIEWS=NONE` or `IGNORE_EXISTING` with factors is refused.
     pub overviews: Vec<usize>,
     /// Overview resampling: `nearest`, `average`, `min`, `max` or `mode`. Defaults to `nearest`
     /// for GeoTIFF and `average` for COG (whose `OVERVIEW_RESAMPLING` or `RESAMPLING` creation
@@ -718,7 +727,7 @@ pub fn read_gcps(path: &str) -> Result<Vec<Gcp>> {
 
 /// Writes a raster, declaring its nodata value.
 pub fn write_raster(raster: &Raster, path: &str, options: &RasterWriteOptions) -> Result<()> {
-    write_raster_with_nodata(raster, Some(raster.nodata), false, path, options)
+    write_raster_with_nodata(raster, Some(raster.nodata), false, path, options).map(|_| ())
 }
 
 /// Writes a raster dataset, declaring a nodata value only when the dataset has one.
@@ -739,16 +748,33 @@ pub fn write_raster(raster: &Raster, path: &str, options: &RasterWriteOptions) -
 /// # Ok::<(), terrio::Error>(())
 /// ```
 pub fn write_raster_dataset(ds: &RasterDataset, path: &str, options: &RasterWriteOptions) -> Result<()> {
+    write_raster_dataset_with_report(ds, path, options).map(|_| ())
+}
+
+/// [`write_raster_dataset`], returning what the GeoTIFF/COG writer measured of the area-matched
+/// overviews it built (`overview_resampling` `area_matched` or `area_matched_mode`): per band, the
+/// valid area each level keeps, relative to the full-resolution image's. `None` for other
+/// overviews and formats. The same values are written to the file's metadata, in the
+/// `OVERVIEW_REPORT` domain (`OVERVIEW_METHOD`, `OVERVIEW_FACTORS`, `OVERVIEW_AREA_RATIOS`,
+/// `OVERVIEW_BASE_VALID_PIXELS`; rasterio: `tags(ns="OVERVIEW_REPORT")`).
+///
+/// ```no_run
+/// let depth = terrio::open_raster("depth.tif")?;
+/// let options = terrio::RasterWriteOptions {
+///     driver: Some(terrio::formats::RasterDriver::Cog),
+///     overview_resampling: Some("area_matched".into()),
+///     ..Default::default()
+/// };
+/// let report = terrio::write_raster_dataset_with_report(&depth, "depth_cog.tif", &options)?.unwrap();
+/// println!("{:?} keep {:?} of the valid area", report.factors, report.area_ratios[0]);
+/// # Ok::<(), terrio::Error>(())
+/// ```
+pub fn write_raster_dataset_with_report(ds: &RasterDataset, path: &str, options: &RasterWriteOptions) -> Result<Option<OverviewReport>> {
     let driver = options.driver.or_else(|| RasterDriver::for_extension(path));
-    let options = RasterWriteOptions {
-        geo_transform: options.geo_transform.or(ds.affine),
-        gcps: options.inherited_gcps(ds, driver),
-        band_metadata: if options.band_metadata.is_empty() { ds.band_metadata.clone() } else { options.band_metadata.clone() },
-        ..options.clone()
-    };
+    let options = options.inherited_from(ds, driver);
     let pam = needs_nodata_pam(ds) && matches!(driver, Some(RasterDriver::GTiff | RasterDriver::Cog));
     let tag = if matches!(driver, Some(RasterDriver::GTiff | RasterDriver::Cog)) { tiff_nodata(ds) } else { ds.nodata() };
-    write_raster_with_nodata(&ds.raster, tag, ds.complex, path, &options)?;
+    let report = write_raster_with_nodata(&ds.raster, tag, ds.complex, path, &options)?;
     if matches!(driver, Some(RasterDriver::GTiff | RasterDriver::Cog)) {
         let mut aux = std::ffi::OsString::from(path);
         aux.push(".aux.xml");
@@ -757,7 +783,7 @@ pub fn write_raster_dataset(ds: &RasterDataset, path: &str, options: &RasterWrit
             crate::drivers::common::write_band_nodata_pam(Path::new(path), &values)?;
         }
     }
-    Ok(())
+    Ok(report)
 }
 
 /// TIFF's shared nodata tag cannot be overridden to "no nodata" by PAM.
@@ -780,7 +806,13 @@ pub(crate) fn needs_nodata_pam(ds: &RasterDataset) -> bool {
     distinct || raw_float32_nodata
 }
 
-fn write_raster_with_nodata(raster: &Raster, nodata: Option<f64>, complex: bool, path: &str, options: &RasterWriteOptions) -> Result<()> {
+fn write_raster_with_nodata(
+    raster: &Raster,
+    nodata: Option<f64>,
+    complex: bool,
+    path: &str,
+    options: &RasterWriteOptions,
+) -> Result<Option<OverviewReport>> {
     ensure_writable_location(path)?;
     let driver = match options.driver.or_else(|| RasterDriver::for_extension(path)) {
         Some(d) => d,
@@ -797,7 +829,7 @@ fn write_raster_with_nodata(raster: &Raster, nodata: Option<f64>, complex: bool,
                 {
                     co.push(("COMPRESS".into(), c.clone()));
                 }
-                return crate::gdal_backend::write_raster_gt(raster, nodata, complex, options.geo_transform, path, &d, &co);
+                return crate::gdal_backend::write_raster_gt(raster, nodata, complex, options.geo_transform, path, &d, &co).map(|_| None);
             }
             return Err(Error::InvalidArgument(format!("cannot tell the output format of '{path}': give it explicitly")));
         }
@@ -842,7 +874,7 @@ fn write_raster_with_nodata(raster: &Raster, nodata: Option<f64>, complex: bool,
         _ => raster,
     };
     if let Some(result) = crate::drivers::write(raster, nodata, path, driver, options) {
-        return result;
+        return result.map(|_| None);
     }
     // Formats terrio reads but cannot write itself.
     #[cfg(feature = "gdal")]
@@ -851,11 +883,11 @@ fn write_raster_with_nodata(raster: &Raster, nodata: Option<f64>, complex: bool,
         if let Some(c) = &options.compression {
             co.push(("COMPRESSED".into(), if c.eq_ignore_ascii_case("NONE") { "NO" } else { "YES" }.into()));
         }
-        return crate::gdal_backend::write_raster_with(raster, nodata, complex, path, "HFA", &co);
+        return crate::gdal_backend::write_raster_with(raster, nodata, complex, path, "HFA", &co).map(|_| None);
     }
     #[cfg(feature = "gdal")]
     if driver == RasterDriver::GRIB {
-        return crate::gdal_backend::write_raster_with(raster, nodata, complex, path, "GRIB", &options.creation_options);
+        return crate::gdal_backend::write_raster_with(raster, nodata, complex, path, "GRIB", &options.creation_options).map(|_| None);
     }
     let compression = options.compression.as_deref().map(parse_compression).transpose()?;
     match driver {
@@ -873,7 +905,7 @@ fn write_raster_with_nodata(raster: &Raster, nodata: Option<f64>, complex: bool,
         }
         d => raster.write(path, d.to_wb())?,
     }
-    Ok(())
+    Ok(None)
 }
 
 /// Writes rasters into one netCDF-4 file, each in its group: `/science/grid` (groups created as
@@ -992,6 +1024,32 @@ pub(crate) fn ensure_writable_location(path: &str) -> Result<()> {
 }
 
 impl RasterWriteOptions {
+    /// Metadata inheritance shared by whole-image and row-streamed TIFF writers.
+    pub(crate) fn inherited_from(&self, ds: &RasterDataset, driver: Option<RasterDriver>) -> Self {
+        let co = |key: &str| self.creation_options.iter().rev().find(|(k, _)| k.eq_ignore_ascii_case(key)).map(|(_, v)| v.as_str());
+        let compression = self.compression.as_deref().or_else(|| co("COMPRESS")).unwrap_or_default();
+        let palette_allowed = !compression.eq_ignore_ascii_case("JPEG")
+            && !compression.eq_ignore_ascii_case("WEBP")
+            && co("PHOTOMETRIC").is_none_or(|p| p.eq_ignore_ascii_case("PALETTE"));
+        let color_table = if self.color_table.is_empty() && palette_allowed { ds.color_table.clone() } else { self.color_table.clone() };
+        let mut band_metadata = if self.band_metadata.is_empty() { ds.band_metadata.clone() } else { self.band_metadata.clone() };
+        // A caller requesting grayscale/unsupported palette compression writes indices
+        // as gray values. Do not retain an inherited Palette color-interpretation role.
+        if color_table.is_empty() && !ds.color_table.is_empty() && self.band_metadata.is_empty() {
+            for b in &mut band_metadata {
+                if b.color_interp.as_deref() == Some("Palette") {
+                    b.color_interp = Some("Gray".into());
+                }
+            }
+        }
+        Self {
+            geo_transform: self.geo_transform.or(ds.affine),
+            gcps: self.inherited_gcps(ds, driver),
+            color_table,
+            band_metadata,
+            ..self.clone()
+        }
+    }
     pub(crate) fn inherited_gcps(&self, ds: &RasterDataset, driver: Option<RasterDriver>) -> Vec<Gcp> {
         if matches!(driver, Some(RasterDriver::GTiff | RasterDriver::Cog))
             && self.gcps.is_empty()

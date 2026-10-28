@@ -49,6 +49,10 @@ and drivers below.
       maximum distance and curvature/refraction controls, with explicit input nodata behavior.
       Done in [#240](https://github.com/opengeos/terrio/pull/240), through Rust, CLI/MCP, Python
       and JavaScript; projected DEM comparisons are registered in conformance.
+- [x] Create new raster/vector footprint indexes and replace single-file outputs across
+      Rust, CLI/MCP, Python and JavaScript, with GTI metadata in GeoPackage/FlatGeobuf,
+      discovery/filtering and source-CRS fields. Done in [#347](https://github.com/opengeos/terrio/pull/347).
+      Append/update, STAC profiles and XML companions remain separate future extensions.
 - [x] Indexed raster catalogs: GTI-compatible GeoPackage/FlatGeobuf tile indexes, spatial source
       selection, compositing order, mixed-CRS sources and a bounded source cache. Done in
       [#249](https://github.com/opengeos/terrio/pull/249), with nested VRT export protection
@@ -122,6 +126,7 @@ commands. Command-group progress:
       hillshade, slope, aspect, color relief, TRI, TPI, roughness), `terrio calc` (`gdal_calc.py`,
       with NumPy's typing rules), `terrio proximity` (`gdal_proximity.py`) and `terrio sieve`
       (`gdal_sieve.py`).
+- [x] Raster blending (`blend`): ten GDAL composition operators, opacity and palette/alpha inputs
 - [x] Raster pixel operations (`unscale`, `nodata-to-alpha`, `reclassify`, `as-features`)
       across Rust, CLI/MCP, Python and WebAssembly. Landed in [#299](https://github.com/opengeos/terrio/pull/299).
 - [x] Focal statistics and kernels (`neighbors`), collar cleaning (`clean-collar` / `nearblack`)
@@ -503,6 +508,10 @@ WebAssembly (the `terrio-js` npm package):
 - [x] PROJJSON v0.7 parsing for static 2D geographic, projected and bound CRSs,
       including units, GIS axis normalization and explicit Helmert operations.
       Rust/CLI/MCP/Python/JavaScript/WASM validation is tracked in #270.
+- [x] PROJJSON v0.7 writing (`SpatialRef::to_projjson`) of geographic, geocentric, projected,
+      vertical, compound, bound and IAU planetary CRSs, refusing what it would describe wrongly:
+      Rust, CLI and MCP (`terrio crs --projjson`), Python (`CRS.to_projjson()`) and JavaScript
+      (`crsToProjjson`), compared with live PROJ/GDAL by `scripts/conformance.py`.
 - IAU and additional projection capabilities remain scoped separately in #271–#272.
 
 ## ndarray interoperability (#298)

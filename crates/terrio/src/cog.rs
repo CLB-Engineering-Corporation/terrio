@@ -4,8 +4,9 @@
 //! GeoTIFFs (Cloud Optimized or not, local or remote) are read in place: opening reads the image
 //! headers, and a window read decodes only the tiles or strips that intersect the window. Remote
 //! files are read through HTTP range requests (see [`crate::http`]), fetching the tiles of a window
-//! in as few requests as possible. Other formats are read whole on open, then windows are cut from
-//! memory.
+//! in as few requests as possible. Raw-layout rasters (SRTM tiles, EHdr, ENVI, SAGA, ERS, Idrisi and
+//! Surfer 6 grids), JPEG 2000, GRIB and Zarr are read in place by their own drivers too. Other
+//! formats are read whole on open, then windows are cut from memory.
 //!
 //! ```no_run
 //! use terrio::{Window, WindowOptions};
@@ -167,6 +168,11 @@ pub(crate) trait WindowSource: Send + Sync {
     fn alpha_band(&self) -> Option<usize> {
         None
     }
+    /// Whether [`LazyRaster::read`] gives the dataset's metadata items, as the driver's eager
+    /// read does, rather than a window's.
+    fn whole_read_keeps_metadata(&self) -> bool {
+        false
+    }
     /// The sizes `(width, height)` of the overviews, largest first.
     fn overviews(&self) -> Vec<(usize, usize)>;
     /// The block size `(width, height)` reads are best aligned to, when the format has one.
@@ -290,6 +296,7 @@ impl LazyRaster {
         if let Inner::Tiff(t) = &self.inner {
             header.raster.metadata = t.tags.metadata.clone();
             header.band_metadata = t.tags.band_properties.clone();
+            header.color_table = t.tags.color_table.clone();
             header.gcps = t.tags.gcps.clone();
             header.raster.crs = t.tags.crs_info();
         }
@@ -340,7 +347,9 @@ impl LazyRaster {
 
     /// Opens a raster: a path, URL, `s3://`, `gs://` or `az://` object, or zip archive member.
     ///
-    /// GeoTIFFs are read in place: only their headers are read now. Other formats are read whole.
+    /// GeoTIFFs are read in place: only their headers are read now. So are raw-layout rasters (SRTM
+    /// tiles, EHdr, ENVI, SAGA, ERS, Idrisi and Surfer 6 grids), JPEG 2000, GRIB and Zarr; other
+    /// formats are read whole.
     pub fn open(path: &str) -> Result<Self> {
         let mut r = Self::open_without_sidecars(path)?;
         r.find_sidecar_mask(path);
@@ -726,6 +735,7 @@ impl LazyRaster {
                 has_nodata: ds.has_nodata,
                 band_nodata: ds.band_nodata.clone(),
                 band_metadata: ds.band_metadata.clone(),
+                color_table: ds.color_table.clone(),
                 gcps: ds.gcps.clone(),
                 affine: ds.affine,
                 complex: ds.complex,
@@ -754,6 +764,7 @@ impl LazyRaster {
         ds.set_geo_transform(self.geo_transform());
         if let Inner::Tiff(t) = &self.inner {
             ds.band_metadata = t.tags.band_properties.clone();
+            ds.color_table = t.tags.color_table.clone();
             ds.gcps = t.tags.gcps.clone();
         }
         ds
@@ -762,7 +773,15 @@ impl LazyRaster {
     /// Reads the whole full-resolution image.
     pub fn read(&mut self) -> Result<RasterDataset> {
         let window = Window::full(self.width(), self.height());
-        self.read_window(window, &WindowOptions::default())
+        let mut ds = self.read_window(window, &WindowOptions::default())?;
+        // The whole image of a source read whole with its dataset's metadata items (which a
+        // window leaves out), as its driver reads it eagerly.
+        if let Inner::Source(header, source) = &self.inner
+            && source.whole_read_keeps_metadata()
+        {
+            ds.raster.metadata = header.raster.metadata.clone();
+        }
+        Ok(ds)
     }
 
     /// Writes the full-resolution image to `path`, as [`crate::write_raster_dataset`] writes the
@@ -822,6 +841,7 @@ impl LazyRaster {
         header.raster.crs = t.tags.crs_info();
         header.raster.metadata = t.tags.metadata.clone();
         header.band_metadata = t.tags.band_properties.clone();
+        header.color_table = t.tags.color_table.clone();
         header.gcps = t.tags.gcps.clone();
         let rows = crate::ops::strips::strip_rows(width, bands, value_size, block);
         let mut out = crate::ops::strips::StripWriter::create(&header, path, options)?;
@@ -890,9 +910,9 @@ impl LazyRaster {
         ds.raster.nodata = first_nodata.unwrap_or(-9999.);
         ds.set_geo_transform([gt[0] + x * gt[1] + y * gt[2], gt[1], gt[2], gt[3] + x * gt[4] + y * gt[5], gt[4], gt[5]]);
         let (full_cols, full_rows) = (self.width(), self.height());
-        let (gcps, band_metadata) = match &self.inner {
-            Inner::Tiff(t) => (&t.tags.gcps, &t.tags.band_properties),
-            Inner::Memory(source) | Inner::Source(source, _) => (&source.gcps, &source.band_metadata),
+        let (gcps, band_metadata, color_table) = match &self.inner {
+            Inner::Tiff(t) => (&t.tags.gcps, &t.tags.band_properties, &t.tags.color_table),
+            Inner::Memory(source) | Inner::Source(source, _) => (&source.gcps, &source.band_metadata, &source.color_table),
         };
         ds.gcps = gcps
             .iter()
@@ -905,6 +925,9 @@ impl LazyRaster {
             .collect();
         ds.band_metadata = bands.iter().map(|&b| band_metadata.get(b - 1).cloned().unwrap_or_default()).collect();
         ds.band_nodata = band_nodata;
+        if bands == [1] {
+            ds.color_table = color_table.clone();
+        }
         Ok(ds)
     }
 }

@@ -240,6 +240,8 @@ test("CRS transforms", () => {
   assert.ok(Math.abs(ys[0]) < 1e-6);
   const crs = terrio.describeCrs("EPSG:32633");
   assert.equal(crs.epsg, 32633);
+  assert.equal(JSON.parse(terrio.crsToProjjson("EPSG:32633")).conversion.name, "UTM zone 33N");
+  assert.throws(() => terrio.crsToProjjson("+proj=longlat +lon_0=10 +datum=WGS84"), /lon_0/);
   assert.match(crs.name, /UTM zone 33N/);
   assert.equal(crs.geographic, false);
   // PROJ 9.8.1 resolves the authority version separately from the EPSG code.
@@ -1694,6 +1696,90 @@ test("near-sided and tilted perspective projections match PROJ", () => {
   }
 });
 
+test("interrupted Goode homolosine matches PROJ", () => {
+  const reference = JSON.parse(readFileSync(new URL("../../crates/terrio-crs/tests/data/igh_reference.json", import.meta.url), "utf8"));
+  for (const c of reference.cases) {
+    const samples = c.samples;
+    for (const target of [c.target, c.wkt2, c.wkt1, c.wkt1_esri]) {
+      const result = terrio.transformPoints(samples.map(s => s[0]), samples.map(s => s[1]), c.source, target);
+      for (let i = 0; i < samples.length; i++) for (let j = 0; j < 2; j++) {
+        assert.ok(Math.abs(result[j][i] - samples[i][2][j]) * c.metres_per_unit <= 0.001, `${c.name} forward ${i}/${j}`);
+      }
+    }
+    const reversible = samples.filter(s => s[3] !== null);
+    const inverse = terrio.transformPoints(reversible.map(s => s[2][0]), reversible.map(s => s[2][1]), c.target, c.source);
+    for (let i = 0; i < reversible.length; i++) {
+      const [lon, lat] = reversible[i][3];
+      const dlon = ((inverse[0][i] - lon + 540) % 360 - 180) * Math.cos(lat * Math.PI / 180);
+      assert.ok(Math.abs(dlon) <= 1e-8 && Math.abs(inverse[1][i] - lat) <= 1e-8, `${c.name} inverse ${i}`);
+    }
+    const refused = samples.filter(s => s[3] === null).map(s => s[2]).concat(c.inverse_samples.filter(([, e]) => e === null).map(([p]) => p));
+    for (const point of refused) {
+      assert.throws(() => terrio.transformPoints([point[0]], [point[1]], c.target, c.source), undefined, `${c.name} inverse ${point}`);
+    }
+  }
+});
+
+test("general oblique transformation matches PROJ", () => {
+  const reference = JSON.parse(readFileSync(new URL("../../crates/terrio-crs/tests/data/ob_tran_reference.json", import.meta.url), "utf8"));
+  for (const c of reference.cases) {
+    const samples = c.samples.filter(s => s[2] !== null);
+    for (const target of [c.target, c.wkt2, c.wkt1]) {
+      const result = terrio.transformPoints(samples.map(s => s[0]), samples.map(s => s[1]), c.source, target);
+      for (let i = 0; i < samples.length; i++) for (let j = 0; j < 2; j++) {
+        assert.ok(Math.abs(result[j][i] - samples[i][2][j]) * c.metres_per_unit <= 0.001, `${c.name} forward ${i}/${j}`);
+      }
+    }
+    for (const s of c.samples.filter(s => s[2] === null)) {
+      assert.throws(() => terrio.transformPoints([s[0]], [s[1]], c.source, c.target), undefined, `${c.name} forward ${s[0]} ${s[1]}`);
+    }
+    const reversible = samples.filter(s => s[3] !== null);
+    const invert = ([x, y]) => terrio.transformPoints([x], [y], c.target, c.source);
+    const edge = [];
+    const singleResults = new Map();
+    for (let i = 0; i < reversible.length; i++) {
+      let inverse;
+      try {
+        inverse = invert(reversible[i][2]);
+      } catch (error) {
+        // The rotated antimeridian is the inverse domain boundary, which libm can round one
+        // ulp outside. Only a point on that edge has exactly one side of the 1e-12 easting
+        // nudge accepted; an interior point refused at its exact coordinate still fails.
+        const [x, y] = reversible[i][2];
+        const nudged = [1 - 1e-12, 1 + 1e-12].map(scale => {
+          try {
+            return invert([x * scale, y]);
+          } catch {
+            return null;
+          }
+        }).filter(r => r !== null);
+        if (nudged.length !== 1) throw error;
+        inverse = nudged[0];
+        edge.push(i);
+      }
+      singleResults.set(reversible[i], [inverse[0][0], inverse[1][0]]);
+      const [lon, lat] = reversible[i][3];
+      const dlon = ((inverse[0][0] - lon + 540) % 360 - 180) * Math.cos(lat * Math.PI / 180);
+      // At a geographic pole longitude is indeterminate, so only latitude is checked, and asin
+      // near 1 loses about sqrt(epsilon) radians: WASM's libm lands 8.5e-7 degrees off the pole.
+      const pole = Math.abs(reversible[i][1]) === 90;
+      assert.ok(pole || Math.abs(dlon) <= 1e-8, `${c.name} inverse longitude ${i}`);
+      assert.ok(Math.abs(inverse[1][0] - lat) <= (pole ? 1e-6 : 1e-8), `${c.name} inverse latitude ${i}`);
+    }
+    // One batched call over the interior samples, which reuses a single transformer.
+    const interior = reversible.filter((_, i) => !edge.includes(i));
+    const batch = terrio.transformPoints(interior.map(s => s[2][0]), interior.map(s => s[2][1]), c.target, c.source);
+    for (let i = 0; i < interior.length; i++) {
+      assert.deepEqual([batch[0][i], batch[1][i]], singleResults.get(interior[i]), `${c.name} batch/single inverse ${i}`);
+    }
+    const pastPole = point => c.refuses_past_pole && Math.abs((point[1] * c.metres_per_unit - c.false_northing_metres) / c.radius_metres) > Math.PI / 2;
+    const refused = samples.filter(s => s[3] === null).map(s => s[2]).concat(c.inverse_samples.filter(([p, e]) => e === null || pastPole(p)).map(([p]) => p));
+    for (const point of refused) {
+      assert.throws(() => terrio.transformPoints([point[0]], [point[1]], c.target, c.source), undefined, `${c.name} inverse ${point}`);
+    }
+  }
+});
+
 test("vector geometry operations: simplify, segmentize, hulls, swap-xy, set-geom-type, combine, sort", () => {
   const line = {
     type: "FeatureCollection",
@@ -2045,4 +2131,108 @@ test("object-store listing rejects HTML and error roots returned with status 200
   for (const body of ["<html><body>Sign in</body></html>", "<Error><Message>Denied</Message></Error>"]) {
     await assert.rejects(terrio.listUrl("s3://bucket/dir", {fetch: async () => new Response(body)}), /not an XML object-store listing/);
   }
+});
+
+test("dataset indexes retain rotated corners, source identities and GTI metadata", () => {
+  // Independent GDAL 3.13.3 Byte TIFF: 4x6 zeros, affine rotation and EPSG:4326.
+  const raster = terrio.open(Uint8Array.from(Buffer.from("SUkqAAgAAAAPAAABAwABAAAABAAAAAEBAwABAAAABgAAAAIBAwABAAAACAAAAAMBAwABAAAAAQAAAAYBAwABAAAAAQAAABEBBAABAAAAmgEAABUBAwABAAAAAQAAABYBAwABAAAABgAAABcBBAABAAAAGAAAABwBAwABAAAAAQAAAFMBAwABAAAAAQAAANiFDAAQAAAAwgAAAK+HAwAgAAAAQgEAALCHDAACAAAAggEAALGHAgAIAAAAkgEAAAAAAAAAAAAAAAAAQAAAAAAAAOA/AAAAAAAAAAAAAAAAAAAkQAAAAAAAANA/AAAAAAAACMAAAAAAAAAAAAAAAAAAADRAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAADwPwEAAQAAAAcAAAQAAAEAAgABBAAAAQABAAAIAAABAOYQAQixhwcAAAAGCAAAAQCOIwkIsIcBAAEACwiwhwEAAACIbXSWHaRyQAAAAECmVFhBV0dTIDg0fAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=", "base64")), "rotated.tif");
+  const index = terrio.rasterIndex({"tile.tif": raster}, {
+    sourceCrsFieldName: "srs", minPixelSize: 2.7, bandCount: 1, ot: "Byte", nodata: [255],
+    fetchMetadata: [["{PIXEL_SIZE}", "pixel_size", "Real"]],
+  });
+  assert.throws(() => terrio.rasterIndex({"tile.tif": raster}, {nodata: [1, 2, 3]}), /inferred/);
+  assert.throws(() => terrio.rasterIndex({"tile.tif": raster}, {colorInterpretations: ["red", "green", "blue"]}), /inferred/);
+  for (const key of ["minPixelSize", "maxPixelSize", "bandCount"]) {
+    for (const value of [NaN, Infinity, -Infinity]) {
+      assert.throws(() => terrio.rasterIndex({"tile.tif": raster}, {[key]: value}), /finite/);
+    }
+  }
+  assert.equal(index.count, 1);
+  assert.equal(index.metadata.NODATA, "255");
+  const feature = index.layer().toGeoJSON().features[0];
+  assert.equal(feature.properties.srs, "EPSG:4326");
+  assert.ok(Math.abs(feature.properties.pixel_size - Math.sqrt(209 / 24)) < 1e-12);
+  assert.deepEqual(feature.geometry.coordinates[0], [[10, 20], [18, 21], [21, 3], [13, 2], [10, 20]]);
+  for (const [name, feature] of [["index.gpkg", "sqlite"], ["index.fgb", "flatgeobuf"]]) {
+    if (needs(feature)) continue;
+    const bytes = index.toBytes(name);
+    const decoded = terrio.open(bytes, name);
+    assert.equal(decoded.toGeoJSON().features.length, 1);
+    assert.equal(decoded.layerNames()[0], "index");
+  }
+  const archive = terrio.rasterIndex({"tile.tif": raster}).toBytes("index.shp.zip");
+  assert.equal(terrio.open(archive, "index.shp.zip").toGeoJSON().features.length, 1);
+  const mixed = terrio.vectorIndex({
+    "roads.json": terrio.fromGeoJSON(SQUARES, "roads"),
+    "counties.json": terrio.fromGeoJSON(SQUARES, "counties"),
+  }, {sourceLayerNames: ["roads"]});
+  assert.equal(mixed.count, 1);
+  assert.equal(mixed.layer().toGeoJSON().features[0].properties.location, "roads.json,0");
+  const vectors = terrio.vectorIndex({"squares.json": SQUARES});
+  assert.equal(vectors.layer().toGeoJSON().features[0].properties.location, "squares.json,0");
+  assert.deepEqual(vectors.layer().toGeoJSON().features[0].geometry.coordinates[0], [[0, 0], [0, 10], [30, 10], [30, 0], [0, 0]]);
+  assert.throws(() => terrio.vectorIndex({"a.json": SQUARES}, {sourceLayerIndexes: [9]}), /layer/);
+  assert.throws(() => terrio.rasterIndex({"a.tif": raster}, {typo: true}), /unknown field/);
+});
+
+test("dataset indexes on real uploaded files", {skip: !DATA && "TERRIO_TEST_DATA is not set"}, () => {
+  const bytes = readFileSync(join(DATA, "cog.tif"));
+  const raster = terrio.open(bytes, "cog.tif");
+  const index = terrio.rasterIndex({"cog.tif": {bytes, filename: "cog.tif"}}, {sourceCrsFieldName: "srs"});
+  const polygon = index.layer().toGeoJSON().features[0];
+  assert.equal(polygon.properties.location, "cog.tif");
+  assert.equal(polygon.properties.srs, raster.crs);
+  assert.equal(terrio.open(index.toBytes("catalog.geojson"), "catalog.geojson").toGeoJSON().features.length, 1);
+  const roads = readFileSync(join(DATA, "TN_Counties.geojson"));
+  const vectors = terrio.vectorIndex({"counties.geojson": {bytes: roads, filename: "counties.geojson"}});
+  assert.equal(vectors.count, 1);
+});
+
+test("raster blend alpha and options", () => {
+  const base = terrio.rasterFromArray(new Uint8Array([30, 80, 170, 255]), 1, 1, [10, 1, 0, 20, 0, -1]);
+  const overlay = terrio.rasterFromArray(new Uint8Array([250, 20, 0, 0]), 1, 1, [10, 1, 0, 20, 0, -1]);
+  const out = terrio.blend(base, overlay);
+  assert.deepEqual([1,2,3,4].map(b => out.readBand(b)[0]), [30, 80, 170, 255]);
+  assert.throws(() => terrio.blend(base, overlay, { operator: "bad" }), /operator/);
+  assert.throws(() => terrio.blend(base, overlay, { opacity: 101 }), /opacity/);
+  out.free(); overlay.free(); base.free();
+});
+
+test("palette blend survives windows and in-memory TIFF writes", () => {
+  // Independent tiny TIFF fixture: one indexed Byte band, an RGB color map,
+  // and 4x6 uncompressed samples. Index 1 is RGB (30,80,170).
+  const entries = [
+    [256, 4, 1, 4], [257, 4, 1, 6], [258, 3, 1, 8],
+    [259, 3, 1, 1], [262, 3, 1, 3], [273, 4, 1, 1682],
+    [277, 3, 1, 1], [278, 4, 1, 6], [279, 4, 1, 24],
+    [284, 3, 1, 1], [320, 3, 768, 146],
+  ];
+  const bytes = new Uint8Array(1706);
+  const view = new DataView(bytes.buffer);
+  bytes.set([73, 73, 42, 0]);
+  view.setUint32(4, 8, true);
+  view.setUint16(8, entries.length, true);
+  entries.forEach(([tag, type, count, value], i) => {
+    const offset = 10 + 12 * i;
+    view.setUint16(offset, tag, true);
+    view.setUint16(offset + 2, type, true);
+    view.setUint32(offset + 4, count, true);
+    view.setUint32(offset + 8, value, true);
+  });
+  [30, 80, 170].forEach((value, channel) => view.setUint16(146 + 2 * (256 * channel + 1), value * 257, true));
+  bytes.fill(1, 1682);
+  const source = terrio.open(bytes, "palette.tif");
+  for (const window of [null, [1, 1, 2, 2]]) {
+    const copy = terrio.open(source.toBytes("copy.tif", window ? {srcwin: window} : {}), "copy.tif");
+    const w = copy.width, h = copy.height;
+    const transparent = terrio.rasterFromArray(new Uint8Array(w * h * 4), w, h, [0, 1, 0, h, 0, -1]);
+    const blended = terrio.blend(copy, transparent);
+    assert.equal(blended.count, 4);
+    assert.deepEqual([1, 2, 3, 4].map(b => blended.readBand(b)[0]), [30, 80, 170, 255]);
+    const gray = terrio.open(copy.toBytes("gray.tif", {compress: "JPEG"}), "gray.tif");
+    const grayBlend = terrio.blend(gray, transparent);
+    assert.equal(grayBlend.count, 1);
+    grayBlend.free(); gray.free(); blended.free(); transparent.free(); copy.free();
+  }
+  source.free();
 });

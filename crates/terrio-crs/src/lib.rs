@@ -56,6 +56,7 @@ mod math;
 mod params;
 mod projections;
 mod projjson;
+mod projjson_write;
 mod rotation;
 mod route;
 mod wkt1;
@@ -341,6 +342,14 @@ impl SpatialRef {
         Ok(Self { proj4: Some(entry.proj.clone()), wkt: Some(entry.wkt.clone()), ..Default::default() })
     }
 
+    /// The CRS as PROJJSON v0.7: geographic 2D and 3D, geocentric, projected, vertical, compound
+    /// and bound (`+towgs84`) CRSs, as PROJ writes them, with the differences listed in the CRS
+    /// documentation. Fails for CRSs it cannot write (dynamic CRSs, projections without an EPSG
+    /// method).
+    pub fn to_projjson(&self) -> Result<String> {
+        projjson_write::write(self)
+    }
+
     /// Parses the supported PROJJSON v0.7 geographic, projected or bound CRS subset.
     /// Unsupported coordinate systems, datum models and operations return errors.
     pub fn from_projjson(text: &str) -> Result<Self> {
@@ -529,6 +538,13 @@ impl SpatialRef {
     /// Whether the CRS has geocentric Cartesian X/Y/Z coordinates.
     pub fn is_geocentric(&self) -> bool {
         Def::new(self).is_ok_and(|d| d.is_geocentric())
+    }
+
+    /// Whether coordinates have a height that transformations change: a compound CRS (with a
+    /// vertical CRS), a geographic 3D or a geocentric CRS. [`Transformer::transform_3d`]
+    /// transforms heights between two such CRSs.
+    pub fn has_height(&self) -> bool {
+        Def::new(self).is_ok_and(|d| d.has_height())
     }
 
     /// Whether the enabled engines recognize a geographic (longitude/latitude) CRS.
@@ -851,7 +867,7 @@ fn strip_authorities(wkt: &str) -> String {
 
 /// The EPSG code a WKT definition declares for itself: the `AUTHORITY["EPSG","4269"]` (WKT 1) or
 /// `ID["EPSG",4269]` (WKT 2) closing its outermost node, not those of its datum or units.
-fn declared_epsg(wkt: &str) -> Option<u32> {
+pub(crate) fn declared_epsg(wkt: &str) -> Option<u32> {
     declared_code(wkt, "EPSG")
 }
 
@@ -1012,6 +1028,9 @@ pub struct Transformer {
     best_route: std::sync::OnceLock<route::Route>,
     policy: TransformOptions,
     missing_grid_checked: std::sync::OnceLock<()>,
+    /// The geoid models with grids of the source and target vertical CRSs, found on first use.
+    src_geoid_grids: std::sync::OnceLock<Vec<std::sync::Arc<datum::Op>>>,
+    dst_geoid_grids: std::sync::OnceLock<Vec<std::sync::Arc<datum::Op>>>,
     emitted_diagnostics: std::sync::atomic::AtomicU8,
     diagnostics: std::sync::atomic::AtomicU8,
     warning_handler: fn(String),
@@ -1257,6 +1276,8 @@ impl Transformer {
             best_route: std::sync::OnceLock::new(),
             policy: opts.clone(),
             missing_grid_checked: std::sync::OnceLock::new(),
+            src_geoid_grids: std::sync::OnceLock::new(),
+            dst_geoid_grids: std::sync::OnceLock::new(),
             emitted_diagnostics: std::sync::atomic::AtomicU8::new(0),
             diagnostics: std::sync::atomic::AtomicU8::new(0),
             warning_handler: warnings::warn,
@@ -1306,6 +1327,10 @@ impl Transformer {
             (1, "ballpark coordinate operation used between different ellipsoids; datum shift is unknown"),
             (2, "best coordinate operation needs a missing grid; set TERRIO_NETWORK=ON or TERRIO_GRID_DIR"),
             (4, "coordinate operation used outside its area of use"),
+            (
+                8,
+                "geoid model did not apply (its grid is missing, unreadable, or has no value at the point), so heights were not converted by it; set TERRIO_NETWORK=ON or TERRIO_GRID_DIR",
+            ),
         ] {
             if flags & bit != 0 {
                 (self.warning_handler)(message.into());
@@ -1387,6 +1412,27 @@ impl Transformer {
             return Err(Error::NoOperation("ALLOW_BALLPARK=NO: no geoid model or vertical transformation applies to this point".into()));
         }
         Ok(())
+    }
+
+    /// Records, for the warning, that a side's heights were not converted by a geoid model although
+    /// one with a grid covers the point: its grid is missing, could not be read or downloaded
+    /// (availability alone cannot tell, as a `.tif` counts as available with the network on), or
+    /// has no value there. Callers have established that no geoid model applied. Under the strict
+    /// options [`check_vertical_policy`](Self::check_vertical_policy) has already refused the point.
+    fn note_missing_geoid(
+        &self,
+        models: &std::sync::OnceLock<Vec<std::sync::Arc<datum::Op>>>,
+        vertical: Option<&std::sync::Arc<def::Vertical>>,
+        p: datum::Point,
+    ) {
+        if self.diagnostics.load(std::sync::atomic::Ordering::Relaxed) & 8 != 0 {
+            return; // already recorded: the warning is reported once
+        }
+        let Some(code) = vertical.and_then(|v| v.code) else { return };
+        let (lon, lat) = (p.lon.to_degrees(), p.lat.to_degrees());
+        if models.get_or_init(|| epsg::geoid_grid_models(code)).iter().any(|op| op.contains(lon, lat)) {
+            self.diagnostics.fetch_or(8, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 
     /// The 2D transformation of a point, with its height kept (or, for transformations PROJ runs
@@ -1553,6 +1599,7 @@ impl Transformer {
         }
         if self.src.vertical().is_some() && !geoid {
             self.check_vertical_policy(!h.src.models.is_empty())?;
+            self.note_missing_geoid(&self.src_geoid_grids, self.src.vertical(), p0);
         }
         if start.is_none() && self.src.vertical().is_some() {
             route::note(None, false, route::OpKind::Vertical);
@@ -1565,6 +1612,7 @@ impl Transformer {
             let Some((r, applied)) = run_model(ops, q, false) else { continue };
             if !applied {
                 self.check_vertical_policy(true)?;
+                self.note_missing_geoid(&self.dst_geoid_grids, self.dst.vertical(), q);
             }
             let r = match &h.dst.routes[*j] {
                 Some(route) => route.apply(&h.dst.defs[*j], r.lon.to_degrees(), r.lat.to_degrees(), r, false).ok_or_else(fail)?,
@@ -1578,6 +1626,7 @@ impl Transformer {
         }
         if self.dst.vertical().is_some() {
             self.check_vertical_policy(!h.dst.models.is_empty())?;
+            self.note_missing_geoid(&self.dst_geoid_grids, self.dst.vertical(), p);
             route::note(None, false, route::OpKind::Vertical);
         }
         let q = h.middle(i, 0).apply(&h.src.defs[i], sx, sy, p, true).ok_or_else(fail)?;

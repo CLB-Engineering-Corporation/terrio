@@ -12,7 +12,7 @@ Everywhere a CRS is expected (`--t-srs`, `--a-srs`, `terrio crs`, the APIs), ter
 - `OGC:CRS84` and `WGS84`;
 - ESRI codes, the geographic and projected CRSs of PROJ's ESRI authority: `ESRI:54009` (World
   Mollweide), `esri:102003`, `urn:ogc:def:crs:ESRI::102003`. The few whose projection terrio
-  does not compute (Goode homolosine, Peirce quincuncial and others) are refused;
+  does not compute (Goode homolosine of the oceans, Peirce quincuncial and others) are refused;
 - WKT1 and WKT2 (2015 and 2019) definitions, including ESRI `.prj` WKT and WKT2 `BOUNDCRS`s
   (a CRS with its transformation to WGS 84, as `+towgs84`); an unknown WKT2 projection method
   or parameter is an error rather than ignored;
@@ -21,9 +21,9 @@ Everywhere a CRS is expected (`--t-srs`, `--a-srs`, `terrio crs`, the APIs), ter
   datum shift and geoid grids;
 - the path of a file holding one of these.
 
-Of PROJ's 117 projections, terrio computes 88 as PROJ does (within 1 mm, on a sphere and on WGS 84,
+Of PROJ's 117 projections, terrio computes 89 as PROJ does (within 1 mm, on a sphere and on WGS 84,
 as PROJ strings with typical parameters and as pyproj's WKT1 and WKT2 of them:
-`crates/terrio-crs/tests/proj_strings.rs`) and refuses the 29 others (`airy`, `bacon`, `igh`,
+`crates/terrio-crs/tests/proj_strings.rs`) and refuses the 28 others (`airy`, `bacon`, `goode`,
 `vandg2` and others) rather than computing something else. The known difference is
 Krovak off Bessel's ellipsoid, where PROJ's inverse is not the inverse of its forward.
 
@@ -40,8 +40,10 @@ Rotated-pole grids (regional climate models: CORDEX, COSMO-CLM) are read as PROJ
 (`+proj=ob_tran +o_proj=longlat` with `+o_lat_p`, `+o_lon_p` and `+lon_0`), as the WKT2 derived
 geographic CRSs PROJ and GDAL write (the netCDF CF, GRIB and PROJ `ob_tran` pole rotations) and as
 CF `rotated_latitude_longitude` grid mappings. Their coordinates are in degrees, but they are not
-geographic CRSs: `is_geographic()` is false, and `is_rotated_pole()` is true. Other `ob_tran`
-forms, and other WKT2 deriving conversions, are errors.
+geographic CRSs: `is_geographic()` is false, and `is_rotated_pole()` is true. The pole may
+also be given as PROJ's other forms (see
+[General oblique transformation](#general-oblique-transformation)) in a PROJ string; other WKT2
+deriving conversions are errors.
 
 Coordinates are always in GIS order: x (easting, longitude) first, then y (northing, latitude),
 whatever the axis order the authority defines.
@@ -473,12 +475,46 @@ usage fields (`scope`, `area`, `bbox`, `usages`, `remarks`) are accepted without
 affecting coordinates.
 
 This is a reader for the documented subset, rather than a general JSON Schema
-validator or PROJJSON serializer. Unsupported semantic members and object types
+validator; [Writing PROJJSON](#writing-projjson) describes the writer. Unsupported semantic members and object types
 are errors: dynamic/derived/compound/vertical CRSs, Cartesian geocentric or 3D
 PROJJSON, polar axis meridians, grid/deformation operations and nested bound
 sources are not supported.
 Geocentric and 3D CRSs remain available through EPSG, PROJ and WKT definitions.
 This prevents silent loss of datum, axis, unit or operation information.
+
+### Writing PROJJSON
+
+`SpatialRef::to_projjson` writes PROJJSON v0.7 for geographic 2D and 3D, geocentric, projected,
+vertical, compound and bound (`+towgs84`) CRSs: `terrio crs CRS --projjson` (and MCP), Python
+`rio.CRS.to_projjson()` (and `to_dict(projjson=True)`), JavaScript `crsToProjjson(crs)`. PROJJSON
+is read wherever a CRS is (above). The `projjson-export` suite of `scripts/conformance.py`
+compares it with live PROJ's PROJJSON of 52 CRSs by meaning (identifiers, datums, ellipsoids,
+prime meridians, axes, methods and parameters by EPSG code) and has GDAL transform points with
+them and with the originals, through each CRS's geographic CRS (a vertical CRS paired with
+WGS 84; no grids), and does the same for every IAU_2015 CRS. Planetary CRSs are written as PROJ writes them: west-positive longitudes as west
+axes, planetocentric latitudes (`+geoc`, a spherical coordinate system) as a `GeodeticCRS` with a
+spherical coordinate system, IAU_2015 CRSs with their `IAU`/2015 identifier. Differences from
+PROJ's output:
+
+- no `scope`, `area`, `bbox` or `usages`;
+- the WGS 84 and ETRS89 ensembles are written as their datum, without members (so GDAL's
+  `IsSame` with the EPSG CRS is false; coordinates are the same);
+- parameters are in degrees and metres, whatever the CRS's units (EPSG:27572's in grads);
+- projection conversions are named `unknown`, except UTM zones (`UTM zone 32N`, EPSG:16032);
+- polar CSs have east and north axes rather than axes along meridians;
+- static datums have no `anchor_epoch`.
+
+Refused rather than written wrongly: dynamic CRSs (their frame epochs; by EPSG code or a WKT 2
+`DYNAMIC` node), projections without an
+EPSG method (`+proj=robin`), engineering CRSs, projections on an auxiliary sphere of an
+ellipsoid (`+R_C`, `+R_A`; 19 IAU_2015 CRSs), planetocentric latitudes with heights, a
+`+towgs84` of other than 3 or 7 values, a prime meridian it cannot read (`+pm=foo`), non-finite
+values, a Krovak projection with another `+alpha` than its default (PROJ ignores its `+lat_1` and
+`+lat_ts`, so they are not written), and any parameter of the PROJ definition the PROJJSON would
+not carry (named in the error), unless it has the value used when it is absent (`+lat_0=0`,
+`+k=1`...). A CRS made from an EPSG code is written unbound (its datum shift is EPSG's); a
+`+towgs84` or `TOWGS84` the definition gives makes a `BoundCRS`, to WGS 84's geographic 2D or 3D
+CRS, or to its geocentric CRS for a geocentric CRS, as PROJ writes them.
 
 
 ## IAU planetary coordinate systems
@@ -605,3 +641,50 @@ domain boundaries, metres/kilometres/US survey feet, offsets and non-default
 origins/tilt/azimuth. Component allowances are 1 mm projected and 1e-8 degrees
 inverse, with longitude weighted by cos(latitude) at the poles. Other projection
 families in #272 remain tracked there.
+
+## Interrupted Goode homolosine
+
+`+proj=igh` is computed as PROJ 9.8.1 does (`igh.cpp`): twelve zones, spherical
+sinusoidal between the equator and 40 degrees 44' 11.8" and Mollweide poleward of it, each
+with its own central meridian, the Mollweide zones shifted north or south to meet
+the sinusoidal ones. It is a spherical projection: with an ellipsoid, the
+semi-major axis is the radius, as in PROJ. `+lon_0`, `+units`, `+x_0` and `+y_0`
+apply. The inverse refuses points in the interruptions, beyond the poles' northings
+and past 180 degrees from the central meridian, as PROJ's does, including PROJ's southern
+bound, which also refuses the south pole's own northing.
+
+GDAL's WKT1 `Interrupted_Goode_Homolosine`, ESRI's `Goode_Homolosine` with
+`Option` 1, and WKT2 `Interrupted Goode Homolosine` are read, and terrio writes
+the first, as GDAL does. ESRI's `Goode_Homolosine` without `Option` 1 and WKT2
+`Goode Homolosine` are PROJ's uninterrupted `goode` (or, with `Option` 2,
+`igh_o`), which terrio refuses; WKT2 `Goode Homolosine` was previously read as
+`igh`. PROJJSON export refuses `igh`, as for other projections without an EPSG
+method.
+
+The `seed-igh` fixture keeps its PROJ 9.9.0 oracle. A PROJ 9.8.1 corpus covers
+8 configurations and 5,120 samples (see Testing). Allowances are 1 mm projected
+and 1e-8 degrees inverse.
+
+## General oblique transformation
+
+`+proj=ob_tran` with an `+o_proj` other than `longlat` is computed as PROJ 9.8.1 does
+(`ob_tran.cpp`): the longitude, relative to `+lon_0`, and latitude are rotated to a new pole,
+then projected by `+o_proj`'s own formulas, with its own parameters (`+lat_ts`, `+lat_1`,
+`+zone`...) and the CRS's figure, which may be an ellipsoid. As in PROJ, the rotated projection's
+own central meridian and false easting and northing do not apply: `+lon_0`, `+units`, `+x_0` and
+`+y_0` apply to the whole. The new pole is `+o_lat_p` and `+o_lon_p`; or a centre `+o_lon_c`,
+`+o_lat_c` and azimuth `+o_alpha`; or two points of the new equator `+o_lon_1`, `+o_lat_1`,
+`+o_lon_2` and `+o_lat_2`, refused where PROJ refuses them. A pole latitude within 1e-10
+radians of 0 is PROJ's transverse case. These forms apply to rotated-pole grids
+(`+o_proj=longlat`) too.
+
+PROJ strings, GDAL's WKT1 (which carries the PROJ string) and PROJ's WKT2 method
+`PROJ ob_tran o_proj=...` are read; terrio writes the WKT1 form. PROJJSON export refuses
+`ob_tran`. Where a projection's own refusals are stricter than PROJ's, they apply rotated too:
+PROJ's spherical sinusoidal inverse returns a latitude past a pole, which its rotation turns into
+a point, and terrio's refuses it; terrio's Mercator refuses the poles. Where terrio is more
+lenient, that applies rotated too: its `utm` accepts a sphere, which PROJ refuses.
+
+The `seed-ob_tran-moll` fixture keeps its PROJ 9.9.0 oracle. A PROJ 9.8.1 corpus covers
+15 configurations and 4,680 samples (see Testing). Allowances are 1 mm projected and 1e-8
+degrees inverse.

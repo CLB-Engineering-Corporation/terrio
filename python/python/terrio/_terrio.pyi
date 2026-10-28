@@ -39,6 +39,9 @@ __all__ = [
     "convert",
     "sql",
     "rasterize",
+    "raster_index",
+    "vector_index",
+    "DatasetIndex",
     "pansharpen",
     "polygonize",
     "transform_points",
@@ -70,6 +73,7 @@ __all__ = [
     "enhance",
     "enhance_luts",
     "unscale",
+    "blend",
     "nodata_to_alpha",
     "reclassify",
     "as_features",
@@ -86,6 +90,7 @@ __all__ = [
     "append_points",
     "tiff_tags",
     "crs_info",
+    "crs_to_projjson",
     "suggested_grid",
     "gcp_transform",
     "RpcTransformer",
@@ -248,7 +253,7 @@ class Raster:
         mask: NDArray[Any] | None = None,
         rpc: Sequence[float] | None = None,
         metadata: Mapping[str, Any] | Sequence[tuple[Any, Any]] | None = None,
-    ) -> None: ...
+    ) -> dict[str, Any] | None: ...
     def to_bytes(
         self,
         filename: str = "raster.tif",
@@ -1373,6 +1378,7 @@ def grid_points(
 
 def tiff_tags(path: str) -> list[dict[int, str | bytes | list[int] | list[float]]] | None: ...
 def crs_info(crs: str) -> dict[str, Any]: ...
+def crs_to_projjson(crs: str) -> str: ...
 def gcp_transform(
     gcps: Sequence[tuple[float, float, float, float, float]],
     xs: Sequence[float],
@@ -1810,3 +1816,37 @@ def move_raster(
     error_threshold: float | None = None,
     ignore_cog_layout_break: bool = False,
 ) -> dict[str, Any]: ...
+@final
+class DatasetIndex:
+    """A polygon footprint index with GTI metadata."""
+    @property
+    def count(self) -> int: ...
+    @property
+    def layer(self) -> Layer: ...
+    @property
+    def metadata(self) -> dict[str, str]: ...
+    def to_bytes(self, filename: str = "index.gpkg", *, format: str | None = None) -> bytes: ...
+    def write(self, path: str, *, format: str | None = None, overwrite: bool = False) -> None: ...
+
+def raster_index(sources: Any, dst: str | None = None, **kwargs: Any) -> DatasetIndex:
+    """Create raster extent polygons; keyword options use CLI names with underscores."""
+    ...
+
+def vector_index(sources: Any, dst: str | None = None, **kwargs: Any) -> DatasetIndex:
+    """Create source layer envelope polygons, retaining original layer indexes."""
+    ...
+
+def blend(
+    src: str | Raster,
+    overlay: str | Raster,
+    dst: str | None = None,
+    *,
+    operator: str = "src-over",
+    opacity: int = 100,
+    format: str | None = None,
+    compress: str | None = None,
+    tile_size: int | None = None,
+    bigtiff: bool = False,
+) -> Raster:
+    """Blends equal-sized Byte images, with GDAL operators and opacity 0..100."""
+    ...

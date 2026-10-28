@@ -9,17 +9,48 @@
   (`N37W120.hgt`), `.hgt.zip` archives, and the NASADEM and water body variants.
   Tiles are written as Int16 with -32768 for nodata; a grid of another size is
   refused.
+- GeoTIFF and COG: LERC masks the padding of partial edge tiles of
+  floating-point bands (one band, or `INTERLEAVE=BAND`), as GDAL does, whatever
+  the nodata value. The padding was stored as valid zeros: on a 6705 x 4852
+  flood-depth COG, LERC with `MAX_Z_ERROR=0.01` shrinks by 3.5% (NaN nodata)
+  to 13% (-9999 nodata). Integer and pixel-interleaved LERC tiles, and the
+  other codecs, keep GDAL's zeros. Pixels inside the raster are unchanged.
+- SRTM HGT tiles and the other raw-layout rasters (EHdr, ENVI, SAGA, ERS,
+  Idrisi, Surfer 6 binary grids) are read in place (#333): `open_raster_lazy`
+  reads only the header, a window reads only the rows it covers, and `info`
+  decodes no pixels. Remote SRTM tiles are read with HTTP range requests, and
+  `convert` to a GeoTIFF or COG writes these inputs a strip at a time.
 - PMTiles and MBTiles written from a raster opened lazily (`terrio convert`, `Raster.write`)
   warp a raster that is not on its zoom level's grid a chunk at a time, from windows of the
   source, instead of reading it whole: the colour and alpha warps of GDAL's MBTiles driver run in
   their own chunks, in step. The archive is byte-identical. A geographic raster reaching beyond
   Web Mercator's latitudes is still read whole.
 
+### Remote I/O
+
+- Signed S3 uploads of local files over 8 MiB sent over HTTPS read the file once
+  per attempt instead of twice (#335), as a retried, redirected or
+  region-rerouted request reads it again: they are signed with
+  `UNSIGNED-PAYLOAD`, as the AWS SDKs sign S3 uploads over HTTPS, and the body
+  is streamed. The signature no longer covers the body of these uploads; TLS
+  protects it in transit. Over plain HTTP, and for smaller or staged uploads,
+  the payload hash is signed as before.
+
 ### Breaking changes
 
+- Signed S3 uploads of local files over 8 MiB over HTTPS use `UNSIGNED-PAYLOAD`
+  (#335). An S3-compatible service, or a bucket policy, that refuses it now
+  rejects those uploads; they can be sent over plain HTTP to keep a signed
+  payload, with `AWS_HTTPS=NO`, or an `http://` `AWS_S3_ENDPOINT` when the
+  endpoint names its scheme (an `https://` endpoint ignores `AWS_HTTPS`). Plain
+  HTTP does not encrypt the request body or headers, including
+  `x-amz-security-token` for temporary credentials; use this workaround only
+  over a trusted connection.
 - `mosaic`, `warp`, `concat` and `filter merge` now treat an input beginning
   with `@` as a file list, so a file named `@name.tif` must be written
   `./@name.tif`.
+- WKT2 `Goode Homolosine` (PROJ's uninterrupted `goode`) is refused; it was read
+  as `igh`.
 
 ### Command line
 
@@ -47,6 +78,17 @@
   grid `origin`; H3 grids are not implemented. Hexagons, counts and boundaries (smoothed or not)
   are identical to PDAL 2.10's on autzen; points are assigned to hexagons as hexer assigns them
   (a port, attributed in `NOTICE`).
+- Reprojection (`terrio convert --t-srs`, `convert_points(t_srs=...)`,
+  `PointCloud.reproject`, `append_points`) now transforms `z` when the points'
+  CRS and the target CRS both have heights, as PDAL's `filters.reprojection`
+  does: vertical units, geoid models and vertical datum transformations apply.
+  It previously transformed only `x` and `y`, so 300 ftUS in
+  `EPSG:6588+6360` stayed 300 in `EPSG:6588+5703` (now 91.44018 m). The
+  vertical CRS a LAS file declares is now part of the CRS reprojected from
+  (it was dropped) unless a CRS is assigned with `--a-srs`, and LAS files
+  written with GeoKeys record a compound CRS's vertical CRS in
+  `VerticalCSTypeGeoKey`. When only the target has heights, `z` is kept and a
+  warning says so.
 
 ### CRS compatibility
 
@@ -76,6 +118,18 @@
   an error of the geoid undulation (about 21 to 28 m across Texas):
   `EPSG:6318+6360` to `EPSG:6319` at 30 N, 97 W turns 328.0833 ftUS
   (100 m) into 73.4074 m, as PROJ 9.9.0, instead of 100 m.
+
+### Projections
+
+- `+proj=igh` (interrupted Goode homolosine) is computed as PROJ does; it was
+  refused. GDAL's WKT1 `Interrupted_Goode_Homolosine`, ESRI's
+  `Goode_Homolosine` with `Option` 1 and WKT2 `Interrupted Goode Homolosine`
+  are read, and the first is written.
+- `+proj=ob_tran` with an `+o_proj` other than `longlat` (a projection on a
+  rotated sphere or ellipsoid) is computed as PROJ does; it was refused. The
+  pole may be given by `+o_lat_p`/`+o_lon_p`, by `+o_lon_c`/`+o_lat_c`/`+o_alpha`
+  or by `+o_lon_1`/`+o_lat_1`/`+o_lon_2`/`+o_lat_2`, for rotated-pole grids too.
+  PROJ's WKT2 `PROJ ob_tran o_proj=...` method is read.
 
 ### Warp
 
