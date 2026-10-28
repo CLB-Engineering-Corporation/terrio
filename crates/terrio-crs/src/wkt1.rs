@@ -513,6 +513,13 @@ pub(crate) fn to_proj(root: &Node) -> Option<Converted> {
             out.push(format!("+proj={name}"));
             push(&mut out, "lon_0", lon_0);
         }
+        // ESRI's Goode homolosine: interrupted with `Option` 1 (2 is PROJ's `igh_o`, and without
+        // it PROJ's uninterrupted `goode`, which terrio does not compute).
+        "goodehomolosine" if get(&["option"]) == Some(1.0) => {
+            out.push("+proj=igh".into());
+            push(&mut out, "lon_0", lon_0);
+        }
+        "goodehomolosine" => return None,
         // World projections of a central meridian, as terrio writes them.
         m => {
             let (proj, _) = super::wkt1_write::WORLD.iter().find(|(_, w)| norm(w) == m)?;

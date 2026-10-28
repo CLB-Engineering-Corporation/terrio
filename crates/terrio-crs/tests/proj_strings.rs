@@ -28,7 +28,6 @@ const UNSUPPORTED: &[&str] = &[
     "gins8",
     "gn_sinu",
     "goode",
-    "igh",
     "imw_p",
     "larr",
     "lask",

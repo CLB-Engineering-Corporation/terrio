@@ -1,13 +1,14 @@
 //! Idrisi / TerrSet rasters: a `.rst` data file with a `.rdc` text header.
 
-use super::common::{self, Interleave, Layout};
+use super::common::{self, Interleave, Layout, RawRaster};
 use crate::formats::RasterDriver;
 use crate::{Error, RasterDataset, Result};
 use std::path::Path;
 use wbraster::{CrsInfo, DataType, Raster};
 
-/// Reads an Idrisi raster through its `.rst` or `.rdc` file.
-pub(crate) fn read(path: &Path) -> Result<RasterDataset> {
+/// Opens an Idrisi raster through its `.rst` or `.rdc` file, reading only the `.rdc` header now:
+/// its pixels are read by window.
+pub(crate) fn open(path: &Path) -> Result<RawRaster> {
     let rdc = common::sibling(path, "rdc");
     let data = common::sibling(path, "rst");
     let text = std::fs::read_to_string(&rdc)?;
@@ -28,16 +29,7 @@ pub(crate) fn read(path: &Path) -> Result<RasterDataset> {
         return Err(Error::Unsupported(format!("{}: only binary Idrisi files are supported", rdc.display())));
     }
     let (cols, rows) = (int("columns").ok_or_else(|| bad("columns"))?, int("rows").ok_or_else(|| bad("rows"))?);
-    // RGB24 is stored blue, green, red by pixel.
     let layout = Layout { cols, rows, bands, data_type, little_endian: true, interleave: Interleave::Bip, offset: 0, bottom_up: false };
-    let mut pixels = common::decode(&std::fs::read(&data)?, &layout)?;
-    if bands == 3
-        && let wbraster::raster::RasterData::U8(v) = &mut pixels
-    {
-        let n = cols * rows;
-        let (blue, rest) = v.split_at_mut(n);
-        blue.swap_with_slice(&mut rest[n..]);
-    }
     let (x0, x1, y0, y1) = (
         num("min. x").unwrap_or(0.0),
         num("max. x").unwrap_or(cols as f64),
@@ -56,8 +48,10 @@ pub(crate) fn read(path: &Path) -> Result<RasterDataset> {
             (refsys.is_empty() && metres).then(|| CrsInfo { epsg: None, wkt: Some(LOCAL_METRES.to_string()), proj4: None })
         })
         .unwrap_or_default();
-    let raster = common::make_raster(cols, rows, bands, pixels, gt, crs, nodata)?;
-    Ok(RasterDataset::with_driver(raster, RasterDriver::RST, nodata.is_some()))
+    let raster = common::raster_header(cols, rows, bands, data_type, gt, crs, nodata)?;
+    let raw = RawRaster::open(RasterDataset::with_driver(raster, RasterDriver::RST, nodata.is_some()), &data, layout, &[&rdc])?;
+    // RGB24 is stored blue, green, red by pixel.
+    Ok(if bands == 3 { raw.with_stored_bands(vec![2, 1, 0]) } else { raw })
 }
 
 /// The local CRS GDAL reads for an unnamed Idrisi reference system in metres.
@@ -158,4 +152,47 @@ pub(crate) fn write(r: &Raster, nodata: Option<f64>, path: &Path) -> Result<()> 
         common::write_pam(&data, &r.crs)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use wbraster::raster::RasterData;
+
+    /// A 4 x 3 RGB24 raster as GDAL's RST driver writes it: blue, green and red by pixel, with
+    /// red `10 + i`, green `100 + i` and blue `200 + i` for pixel `i`.
+    fn write_rgb24(dir: &std::path::Path) -> std::path::PathBuf {
+        let rdc = "file format : Idrisi Raster A.1\ndata type   : rgb24\nfile type   : binary\ncolumns     : 4\nrows        : 3\n\
+                   ref. system : plane\nref. units  : m\nmin. X      : 0.0000000\nmax. X      : 4.0000000\nmin. Y      : 0.0000000\n\
+                   max. Y      : 3.0000000\nflag value  : none\nflag def'n  : none\n";
+        std::fs::write(dir.join("rgb.rdc"), rdc).unwrap();
+        let bytes: Vec<u8> = (0..12u8).flat_map(|i| [200 + i, 100 + i, 10 + i]).collect();
+        let rst = dir.join("rgb.rst");
+        std::fs::write(&rst, bytes).unwrap();
+        rst
+    }
+
+    #[test]
+    fn reads_rgb24_bands_red_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_rgb24(dir.path());
+        let path = path.to_str().unwrap();
+        // The values GDAL 3.13 reads: band 1 red, band 2 green, band 3 blue.
+        let band = |base: u8| -> Vec<u8> { (0..12).map(|i| base + i).collect() };
+        let whole = crate::open_raster(path).unwrap();
+        assert_eq!(whole.raster.bands, 3);
+        let RasterData::U8(v) = &whole.raster.data else { panic!() };
+        assert_eq!(v, &[band(10), band(100), band(200)].concat());
+
+        let mut lazy = crate::open_raster_lazy(path).unwrap();
+        assert!(lazy.dataset().is_none());
+        let RasterData::U8(all) = lazy.read().unwrap().raster.data else { panic!() };
+        assert_eq!(&all, v);
+        // A window of some bands, in any order: rows 1 and 2, columns 1 to 3.
+        for bands in [vec![1], vec![3], vec![3, 1], vec![2, 3, 1]] {
+            let options = crate::WindowOptions { bands: bands.clone(), overview: None };
+            let RasterData::U8(got) = lazy.read_window(crate::Window::new(1, 1, 3, 2), &options).unwrap().raster.data else { panic!() };
+            let want: Vec<u8> = bands.iter().flat_map(|b| [5u8, 6, 7, 9, 10, 11].map(|i| [10, 100, 200][b - 1] + i)).collect();
+            assert_eq!(got, want, "{bands:?}");
+        }
+    }
 }

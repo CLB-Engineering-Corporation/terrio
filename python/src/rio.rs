@@ -13,6 +13,7 @@ use terrio::vfs::Location;
 pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(tiff_tags, m)?)?;
     m.add_function(wrap_pyfunction!(crs_info, m)?)?;
+    m.add_function(wrap_pyfunction!(crs_to_projjson, m)?)?;
     m.add_function(wrap_pyfunction!(suggested_grid, m)?)?;
     m.add_function(wrap_pyfunction!(gcp_transform, m)?)?;
     m.add_class::<PyRpcTransformer>()?;
@@ -258,6 +259,15 @@ fn crs_info<'py>(py: Python<'py>, crs: &str) -> PyResult<Bound<'py, PyDict>> {
     d.set_item("name", s.name())?;
     d.set_item("is_geographic", s.is_geographic())?;
     Ok(d)
+}
+
+/// The PROJJSON v0.7 of a CRS.
+///
+/// Raises:
+///     CRSError: If the CRS cannot be parsed, or would be described wrongly.
+#[pyfunction]
+fn crs_to_projjson(crs: &str) -> PyResult<String> {
+    SpatialRef::parse(crs).and_then(|s| s.to_projjson()).py()
 }
 
 /// The output grid GDAL suggests for a raster reprojected to another CRS
