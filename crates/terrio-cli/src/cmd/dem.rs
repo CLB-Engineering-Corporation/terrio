@@ -77,8 +77,9 @@ pub struct Args {
     nearest_color_entry: bool,
     /// About how much memory (MiB) the strips of rows in flight may take, which sets their
     /// height (by default, strips of about 64 MiB of input values). The output does not depend on
-    /// it. Refused for a VRT output and for an output that is also the input, which are not
-    /// written in strips.
+    /// it. Below one row of the input's blocks, each strip decodes the blocks it touches again:
+    /// slower, same values. Refused for a VRT output and for an output that is also the input,
+    /// which are not written in strips.
     #[arg(long = "max-memory", value_name = "MIB")]
     max_memory: Option<f64>,
     #[command(flatten)]

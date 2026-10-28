@@ -140,7 +140,8 @@ pub struct DemOptions {
     /// [`color_relief_to_path`]): about how much memory, in MiB, the strips in flight may take
     /// (read ahead, computed, being written), which sets their height (like `gdalwarp -wm`). By
     /// default, strips of about 64 MiB of input values, as `dem_to_path` always used (about
-    /// 300 to 550 MiB in flight for a Float32 DEM). The values do not depend on it.
+    /// 300 to 550 MiB in flight for a Float32 DEM). The values do not depend on it. Below one row
+    /// of the input's blocks, each strip decodes the blocks it touches again: slower, same values.
     pub max_memory_mib: Option<f64>,
 }
 
@@ -1181,7 +1182,8 @@ fn budget_rows(src: &crate::LazyRaster, max_memory_mib: Option<f64>, row: usize)
 /// The rows of the strips a DEM operation written a strip at a time processes, for an output of
 /// `out_bytes` bytes per pixel (all bands): as many rows as `max_memory_mib` holds (see
 /// [`budget_rows`]). About three strips of input values (read ahead, read, worked on) and three of
-/// output (computed, queued, being written) are in flight, with the `f64` values of one.
+/// output (computed, queued, being written) are in flight, with the `f64` values of one strip (8
+/// bytes a pixel) and its 4-byte copy in [`read_band`].
 fn strip_rows(src: &crate::LazyRaster, o: &DemOptions, out_bytes: usize) -> usize {
     let value = src.data_type().size_bytes().max(4);
     budget_rows(src, o.max_memory_mib, src.width().max(1) * (3 * value + 8 + 4 + 3 * out_bytes))

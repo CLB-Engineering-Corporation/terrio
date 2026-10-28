@@ -1,7 +1,7 @@
 //! Terrain analysis and raster algebra: `dem`, `calc`, `proximity` and `sieve`, with keyword
 //! arguments named after the command-line options.
 
-use crate::ops::{finish_raster, input_raster};
+use crate::ops::{finish_raster, input_raster, raster_path};
 use crate::raster::PyRaster;
 use crate::{PyResultExt, invalid};
 use pyo3::prelude::*;
@@ -168,7 +168,7 @@ fn dem(
             _ => return Err(invalid("alg applies to hillshade, slope, aspect and TRI")),
         }
     }
-    let path = src.extract::<String>().ok();
+    let path = raster_path(src)?;
     let vrt_out = match (format, dst) {
         (Some(f), _) => f.eq_ignore_ascii_case("VRT"),
         (None, Some(d)) => d.to_ascii_lowercase().ends_with(".vrt"),
@@ -195,7 +195,12 @@ fn dem(
         return Ok(PyRaster { inner: out });
     }
     if max_memory_mib.is_some() {
-        return Err(invalid("max_memory_mib applies when src and dst are paths"));
+        let message = if vrt_out {
+            "max_memory_mib does not apply to a VRT output, which is not written in strips"
+        } else {
+            "max_memory_mib applies when src and dst are paths"
+        };
+        return Err(invalid(message));
     }
     let ds = input_raster(py, src)?;
     if vrt_out {

@@ -369,9 +369,9 @@ def test_dem_products(tmp_path):
         terrio.dem(r, "slope", multidirectional=True)
 
 
-def test_dem_path_to_path_is_streamed(tmp_path):
-    """A DEM path to an output path is processed a strip of rows at a time, with the values of
-    the computation in memory, and returned opened lazily from the output."""
+def test_dem_path_to_path_matches_in_memory(tmp_path):
+    """A DEM path to an output path gives the values of the in-memory computation, and is
+    returned opened lazily from the output."""
     rows, cols = np.mgrid[0:60, 0:45]
     dem = ((rows * 7 + cols * 13) % 37 + rows * 2.5).astype("float32")
     dem[0, 0] = dem[20, 30] = -9999
@@ -394,8 +394,14 @@ def test_dem_path_to_path_is_streamed(tmp_path):
             assert r.nodata == whole.nodata and r.count == whole.count
             assert r.crs == whole.crs
             assert r.transform == whole.transform
+    # A pathlib.Path source takes the same path to path route, and so the budget.
+    r = terrio.dem(src, "slope", dst=str(tmp_path / "path.tif"), max_memory_mib=0.001)
+    assert r.is_lazy
+    np.testing.assert_array_equal(r.read(), terrio.dem(terrio.open_raster(str(src)), "slope").read())
     with pytest.raises(terrio.InvalidArgumentError):
         terrio.dem(str(src), "slope", max_memory_mib=10)
+    with pytest.raises(terrio.InvalidArgumentError, match="VRT output"):
+        terrio.dem(str(src), "color-relief", color_file=str(colors), dst=str(tmp_path / "x.vrt"), max_memory_mib=10)
     # An output that is also the input is read whole: a budget cannot apply.
     with pytest.raises(terrio.InvalidArgumentError):
         terrio.dem(str(src), "slope", dst=str(src), max_memory_mib=10)
