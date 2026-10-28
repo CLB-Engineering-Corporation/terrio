@@ -486,6 +486,13 @@ impl PyRaster {
         options_.overviews = overviews.unwrap_or_default();
         options_.overview_resampling = overview_resampling;
         let options = options_;
+        // A raster read by window is written as a tile archive a tile row at a time.
+        let driver = options.driver.or_else(|| terrio::formats::RasterDriver::for_extension(path));
+        if self.inner.dataset().is_none()
+            && matches!(driver, Some(terrio::formats::RasterDriver::PMTiles | terrio::formats::RasterDriver::MBTiles))
+        {
+            return py.detach(|| self.inner.write(path, &options)).py();
+        }
         py.detach(|| self.with_dataset(|ds| terrio::write_raster_dataset(ds, path, &options))).py()
     }
 
