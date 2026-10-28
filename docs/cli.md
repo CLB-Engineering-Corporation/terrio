@@ -863,6 +863,13 @@ scaled from the ellipsoid at their centre latitude, as `gdaldem` does since GDAL
 are GDAL's: `value R G B [A]` or `value colorname [A]`, where the value may be `nv` (the nodata
 value) or a percentage of the band's range; GMT `.cpt` files work too.
 
+The DEM is read and the output written a strip of rows at a time, so neither is held whole
+(for a GeoTIFF or COG output; other formats gather the output). `--max-memory MIB` (default 256)
+sets about how much memory the strips in flight may take, and so their height, like
+`gdalwarp -wm`; the values do not depend on it. Percentages in a color file are of the band's
+range from the `.aux.xml` statistics when there are some, otherwise from a pass over the band, a
+strip at a time. An output that is also the input is read whole first.
+
 `--kernel-version 3.12|3.13` selects terrain arithmetic (default `3.12`). The
 `3.13` profile supports slope and standard hillshade, including both gradient
 algorithms. Other products and hillshade variants require `3.12`. Use the version
