@@ -566,8 +566,7 @@ pub(crate) fn write_archive(mut tiles: Vec<OutTile>, metadata: &[u8], params: &A
         };
         push_entry(&mut entries, id, offset, length);
     }
-    let prelude = archive_prelude(&entries, addressed, seen.len() as u64, tile_data.len() as u64, metadata, params)?;
-    let mut out = prelude;
+    let mut out = archive_prelude(&entries, addressed, seen.len() as u64, tile_data.len() as u64, metadata, params)?;
     out.extend_from_slice(&tile_data);
     Ok(out)
 }
@@ -601,6 +600,7 @@ fn archive_prelude(
     let metadata_offset = root_dir_offset + root.len() as u64;
     let leaf_dirs_offset = metadata_offset + metadata.len() as u64;
     let tile_data_offset = leaf_dirs_offset + leaves.len() as u64;
+    // Truncated, as GDAL writes them.
     let e7 = |deg: f64| (deg * 1e7) as i32;
     let header = Header {
         root_dir_offset,

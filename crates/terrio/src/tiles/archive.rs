@@ -384,12 +384,14 @@ fn write_pyramid(
             let md = raster_metadata(s.bounds, s.min_zoom, s.max_zoom, s.format, o, &name, &[]);
             let (json, params) = pmtiles_parts(md, s.format, s.min_zoom, s.max_zoom, s.bounds);
             let tiles = std::mem::take(&mut spill.tiles);
+            // Created before anything is written, so that a failure to create it removes nothing.
+            let mut out = std::io::BufWriter::with_capacity(1 << 20, std::fs::File::create(path)?);
             let written = (|| -> Result<()> {
-                let mut out = std::io::BufWriter::with_capacity(1 << 20, std::fs::File::create(path)?);
                 pmtiles::write_archive_spilled(tiles, spill.file()?, &json, &params, &mut out)?;
                 std::io::Write::flush(&mut out)?;
                 Ok(())
             })();
+            drop(out);
             if written.is_err() {
                 let _ = std::fs::remove_file(path);
             }

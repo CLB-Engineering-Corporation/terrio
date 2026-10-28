@@ -694,6 +694,12 @@ fn warp_plan<'a>(ds: &'a RasterDataset, o: &TileWriteOptions, grid: Option<Grid>
     if width == 0 || height == 0 {
         return Err(Error::InvalidArgument("the raster is empty at that zoom level".into()));
     }
+    // Checked here, so that a level read by window is refused as one warped whole is.
+    if (width as u64) * (height as u64) > 1 << 31 {
+        return Err(Error::Unsupported(format!(
+            "the raster would be {width} x {height} pixels at zoom level {zoom}: choose a lower MAXZOOM"
+        )));
+    }
     Ok(WarpPlan { src, zoom, sgt, width, height, res })
 }
 
@@ -715,11 +721,6 @@ fn warp_level(ds: &RasterDataset, o: &TileWriteOptions, grid: Option<Grid>) -> R
     let src_srs = ds.crs();
     let web = SpatialRef::from_epsg(3857)?;
     let resampling = crate::ops::Resampling::parse(o.resampling.as_deref().unwrap_or("bilinear"))?;
-    if (width as u64) * (height as u64) > 1 << 31 {
-        return Err(Error::Unsupported(format!(
-            "the raster would be {width} x {height} pixels at zoom level {zoom}: choose a lower MAXZOOM"
-        )));
-    }
 
     // Warp, with an alpha band: the source's, or one added when reprojecting gray or RGB.
     let src_alpha = matches!(src.raster.bands, 2 | 4);
@@ -971,7 +972,9 @@ fn aligned_level(header: &RasterDataset, o: &TileWriteOptions) -> Result<Option<
     }
     let p = warp_plan(header, o, None)?;
     let dst = [p.sgt[0], p.res, 0.0, p.sgt[3], 0.0, -p.res];
-    let near_int = |v: f64| (v - v.round()).abs() < 1e-8;
+    // Coordinates near 2e7 m are only good to about 4e-9 m, more than 1e-8 of a pixel at zoom 19
+    // and above, so the tolerance is a millionth of a pixel.
+    let near_int = |v: f64| (v - v.round()).abs() < 1e-6;
     let translation = (gt[1] - dst[1]).abs() < 1e-12 * gt[1].abs()
         && (gt[5] - dst[5]).abs() < 1e-12 * gt[5].abs()
         && near_int((dst[0] - gt[0]) / gt[1])
@@ -1012,6 +1015,7 @@ pub(crate) fn make_tiles_streamed(
     sink: &mut dyn super::pyramid::TileSink,
 ) -> Result<Streamed> {
     let format = tile_format(o)?;
+    crate::ops::Resampling::parse(o.resampling.as_deref().unwrap_or("bilinear"))?;
     let header = src.header();
     if let Some((p, dx, dy)) = aligned_level(&header, o)? {
         let src_alpha = matches!(header.raster.bands, 2 | 4);
@@ -1420,6 +1424,25 @@ mod tests {
             .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
             .collect();
         assert!(left.is_empty());
+    }
+
+    /// Rasters on the grids of zoom 19 and 20 are still read a strip at a time, and give the
+    /// in-memory tiles: at these zooms the rounding of coordinates near 2e7 m is about the size
+    /// of the alignment tolerance.
+    #[test]
+    fn aligned_rasters_at_high_zooms_stream_as_the_in_memory_writer_writes_them() {
+        let dir = tempfile::tempdir().unwrap();
+        for zoom in [19, 20] {
+            let (path, ds) = aligned_raster(dir.path(), &format!("z{zoom}.tif"), 3, zoom);
+            let o = TileWriteOptions { resampling: Some("near".into()), max_zoom: Some(zoom), ..Default::default() };
+            let mut lazy = crate::open_raster_lazy(&path).unwrap();
+            assert!(aligned_level(&lazy.header(), &o).unwrap().is_some(), "zoom {zoom} aligned");
+            let w = warp_level(&ds, &o, None).unwrap();
+            let reference = pyramid_reference(w.level, w.zoom, w.minx, w.maxy, &o, TileFormat::Png, None).unwrap();
+            let mut tiles = Vec::new();
+            make_tiles_streamed(&mut lazy, &o, &mut tiles).unwrap();
+            assert!(sorted(tiles) == sorted(reference.tiles), "zoom {zoom}");
+        }
     }
 
     /// A raster that is not on a zoom level's grid (another resolution, another CRS) is warped as

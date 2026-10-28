@@ -505,6 +505,7 @@ fn convert(
             && overview.is_none()
             && t_srs.is_none()
             && !vector_set
+            && layers.is_none()
             && terrio::tiles::is_archive(dst)
             && !terrio::tiles::is_archive(src)
             && let Some(options) = &raster_options
