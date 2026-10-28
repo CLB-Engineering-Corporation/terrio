@@ -30,6 +30,12 @@
   reads only the header, a window reads only the rows it covers, and `info`
   decodes no pixels. Remote SRTM tiles are read with HTTP range requests, and
   `convert` to a GeoTIFF or COG writes these inputs a strip at a time.
+- GeoTIFF and COG: LERC masks the padding of partial edge tiles of
+  floating-point bands (one band, or `INTERLEAVE=BAND`), as GDAL does, whatever
+  the nodata value. The padding was stored as valid zeros: on a 6705 x 4852
+  flood-depth COG, LERC with `MAX_Z_ERROR=0.01` shrinks by 3.5% (NaN nodata)
+  to 13% (-9999 nodata). Integer and pixel-interleaved LERC tiles, and the
+  other codecs, keep GDAL's zeros. Pixels inside the raster are unchanged.
 
 ### Breaking changes
 
