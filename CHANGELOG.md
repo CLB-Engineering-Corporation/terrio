@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### Raster processing
+
+- `terrio blend`, and Python's `terrio.blend` from paths to `dst`, read both inputs and write a
+  GeoTIFF or COG a strip of rows at a time (Rust: `ops::blend::blend_to_path`), so memory no
+  longer grows with the image: blending a 15,000 x 12,000 RGBA relief with its hillshade peaks
+  at about 260 MiB instead of 3,120 MiB. The pixels are those of the in-memory blend. A path-to-path
+  `terrio.blend` returns the result opened lazily from `dst`. An output that is one of the inputs
+  is read whole first, as before. The docs give a bounded-memory hillshaded color relief
+  (`dem color-relief`, `dem hillshade`, then `blend --operator hsv-value`).
+
 ### Formats
 
 - SRTM HGT tiles are read and written (the `SRTMHGT` driver), as GDAL's SRTMHGT

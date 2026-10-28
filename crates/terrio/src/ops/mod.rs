@@ -582,6 +582,14 @@ pub(crate) fn derived(ds: &RasterDataset, data: RasterData, nbands: usize) -> Re
     if data.len() != r.cols * r.rows * nbands {
         return Err(Error::InvalidData(format!("{} values for {nbands} band(s) of {}x{} pixels", data.len(), r.cols, r.rows)));
     }
+    let mut out = derived_header(ds, data.data_type(), nbands);
+    out.raster.data = data;
+    Ok(out)
+}
+
+/// The dataset [`derived`] makes of `ds`, without pixels: its data buffer is empty.
+pub(crate) fn derived_header(ds: &RasterDataset, data_type: DataType, nbands: usize) -> RasterDataset {
+    let r = &ds.raster;
     let raster = Raster {
         cols: r.cols,
         rows: r.rows,
@@ -591,16 +599,16 @@ pub(crate) fn derived(ds: &RasterDataset, data: RasterData, nbands: usize) -> Re
         cell_size_x: r.cell_size_x,
         cell_size_y: r.cell_size_y,
         nodata: r.nodata,
-        data_type: data.data_type(),
+        data_type,
         crs: r.crs.clone(),
         metadata: r.metadata.clone(),
-        data,
+        data: RasterData::new_filled(data_type, 0, 0.0),
     };
     let mut out = RasterDataset::with_driver(raster, ds.driver, false);
     out.affine = ds.affine;
     out.gcps = ds.gcps.clone();
     out.geolocation = ds.geolocation.clone();
-    Ok(out)
+    out
 }
 
 /// Builds a raster dataset from its values (`nbands` bands, band after band), of their type.

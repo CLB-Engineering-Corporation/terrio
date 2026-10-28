@@ -1,6 +1,6 @@
 //! `terrio unscale`, `terrio nodata-to-alpha`, `terrio reclassify` and `terrio as-features`.
 
-use super::rasterout::{OutputArgs, open};
+use super::rasterout::{OutputArgs, open, open_lazy, same_file};
 use terrio::formats::VectorDriver;
 use terrio::ops::as_features::{AsFeaturesOptions, PixelGeometry};
 use terrio::ops::parse_data_type;
@@ -179,10 +179,16 @@ pub struct BlendArgs {
     #[command(flatten)]
     out: OutputArgs,
 }
-/// Runs raster blending.
+/// Runs raster blending: inputs read and a GeoTIFF or COG output written a strip of rows at a
+/// time, unless the output is one of the inputs, which are then read whole.
 pub fn blend(a: BlendArgs) -> terrio::Result<()> {
     let options = terrio::ops::blend::BlendOptions { operator: terrio::ops::blend::BlendOperator::parse(&a.operator)?, opacity: a.opacity };
-    let base = open(&a.input)?;
-    let overlay = open(&a.overlay)?;
-    a.out.write(&terrio::ops::blend::blend(&base, &overlay, &options)?, &a.output)
+    if same_file(&a.input, &a.output) || same_file(&a.overlay, &a.output) {
+        let base = open(&a.input)?;
+        let overlay = open(&a.overlay)?;
+        return a.out.write(&terrio::ops::blend::blend(&base, &overlay, &options)?, &a.output);
+    }
+    let mut base = open_lazy(&a.input)?;
+    let mut overlay = open_lazy(&a.overlay)?;
+    super::quiet(|| terrio::ops::blend::blend_to_path(&mut base, &mut overlay, &options, &a.output, &a.out.options()?))
 }

@@ -1996,9 +1996,31 @@ and makes the palette nodata entry transparent.
 Output band count follows the color input, except multiply/screen/overlay/hard-light
 swap inputs when the overlay has more bands, as GDAL does. Output CRS and transform
 follow that effective color input. Outputs have color interpretations but no nodata,
-packing scales or descriptive metadata. Inputs and output are materialized in memory;
-this command does not offer GDAL's lazy GDALG pipeline output or append-as-subdataset
-mode. Standard raster format/compression/creation options apply.
+packing scales or descriptive metadata. Standard raster format/compression/creation
+options apply. This command does not offer GDAL's lazy GDALG pipeline output or
+append-as-subdataset mode.
+
+The CLI, and Python with paths for the inputs and `dst`, read both inputs and write a
+GeoTIFF or COG a strip of rows at a time (Rust `ops::blend::blend_to_path`), so memory
+does not grow with the image; other output formats are gathered and written at the end.
+The pixels are those of the in-memory blend. An output that is one of the inputs is
+read whole first.
+
+A hillshaded color relief, in bounded memory:
+
+```sh
+terrio dem color-relief dem.tif colors.txt relief.tif --alpha
+terrio dem hillshade dem.tif hillshade.tif --multidirectional --compute-edges
+terrio blend relief.tif hillshade.tif shaded.tif --operator hsv-value --opacity 60
+```
+
+`hsv-value` keeps the relief's alpha, so nodata stays transparent. `multiply` darkens
+each channel instead (about `c * (1 - o + o * shade / 255)`, in GDAL's integer
+arithmetic), and its output alpha combines both inputs' alpha. A hillshade marks nodata
+with the value 0 and has no alpha band, so without one the relief's nodata area takes the
+overlay's opacity: give it an alpha band first with `terrio nodata-to-alpha hillshade.tif
+hillshade_a.tif` (which reads the hillshade whole). Fully transparent outputs of
+`multiply` are `0 0 0 0`, as in GDAL.
 
 GDAL 3.13.3 has unsafe optimized paths when a non-swapping operator receives more
 overlay bands than color bands, and treats gray-alpha channels inconsistently in

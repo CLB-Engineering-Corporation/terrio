@@ -202,4 +202,8 @@ fn blend_image_and_refusals() {
     assert!(fails(&["blend", "base.tif", "overlay.tif", "out.tif", "--opacity", "101"], tmp.path()).contains("opacity"));
     assert_eq!(std::fs::read(tmp.path().join("out.tif")).unwrap(), before);
     assert!(fails(&["blend", "base.tif", "overlay.tif", "out.tif", "--operator", "invalid"], tmp.path()).contains("operator"));
+    // An output that is one of the inputs: the inputs are read whole before it is written.
+    ok(&["blend", "base.tif", "overlay.tif", "base.tif", "--operator", "multiply"], tmp.path());
+    let read = |name: &str| terrio::open_raster(tmp.path().join(name).to_str().unwrap()).unwrap().raster.data.to_f64_vec();
+    assert_eq!(read("base.tif"), read("out.tif"));
 }

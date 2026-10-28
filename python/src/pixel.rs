@@ -3,8 +3,9 @@
 
 use crate::PyResultExt;
 use crate::invalid;
-use crate::ops::{finish_raster, input_raster, vector_write_options, write_mode};
+use crate::ops::{finish_raster, input_raster, raster_path, vector_write_options, write_mode};
 use crate::raster::PyRaster;
+use crate::raster::write_options;
 use crate::vector::PyLayer;
 use pyo3::prelude::*;
 use terrio::ops::as_features::{AsFeaturesOptions, PixelGeometry};
@@ -199,7 +200,9 @@ fn as_features(
     Ok(PyLayer { inner: layer })
 }
 
-/// Blends equal-sized Byte images. Operator names match GDAL; opacity is 0..100.
+/// Blends equal-sized Byte images. Operator names match GDAL; opacity is 0..100. From paths to
+/// `dst`, the inputs are read and the output written a strip of rows at a time, and the result is
+/// returned lazily.
 #[pyfunction]
 #[pyo3(signature = (src, overlay, dst=None, *, operator="src-over", opacity=100, format=None, compress=None, tile_size=None, bigtiff=false))]
 #[allow(clippy::too_many_arguments)]
@@ -216,6 +219,19 @@ fn blend(
     bigtiff: bool,
 ) -> PyResult<PyRaster> {
     let o = terrio::ops::blend::BlendOptions { operator: terrio::ops::blend::BlendOperator::parse(operator).py()?, opacity };
+    // Path to path, the inputs are read and the output written a strip of rows at a time.
+    if let (Some(dst), Some(c), Some(v)) = (dst, raster_path(src)?, raster_path(overlay)?) {
+        let same = |p: &str| std::fs::canonicalize(p).ok().zip(std::fs::canonicalize(dst).ok()).is_some_and(|(a, b)| a == b);
+        if !same(&c) && !same(&v) {
+            let options = write_options(format, compress, tile_size, bigtiff)?;
+            py.detach(|| {
+                let (mut c, mut v) = (terrio::open_raster_lazy(&c)?, terrio::open_raster_lazy(&v)?);
+                terrio::ops::blend::blend_to_path(&mut c, &mut v, &o, dst, &options)
+            })
+            .py()?;
+            return Ok(PyRaster { inner: py.detach(|| terrio::open_raster_lazy(dst)).py()? });
+        }
+    }
     let base = input_raster(py, src)?;
     let overlay = input_raster(py, overlay)?;
     let out = py.detach(|| terrio::ops::blend::blend(&base, &overlay, &o)).py()?;
