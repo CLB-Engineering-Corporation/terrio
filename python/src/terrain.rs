@@ -8,7 +8,7 @@ use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use terrio::RasterDataset;
 use terrio::ops::calc::{CalcExtent, CalcInput, CalcNodata, CalcOptions};
-use terrio::ops::dem::{ColorMap, ColorSelection, DemOptions, DemProduct, GradientAlg, Shading, TriAlg, pam_statistics};
+use terrio::ops::dem::{ColorMap, ColorSelection, DemOptions, DemProduct, GradientAlg, HillshadeBlend, Shading, TriAlg, pam_statistics};
 use terrio::ops::parse_data_type;
 use terrio::ops::proximity::{ProximityOptions, parse_values};
 use terrio::ops::sieve::{SieveMask, SieveOptions};
@@ -29,8 +29,10 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
 ///
 /// Args:
 ///     src: The DEM: a path or a `Raster`.
-///     processing: `"hillshade"`, `"slope"`, `"aspect"`, `"color-relief"`, `"TRI"`, `"TPI"` or
-///         `"roughness"`.
+///     processing: `"hillshade"`, `"slope"`, `"aspect"`, `"color-relief"`, `"TRI"`, `"TPI"`,
+///         `"roughness"`, or `"shaded-relief"`: the color relief darkened by the hillshade (with
+///         the hillshade options given), in one pass; transparent pixels and pixels without a
+///         hillshade keep their colors.
 ///     dst: Also write the result to this path.
 ///     color_file: For color relief, the color file: lines of `value R G B [A]` or
 ///         `value colorname`, where the value may be `nv` (nodata) or a percentage.
@@ -63,6 +65,8 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
 ///     compress: GeoTIFF/COG compression, for `dst`.
 ///     tile_size: GeoTIFF/COG tile size, for `dst`.
 ///     bigtiff: Write a BigTIFF, for `dst`.
+///     hillshade_strength: How much the hillshade darkens a shaded relief, from 0 to 1 (default
+///         0.6): colors are multiplied by `1 - strength * (1 - shade / 255)`.
 ///     max_memory_mib: With a `src` path and `dst`: about how much memory (MiB) the strips of
 ///         rows in flight may take, which sets their height. By default 256 MiB.
 ///
@@ -75,7 +79,8 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     src, processing, dst=None, *, color_file=None, band=1, z=1.0, scale=None, xscale=None, yscale=None, azimuth=None,
     altitude=None, combined=false, multidirectional=false, igor=false, alg=None, percent=false, trigonometric=false,
     zero_for_flat=false, compute_edges=false, alpha=false, exact_color_entry=false, nearest_color_entry=false,
-    format=None, compress=None, tile_size=None, bigtiff=false, kernel_version="3.12", max_memory_mib=None
+    format=None, compress=None, tile_size=None, bigtiff=false, kernel_version="3.12", max_memory_mib=None,
+    hillshade_strength=None
 ))]
 #[allow(clippy::too_many_arguments)]
 fn dem(
@@ -108,6 +113,7 @@ fn dem(
     bigtiff: bool,
     kernel_version: &str,
     max_memory_mib: Option<f64>,
+    hillshade_strength: Option<f64>,
 ) -> PyResult<PyRaster> {
     if [combined, multidirectional, igor].iter().filter(|b| **b).count() > 1 {
         return Err(invalid("combined, multidirectional and igor exclude each other"));
@@ -121,11 +127,16 @@ fn dem(
     if exact_color_entry && nearest_color_entry {
         return Err(invalid("exact_color_entry and nearest_color_entry exclude each other"));
     }
-    let color = processing.eq_ignore_ascii_case("color-relief");
+    let shaded = processing.eq_ignore_ascii_case("shaded-relief");
+    let color = shaded || processing.eq_ignore_ascii_case("color-relief");
     let product = if color { None } else { Some(DemProduct::parse(processing).py()?) };
     if color != color_file.is_some() {
-        return Err(invalid("color_file is needed by color-relief, and only by it"));
+        return Err(invalid("color_file is needed by color-relief and shaded-relief, and only by them"));
     }
+    if hillshade_strength.is_some() && !shaded {
+        return Err(invalid("hillshade_strength applies to shaded-relief"));
+    }
+    let blend = HillshadeBlend { strength: hillshade_strength.unwrap_or(HillshadeBlend::default().strength) };
     let mut o = DemOptions {
         kernel_version: terrio::ops::warp::KernelVersion::parse(kernel_version).py()?,
         band,
@@ -163,6 +174,7 @@ fn dem(
         match product {
             Some(DemProduct::Tri) => o.tri = TriAlg::parse(alg).py()?,
             Some(DemProduct::Hillshade | DemProduct::Slope | DemProduct::Aspect) => o.gradient = GradientAlg::parse(alg).py()?,
+            None if shaded => o.gradient = GradientAlg::parse(alg).py()?,
             _ => return Err(invalid("alg applies to hillshade, slope, aspect and TRI")),
         }
     }
@@ -183,7 +195,11 @@ fn dem(
                     let text = std::fs::read_to_string(file)
                         .map_err(|e| terrio::Error::InvalidArgument(format!("cannot read the color file '{file}': {e}")))?;
                     let map = ColorMap::parse_lazy(&text, &mut lazy, band, pam_statistics(src_path, band))?;
-                    terrio::ops::dem::color_relief_to_path(&mut lazy, &map, &o, out_path, &options)?;
+                    if shaded {
+                        terrio::ops::dem::shaded_relief_to_path(&mut lazy, &map, &o, &blend, out_path, &options)?;
+                    } else {
+                        terrio::ops::dem::color_relief_to_path(&mut lazy, &map, &o, out_path, &options)?;
+                    }
                 }
                 (None, None) => unreachable!("checked"),
             }
@@ -197,6 +213,9 @@ fn dem(
     }
     let ds = input_raster(py, src)?;
     if vrt_out {
+        if shaded {
+            return Err(invalid("a shaded relief cannot be written as a VRT"));
+        }
         let (Some(file), Some(src_path), Some(out_path)) = (color_file, path.as_deref(), dst) else {
             return Err(invalid("a VRT output needs color-relief, a source path and dst"));
         };
@@ -218,7 +237,8 @@ fn dem(
                 let text = std::fs::read_to_string(file)
                     .map_err(|e| terrio::Error::InvalidArgument(format!("cannot read the color file '{file}': {e}")))?;
                 let range = path.as_deref().and_then(|p| pam_statistics(p, band));
-                terrio::ops::dem::color_relief(&ds, &ColorMap::parse(&text, &ds, band, range)?, &o)
+                let map = ColorMap::parse(&text, &ds, band, range)?;
+                if shaded { terrio::ops::dem::shaded_relief(&ds, &map, &o, &blend) } else { terrio::ops::dem::color_relief(&ds, &map, &o) }
             }
             (None, None) => unreachable!("checked"),
         })

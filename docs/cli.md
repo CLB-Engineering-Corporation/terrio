@@ -853,9 +853,9 @@ clockwise.
 terrio dem MODE INPUT [COLOR_FILE] OUTPUT [options]
 ```
 
-`MODE` is `hillshade`, `slope`, `aspect`, `color-relief` (which takes a color file), `TRI`, `TPI`
-or `roughness`. Options: `-b`, `--compute-edges`, `--alg Horn|ZevenbergenThorne` (hillshade,
-slope, aspect) or `--alg Riley|Wilson` (TRI); for hillshade `-z`, `-s` (`111120` for a geographic
+`MODE` is `hillshade`, `slope`, `aspect`, `color-relief` (which takes a color file), `shaded-relief`
+(likewise, below), `TRI`, `TPI` or `roughness`. Options: `-b`, `--compute-edges`,
+`--alg Horn|ZevenbergenThorne` (hillshade, slope, aspect) or `--alg Riley|Wilson` (TRI); for hillshade `-z`, `-s` (`111120` for a geographic
 DEM in metres), `--xscale`/`--yscale`, `--az`, `--alt`, `--combined`, `--multidirectional`,
 `--igor`; `-p` (slope in percent); `--trigonometric`, `--zero-for-flat` (aspect); `--alpha`,
 `--exact-color-entry`, `--nearest-color-entry` (color relief). Without `-s`, geographic DEMs are
@@ -869,6 +869,18 @@ sets about how much memory the strips in flight may take, and so their height, l
 `gdalwarp -wm`; the values do not depend on it. Percentages in a color file are of the band's
 range from the `.aux.xml` statistics when there are some, otherwise from a pass over the band, a
 strip at a time. An output that is also the input is read whole first.
+
+`shaded-relief` (terrio's own mode, not `gdaldem`'s) takes a color file too and writes the color
+relief darkened by the hillshade of the same DEM in one pass: each color channel is multiplied by
+`1 - s * (1 - shade / 255)`, in Float32 and truncated, where `s` is `--hillshade-strength`
+(default 0.6, 0 to 1). The hillshade takes the hillshade options (`-z`, `-s`, `--az`, `--alt`,
+`--combined`, `--multidirectional`, `--igor`, `--alg`, `--compute-edges`). Pixels that are
+transparent, or where the hillshade is nodata, keep their color, so the color of an `nv` entry
+under alpha 0 is not darkened. It is streamed as the other modes are; a VRT output is refused.
+
+```sh
+terrio dem shaded-relief dem.tif colors.txt shaded.tif --alpha --multidirectional --compute-edges
+```
 
 `--kernel-version 3.12|3.13` selects terrain arithmetic (default `3.12`). The
 `3.13` profile supports slope and standard hillshade, including both gradient

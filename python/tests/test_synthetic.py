@@ -396,6 +396,39 @@ def test_dem_path_to_path_is_streamed(tmp_path):
         terrio.dem(str(src), "slope", max_memory_mib=10)
 
 
+def test_shaded_relief_matches_the_numpy_blend(tmp_path):
+    """A shaded relief is the color relief darkened by the hillshade as the NumPy step
+    `rgb * (1 - s * (1 - shade / 255))` (float32, truncated, where alpha and the hillshade are not
+    0) computes it, in memory and path to path; transparent pixels keep the nv color."""
+    rows, cols = np.mgrid[0:50, 0:40]
+    dem = (np.sin(rows / 5.0) * 40 + cols * 3.0 + 100).astype("float32")
+    dem[:3, :4] = -9999
+    src = tmp_path / "dem.tif"
+    terrio.Raster.from_array(dem, TRANSFORM, crs="EPSG:32610", nodata=-9999).write(str(src))
+    colors = tmp_path / "colors.txt"
+    colors.write_text("60 20 120 40\n160 230 200 90\n260 255 255 255\nnv 20 120 40 0\n")
+    shade_kw = {"multidirectional": True, "compute_edges": True}
+    relief = terrio.dem(str(src), "color-relief", color_file=str(colors), alpha=True)
+    shade = terrio.dem(str(src), "hillshade", **shade_kw)
+    rgba = np.asarray(relief.read()).copy()
+    values = np.asarray(shade.read()).astype(np.float32)[0]
+    factor = (1.0 - 0.6 * (1.0 - values / 255.0)).astype(np.float32)
+    factor = np.where((rgba[3] > 0) & (values > 0), factor, np.float32(1.0))
+    rgba[:3] = np.clip(rgba[:3].astype(np.float32) * factor, 0, 255).astype(np.uint8)
+    kwargs = {"color_file": str(colors), "alpha": True, **shade_kw}
+    whole = terrio.dem(str(src), "shaded-relief", **kwargs)
+    streamed = terrio.dem(
+        str(src), "shaded-relief", dst=str(tmp_path / "s.tif"), max_memory_mib=0.001, **kwargs
+    )
+    for r in (whole, streamed):
+        np.testing.assert_array_equal(r.read(), rgba)
+    assert tuple(rgba[:, 0, 0]) == (20, 120, 40, 0)
+    lighter = terrio.dem(str(src), "shaded-relief", hillshade_strength=0.2, **kwargs).read()
+    assert (lighter[:3].astype(int) >= rgba[:3]).all()
+    with pytest.raises(terrio.InvalidArgumentError):
+        terrio.dem(str(src), "color-relief", color_file=str(colors), hillshade_strength=0.5)
+
+
 def test_calc_numpy_typing():
     """Checks that calc follows NumPy's typing rules, as gdal_calc.py does."""
     a = np.array([[200, 3], [0, 100]], dtype="uint8")

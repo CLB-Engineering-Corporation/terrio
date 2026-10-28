@@ -17,6 +17,10 @@
   instead of holding a Float64 copy of the band and four Float64 output planes.
 - `dem_to_path` and `color_relief_to_path` read a DEM that is also the output whole first,
   instead of truncating it while it is read.
+- `terrio dem shaded-relief` (Python `terrio.dem(..., "shaded-relief", hillshade_strength=...)`,
+  Rust `shaded_relief` and `shaded_relief_to_path`) writes a color relief darkened by the DEM's
+  hillshade in one pass, streamed path to path, instead of a color relief, a hillshade and a
+  blend of the two held in memory.
 
 ### Formats
 
