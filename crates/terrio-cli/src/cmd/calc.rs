@@ -148,6 +148,7 @@ pub fn run(a: Args) -> terrio::Result<()> {
         projwin: a.projwin.map(|v| (v[0], v[1], v[2], v[3])),
         all_bands: a.all_bands,
         projection_check: a.projection_check,
+        max_memory_mib: None,
     };
     let _ = (a.overwrite, a.quiet);
     let out = calc(&inputs, &o)?;

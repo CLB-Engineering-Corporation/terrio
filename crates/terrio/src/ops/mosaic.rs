@@ -351,26 +351,71 @@ fn resampled_in_strips(
     options: &crate::RasterWriteOptions,
     rows: usize,
 ) -> Result<()> {
-    use super::vrt::SourceRead;
-    let (w, h, nbands) = (vrt.width, vrt.height, vrt.bands.len());
-    let data_type = vrt.bands[0].data_type;
-    let grid = Grid { width: w, height: h, geo_transform: vrt.geo_transform.unwrap_or([0.0, 1.0, 0.0, 0.0, 0.0, -1.0]) };
-    let mut header = super::raster_header(grid, data_type, nbands, vrt.bands[0].nodata, &vrt.srs.clone().unwrap_or_default())?;
+    let h = vrt.height;
+    let header = mosaic_header(vrt)?;
+    let strips = Strips::new(vrt, sources, &(0..vrt.bands.len()).collect::<Vec<_>>())?;
+    let mut out = super::strips::StripWriter::create(&header, path, options)?;
+    let span = |i: usize| (i * rows, ((i + 1) * rows).min(h));
+    super::strips::pipelined(
+        h.div_ceil(rows),
+        |i| {
+            let (y0, y1) = span(i);
+            strips.read(lazy, y0..y1)
+        },
+        |i, reads| {
+            let (y0, y1) = span(i);
+            out.write(strips.draw(&reads, y0..y1), y1 - y0)
+        },
+    )?;
+    out.finish()
+}
+
+/// The header of the raster [`vrt_from_memory`] reads from a mosaic's VRT (its pixels are not
+/// read).
+pub(crate) fn mosaic_header(vrt: &VrtDataset) -> Result<RasterDataset> {
+    let grid = Grid { width: vrt.width, height: vrt.height, geo_transform: vrt.geo_transform.unwrap_or([0.0, 1.0, 0.0, 0.0, 0.0, -1.0]) };
+    let mut header =
+        super::raster_header(grid, vrt.bands[0].data_type, vrt.bands.len(), vrt.bands[0].nodata, &vrt.srs.clone().unwrap_or_default())?;
     header.band_nodata = vrt.bands.iter().map(|band| band.nodata).collect();
-    // Each band's sources, in drawing order: the source's index and its read without values.
-    let mut draws = Vec::new();
-    for (b, band) in vrt.bands.iter().enumerate() {
-        for src in &band.sources {
-            let k = sources
-                .iter()
-                .position(|s| absolute(&s.path) == src.filename)
-                .ok_or_else(|| Error::InvalidData(format!("unknown source '{}'", src.filename)))?;
-            draws.push((b, k, src));
+    Ok(header)
+}
+
+/// Bands of a mosaic of resampled sources drawn a strip of rows at a time, each pixel as
+/// [`vrt_from_memory`] draws it for the whole mosaic.
+pub(crate) struct Strips<'a> {
+    vrt: &'a VrtDataset,
+    sources: &'a [MosaicSource<'a>],
+    /// The mosaic's bands drawn, from 0.
+    bands: Vec<usize>,
+    /// The sources drawn, in drawing order: the drawn band's position, the source's index, and
+    /// the VRT source.
+    draws: Vec<(usize, usize, &'a VrtSource)>,
+}
+
+/// Source rows read for a strip of [`Strips`]: the draw, the first row, and the pixels.
+pub(crate) type StripRead = (usize, usize, RasterDataset);
+
+impl<'a> Strips<'a> {
+    /// Draws the mosaic `vrt` of `sources` (headers only), its bands `bands` (from 0).
+    pub(crate) fn new(vrt: &'a VrtDataset, sources: &'a [MosaicSource<'a>], bands: &[usize]) -> Result<Self> {
+        let mut draws = Vec::new();
+        for (k, b) in bands.iter().enumerate() {
+            let band = vrt.bands.get(*b).ok_or_else(|| Error::InvalidArgument(format!("the mosaic has no band {}", b + 1)))?;
+            for src in &band.sources {
+                let i = sources
+                    .iter()
+                    .position(|s| absolute(&s.path) == src.filename)
+                    .ok_or_else(|| Error::InvalidData(format!("unknown source '{}'", src.filename)))?;
+                draws.push((k, i, src));
+            }
         }
+        Ok(Self { vrt, sources, bands: bands.to_vec(), draws })
     }
-    let geometry = |k: usize, src: &super::vrt::VrtSource| {
-        let ds = sources[k].ds;
-        SourceRead {
+
+    /// The read of a source without its pixels.
+    fn geometry(&self, i: usize, src: &VrtSource) -> super::vrt::SourceRead<'static> {
+        let ds = self.sources[i].ds;
+        super::vrt::SourceRead {
             values: super::BandView::F64(&[]),
             valid: None,
             width: ds.raster.cols,
@@ -383,47 +428,45 @@ fn resampled_in_strips(
             working_float: src.complex,
             invalid_value: None,
         }
-    };
-    let mut out = super::strips::StripWriter::create(&header, path, options)?;
-    let span = |i: usize| (i * rows, ((i + 1) * rows).min(h));
-    super::strips::pipelined(
-        h.div_ceil(rows),
-        // The source rows each draw needs for the strip.
-        |i| {
-            let (y0, y1) = span(i);
-            let mut reads = Vec::new();
-            for (d, (_, k, src)) in draws.iter().enumerate() {
-                let Some(needed) = geometry(*k, src).source_rows(w, h, y0..y1) else { continue };
-                let window = crate::Window::new(0, needed.start, sources[*k].ds.raster.cols, needed.len());
-                let read = crate::WindowOptions { bands: vec![src.band], ..Default::default() };
-                reads.push((d, needed.start, lazy[*k].read_window(window, &read)?));
-            }
-            Ok(reads)
-        },
-        |i, reads| {
-            let (y0, y1) = span(i);
-            let n = w * (y1 - y0);
-            let mut data = RasterData::new_filled(data_type, n * nbands, 0.0);
-            for (b, band) in vrt.bands.iter().enumerate() {
-                crate::pixel::with_data!(&mut data, v => {
-                    let fill = super::convert_value(band.nodata.unwrap_or(0.0), data_type);
-                    v[b * n..(b + 1) * n].iter_mut().for_each(|x| *x = fill as _);
-                });
-            }
-            // In the sources' order: later ones on top.
-            for (d, row0, ds) in &reads {
-                let (b, k, src) = draws[*d];
-                let values = super::BandView::of(&ds.raster, 0);
-                let valid: Option<Vec<bool>> = src.nodata.map(|nd| values.valid(nd));
-                let read = SourceRead { values, valid: valid.as_deref(), row0: *row0, ..geometry(k, src) };
-                crate::pixel::with_data!(&mut data, v => {
-                    read.read_rows(w, h, y0..y1, &mut v[b * n..(b + 1) * n], |x| super::convert_value(x, data_type) as _);
-                });
-            }
-            out.write(data, y1 - y0)
-        },
-    )?;
-    out.finish()
+    }
+
+    /// Reads the source rows the mosaic rows `rows` need, from `lazy` (the sources, opened).
+    pub(crate) fn read(&self, lazy: &mut [crate::LazyRaster], rows: std::ops::Range<usize>) -> Result<Vec<StripRead>> {
+        let mut reads = Vec::new();
+        for (d, (_, i, src)) in self.draws.iter().enumerate() {
+            let Some(needed) = self.geometry(*i, src).source_rows(self.vrt.width, self.vrt.height, rows.clone()) else { continue };
+            let window = crate::Window::new(0, needed.start, self.sources[*i].ds.raster.cols, needed.len());
+            let read = crate::WindowOptions { bands: vec![src.band], ..Default::default() };
+            reads.push((d, needed.start, lazy[*i].read_window(window, &read)?));
+        }
+        Ok(reads)
+    }
+
+    /// The mosaic rows `rows`, drawn from `reads` ([`Self::read`]): the bands drawn, one after the
+    /// other, in the mosaic's data type.
+    pub(crate) fn draw(&self, reads: &[StripRead], rows: std::ops::Range<usize>) -> RasterData {
+        let w = self.vrt.width;
+        let n = w * rows.len();
+        let data_type = self.vrt.bands[0].data_type;
+        let mut data = RasterData::new_filled(data_type, n * self.bands.len(), 0.0);
+        for (k, b) in self.bands.iter().enumerate() {
+            crate::pixel::with_data!(&mut data, v => {
+                let fill = super::convert_value(self.vrt.bands[*b].nodata.unwrap_or(0.0), data_type);
+                v[k * n..(k + 1) * n].iter_mut().for_each(|x| *x = fill as _);
+            });
+        }
+        // In the sources' order: later ones on top.
+        for (d, row0, ds) in reads {
+            let (k, i, src) = self.draws[*d];
+            let values = super::BandView::of(&ds.raster, 0);
+            let valid: Option<Vec<bool>> = src.nodata.map(|nd| values.valid(nd));
+            let read = super::vrt::SourceRead { values, valid: valid.as_deref(), row0: *row0, ..self.geometry(i, src) };
+            crate::pixel::with_data!(&mut data, v => {
+                read.read_rows(w, self.vrt.height, rows.clone(), &mut v[k * n..(k + 1) * n], |x| super::convert_value(x, data_type) as _);
+            });
+        }
+        data
+    }
 }
 
 /// Writes a mosaic whose sources are all copied pixel for pixel, in strips of `rows` rows.
