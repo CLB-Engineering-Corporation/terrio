@@ -302,7 +302,7 @@ fn cog_layout_is_kept_when_no_overview_changes() {
         &RasterWriteOptions {
             driver: Some(terrio::formats::RasterDriver::Cog),
             tile_size: Some(16),
-            overviews: vec![2],
+            overviews: vec![2, 4],
             ..Default::default()
         },
     );

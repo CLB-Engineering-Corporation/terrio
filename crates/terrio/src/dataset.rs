@@ -631,7 +631,11 @@ pub struct RasterWriteOptions {
     /// A color table for a single-band Byte or UInt16 GeoTIFF: `(red, green, blue, alpha)`
     /// entries from index 0. Empty for none.
     pub color_table: Vec<[u8; 4]>,
-    /// GeoTIFF overviews to build, as decimation factors such as `[2, 4, 8]`.
+    /// Overviews to build, as decimation factors such as `[2, 4, 8]` (each level
+    /// `ceil(cols / f) x ceil(rows / f)`, reduced from the previous one). For a COG they are the
+    /// levels written instead of the automatic pyramid (halving until a level fits in a tile), as
+    /// GDAL's COG driver reuses the overviews `gdaladdo` built on its source with `OVERVIEWS=AUTO`
+    /// or `FORCE_USE_EXISTING`; `OVERVIEWS=NONE` or `IGNORE_EXISTING` with factors is refused.
     pub overviews: Vec<usize>,
     /// Overview resampling: `nearest`, `average`, `min`, `max` or `mode`. Defaults to `nearest`
     /// for GeoTIFF and `average` for COG (whose `OVERVIEW_RESAMPLING` or `RESAMPLING` creation
