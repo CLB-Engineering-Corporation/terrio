@@ -638,6 +638,7 @@ fn archive_prelude(
 
 /// A tile whose bytes were spilled to a file: its id and place, at `offset` in the file, and a
 /// hash of its bytes.
+#[cfg(not(target_family = "wasm"))]
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct SpilledTile {
     pub id: u64,

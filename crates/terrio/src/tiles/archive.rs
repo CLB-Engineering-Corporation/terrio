@@ -361,7 +361,9 @@ fn pmtiles_parts(
 /// window, [`raster::make_tiles_from_dataset`] for one in memory), and the tiles of a PMTiles
 /// archive are spilled to a temporary file beside `path`, then laid out in tile id order. The
 /// archive is the one the in-memory writer writes, byte for byte. MBTiles archives gather their
-/// (encoded) tiles in memory.
+/// (encoded) tiles in memory. The tile index is held whole, though: a `SpilledTile` (about 32
+/// bytes) per tile, the directory entries and a map of the distinct tile contents, so memory grows
+/// with the number of tiles, not with their bytes.
 #[cfg(not(target_family = "wasm"))]
 fn write_pyramid(
     path: &str,
@@ -375,7 +377,15 @@ fn write_pyramid(
             let mut tiles = Vec::new();
             let s = build(&mut tiles)?;
             let md = raster_metadata(s.bounds, s.min_zoom, s.max_zoom, s.format, o, &name, &[]);
-            std::fs::write(path, mbtiles::write(&md, tiles)?)?;
+            let bytes = mbtiles::write(&md, tiles)?;
+            // Created before anything is written, as for PMTiles, so that a failure to write removes it.
+            let mut out = std::fs::File::create(path)?;
+            let written = std::io::Write::write_all(&mut out, &bytes);
+            drop(out);
+            if written.is_err() {
+                let _ = std::fs::remove_file(path);
+            }
+            written?;
             Ok(())
         }
         ArchiveKind::PMTiles => {

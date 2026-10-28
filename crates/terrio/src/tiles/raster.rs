@@ -695,7 +695,7 @@ fn warp_plan<'a>(ds: &'a RasterDataset, o: &TileWriteOptions, grid: Option<Grid>
         return Err(Error::InvalidArgument("the raster is empty at that zoom level".into()));
     }
     // Checked here, so that a level read by window is refused as one warped whole is.
-    if (width as u64) * (height as u64) > 1 << 31 {
+    if (width as u64).checked_mul(height as u64).is_none_or(|pixels| pixels > 1 << 31) {
         return Err(Error::Unsupported(format!(
             "the raster would be {width} x {height} pixels at zoom level {zoom}: choose a lower MAXZOOM"
         )));
@@ -907,6 +907,7 @@ fn pyramid(
 /// the source pixel of the level's first pixel; pixels outside the source are those the warper
 /// leaves at its initial value (zero), transparent unless the source has no alpha band (as
 /// [`warp_level`] adds none to a raster already in EPSG:3857).
+#[cfg(not(target_family = "wasm"))]
 struct AlignedRows<'a> {
     src: &'a mut crate::LazyRaster,
     w: usize,
@@ -917,6 +918,7 @@ struct AlignedRows<'a> {
     next: usize,
 }
 
+#[cfg(not(target_family = "wasm"))]
 impl super::pyramid::BaseRows for AlignedRows<'_> {
     fn next_rows(&mut self, n: usize) -> Result<Vec<Vec<u8>>> {
         let (w, bands) = (self.w, self.data_bands);
@@ -965,6 +967,7 @@ impl super::pyramid::BaseRows for AlignedRows<'_> {
 /// When a raster is already on the pixel grid [`warp_level`] would warp it to (EPSG:3857 at the
 /// zoom level's resolution, shifted by whole pixels), the level's size, zoom and corner, and the
 /// source pixel of its first pixel: the warp copies pixels, so the level can be read by window.
+#[cfg(not(target_family = "wasm"))]
 fn aligned_level(header: &RasterDataset, o: &TileWriteOptions) -> Result<Option<(WarpPlanned, i64, i64)>> {
     let gt = header.geo_transform();
     if header.crs().epsg != Some(3857) || !header.gcps.is_empty() || gt[2] != 0.0 || gt[4] != 0.0 || gt[1] <= 0.0 || gt[5] >= 0.0 {
@@ -987,6 +990,7 @@ fn aligned_level(header: &RasterDataset, o: &TileWriteOptions) -> Result<Option<
 }
 
 /// The level [`warp_plan`] plans, without its source.
+#[cfg(not(target_family = "wasm"))]
 struct WarpPlanned {
     zoom: u8,
     minx: f64,
@@ -997,6 +1001,7 @@ struct WarpPlanned {
 
 /// A tile pyramid being written: built a tile row at a time from rows of its full-resolution
 /// level, its tiles given to `sink`. Returns the bounds and the zoom levels.
+#[cfg(not(target_family = "wasm"))]
 pub(crate) struct Streamed {
     pub bounds: [f64; 4],
     pub min_zoom: u8,
@@ -1009,6 +1014,7 @@ pub(crate) struct Streamed {
 /// zoom level (in EPSG:3857, at the level's resolution: a raster `terrio warp` wrote with `-tap`
 /// and the zoom level's `-tr`) is read a strip at a time, so that it is never held whole; others
 /// are read whole and warped first, as [`make_tiles`] warps them.
+#[cfg(not(target_family = "wasm"))]
 pub(crate) fn make_tiles_streamed(
     src: &mut crate::LazyRaster,
     o: &TileWriteOptions,
@@ -1031,6 +1037,7 @@ pub(crate) fn make_tiles_streamed(
 
 /// [`make_tiles_streamed`] for a raster in memory: warped whole, then its pyramid built a tile
 /// row at a time.
+#[cfg(not(target_family = "wasm"))]
 pub(crate) fn make_tiles_from_dataset(
     ds: &RasterDataset,
     o: &TileWriteOptions,
@@ -1144,7 +1151,7 @@ pub(crate) fn update_tiles(archive: TileArchive, ds: &RasterDataset, o: &TileWri
 pub(crate) fn encode_tile(px: &[u8], bands: usize, format: TileFormat, quality: u8) -> Result<Vec<u8>> {
     let ch = bands + 1;
     let (channels, samples): (usize, std::borrow::Cow<[u8]>) = if format == TileFormat::Jpeg {
-        (bands, px.chunks(ch).flat_map(|p| p[..ch - 1].to_vec()).collect::<Vec<u8>>().into())
+        (bands, px.chunks(ch).flat_map(|p| p[..ch - 1].iter().copied()).collect::<Vec<u8>>().into())
     } else {
         (ch, px.into())
     };
