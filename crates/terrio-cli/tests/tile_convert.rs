@@ -41,16 +41,20 @@ fn streamed_convert_writes_the_archive_the_in_memory_writer_writes() {
     let directory = tempfile::tempdir().unwrap();
     let input = directory.path().join("input.tif");
     terrio::write_raster_dataset(&rgb_raster(), input.to_str().unwrap(), &terrio::RasterWriteOptions::default()).unwrap();
-    let output = run(&["convert", "input.tif", "streamed.pmtiles", "--minzoom", "9", "--maxzoom", "11"], directory.path());
+    // Both archives are named `tiles.pmtiles` (in two directories): the archive's name and
+    // description are its file name's stem.
+    std::fs::create_dir(directory.path().join("streamed")).unwrap();
+    std::fs::create_dir(directory.path().join("memory")).unwrap();
+    let output = run(&["convert", "input.tif", "streamed/tiles.pmtiles", "--minzoom", "9", "--maxzoom", "11"], directory.path());
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
     let options = terrio::RasterWriteOptions {
         creation_options: vec![("MINZOOM".into(), "9".into()), ("MAXZOOM".into(), "11".into())],
         ..Default::default()
     };
     let whole = terrio::open_raster(input.to_str().unwrap()).unwrap();
-    let memory = directory.path().join("memory.pmtiles");
+    let memory = directory.path().join("memory").join("tiles.pmtiles");
     terrio::write_raster_dataset(&whole, memory.to_str().unwrap(), &options).unwrap();
-    let streamed = std::fs::read(directory.path().join("streamed.pmtiles")).unwrap();
+    let streamed = std::fs::read(directory.path().join("streamed").join("tiles.pmtiles")).unwrap();
     assert!(!streamed.is_empty());
     assert!(streamed == std::fs::read(&memory).unwrap(), "the streamed archive differs from the in-memory one");
 }

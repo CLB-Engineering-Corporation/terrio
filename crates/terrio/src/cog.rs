@@ -805,10 +805,11 @@ impl LazyRaster {
     /// # Ok::<(), terrio::Error>(())
     /// ```
     pub fn write(&mut self, path: &str, options: &crate::RasterWriteOptions) -> Result<()> {
-        // Tile archives are built a tile row at a time (see `crate::tiles`).
+        // Tile archives are built a tile row at a time (see `crate::tiles`). A source that cannot
+        // list the files it reads, or an output replacing one of them, is read whole, as before.
         #[cfg(all(feature = "tiles", not(target_family = "wasm")))]
         if let Some(driver @ (RasterDriver::PMTiles | RasterDriver::MBTiles)) = options.driver.or_else(|| RasterDriver::for_extension(path))
-            && !crate::ops::strips::overwrites(path, &self.input_paths()?)
+            && self.input_paths().is_ok_and(|inputs| !crate::ops::strips::overwrites(path, &inputs))
         {
             return crate::tiles::write_raster_lazy(self, path, driver, options);
         }
@@ -1641,6 +1642,59 @@ mod tests {
             assert_eq!(read.raster.data.to_f64_vec(), vec![11.; 12]);
         }
         assert_eq!(pixels.load(Ordering::Relaxed), 36);
+    }
+
+    /// A source that cannot list the files it reads is still written as a tile archive (read
+    /// whole), the archive the raster in memory gives.
+    #[cfg(all(feature = "tiles", not(target_family = "wasm")))]
+    #[test]
+    fn writes_a_tile_archive_from_a_source_without_an_inventory() {
+        struct Uninventoried(RasterDataset);
+        impl WindowSource for Uninventoried {
+            fn overviews(&self) -> Vec<(usize, usize)> {
+                Vec::new()
+            }
+            fn read(&mut self, level: usize, window: Window, bands: &[usize]) -> Result<RasterData> {
+                assert_eq!(level, 0);
+                let (cols, rows) = (self.0.raster.cols, self.0.raster.rows);
+                let all = self.0.raster.data.to_f64_vec();
+                let mut v = Vec::with_capacity(window.width * window.height * bands.len());
+                for &b in bands {
+                    for y in window.y..window.y + window.height {
+                        let row = ((b - 1) * rows + y) * cols;
+                        v.extend_from_slice(&all[row + window.x..row + window.x + window.width]);
+                    }
+                }
+                Ok(RasterData::from_f64_vec(DataType::U8, v))
+            }
+        }
+        let res = 2.0 * 6378137.0 * std::f64::consts::PI / 256.0 / 1024.0;
+        let cfg = wbraster::RasterConfig {
+            cols: 300,
+            rows: 200,
+            bands: 1,
+            x_min: 1000.0 * res,
+            y_min: 2000.0 * res,
+            cell_size: res,
+            data_type: DataType::U8,
+            crs: crate::crs::SpatialRef::from_epsg(3857).unwrap().to_crs_info(),
+            ..Default::default()
+        };
+        let data = RasterData::from_f64_vec(DataType::U8, (0..300 * 200).map(|i| (i % 251) as f64).collect());
+        let ds = RasterDataset::new(wbraster::Raster::from_data_native(cfg, data).unwrap(), false);
+        let mut lazy = LazyRaster::from_source(LazyRaster::from(ds.clone()).header(), Box::new(Uninventoried(ds.clone())));
+        assert!(lazy.input_paths().is_err());
+        let dir = tempfile::tempdir().unwrap();
+        let options = crate::RasterWriteOptions { creation_options: vec![("MAXZOOM".into(), "10".into())], ..Default::default() };
+        for name in ["tiles.pmtiles", "tiles.mbtiles"] {
+            let (lazy_dir, memory_dir) = (dir.path().join("lazy"), dir.path().join("memory"));
+            std::fs::create_dir_all(&lazy_dir).unwrap();
+            std::fs::create_dir_all(&memory_dir).unwrap();
+            let (written, expected) = (lazy_dir.join(name), memory_dir.join(name));
+            lazy.write(written.to_str().unwrap(), &options).unwrap();
+            crate::write_raster_dataset(&ds, expected.to_str().unwrap(), &options).unwrap();
+            assert!(std::fs::read(&written).unwrap() == std::fs::read(&expected).unwrap(), "{name}");
+        }
     }
 
     #[test]
