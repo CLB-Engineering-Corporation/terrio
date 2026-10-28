@@ -122,6 +122,43 @@ def test_gdal_reads_terrio_cogs_as_its_own(tmp_path):
         assert np.nanmax(np.abs(src.read(1) - a)) <= 0.01 + 1e-6
 
 
+def test_cog_overview_factors_are_written(tmp_path):
+    a = river()
+    cog, gtiff = tmp_path / "f.tif", tmp_path / "g.tif"
+    raster(a).write(str(cog), driver="COG", overviews=[2, 4, 8], overview_resampling="average")
+    raster(a).write(str(gtiff), driver="GTiff", overviews=[2, 4, 8], overview_resampling="average")
+    got, want = overviews(cog), overviews(gtiff)
+    assert [o.shape for o in got] == [(550, 650), (275, 325), (138, 163)]
+    for g, w in zip(got, want, strict=True):
+        np.testing.assert_array_equal(g, w)
+    assert terrio.validate_cog(str(cog))[0]
+    for options in ({"OVERVIEWS": "NONE"}, {"OVERVIEWS": "IGNORE_EXISTING"}):
+        with pytest.raises(terrio.TerrioError):
+            raster(a).write(str(tmp_path / "x.tif"), driver="COG", overviews=[2], options=options)
+
+
+def test_cog_overview_factors_match_gdal_reuse(tmp_path):
+    """GDAL: gdaladdo the factors on the source, then the COG driver reuses them (OVERVIEWS=AUTO)."""
+    rasterio = pytest.importorskip("rasterio")
+    from rasterio.enums import Resampling
+    from rasterio.shutil import copy
+
+    a = river()
+    src = tmp_path / "src.tif"
+    raster(a).write(str(src))
+    with rasterio.open(src, "r+") as ds:
+        ds.build_overviews([2, 4, 8], Resampling.nearest)
+    gdal = tmp_path / "gdal.tif"
+    copy(src, gdal, driver="COG")
+    ours = tmp_path / "ours.tif"
+    raster(a).write(str(ours), driver="COG", overviews=[2, 4, 8], overview_resampling="nearest")
+    with rasterio.open(gdal) as g, rasterio.open(ours) as o:
+        assert g.overviews(1) == o.overviews(1) == [2, 4, 8]
+        for f in (2, 4, 8):
+            shape = (1, -(-a.shape[0] // f), -(-a.shape[1] // f))
+            np.testing.assert_array_equal(g.read(out_shape=shape), o.read(out_shape=shape))
+
+
 def test_area_matched_write_reports_the_area_ratios(tmp_path):
     a = river()
     a[100:180, 900:1000] = 7.0  # a pond away from the river
