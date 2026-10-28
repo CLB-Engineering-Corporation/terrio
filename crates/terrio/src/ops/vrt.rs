@@ -351,6 +351,7 @@ impl VrtDataset {
                     valid: valid.as_deref(),
                     width: r.cols,
                     height: r.rows,
+                    row0: 0,
                     src_type: r.data_type,
                     src_rect,
                     dst_rect: src.dst_rect,
@@ -498,6 +499,9 @@ pub(crate) struct SourceRead<'a> {
     pub width: usize,
     /// The source's height.
     pub height: usize,
+    /// The source row `values` (and `valid`) start at: they hold rows `row0..`, the source's
+    /// whole width each ([`SourceRead::source_rows`] tells which rows a read needs).
+    pub row0: usize,
     /// The source's data type (resampled values are rounded to it, as GDAL does).
     pub src_type: DataType,
     /// The source window.
@@ -518,20 +522,37 @@ impl SourceRead<'_> {
     /// Reads into a destination `out` of `dw × dh` pixels, setting each valid destination pixel
     /// the source covers to `f(value)`. Rows are read in parallel.
     pub fn read<T: Send>(&self, dw: usize, dh: usize, out: &mut [T], f: impl Fn(f64) -> T + Sync + Send) {
-        let Some(w) = self.window(dw as f64, dh as f64, dw, dh) else { return };
-        let (ow, oh) = (w.out_size.0, w.out_size.1);
-        if ow == 0 || oh == 0 {
-            return;
-        }
+        self.read_rows(dw, dh, 0..dh, out, f);
+    }
+
+    /// The source pixel `(x, y)`'s index in `values`.
+    #[inline]
+    fn at(&self, x: usize, y: usize) -> usize {
+        (y - self.row0) * self.width + x
+    }
+
+    /// The rows `rows` of a read of the whole destination of `dw × dh` pixels ([`Self::read`])
+    /// into `out`, `rows.len()` rows of `dw` pixels: each pixel is computed as the whole read
+    /// computes it, so that reads of consecutive row ranges give the whole read, whatever the
+    /// ranges. `values` need only hold the source rows [`Self::source_rows`] gives for `rows`.
+    pub fn read_rows<T: Send>(
+        &self,
+        dw: usize,
+        dh: usize,
+        rows: std::ops::Range<usize>,
+        out: &mut [T],
+        f: impl Fn(f64) -> T + Sync + Send,
+    ) {
+        let Some((w, r0, r1)) = self.rows_window(dw, dh, &rows) else { return };
+        let (ow, oh) = w.out_size;
         let is_valid = |i: usize| self.valid.is_none_or(|m| m[i]);
-        // The destination rows the source covers.
-        let start = (w.out_off.1 * dw).min(out.len());
-        let end = ((w.out_off.1 + oh) * dw).min(out.len());
-        let rows = &mut out[start..end];
+        // The destination rows the source covers, among those read.
+        let first = w.out_off.1 + r0 - rows.start;
+        let lines = &mut out[first * dw..(first + r1 - r0) * dw];
         let x0 = w.out_off.0;
         if w.req_size.0 == ow && w.req_size.1 == oh {
-            crate::par::chunks_mut(rows, dw, |r, line| {
-                let sy = w.req_off.1 + r;
+            crate::par::chunks_mut(lines, dw, |k, line| {
+                let sy = w.req_off.1 + r0 + k;
                 if sy >= self.height {
                     return;
                 }
@@ -540,7 +561,7 @@ impl SourceRead<'_> {
                     if sx >= self.width {
                         continue;
                     }
-                    let i = sy * self.width + sx;
+                    let i = self.at(sx, sy);
                     if is_valid(i) {
                         line[x0 + c] = f(self.values.get(i));
                     }
@@ -550,16 +571,14 @@ impl SourceRead<'_> {
         }
         let (fx, fy, fw, fh) = (w.dreq_off.0, w.dreq_off.1, w.dreq_size.0, w.dreq_size.1);
         if self.resampling == Resampling::Nearest {
-            const EPS: f64 = 1e-10;
             let incx = fw / ow as f64;
-            let incy = fh / oh as f64;
-            crate::par::chunks_mut(rows, dw, |r, line| {
-                let sy = ((r as f64 + 0.5) * incy + fy + EPS).max(0.0).min((self.height - 1) as f64) as usize;
-                let mut sxf = 0.5 * incx + fx + EPS;
+            crate::par::chunks_mut(lines, dw, |k, line| {
+                let sy = nearest_row(r0 + k, fy, fh / oh as f64, self.height);
+                let mut sxf = 0.5 * incx + fx + NEAREST_EPS;
                 for c in 0..ow {
                     let sx = sxf.max(0.0).min((self.width - 1) as f64) as usize;
                     sxf += incx;
-                    let i = sy * self.width + sx;
+                    let i = self.at(sx, sy);
                     if is_valid(i) {
                         line[x0 + c] = f(self.values.get(i));
                     }
@@ -568,11 +587,11 @@ impl SourceRead<'_> {
             return;
         }
         let res = if self.resampling == Resampling::Average {
-            gdal_average(self, w.req_off, (fx, fy, fw, fh), (ow, oh))
+            gdal_average_with_origin(self, w.req_off, (fx, fy, fw, fh), (ow, oh), None, r0..r1)
         } else {
-            resample_window(self, (fx, fy, fw, fh), (ow, oh))
+            resample_window(self, (fx, fy, fw, fh), (ow, oh), r0..r1)
         };
-        crate::par::chunks_mut(rows, dw, |r, line| {
+        crate::par::chunks_mut(lines, dw, |r, line| {
             for c in 0..ow {
                 match res[r * ow + c] {
                     Some(v) => line[x0 + c] = f(if self.working_float { v } else { convert_value(v, self.src_type) }),
@@ -584,6 +603,45 @@ impl SourceRead<'_> {
                 }
             }
         });
+    }
+
+    /// The window of a whole read of `dw × dh` pixels, and the rows `r0..r1` of its output block
+    /// (from `out_off.1`) among the destination rows `rows`; `None` when it draws none of them.
+    fn rows_window(&self, dw: usize, dh: usize, rows: &std::ops::Range<usize>) -> Option<(Window, usize, usize)> {
+        let w = self.window(dw as f64, dh as f64, dw, dh)?;
+        let (ow, oh) = w.out_size;
+        if ow == 0 || oh == 0 {
+            return None;
+        }
+        let first = w.out_off.1.max(rows.start);
+        let last = (w.out_off.1 + oh).min(rows.end).min(dh);
+        if first >= last {
+            return None;
+        }
+        let off = w.out_off.1;
+        Some((w, first - off, last - off))
+    }
+
+    /// The source rows a read of the destination rows `rows` of a whole read of `dw × dh`
+    /// pixels ([`Self::read_rows`]) uses: `None` when it uses none. Only the window's
+    /// geometry is used, not `values`.
+    pub fn source_rows(&self, dw: usize, dh: usize, rows: std::ops::Range<usize>) -> Option<std::ops::Range<usize>> {
+        let (w, r0, r1) = self.rows_window(dw, dh, &rows)?;
+        let (ow, oh) = w.out_size;
+        let range = if w.req_size.0 == ow && w.req_size.1 == oh {
+            w.req_off.1 + r0..(w.req_off.1 + r1).min(self.height)
+        } else {
+            let (fx, fy, fw, fh) = (w.dreq_off.0, w.dreq_off.1, w.dreq_size.0, w.dreq_size.1);
+            match self.resampling {
+                Resampling::Nearest => {
+                    let incy = fh / oh as f64;
+                    nearest_row(r0, fy, incy, self.height)..nearest_row(r1 - 1, fy, incy, self.height) + 1
+                }
+                Resampling::Average => gdal_average_rows(self, w.req_off, (fw / ow as f64, fh / oh as f64), (ow, oh), r0..r1),
+                _ => resample_rows(self, (fx, fy, fw, fh), (ow, oh), r0..r1),
+            }
+        };
+        (range.start < range.end).then_some(range)
     }
 
     /// How a read of the whole destination of `dw × dh` pixels copies source pixels, when it
@@ -742,6 +800,15 @@ impl SourceRead<'_> {
     }
 }
 
+/// The epsilon of GDAL's nearest-neighbour source positions.
+const NEAREST_EPS: f64 = 1e-10;
+
+/// The source row of output row `r` (from the window's output offset) of a nearest-neighbour
+/// read at source rows `fy + incy * (r + 0.5)`, as GDAL rounds it.
+fn nearest_row(r: usize, fy: f64, incy: f64, height: usize) -> usize {
+    ((r as f64 + 0.5) * incy + fy + NEAREST_EPS).max(0.0).min((height - 1) as f64) as usize
+}
+
 /// A read of source pixels one for one ([`SourceRead::plain_copy`]): source pixel
 /// `(src.0 + c, src.1 + r)` goes to destination pixel `(dst_x + c, dst_rows.start + r)`, for `c`
 /// below `cols`.
@@ -866,26 +933,44 @@ fn gdal_chunks(
     chunks
 }
 
+/// The source rows [`gdal_average_with_origin`] reads for the output rows `rows`: those of the
+/// chunks the rows are in, whose validity decides how all their pixels are averaged.
+fn gdal_average_rows(
+    s: &SourceRead,
+    req_off: (usize, usize),
+    ratio: (f64, f64),
+    out: (usize, usize),
+    rows: std::ops::Range<usize>,
+) -> std::ops::Range<usize> {
+    let (mut y0, mut y1) = (usize::MAX, 0);
+    for (dst, src) in gdal_chunks(s, req_off, ratio, out, 0) {
+        if dst[1] < rows.end && rows.start < dst[1] + dst[3] {
+            y0 = y0.min(src[1]);
+            y1 = y1.max(src[3]);
+        }
+    }
+    if y0 >= y1 { 0..0 } else { y0..y1 }
+}
+
 /// Averages a source window into `out` pixels with the arithmetic of GDAL's overview code
 /// (`GDALResampleChunk_AverageOrRMS_T()`, through `GDALRasterBand::RasterIOResampled()`): per
 /// chunk, a weighted sum scaled by the pixel count where the chunk has no nodata pixel (and, at a
 /// factor of two, GDAL's sum of quarters in the work type), a sum over the valid pixels otherwise,
-/// in the work type of the source's data type; `None` where no pixel is valid.
-pub(crate) fn gdal_average(s: &SourceRead, req_off: (usize, usize), win: (f64, f64, f64, f64), out: (usize, usize)) -> Vec<Option<f64>> {
-    gdal_average_with_origin(s, req_off, win, out, None)
-}
-
-/// Average with an explicit RasterIO reference frame, preserving virtual-output offsets.
+/// in the work type of the source's data type; `None` where no pixel is valid. `origin` gives an
+/// explicit RasterIO reference frame, preserving virtual-output offsets. Only the output rows
+/// `rows` (of `out.1`) are computed, `rows.len()` rows of `out.0` values, each as for the whole
+/// output.
 pub(crate) fn gdal_average_with_origin(
     s: &SourceRead,
     req_off: (usize, usize),
     win: (f64, f64, f64, f64),
     out: (usize, usize),
     origin: Option<[f64; 8]>,
+    rows: std::ops::Range<usize>,
 ) -> Vec<Option<f64>> {
     let (fx, fy, fw, fh) = win;
     let (ow, oh) = out;
-    let mut res = vec![None; ow * oh];
+    let mut res = vec![None; ow * rows.len()];
     if ow == 0 || oh == 0 {
         return res;
     }
@@ -911,10 +996,15 @@ pub(crate) fn gdal_average_with_origin(
         Some(nd) if v == wt.cast(nd) => wt.nodata_replacement(nd),
         _ => v,
     };
-    let val = |x: usize, y: usize| wt.cast(s.values.get(y * s.width + x));
-    let valid = |x: usize, y: usize| s.valid.is_none_or(|m| m[y * s.width + x]);
+    let val = |x: usize, y: usize| wt.cast(s.values.get(s.at(x, y)));
+    let valid = |x: usize, y: usize| s.valid.is_none_or(|m| m[s.at(x, y)]);
     for (dst, src) in gdal_chunks(s, req_off, ratio, out, 0) {
         let [dx0, dy0, nx, ny] = dst;
+        // Chunks outside the rows read: the whole output's chunks, so that each pixel is computed
+        // as for the whole output (the chunk's validity decides how it is averaged).
+        if dy0 >= rows.end || dy0 + ny <= rows.start {
+            continue;
+        }
         let [cx0, cy0, cx1, cy1] = src;
         // GDAL reads the chunk's mask: all valid, it averages without one; none valid, nodata.
         let mut any_valid = false;
@@ -969,7 +1059,7 @@ pub(crate) fn gdal_average_with_origin(
         // Absolute source coordinates of request-relative ones.
         let ax = |x: i64| (x - source_origin.0) as usize;
         let ay = |y: i64| (y - source_origin.1) as usize;
-        for j in dy0..dy0 + ny {
+        for j in dy0.max(rows.start)..(dy0 + ny).min(rows.end) {
             let a = delta.1 + (j as f64 + o[1]) * ratio.1;
             let y0 = ((a + 1e-8) as i64).max(ry0);
             let b = delta.1 + (j as f64 + o[1] + 1.) * ratio.1;
@@ -978,7 +1068,7 @@ pub(crate) fn gdal_average_with_origin(
                 y1 += 1;
             }
             y1 = y1.min(ry1);
-            let line = &mut res[j * ow..(j + 1) * ow];
+            let line = &mut res[(j - rows.start) * ow..(j - rows.start + 1) * ow];
             if spacing_two && y1 == y0 + 2 && !masked {
                 // A factor of two without nodata.
                 let (r0, r1) = (ay(y0), ay(y0 + 1));
@@ -1114,13 +1204,66 @@ pub(crate) fn gdal_average_with_origin(
 /// Resamples a floating-point source window to `out` pixels as GDAL's overview code does
 /// (`GDALRasterIOResampled()`): separable convolution kernels stretched when downsampling,
 /// coverage-weighted averages, or the most frequent value.
-fn resample_window(s: &SourceRead, win: (f64, f64, f64, f64), out: (usize, usize)) -> Vec<Option<f64>> {
+/// The source rows `[start, stop)` of output row `r` of an area method: the rows its footprint
+/// `fy + r * ry .. + ry` overlaps.
+fn area_rows(r: usize, fy: f64, ry: f64, height: usize) -> (usize, usize) {
+    let y0 = fy + r as f64 * ry;
+    let y1 = y0 + ry;
+    let iy0 = (y0 + 1e-8).floor().max(0.0) as usize;
+    let iy1 = ((y1 - 1e-8).ceil() as usize).min(height).max(iy0 + 1).min(height);
+    (iy0, iy1)
+}
+
+/// The kernel taps of output pixel `dst` along an axis of `size` source pixels: the first source
+/// pixel, the number of taps and the kernel's scale and centre.
+fn kernel_taps(method: Resampling, dst: usize, ratio: f64, off: f64, size: usize) -> (usize, usize, f64, f64) {
+    let radius = method.radius().max(1) as f64;
+    let center = (dst as f64 + 0.5) * ratio + off;
+    let scale = if 1.0 / ratio >= 1.0 { 1.0 } else { 1.0 / ratio };
+    let r = radius / scale;
+    let start = ((center - r + 0.5).floor() as i64).max(0) as usize;
+    let stop = ((center + r + 0.5) as i64).min(size as i64).max(start as i64) as usize;
+    (start, stop - start, scale, center)
+}
+
+/// The source rows [`resample_window`] reads for the output rows `rows` (of `out.1`).
+fn resample_rows(s: &SourceRead, win: (f64, f64, f64, f64), out: (usize, usize), rows: std::ops::Range<usize>) -> std::ops::Range<usize> {
+    let (_, fy, _, fh) = win;
+    let ry = fh / out.1 as f64;
+    let (mut y0, mut y1) = (usize::MAX, 0);
+    for r in [rows.start, rows.end - 1] {
+        let area = matches!(
+            s.resampling,
+            Resampling::Average
+                | Resampling::Rms
+                | Resampling::Mode
+                | Resampling::Min
+                | Resampling::Max
+                | Resampling::Med
+                | Resampling::Q1
+                | Resampling::Q3
+                | Resampling::Sum
+        );
+        let (a, b) = if area {
+            area_rows(r, fy, ry, s.height)
+        } else {
+            let (start, taps, _, _) = kernel_taps(s.resampling, r, ry, fy, s.height);
+            (start, start + taps)
+        };
+        y0 = y0.min(a);
+        y1 = y1.max(b);
+    }
+    if y0 >= y1 { 0..0 } else { y0..y1 }
+}
+
+/// [`resample_window`]'s output rows `rows` (of `out.1`), `rows.len()` rows of `out.0` values.
+fn resample_window(s: &SourceRead, win: (f64, f64, f64, f64), out: (usize, usize), rows: std::ops::Range<usize>) -> Vec<Option<f64>> {
     let (fx, fy, fw, fh) = win;
     let (ow, oh) = out;
     let (rx, ry) = (fw / ow as f64, fh / oh as f64);
     let is_valid = |i: usize| s.valid.is_none_or(|m| m[i]);
-    let mut res = vec![None; ow * oh];
-    if ow == 0 {
+    let mut res = vec![None; ow * rows.len()];
+    if ow == 0 || oh == 0 {
         return res;
     }
     match s.resampling {
@@ -1133,7 +1276,8 @@ fn resample_window(s: &SourceRead, win: (f64, f64, f64, f64), out: (usize, usize
         | Resampling::Q1
         | Resampling::Q3
         | Resampling::Sum => {
-            crate::par::chunks_mut(&mut res, ow, |r, line| {
+            crate::par::chunks_mut(&mut res, ow, |k, line| {
+                let r = rows.start + k;
                 let mut vals: Vec<(f64, f64)> = Vec::new();
                 let y0 = fy + r as f64 * ry;
                 let y1 = y0 + ry;
@@ -1141,14 +1285,13 @@ fn resample_window(s: &SourceRead, win: (f64, f64, f64, f64), out: (usize, usize
                     let x0 = fx + c as f64 * rx;
                     let x1 = x0 + rx;
                     vals.clear();
-                    let iy0 = (y0 + 1e-8).floor().max(0.0) as usize;
-                    let iy1 = ((y1 - 1e-8).ceil() as usize).min(s.height).max(iy0 + 1).min(s.height);
+                    let (iy0, iy1) = area_rows(r, fy, ry, s.height);
                     let ix0 = (x0 + 1e-8).floor().max(0.0) as usize;
                     let ix1 = ((x1 - 1e-8).ceil() as usize).min(s.width).max(ix0 + 1).min(s.width);
                     for y in iy0..iy1 {
                         let wy = (y1.min(y as f64 + 1.0) - y0.max(y as f64)).max(0.0);
                         for x in ix0..ix1 {
-                            let i = y * s.width + x;
+                            let i = s.at(x, y);
                             if !is_valid(i) {
                                 continue;
                             }
@@ -1164,26 +1307,21 @@ fn resample_window(s: &SourceRead, win: (f64, f64, f64, f64), out: (usize, usize
             });
         }
         method => {
-            let radius = method.radius().max(1) as f64;
             let taps = |dst: usize, ratio: f64, off: f64, size: usize| -> (usize, Vec<f64>) {
-                let center = (dst as f64 + 0.5) * ratio + off;
-                let scale = if 1.0 / ratio >= 1.0 { 1.0 } else { 1.0 / ratio };
-                let r = radius / scale;
-                let start = ((center - r + 0.5).floor() as i64).max(0) as usize;
-                let stop = ((center + r + 0.5) as i64).min(size as i64).max(start as i64) as usize;
-                let w = (start..stop).map(|p| method.weight(scale * (p as f64 - center + 0.5))).collect();
+                let (start, n, scale, center) = kernel_taps(method, dst, ratio, off, size);
+                let w = (start..start + n).map(|p| method.weight(scale * (p as f64 - center + 0.5))).collect();
                 (start, w)
             };
             let xt: Vec<(usize, Vec<f64>)> = (0..ow).map(|c| taps(c, rx, fx, s.width)).collect();
             let negative_weights = matches!(method, Resampling::Cubic | Resampling::Lanczos);
-            crate::par::chunks_mut(&mut res, ow, |r, line| {
-                let (y0, wys) = taps(r, ry, fy, s.height);
+            crate::par::chunks_mut(&mut res, ow, |k, line| {
+                let (y0, wys) = taps(rows.start + k, ry, fy, s.height);
                 for c in 0..ow {
                     let (x0, wxs) = &xt[c];
                     let (mut acc, mut wsum) = (0.0, 0.0);
                     let mut nan = false;
                     for (j, wy) in wys.iter().enumerate() {
-                        let row = (y0 + j) * s.width;
+                        let row = s.at(0, y0 + j);
                         // GDAL filters rows first, adding `value * weight * mask` for every
                         // pixel: an infinite nodata value (weight 0) makes the row NaN, and a
                         // NaN row the result, unless the row has no valid pixel (or too few
@@ -1409,6 +1547,7 @@ mod tests {
             valid: None,
             width: 4,
             height: 4,
+            row0: 0,
             src_type: DataType::F32,
             src_rect: [0.0, 0.0, 4.0, 4.0],
             dst_rect: [2.0, 1.0, 4.0, 4.0],

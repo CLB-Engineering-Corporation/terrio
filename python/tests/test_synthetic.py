@@ -402,6 +402,27 @@ def test_warp_and_mosaic_paths_are_streamed(tmp_path):
     np.testing.assert_array_equal(m.read(), ref.read())
 
 
+@pytest.mark.parametrize("resampling", ["near", "bilinear", "cubic", "average", "mode"])
+def test_resampled_mosaic_path_equals_the_whole_mosaic(tmp_path, resampling):
+    """Sources at fractional offsets and resolutions are mosaicked to a path a strip at a time,
+    bit for bit as the whole mosaic in memory."""
+    rows, cols = np.mgrid[0:90, 0:70]
+    data = ((rows * 7 + cols * 13) % 251).astype("float32") + 0.25
+    data[30:33, 10:50] = -9999
+    srcs = []
+    for i, (dx, dy, res) in enumerate([(0.0, 0.0, 10.0), (37.3, -21.9, 14.6), (-12.7, 8.1, 6.3)]):
+        t = (TRANSFORM[0] + dx, res, 0.0, TRANSFORM[3] + dy, 0.0, -res)
+        path = str(tmp_path / f"s{i}.tif")
+        terrio.Raster.from_array(data[i:, : 70 - i].copy(), t, crs="EPSG:32610", nodata=-9999).write(path)
+        srcs.append(path)
+    ref = terrio.mosaic([terrio.open_raster(p) for p in srcs], resolution="highest", resampling=resampling)
+    out = terrio.mosaic(srcs, str(tmp_path / "m.tif"), resolution="highest", resampling=resampling)
+    assert out.is_lazy
+    a, b = np.asarray(out.read()), np.asarray(ref.read())
+    assert a.shape == b.shape and a.tobytes() == b.tobytes()
+    assert out.transform == ref.transform and out.nodata == ref.nodata
+
+
 def test_calc_numpy_typing():
     """Checks that calc follows NumPy's typing rules, as gdal_calc.py does."""
     a = np.array([[200, 3], [0, 100]], dtype="uint8")
