@@ -160,7 +160,7 @@ pub fn run(a: Args) -> terrio::Result<()> {
         (None, Some(product)) if same_file(input, output) => return a.out.write(&dem(&open(input)?, product, &o)?, output),
         (None, Some(product)) => {
             let mut src = open_lazy(input)?;
-            return super::quiet(|| dem_to_path(&mut src, product, &o, output, &a.out.options()?)).map_err(flag_names);
+            return super::quiet(|| dem_to_path(&mut src, product, &o, output, &a.out.options()?)).map_err(cli_flag_names);
         }
         (Some(colors), None) => colors,
         _ => unreachable!("color-relief alone takes a color file"),
@@ -170,8 +170,8 @@ pub fn run(a: Args) -> terrio::Result<()> {
     // A color relief a strip at a time, without holding the DEM or the output whole.
     if !vrt && !same_file(input, output) {
         let mut src = open_lazy(input)?;
-        let map = ColorMap::parse_lazy(&text, &mut src, o.band, pam_statistics(input, o.band), o.max_memory_mib).map_err(flag_names)?;
-        return super::quiet(|| color_relief_to_path(&mut src, &map, &o, output, &a.out.options()?)).map_err(flag_names);
+        let map = ColorMap::parse_lazy(&text, &mut src, o.band, pam_statistics(input, o.band), o.max_memory_mib).map_err(cli_flag_names)?;
+        return super::quiet(|| color_relief_to_path(&mut src, &map, &o, output, &a.out.options()?)).map_err(cli_flag_names);
     }
     let ds = open(input)?;
     let map = ColorMap::parse(&text, &ds, o.band, pam_statistics(input, o.band))?;
@@ -183,7 +183,7 @@ pub fn run(a: Args) -> terrio::Result<()> {
 
 /// The library's refusals of a memory budget under the CLI's flag name: `same_file` above compares
 /// paths, so an output that is a hard link to the input is refused by the library instead.
-fn flag_names(e: Error) -> Error {
+fn cli_flag_names(e: Error) -> Error {
     match e {
         Error::InvalidArgument(m) => Error::InvalidArgument(m.replace("max_memory_mib", "--max-memory")),
         e => e,
