@@ -392,6 +392,32 @@ fn quadrilateralized_spherical_cube_coordinates_through_mcp() {
 }
 
 #[test]
+fn healpix_and_rhealpix_coordinates_through_mcp() {
+    // rust-proj-capability's method-healpix and method-rhealpix fixtures (PROJ 9.9.0), forward
+    // and back.
+    for (target, x, y) in [
+        ("+proj=healpix +datum=WGS84 +units=m +no_defs", 16344055.09510788, -5009843.133575987),
+        ("+proj=rhealpix +datum=WGS84 +units=m +no_defs", -20009043.56085063, -8674831.599318739),
+    ] {
+        let (xs, ys) = (x.to_string(), y.to_string());
+        let replies = session(&[
+            call(1, "crs", &["OGC:CRS84", "--to", target, "147", "-42"]),
+            call(2, "crs", &[target, "--to", "OGC:CRS84", &xs, &ys]),
+        ]);
+        let values = |id: u64| -> Vec<f64> {
+            assert_eq!(replies[&id]["result"]["isError"], false);
+            replies[&id]["result"]["content"][0]["text"].as_str().unwrap().split_whitespace().filter_map(|v| v.parse().ok()).collect()
+        };
+        let forward = values(1);
+        assert_eq!(forward.len(), 2);
+        assert!((forward[0] - x).abs() < 0.001 && (forward[1] - y).abs() < 0.001, "{target} {forward:?}");
+        let inverse = values(2);
+        assert_eq!(inverse.len(), 2);
+        assert!((inverse[0] - 147.0).abs() < 1e-8 && (inverse[1] + 42.0).abs() < 1e-8, "{target} {inverse:?}");
+    }
+}
+
+#[test]
 fn vector_geometry_tools_are_discoverable_and_execute() {
     let dir = tempfile::tempdir().unwrap();
     let input = dir.path().join("line.geojson");

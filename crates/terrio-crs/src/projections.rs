@@ -100,6 +100,8 @@ pub(crate) fn build(name: &str, s: &mut Setup<'_>) -> Result<Option<Box<dyn Proj
         "geos" => Box::new(Geos::new(s)?),
         "robin" => Box::new(Robin),
         "moll" | "wag4" | "wag5" => Box::new(Moll::new(name)),
+        "healpix" => Box::new(Healpix::new(s, false)?),
+        "rhealpix" => Box::new(Healpix::new(s, true)?),
         "igh" => Box::new(Igh::new()?),
         "qsc" => Box::new(Qsc::new(s)),
         "wintri" => Box::new(Wintri::new(s)?),
@@ -3018,6 +3020,321 @@ impl Proj for Moll {
         }
         let twice = 2.0 * theta;
         Some((lam, aasin_checked((twice + twice.sin()) / self.cp)?))
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// HEALPix and rHEALPix, ported from PROJ's healpix.cpp (Raichev and Speth): the equal-area HEALPix
+// projection, cylindrical equal-area between the latitudes +-asin(2/3) and in four interrupted
+// polar caps beyond them, and rHEALPix, which combines each pole's caps into one square. On an
+// ellipsoid, as in PROJ, the latitude is the authalic one and the sphere has the authalic radius.
+
+/// PROJ's slack on the edges of the image.
+const HEALPIX_EPS: f64 = 1e-15;
+
+/// The rotations PROJ indexes by -3 to 3 (counterclockwise by that many right angles).
+fn healpix_rotation(index: i32) -> [[f64; 2]; 2] {
+    match index.rem_euclid(4) {
+        1 => [[0.0, -1.0], [1.0, 0.0]],
+        2 => [[-1.0, 0.0], [0.0, -1.0]],
+        3 => [[0.0, 1.0], [-1.0, 0.0]],
+        _ => [[1.0, 0.0], [0.0, 1.0]],
+    }
+}
+
+/// PROJ's `sign`: 1, -1 or 0.
+fn healpix_sign(v: f64) -> f64 {
+    if v > 0.0 {
+        1.0
+    } else if v < 0.0 {
+        -1.0
+    } else {
+        0.0
+    }
+}
+
+/// PROJ's `rotate`.
+fn healpix_rotate((x, y): (f64, f64), angle: f64) -> (f64, f64) {
+    (x * angle.cos() - y * angle.sin(), y * angle.cos() + x * angle.sin())
+}
+
+/// PROJ's `pnpoly`: whether the point is inside the polygon (or one of its vertices). As in
+/// PROJ, the edge from the last vertex back to the first is not counted.
+fn healpix_pnpoly(vert: &[(f64, f64)], x: f64, y: f64) -> bool {
+    if vert.iter().any(|&(vx, vy)| x == vx && y == vy) {
+        return true;
+    }
+    let mut counter = 0;
+    let mut p1 = vert[0];
+    for &p2 in &vert[1..] {
+        if y > p1.1.min(p2.1) && y <= p1.1.max(p2.1) && x <= p1.0.max(p2.0) && p1.1 != p2.1 {
+            let xinters = (y - p1.1) * (p2.0 - p1.0) / (p2.1 - p1.1) + p1.0;
+            if p1.0 == p2.0 || x <= xinters {
+                counter += 1;
+            }
+        }
+        p1 = p2;
+    }
+    counter % 2 == 1
+}
+
+/// PROJ's `healpix_sphere`: HEALPix on the unit sphere.
+fn healpix_sphere(lam: f64, phi: f64) -> (f64, f64) {
+    let phi0 = (2.0f64 / 3.0).asin();
+    if phi.abs() <= phi0 {
+        (lam, 3.0 * PI / 8.0 * phi.sin())
+    } else {
+        let sigma = (3.0 * (1.0 - phi.sin().abs())).sqrt();
+        let cn = (2.0 * lam / PI + 2.0).floor().min(3.0);
+        let lamc = -3.0 * FORTPI + HALFPI * cn;
+        (lamc + (lam - lamc) * sigma, healpix_sign(phi) * FORTPI * (2.0 - sigma))
+    }
+}
+
+/// PROJ's inverse of `healpix_sphere`.
+fn healpix_sphere_inverse(x: f64, y: f64) -> (f64, f64) {
+    if y.abs() <= FORTPI {
+        (x, (8.0 * y / (3.0 * PI)).asin())
+    } else if y.abs() < HALFPI {
+        let cn = (2.0 * x / PI + 2.0).floor().min(3.0);
+        let xc = -3.0 * FORTPI + HALFPI * cn;
+        let tau = 2.0 - 4.0 * y.abs() / PI;
+        (xc + (x - xc) / tau, healpix_sign(y) * (1.0 - tau * tau / 3.0).asin())
+    } else {
+        (-PI, healpix_sign(y) * HALFPI)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum HealpixRegion {
+    North,
+    South,
+    Equatorial,
+}
+
+/// The authalic latitude as PROJ 9.8.1 computes it on an ellipsoid.
+#[derive(Debug)]
+struct HealpixAuthalic {
+    /// Geodetic to authalic (`C[xi,phi]`), used when |n| < 0.01.
+    forward: Option<[f64; 6]>,
+    /// Authalic to geodetic (`C[phi,xi]`).
+    apa: [f64; 6],
+    e: f64,
+    one_es: f64,
+    qp: f64,
+}
+
+impl HealpixAuthalic {
+    /// PROJ's `pj_authalic_lat`.
+    fn forward(&self, phi: f64) -> f64 {
+        match &self.forward {
+            Some(c) => authlat(phi, c),
+            None => (qsfn(phi.sin(), self.e, self.one_es) / self.qp).clamp(-1.0, 1.0).asin(),
+        }
+    }
+
+    /// PROJ's `pj_authalic_lat_inverse`.
+    fn inverse(&self, beta: f64) -> f64 {
+        authlat_inverse(beta, &self.apa, self.e, self.one_es, self.qp)
+    }
+}
+
+#[derive(Debug)]
+struct Healpix {
+    /// rHEALPix's north and south polar square positions (0 to 3); `None` for HEALPix.
+    squares: Option<(i32, i32)>,
+    /// HEALPix's rotation of the image (`+rot_xy`), in radians.
+    rot_xy: f64,
+    /// `None` on a sphere.
+    authalic: Option<HealpixAuthalic>,
+    /// The authalic radius on the unit semi-major axis (1 on a sphere).
+    scale: f64,
+}
+
+impl Healpix {
+    fn new(s: &Setup<'_>, rhealpix: bool) -> Result<Self> {
+        let squares = if rhealpix {
+            // pj_param's integer: digits only (else an invalid value), then atoi, which reads a
+            // C long (saturating) and casts it to int.
+            let int = |key: &str| -> Result<i32> {
+                let v = s.p.str(key).unwrap_or("");
+                if !v.bytes().all(|b| b.is_ascii_digit()) {
+                    return Err(err(&format!("rhealpix: invalid {key}, it should be an integer")));
+                }
+                Ok(if v.is_empty() { 0 } else { v.parse::<i64>().unwrap_or(i64::MAX) as i32 })
+            };
+            let (north, south) = (int("north_square")?, int("south_square")?);
+            if !(0..=3).contains(&north) {
+                return Err(err("rhealpix: invalid north_square, it should be in [0,3]"));
+            }
+            if !(0..=3).contains(&south) {
+                return Err(err("rhealpix: invalid south_square, it should be in [0,3]"));
+            }
+            Some((north, south))
+        } else {
+            None
+        };
+        let rot_xy = if rhealpix { 0.0 } else { s.p.angle("rot_xy").unwrap_or(0.0) };
+        let (authalic, scale) = if s.ell.es != 0.0 {
+            let (e, one_es) = (s.ell.e, s.ell.one_es);
+            let b = one_es.sqrt();
+            let n = (1.0 - b) / (1.0 + b);
+            let qp = qsfn(1.0, e, one_es);
+            let forward = (n.abs() < 0.01).then(|| authset_forward(s.ell.es));
+            (Some(HealpixAuthalic { forward, apa: authset(s.ell.es), e, one_es, qp }), (0.5 * qp).sqrt())
+        } else {
+            (None, 1.0)
+        };
+        Ok(Self { squares, rot_xy, authalic, scale })
+    }
+
+    /// PROJ's `in_image`.
+    fn in_image(&self, x: f64, y: f64) -> bool {
+        let e = HEALPIX_EPS;
+        match self.squares {
+            None => {
+                let verts = [
+                    (-PI - e, FORTPI),
+                    (-3.0 * FORTPI, HALFPI + e),
+                    (-HALFPI, FORTPI + e),
+                    (-FORTPI, HALFPI + e),
+                    (0.0, FORTPI + e),
+                    (FORTPI, HALFPI + e),
+                    (HALFPI, FORTPI + e),
+                    (3.0 * FORTPI, HALFPI + e),
+                    (PI + e, FORTPI),
+                    (PI + e, -FORTPI),
+                    (3.0 * FORTPI, -HALFPI - e),
+                    (HALFPI, -FORTPI - e),
+                    (FORTPI, -HALFPI - e),
+                    (0.0, -FORTPI - e),
+                    (-FORTPI, -HALFPI - e),
+                    (-HALFPI, -FORTPI - e),
+                    (-3.0 * FORTPI, -HALFPI - e),
+                    (-PI - e, -FORTPI),
+                    (-PI - e, FORTPI),
+                ];
+                healpix_pnpoly(&verts, x, y)
+            }
+            Some((north, south)) => {
+                let (north, south) = (north as f64, south as f64);
+                let verts = [
+                    (-PI - e, FORTPI + e),
+                    (-PI + north * HALFPI - e, FORTPI + e),
+                    (-PI + north * HALFPI - e, 3.0 * FORTPI + e),
+                    (-PI + (north + 1.0) * HALFPI + e, 3.0 * FORTPI + e),
+                    (-PI + (north + 1.0) * HALFPI + e, FORTPI + e),
+                    (PI + e, FORTPI + e),
+                    (PI + e, -FORTPI - e),
+                    (-PI + (south + 1.0) * HALFPI + e, -FORTPI - e),
+                    (-PI + (south + 1.0) * HALFPI + e, -3.0 * FORTPI - e),
+                    (-PI + south * HALFPI - e, -3.0 * FORTPI - e),
+                    (-PI + south * HALFPI - e, -FORTPI - e),
+                    (-PI - e, -FORTPI - e),
+                ];
+                healpix_pnpoly(&verts, x, y)
+            }
+        }
+    }
+
+    /// PROJ's `get_cap`: the polar cap's number, its tip and the region of a point of the HEALPix
+    /// image (forward), or of the rHEALPix image (inverse).
+    fn cap(x: f64, y: f64, north: i32, south: i32, inverse: bool) -> (i32, f64, f64, HealpixRegion) {
+        let e = HEALPIX_EPS;
+        if !inverse {
+            let (region, c) = if y > FORTPI {
+                (HealpixRegion::North, HALFPI)
+            } else if y < -FORTPI {
+                (HealpixRegion::South, -HALFPI)
+            } else {
+                return (0, x, y, HealpixRegion::Equatorial);
+            };
+            let (cn, cx) = if x < -HALFPI {
+                (0, -3.0 * FORTPI)
+            } else if x < 0.0 {
+                (1, -FORTPI)
+            } else if x < HALFPI {
+                (2, FORTPI)
+            } else {
+                (3, 3.0 * FORTPI)
+            };
+            (cn, cx, c, region)
+        } else if y > FORTPI {
+            let cx = -3.0 * FORTPI + north as f64 * HALFPI;
+            let x = x - north as f64 * HALFPI;
+            // The HEALPix cap that the point moves to when the polar square is taken apart.
+            let cn = if y >= -x - FORTPI - e && y < x + 5.0 * FORTPI - e {
+                (north + 1) % 4
+            } else if y > -x - FORTPI + e && y >= x + 5.0 * FORTPI - e {
+                (north + 2) % 4
+            } else if y <= -x - FORTPI + e && y > x + 5.0 * FORTPI + e {
+                (north + 3) % 4
+            } else {
+                north
+            };
+            (cn, cx, HALFPI, HealpixRegion::North)
+        } else if y < -FORTPI {
+            let cx = -3.0 * FORTPI + south as f64 * HALFPI;
+            let x = x - south as f64 * HALFPI;
+            let cn = if y <= x + FORTPI + e && y > -x - 5.0 * FORTPI + e {
+                (south + 1) % 4
+            } else if y < x + FORTPI - e && y <= -x - 5.0 * FORTPI + e {
+                (south + 2) % 4
+            } else if y >= x + FORTPI - e && y < -x - 5.0 * FORTPI - e {
+                (south + 3) % 4
+            } else {
+                south
+            };
+            (cn, cx, -HALFPI, HealpixRegion::South)
+        } else {
+            (0, x, y, HealpixRegion::Equatorial)
+        }
+    }
+
+    /// PROJ's `combine_caps`: HEALPix to rHEALPix (forward) or back (inverse).
+    fn combine_caps(x: f64, y: f64, north: i32, south: i32, inverse: bool) -> (f64, f64) {
+        let (cn, cx, cy, region) = Self::cap(x, y, north, south, inverse);
+        if region == HealpixRegion::Equatorial {
+            return (cx, cy);
+        }
+        let pole = if region == HealpixRegion::North { north } else { south };
+        // Forward, rotate about the cap's tip and move it to the polar square; inverse, undo it.
+        let turn = if (region == HealpixRegion::North) != inverse { cn - pole } else { -(cn - pole) };
+        let r = healpix_rotation(turn);
+        let (vx, vy) = (x - cx, y - cy);
+        let (dx, dy) = (r[0][0] * vx + r[0][1] * vy, r[1][0] * vx + r[1][1] * vy);
+        let ax = -3.0 * FORTPI + (if inverse { cn } else { pole }) as f64 * HALFPI;
+        let ay = if region == HealpixRegion::North { HALFPI } else { -HALFPI };
+        (dx + ax, dy + ay)
+    }
+}
+
+impl Proj for Healpix {
+    fn fwd(&self, lam: f64, phi: f64) -> Option<(f64, f64)> {
+        let phi = self.authalic.as_ref().map_or(phi, |a| a.forward(phi));
+        let (x, y) = healpix_sphere(lam, phi);
+        let (x, y) = match self.squares {
+            None => healpix_rotate((x, y), -self.rot_xy),
+            Some((north, south)) => Self::combine_caps(x, y, north, south, false),
+        };
+        Some((x * self.scale, y * self.scale))
+    }
+
+    fn inv(&self, x: f64, y: f64) -> Option<(f64, f64)> {
+        let (x, y) = (x / self.scale, y / self.scale);
+        let (x, y) = match self.squares {
+            None => healpix_rotate((x, y), self.rot_xy),
+            Some(_) => (x, y),
+        };
+        if !self.in_image(x, y) {
+            return None;
+        }
+        let (x, y) = match self.squares {
+            None => (x, y),
+            Some((north, south)) => Self::combine_caps(x, y, north, south, true),
+        };
+        let (lam, phi) = healpix_sphere_inverse(x, y);
+        Some((lam, self.authalic.as_ref().map_or(phi, |a| a.inverse(phi))))
     }
 }
 

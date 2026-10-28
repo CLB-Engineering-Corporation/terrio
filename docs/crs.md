@@ -710,3 +710,32 @@ The `method-qsc` fixture keeps its PROJ 9.9.0 oracle. A PROJ 9.8.1 corpus covers
 configurations and 4,288 samples (see Testing). Allowances are 1 mm projected and 1e-8 degrees
 inverse. At the point opposite the face centre the inverse is allowed 1e-5 degrees, and must
 project back within 1 mm.
+
+## HEALPix and rHEALPix
+
+`+proj=healpix` and `+proj=rhealpix` are computed as PROJ 9.8.1 does (`healpix.cpp`): an
+equal-area cylindrical projection between the latitudes of asin(2/3) and Collignon projections
+in the four polar caps on each side, which `healpix` leaves as triangles and `rhealpix` combines
+into one square at each pole. `+rot_xy` rotates the `healpix` image, in degrees; `+north_square`
+and `+south_square` (0 to 3, the default 0) pick the equatorial square below which `rhealpix`
+places each polar square, and other values are refused, as in PROJ. On an ellipsoid the
+latitude is the authalic latitude and the image is scaled by the authalic radius, as in PROJ
+9.8.1 (PROJ 9.4 differs by 0.18 m on WGS 84 at the south pole). `+lon_0`, `+units`,
+`+x_0` and `+y_0` apply. The inverse refuses points outside the image, as PROJ's does. As in
+PROJ, whose point-in-polygon test leaves out the polygon's closing edge, the `rhealpix` inverse
+accepts points left of the image between the polar squares, such as (-4, 0) on the unit sphere.
+
+GDAL's WKT1 (`custom_proj4`, which carries the PROJ string), ESRI's `PROJ_healpix` and
+`PROJ_rhealpix`, and PROJ's WKT2 methods `PROJ healpix` and `PROJ rhealpix` are read; terrio
+writes the WKT1 form, as GDAL does. PROJJSON with these methods is not read, and PROJJSON
+export refuses them, as for other projections without an EPSG method.
+
+On the edge of the image (the poles, the antimeridian of the central meridian and the edges of
+the polar caps) the last bit of a projected coordinate moves a point in or out of the image.
+There a US survey foot in the PROJ string's `+units` can decide it: PROJ 9.8.1 takes that unit
+in these methods' own `+units` as 0.304800609601219 m, and terrio, as PROJ's `unitconvert` for
+other methods, as 1200/3937 m.
+
+The `method-healpix` and `method-rhealpix` fixtures keep their PROJ 9.9.0 oracles. A PROJ
+9.8.1 corpus covers 22 configurations and 6,600 samples (see Testing). Allowances are 1 mm
+projected and 1e-8 degrees inverse.

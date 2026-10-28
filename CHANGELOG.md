@@ -152,6 +152,11 @@
   each of the six cube faces and on a sphere or an ellipsoid; it was refused.
   GDAL's and ESRI's WKT1 `Quadrilateralized_Spherical_Cube` and WKT2
   `Quadrilateralized Spherical Cube` are read, and the WKT1 form is written.
+- `+proj=healpix` and `+proj=rhealpix` are computed as PROJ does, with
+  `+rot_xy` and `+north_square`/`+south_square`; they were refused. On an
+  ellipsoid they use the authalic latitude, as PROJ 9.8.1. GDAL's WKT1 (which
+  carries the PROJ string), ESRI's `PROJ_healpix` and `PROJ_rhealpix` and WKT2
+  `PROJ healpix` and `PROJ rhealpix` are read, and the first is written.
 
 ### Warp
 

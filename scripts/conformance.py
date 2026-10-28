@@ -1172,6 +1172,30 @@ def suite_qsc(ctx):
     return suite
 
 
+def suite_healpix(ctx):
+    """HEALPix and rHEALPix, as PROJ strings and as GDAL's and ESRI's WKT, and their inverse refusals."""
+    suite = Suite("healpix", "HEALPix and rHEALPix", "GDAL/PROJ",
+                  "22 spherical/WGS84/flattened configurations (central meridians, rot_xy, polar squares, "
+                  "units and false offsets) and 6,600 geographic samples over the equatorial region, each "
+                  "side of the polar caps' edges and the poles, as PROJ strings, WKT2, WKT1 and ESRI WKT1; "
+                  "inverse refusals outside the image. Projected allowance 1 mm; inverse 1e-8 degrees, "
+                  "longitude weighted by cos(latitude).")
+    if missing_modules("osgeo"):
+        suite.skipped = "needs GDAL Python bindings"
+        return suite
+    code, out, err = run([sys.executable, str(SCRIPTS / "compare_healpix_with_gdal.py"), ctx.data, "--terrio", ctx.terrio, "--json"])
+    try:
+        cases = json.loads(out)
+    except json.JSONDecodeError:
+        suite.error = tail(err or out)
+        return suite
+    for case in cases:
+        suite.cases.append(Case("HEALPix and rHEALPix", case["name"], case["status"], case["detail"]))
+    if code and not any(c.status == DIFFERS for c in suite.cases):
+        suite.error = tail(err or out)
+    return suite
+
+
 def suite_projjson(ctx):
     """PROJJSON units, axes and bound transformations, with and without IDs."""
     suite = Suite("projjson", "PROJJSON CRS definitions", "GDAL/PROJ",
@@ -1932,6 +1956,7 @@ SUITES = OrderedDict(
         ("igh", suite_igh),
         ("ob_tran", suite_ob_tran),
         ("qsc", suite_qsc),
+        ("healpix", suite_healpix),
         ("projjson", suite_projjson),
         ("projjson-export", suite_projjson_export),
         ("iau", suite_iau),
