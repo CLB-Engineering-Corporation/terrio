@@ -26,6 +26,26 @@
 
 ### Formats
 
+- HEC-RAS geometry (`.g##.hdf`) and plan (`.p##.hdf`) HDF files are read as
+  vector layers (the `HECRAS` driver, the `hecras` feature, on by default), through the
+  [`ras-commander-fast-hdf`](https://crates.io/crates/ras-commander-fast-hdf)
+  engine: 2D mesh cells, cell centres, faces, face points and perimeters (with
+  the stored 2D flow area table); cross sections (with station-elevation,
+  Manning's n and ineffective areas as JSON fields), river lines, storage
+  areas, structures, boundary-condition lines, breaklines, refinement regions,
+  reference lines and points, junctions, pump stations, and pipe conduits and
+  nodes, each with its stored attribute columns. Stored results join through
+  open options (summary maxima and minima with their times, time-step values,
+  series extremes, cross-section, structure, boundary and reference results).
+  The CRS is the stored `Projection` WKT. A file is claimed only when its root
+  `File Type` is `HEC-RAS Geometry` or `HEC-RAS Results`; other HDF5 and
+  NetCDF files are not affected. Compared with h5py on the HEC-RAS 7.0.1 files
+  of a public corpus: every value identical. See `docs/hecras.md`.
+- `hdf5-reader` and `netcdf-reader` are the crates.io 0.10.1 releases; the
+  `[patch]` to a netcdf-rust branch is gone (its fix, roteiro-gis/netcdf-rust#95,
+  is in 0.10). The HEC-RAS engine uses the same `hdf5-reader`, so a build
+  compiles one HDF5 reader.
+
 - SRTM HGT tiles are read and written (the `SRTMHGT` driver), as GDAL's SRTMHGT
   driver does: 3", 1" and 0.5" tiles georeferenced from their name
   (`N37W120.hgt`), `.hgt.zip` archives, and the NASADEM and water body variants.
