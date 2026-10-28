@@ -194,18 +194,15 @@ engine's roadmap.
 
 The `hecras` feature is a default feature; build with `--no-default-features` (and the features you
 want) to leave it out. It implies `netcdf-hdf5`. Over the default features it adds one crate,
-the engine (its other dependencies are already terrio's). Measured on Windows x86-64, release,
-4 jobs (2026-10-24):
+the engine; its other dependencies, including the HDF5 reader, are already terrio's.
 
 | | Without `hecras` | With `hecras` | Difference |
 |---|---:|---:|---:|
-| `terrio` command-line binary | 51.6 MB | 54.9 MB | +3.3 MB (+6.5%) |
-| JavaScript module (`wasm-pack --release`, `wasm-opt`) | 22.3 MB | 24.6 MB | +2.3 MB (+10.4%) |
-| JavaScript module, gzipped | 7.28 MB | 7.82 MB | +0.54 MB (+7.5%) |
-| Engine crate compile time (clean build) | | 55 s | about 30 s on the critical path, as it builds alongside terrio's other dependencies | The engine embeds its own patched copy of
-`hdf5-reader`, so a build with `hecras` compiles two HDF5 readers; see
-[the upstream path to one reader](#one-hdf5-reader). The Python package and the JavaScript
-package's full module include it.
+| `terrio` command-line binary (Windows x86-64, release, 2026-10-28) | 69.4 MB | 72.0 MB | +2.6 MB (+3.8%) |
+| JavaScript module (`wasm-pack --release`, `wasm-opt`; 2026-10-24, when the engine still embedded a second HDF5 reader, so an upper bound) | 22.3 MB | 24.6 MB | +2.3 MB (+10.4%) |
+| JavaScript module, gzipped (same) | 7.28 MB | 7.82 MB | +0.54 MB (+7.5%) |
+
+The Python package and the JavaScript package's full module include it.
 
 ### One HDF5 reader
 
