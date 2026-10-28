@@ -174,8 +174,13 @@ lz4_flex = { opt-level = 3 }
 # read wrong. Fixed in roteiro-gis/netcdf-rust#95; until a release carries it, build against that
 # branch. All four crates come from the same commit so their shared types agree. (`cargo publish`
 # ignores this section: a published terrio uses the crates.io release.)
+# LERC_ENCODER needs lerc-writer's EncoderProfile (lerc-rust pull requests 48 and 49), not yet
+# released: build all three LERC crates from the same commit of that branch.
 [patch.crates-io]
 hdf5-core = { git = "https://github.com/gpt-cmdr/netcdf-rust", rev = "24ff6fcfcc79a35c30aa5d8cb3028ab4d9d00564" }
 hdf5-reader = { git = "https://github.com/gpt-cmdr/netcdf-rust", rev = "24ff6fcfcc79a35c30aa5d8cb3028ab4d9d00564" }
 netcdf-core = { git = "https://github.com/gpt-cmdr/netcdf-rust", rev = "24ff6fcfcc79a35c30aa5d8cb3028ab4d9d00564" }
 netcdf-reader = { git = "https://github.com/gpt-cmdr/netcdf-rust", rev = "24ff6fcfcc79a35c30aa5d8cb3028ab4d9d00564" }
+lerc-core = { git = "https://github.com/gpt-cmdr/lerc-rust", rev = "9c08d84549df627910201b8327c716804d92f6b1" }
+lerc-reader = { git = "https://github.com/gpt-cmdr/lerc-rust", rev = "9c08d84549df627910201b8327c716804d92f6b1" }
+lerc-writer = { git = "https://github.com/gpt-cmdr/lerc-rust", rev = "9c08d84549df627910201b8327c716804d92f6b1" }
