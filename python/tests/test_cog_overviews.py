@@ -157,3 +157,43 @@ def test_cog_overview_factors_match_gdal_reuse(tmp_path):
         for f in (2, 4, 8):
             shape = (1, -(-a.shape[0] // f), -(-a.shape[1] // f))
             np.testing.assert_array_equal(g.read(out_shape=shape), o.read(out_shape=shape))
+
+
+def test_area_matched_write_reports_the_area_ratios(tmp_path):
+    a = river()
+    a[100:180, 900:1000] = 7.0  # a pond away from the river
+    valid = int((a != -9999).sum())
+    for driver, kwargs, method in [
+        ("COG", {}, "area_matched"),
+        ("COG", {}, "area_matched_mode"),
+        ("GTiff", {"overviews": [2, 4]}, "area_matched"),
+    ]:
+        out = tmp_path / f"{driver}_{method}.tif"
+        report = raster(a).write(str(out), driver=driver, overview_resampling=method, **kwargs)
+        assert report["method"] == method
+        assert report["factors"] == [2, 4]
+        assert report["base_valid_pixels"] == [valid]
+        # Exactly the area the written levels keep, as ras2cng computes it from them.
+        expected = [
+            int((ov != -9999).sum()) * f * f / valid
+            for ov, f in zip(overviews(out), report["factors"], strict=True)
+        ]
+        assert report["area_ratios"] == [expected]
+    # Nothing to report for other overviews.
+    assert raster(a).write(str(tmp_path / "avg.tif"), driver="COG") is None
+    assert raster(a).write(str(tmp_path / "plain.tif")) is None
+
+
+def test_area_ratios_in_image_structure_metadata(tmp_path):
+    rasterio = pytest.importorskip("rasterio")
+    a = river()
+    out = tmp_path / "am.tif"
+    report = raster(a).write(str(out), driver="COG", overview_resampling="area_matched")
+    with rasterio.open(out) as src:
+        assert src.tags(ns="IMAGE_STRUCTURE")["OVERVIEW_RESAMPLING"] == "AREA_MATCHED"
+        tags = src.tags(ns="OVERVIEW_REPORT")
+        assert src.tags() == {"AREA_OR_POINT": "Area"}  # the default domain stays the caller's
+    assert tags["OVERVIEW_METHOD"] == "area_matched"
+    assert tags["OVERVIEW_FACTORS"] == "2,4"
+    assert [float(v) for v in tags["OVERVIEW_AREA_RATIOS"].split(",")] == report["area_ratios"][0]
+    assert int(tags["OVERVIEW_BASE_VALID_PIXELS"]) == report["base_valid_pixels"][0]

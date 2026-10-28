@@ -92,6 +92,13 @@ kept neighbours then a deterministic hash, and holds the mean of their valid pix
 categorical rasters, the lowest value on ties). It needs a nodata value. The algorithm and its
 output are ras2cng's `build_area_matched_overviews`.
 
+`write_raster_dataset_with_report` returns what was measured while building them, an
+`OverviewReport`: per band, the valid area each level keeps (kept cells × f² over the valid
+full-resolution pixels, ras2cng's `overview_area_ratios`) and the valid pixel count. The file
+carries the same values in the `OVERVIEW_REPORT` metadata domain (`OVERVIEW_METHOD`,
+`OVERVIEW_FACTORS`, `OVERVIEW_AREA_RATIOS`, `OVERVIEW_BASE_VALID_PIXELS`), which GDAL and rasterio
+read (`tags(ns="OVERVIEW_REPORT")`); Python's `Raster.write` returns the report as a dict.
+
 Overviews computed elsewhere are written as they are with `RasterWriteOptions::overview_data`
 (GDAL's `OVERVIEWS=FORCE_USE_EXISTING`): the levels of factors 2, 4, 8…, each of the raster's
 bands and data type and `ceil(cols / f) x ceil(rows / f)` pixels.

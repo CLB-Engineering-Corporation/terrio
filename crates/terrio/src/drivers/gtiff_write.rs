@@ -60,6 +60,9 @@ struct ChunkInfo {
     h: usize,
     spp: usize,
     t: DataType,
+    /// The width and height of the part of the chunk inside the image: less than `w` x `h` in a
+    /// partial tile at the right or bottom edge, whose other pixels are padding.
+    valid: (usize, usize),
 }
 
 impl Compression {
@@ -155,7 +158,9 @@ fn deflate_at(data: &[u8], level: Option<u8>) -> Result<Vec<u8>> {
 
 /// Encodes a chunk (little-endian samples, interleaved) as a LERC blob of `spp` values per pixel,
 /// as GDAL's LERC codec does. Floating-point chunks of one sample with NaNs get a mask of the
-/// valid pixels.
+/// valid pixels. As in GDAL, a floating-point chunk of one sample (one band, or `INTERLEAVE=BAND`)
+/// also masks the padding of a partial edge tile, so the padding costs no LERC blocks; integer
+/// and pixel-interleaved chunks keep it as zeros.
 #[cfg(feature = "lerc")]
 fn lerc_encode(data: &[u8], c: &ChunkInfo, max_z_error: f64) -> Result<Vec<u8>> {
     let lerc = |e: lerc_core::Error| Error::InvalidData(format!("LERC: {e}"));
@@ -176,7 +181,13 @@ fn lerc_encode(data: &[u8], c: &ChunkInfo, max_z_error: f64) -> Result<Vec<u8>> 
             if v.chunks_exact(c.spp).any(|px| px.iter().any(|x| x.is_nan()) && !px.iter().all(|x| x.is_nan())) {
                 return Err(Error::Unsupported("LERC: NaN in some bands of a pixel only (write with INTERLEAVE=BAND)".into()));
             }
-            let valid: Vec<u8> = v.chunks_exact(c.spp).map(|px| u8::from(!px.iter().all(|x| x.is_nan()))).collect();
+            let (vw, vh) = c.valid;
+            let pad = c.spp == 1 && (vw < c.w || vh < c.h);
+            let valid: Vec<u8> = v
+                .chunks_exact(c.spp)
+                .enumerate()
+                .map(|(i, px)| u8::from((!pad || (i % c.w < vw && i / c.w < vh)) && !px.iter().all(|x| x.is_nan())))
+                .collect();
             let raster = lerc_writer::RasterView::new(w, h, d, &v).map_err(lerc)?;
             if valid.contains(&0) {
                 // Masked pixels: their values are not stored.
@@ -881,13 +892,15 @@ pub(crate) struct Image {
     pub(crate) tiled: bool,
 }
 
-/// Writes a raster as a GeoTIFF or COG.
-pub(crate) fn write(raster: &Raster, path: &str, opts: &TiffOptions) -> Result<()> {
-    let images = prepare(raster, opts)?;
+/// Writes a raster as a GeoTIFF or COG. Returns what the writer measured of the area-matched
+/// overviews it built, if any.
+pub(crate) fn write(raster: &Raster, path: &str, opts: &TiffOptions) -> Result<Option<OverviewReport>> {
+    let mut images = prepare(raster, opts)?;
+    let report = images.report.take();
     let mut file = std::io::BufWriter::with_capacity(1 << 20, std::fs::File::create(path)?);
     images.write_to(&mut file)?;
     file.flush()?;
-    Ok(())
+    Ok(report)
 }
 
 /// Encodes a raster as a GeoTIFF or COG in memory.
@@ -902,6 +915,7 @@ struct Prepared {
     images: Vec<Image>,
     big: bool,
     cog: bool,
+    report: Option<OverviewReport>,
 }
 
 impl Prepared {
@@ -922,6 +936,11 @@ struct Plan {
 
 /// Checks the options against the raster (only its header is read) and plans the file.
 fn plan(raster: &Raster, opts: &TiffOptions) -> Result<Plan> {
+    plan_with(raster, opts, &[])
+}
+
+/// [`plan`], with metadata items measured while the overviews were built.
+fn plan_with(raster: &Raster, opts: &TiffOptions, measured: &[DomainItem]) -> Result<Plan> {
     if raster.cols == 0 || raster.rows == 0 || raster.bands == 0 {
         return Err(Error::InvalidArgument("cannot write an empty raster".into()));
     }
@@ -1029,16 +1048,18 @@ fn plan(raster: &Raster, opts: &TiffOptions) -> Result<Plan> {
                 Some(true) => "AREA_MATCHED_MODE",
                 None => opts.overview_resampling.gdal_name(),
             };
-            structure.push(("OVERVIEW_RESAMPLING", name.to_string()));
+            structure.push(("IMAGE_STRUCTURE", "OVERVIEW_RESAMPLING", name.to_string()));
         }
         if matches!(opts.compression, Compression::Lerc | Compression::LercDeflate | Compression::LercZstd) {
             if opts.codec.max_z_error > 0.0 {
-                structure.push(("MAX_Z_ERROR", format!("{}", opts.codec.max_z_error)));
+                structure.push(("IMAGE_STRUCTURE", "MAX_Z_ERROR", format!("{}", opts.codec.max_z_error)));
             } else {
-                structure.push(("COMPRESSION_REVERSIBILITY", "LOSSLESS".to_string()));
+                structure.push(("IMAGE_STRUCTURE", "COMPRESSION_REVERSIBILITY", "LOSSLESS".to_string()));
             }
         }
     }
+    // What the area-matched overviews measured (the valid area each level keeps), COG or not.
+    structure.extend(measured.iter().cloned());
     let mut geo = geo_tags(raster, opts.nodata, &opts.band_metadata, &metadata, &structure)?;
     if !opts.georeferenced || !opts.gcps.is_empty() || opts.geo_transform.is_some_and(|gt| !crate::is_north_up(&gt)) {
         geo.retain(|(tag, _)| !matches!(tag, 33550 | 33922));
@@ -1100,7 +1121,7 @@ pub(crate) fn georeferencing_tags(raster: &Raster, opts: &TiffOptions) -> Result
 }
 
 fn prepare(raster: &Raster, opts: &TiffOptions) -> Result<Prepared> {
-    let Plan { tile, layout, geo, color_map } = plan(raster, opts)?;
+    let Plan { tile, mut layout, mut geo, mut color_map } = plan(raster, opts)?;
     if let Some(m) = &opts.mask
         && m.len() != raster.cols * raster.rows
     {
@@ -1110,6 +1131,7 @@ fn prepare(raster: &Raster, opts: &TiffOptions) -> Result<Prepared> {
     // The full-resolution image, then overviews: those supplied, or a COG's until one fits in a
     // tile, or the factors asked for.
     let mut levels = vec![Level::from_raster(raster)];
+    let mut report = None;
     if !opts.supplied_overviews.is_empty() {
         levels.extend(supplied_levels(raster, opts)?);
     } else if let Some(categorical) = opts.area_matched {
@@ -1129,7 +1151,13 @@ fn prepare(raster: &Raster, opts: &TiffOptions) -> Result<Prepared> {
                 factors.len()
             }
         };
-        levels.extend(area_matched_levels(raster, opts, count, categorical)?);
+        let (computed, measured) = area_matched_levels(raster, opts, count, categorical)?;
+        levels.extend(computed);
+        if let Some(m) = measured {
+            // The tags of the full-resolution image carry what the levels measured.
+            Plan { tile: _, layout, geo, color_map } = plan_with(raster, opts, &m.metadata_items())?;
+            report = Some(m);
+        }
     } else if opts.no_overviews {
     } else if let (true, Some((t, _)), true) = (opts.cog, tile, opts.overviews.is_empty()) {
         let t = t as usize;
@@ -1211,7 +1239,7 @@ fn prepare(raster: &Raster, opts: &TiffOptions) -> Result<Prepared> {
 
     let data_len: u64 = images.iter().flat_map(|i| i.chunks.iter()).map(|c| c.len() as u64 + 8).sum();
     let big = opts.bigtiff || data_len > (u32::MAX as u64) - (1 << 24);
-    Ok(Prepared { images, big, cog: opts.cog })
+    Ok(Prepared { images, big, cog: opts.cog, report })
 }
 
 /// The number of overviews a COG of `cols` x `rows` pixels in tiles of `t` gets: until one fits in
@@ -1270,8 +1298,14 @@ fn supplied_levels<'a>(raster: &Raster, opts: &'a TiffOptions) -> Result<Vec<Lev
         .collect()
 }
 
-/// `count` area-matched overviews of a raster (see [`super::area_matched`]), each band on its own.
-fn area_matched_levels(raster: &Raster, opts: &TiffOptions, count: usize, categorical: bool) -> Result<Vec<Level<'static>>> {
+/// `count` area-matched overviews of a raster (see [`super::area_matched`]), each band on its own,
+/// and the valid area each level keeps (`None` without levels).
+fn area_matched_levels(
+    raster: &Raster,
+    opts: &TiffOptions,
+    count: usize,
+    categorical: bool,
+) -> Result<(Vec<Level<'static>>, Option<OverviewReport>)> {
     let nodata = opts.nodata.ok_or_else(|| {
         Error::InvalidArgument("area-matched overviews need a nodata value: the valid area is the pixels that are not nodata".into())
     })?;
@@ -1279,17 +1313,27 @@ fn area_matched_levels(raster: &Raster, opts: &TiffOptions, count: usize, catego
         return Err(Error::Unsupported("area-matched overviews are built for rasters without a mask, alpha or complex bands".into()));
     }
     if count == 0 {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), None));
     }
     let integral = !matches!(raster.data_type, DataType::F32 | DataType::F64);
     let n = raster.cols * raster.rows;
+    let mut report = OverviewReport {
+        method: if categorical { "area_matched_mode" } else { "area_matched" }.to_string(),
+        factors: (0..count).map(|k| 1usize << (k + 1)).collect(),
+        area_ratios: Vec::with_capacity(raster.bands),
+        base_valid_pixels: Vec::with_capacity(raster.bands),
+    };
     macro_rules! levels {
         ($($variant:ident),*) => {
             match &raster.data {
                 $(RasterData::$variant(v) => {
-                    let bands: Vec<_> = crate::par::map_range_coarse(raster.bands, |b| {
+                    let mut bands: Vec<_> = crate::par::map_range_coarse(raster.bands, |b| {
                         super::area_matched::area_matched_band(&v[b * n..(b + 1) * n], raster.cols, raster.rows, nodata, count, categorical, integral)
                     });
+                    for b in &mut bands {
+                        report.area_ratios.push(std::mem::take(&mut b.area_ratios));
+                        report.base_valid_pixels.push(b.base_valid);
+                    }
                     (0..count)
                         .map(|k| {
                             let (cols, rows) = overview_size(raster.cols, raster.rows, k, false);
@@ -1301,8 +1345,47 @@ fn area_matched_levels(raster: &Raster, opts: &TiffOptions, count: usize, catego
             }
         };
     }
-    Ok(levels!(U8, I8, U16, I16, U32, I32, U64, I64, F32, F64))
+    let levels = levels!(U8, I8, U16, I16, U32, I32, U64, I64, F32, F64);
+    Ok((levels, Some(report)))
 }
+
+/// What the writer measured of the area-matched overviews it built: per band, the valid area each
+/// level keeps, as ras2cng's `OverviewReport` records it. GeoTIFFs and COGs also carry it in
+/// their metadata, in the [`OVERVIEW_REPORT_DOMAIN`] domain (see [`OverviewReport::metadata_items`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct OverviewReport {
+    /// `area_matched` or `area_matched_mode`.
+    pub method: String,
+    /// The decimation factor of each level, from the largest level: 2, 4, 8...
+    pub factors: Vec<usize>,
+    /// Per band, per level: the kept cells times `factor^2` over the band's valid full-resolution
+    /// pixels (1.0 is the full-resolution valid area; 0.0 when the band has no valid pixel).
+    pub area_ratios: Vec<Vec<f64>>,
+    /// Per band, the valid (neither nodata nor NaN) full-resolution pixels.
+    pub base_valid_pixels: Vec<u64>,
+}
+
+impl OverviewReport {
+    /// The metadata items, of the [`OVERVIEW_REPORT_DOMAIN`] domain, the writer stores the report
+    /// in: `OVERVIEW_METHOD`, `OVERVIEW_FACTORS` (`2,4,8`), `OVERVIEW_AREA_RATIOS` (per level,
+    /// comma-separated, each in Rust's shortest round-trip form) and `OVERVIEW_BASE_VALID_PIXELS`.
+    /// With several bands, the bands' values are separated by `;`.
+    pub fn metadata_items(&self) -> Vec<(&'static str, &'static str, String)> {
+        let join = |v: &[f64]| v.iter().map(|r| format!("{r:?}")).collect::<Vec<_>>().join(",");
+        let d = OVERVIEW_REPORT_DOMAIN;
+        vec![
+            (d, "OVERVIEW_METHOD", self.method.clone()),
+            (d, "OVERVIEW_FACTORS", self.factors.iter().map(usize::to_string).collect::<Vec<_>>().join(",")),
+            (d, "OVERVIEW_AREA_RATIOS", self.area_ratios.iter().map(|b| join(b)).collect::<Vec<_>>().join(";")),
+            (d, "OVERVIEW_BASE_VALID_PIXELS", self.base_valid_pixels.iter().map(u64::to_string).collect::<Vec<_>>().join(";")),
+        ]
+    }
+}
+
+/// The GDAL metadata domain of the [`OverviewReport`] items in a GeoTIFF or COG (rasterio:
+/// `tags(ns="OVERVIEW_REPORT")`). GDAL's GeoTIFF reader exposes only the `IMAGE_STRUCTURE` items
+/// it knows, so the report has a domain of its own.
+pub const OVERVIEW_REPORT_DOMAIN: &str = "OVERVIEW_REPORT";
 
 /// GDAL's internal mask (`GDAL_TIFF_INTERNAL_MASK`): a 1-bit transparency mask image
 /// (`NewSubfileType` 4, `PhotometricInterpretation` 4) in the blocks of the image it masks
@@ -1328,7 +1411,8 @@ pub(crate) fn mask_image(mask: &[u8], cols: usize, rows: usize, block: (usize, u
                 }
             }
         }
-        compression.compress(buf, &ChunkInfo { w: chunk_w, h, spp: 1, t: DataType::U8 }, &CodecParams::default())
+        let valid = (chunk_w.min(cols - x0), h.min(rows - y0));
+        compression.compress(buf, &ChunkInfo { w: chunk_w, h, spp: 1, t: DataType::U8, valid }, &CodecParams::default())
     });
     let chunks = chunks.into_iter().collect::<Result<Vec<_>>>()?;
     let mut tags = vec![
@@ -1439,7 +1523,8 @@ impl<'a> Level<'a> {
                 with_data!(self.data.as_ref(), v => chunk_bytes(v, self.cols, self.rows, spp * parts, x0, y0, chunk_w, h))
             };
             apply_predictor(&mut buf, layout.predictor, chunk_w * chunk_spp, chunk_spp, size);
-            compression.compress(buf, &ChunkInfo { w: chunk_w, h, spp: chunk_spp, t }, codec)
+            let valid = (chunk_w.min(self.cols - x0), h.min(self.rows - y0));
+            compression.compress(buf, &ChunkInfo { w: chunk_w, h, spp: chunk_spp, t, valid }, codec)
         });
         let chunks = chunks.into_iter().collect::<Result<Vec<_>>>()?;
         let (bits, format) = sample_format(t);
@@ -1991,14 +2076,14 @@ fn pixel_is_point(r: &Raster) -> bool {
 }
 
 /// The georeferencing tags: pixel scale and tie point, GeoKeys, nodata and metadata.
-/// `metadata` holds the dataset items, `structure` the `IMAGE_STRUCTURE` items GDAL keeps in the
-/// same tag.
+/// `metadata` holds the dataset items, `structure` items of other domains (`IMAGE_STRUCTURE`...)
+/// GDAL keeps in the same tag.
 fn geo_tags(
     r: &Raster,
     nodata: Option<f64>,
     bands: &[crate::BandMetadata],
     metadata: &[(String, String)],
-    structure: &[(&str, String)],
+    structure: &[DomainItem],
 ) -> Result<Vec<(u16, Value)>> {
     let mut tags = vec![
         (33550, Value::Doubles(vec![r.cell_size_x, r.cell_size_y, 0.0])),
@@ -2079,15 +2164,18 @@ fn gdal_metadata_xml(dataset: &[(String, String)], bands: &[crate::BandMetadata]
     gdal_metadata_xml_with(dataset, bands, &[])
 }
 
-/// [`gdal_metadata_xml`] with items of GDAL's `IMAGE_STRUCTURE` domain, after the dataset ones as
-/// GDAL writes them.
-fn gdal_metadata_xml_with(dataset: &[(String, String)], bands: &[crate::BandMetadata], structure: &[(&str, String)]) -> Option<String> {
+/// A dataset metadata item of a domain other than the default one: `(domain, name, value)`.
+type DomainItem = (&'static str, &'static str, String);
+
+/// [`gdal_metadata_xml`] with items of other domains (GDAL's `IMAGE_STRUCTURE`...), after the
+/// dataset ones as GDAL writes them.
+fn gdal_metadata_xml_with(dataset: &[(String, String)], bands: &[crate::BandMetadata], structure: &[DomainItem]) -> Option<String> {
     let mut xml = String::from("<GDALMetadata>\n");
     let mut any = false;
-    let mut item = |name: &str, value: &str, sample: Option<usize>, role: Option<&str>| {
+    let mut item = |name: &str, value: &str, sample: Option<usize>, role: Option<&str>, domain: Option<&str>| {
         let mut attrs = format!("name=\"{}\"", xml_escape(name));
-        if role == Some("IMAGE_STRUCTURE") {
-            attrs.push_str(" domain=\"IMAGE_STRUCTURE\"");
+        if let Some(domain) = domain {
+            attrs.push_str(&format!(" domain=\"{}\"", xml_escape(domain)));
             xml.push_str(&format!("  <Item {attrs}>{}</Item>\n", xml_escape(&xml_escape(value))));
             any = true;
             return;
@@ -2105,29 +2193,29 @@ fn gdal_metadata_xml_with(dataset: &[(String, String)], bands: &[crate::BandMeta
         if k == "AREA_OR_POINT" {
             continue;
         }
-        item(k, v, None, None);
+        item(k, v, None, None, None);
     }
-    for (k, v) in structure {
-        item(k, v, None, Some("IMAGE_STRUCTURE"));
+    for (domain, k, v) in structure {
+        item(k, v, None, None, Some(domain));
     }
     for (i, b) in bands.iter().enumerate() {
         if let Some(v) = b.offset {
-            item("OFFSET", &format!("{v}"), Some(i), Some("offset"));
+            item("OFFSET", &format!("{v}"), Some(i), Some("offset"), None);
         }
         if let Some(v) = b.scale {
-            item("SCALE", &format!("{v}"), Some(i), Some("scale"));
+            item("SCALE", &format!("{v}"), Some(i), Some("scale"), None);
         }
         if let Some(v) = &b.unit {
-            item("UNITTYPE", v, Some(i), Some("unittype"));
+            item("UNITTYPE", v, Some(i), Some("unittype"), None);
         }
         if let Some(v) = &b.description {
-            item("DESCRIPTION", v, Some(i), Some("description"));
+            item("DESCRIPTION", v, Some(i), Some("description"), None);
         }
         for (k, v) in &b.items {
-            item(k, v, Some(i), None);
+            item(k, v, Some(i), None, None);
         }
         if let Some(v) = &b.color_interp {
-            item("COLORINTERP", v, Some(i), Some("colorinterp"));
+            item("COLORINTERP", v, Some(i), Some("colorinterp"), None);
         }
     }
     xml.push_str("</GDALMetadata>");
@@ -3315,6 +3403,11 @@ mod tests {
             (67, 93, 2, DataType::U8, true, Max, true, Compression::Deflate),
             (35, 131, 1, DataType::I16, false, Mode, false, Compression::Deflate),
             (33, 129, 2, DataType::U8, false, Nearest, true, Compression::None),
+            // LERC masks the padding of partial edge tiles of floating-point bands.
+            #[cfg(feature = "lerc")]
+            (70, 50, 1, DataType::F32, false, Average, false, Compression::Lerc),
+            #[cfg(feature = "lerc")]
+            (73, 127, 2, DataType::F32, true, Nearest, false, Compression::LercDeflate),
         ] {
             let cfg = wbraster::RasterConfig {
                 cols,
@@ -3435,7 +3528,7 @@ mod tests {
             let opts = TiffOptions::from_write_options(&options, false, None).unwrap().unwrap();
             let dir = tempfile::tempdir().unwrap();
             let p = dir.path().join("t.tif");
-            write(r, p.to_str().unwrap(), &opts).map(|()| crate::geotiff::read_geotiff(&p).unwrap())
+            write(r, p.to_str().unwrap(), &opts).map(|_| crate::geotiff::read_geotiff(&p).unwrap())
         };
         // Pixel 5 has a NaN in its first sample only: its second cannot be stored under a mask.
         let err = lerc(&r, "PIXEL").unwrap_err().to_string();
@@ -3450,6 +3543,106 @@ mod tests {
         let RasterData::F32(b) = &back.raster.data else { unreachable!() };
         assert!(b[0].is_nan() && b[band].is_nan());
         assert_eq!(b[5], 1.0);
+    }
+
+    /// GDAL (3.12) masks the padding of a partial edge tile in a LERC blob of one floating-point
+    /// sample per pixel, whatever the nodata; integer and pixel-interleaved blobs keep the padding
+    /// as unmasked zeros. Every codec stores zeros there. The pixels inside are unchanged.
+    #[cfg(feature = "lerc")]
+    #[test]
+    fn partial_tiles_are_padded_as_gdal() {
+        let (cols, rows, tile) = (21, 19, 16);
+        for (t, bands, planar, compression, nan) in [
+            (DataType::F32, 1, false, Compression::Lerc, false),
+            (DataType::F32, 1, false, Compression::Lerc, true),
+            (DataType::F64, 1, false, Compression::LercDeflate, false),
+            (DataType::F32, 2, true, Compression::Lerc, true),
+            (DataType::F32, 2, false, Compression::Lerc, false),
+            (DataType::I16, 1, false, Compression::Lerc, false),
+            (DataType::U8, 1, false, Compression::Lerc, false),
+            (DataType::F32, 1, false, Compression::Deflate, true),
+        ] {
+            let n = cols * rows * bands;
+            let value = |i: usize| if nan && i % cols < 3 && (i / cols) % rows < 2 { f64::NAN } else { (i % 89) as f64 + 1.5 };
+            let data = match t {
+                DataType::F32 => RasterData::F32((0..n).map(|i| value(i) as f32).collect()),
+                DataType::F64 => RasterData::F64((0..n).map(value).collect()),
+                DataType::I16 => RasterData::I16((0..n).map(|i| (i % 89) as i16 - 7).collect()),
+                _ => RasterData::U8((0..n).map(|i| (i % 89) as u8 + 1).collect()),
+            };
+            let level = Level { cols, rows, bands, data: std::borrow::Cow::Owned(data.clone()) };
+            let layout = Layout {
+                tile: Some((tile as u32, tile as u32)),
+                rows_per_strip: None,
+                planar,
+                photometric: 1,
+                extra: if bands > 1 && !planar { vec![0; bands - 1] } else { Vec::new() },
+                predictor: 1,
+                parts: 1,
+            };
+            let img = level.image(t, compression, &CodecParams::default(), &layout).unwrap();
+            let (across, down) = (cols.div_ceil(tile), rows.div_ceil(tile));
+            let spp = if planar { 1 } else { bands };
+            assert_eq!(img.chunks.len(), across * down * bands / spp);
+            let case = format!("{t:?} x{bands} planar {planar} {compression:?} nan {nan}");
+            for (k, chunk) in img.chunks.iter().enumerate() {
+                let (plane, j) = (k / (across * down), k % (across * down));
+                let (x0, y0) = ((j % across) * tile, (j / across) * tile);
+                let (vw, vh) = ((cols - x0).min(tile), (rows - y0).min(tile));
+                let blob = match compression {
+                    Compression::LercDeflate => {
+                        let mut d = Vec::new();
+                        std::io::Read::read_to_end(&mut flate2::read::ZlibDecoder::new(&chunk[..]), &mut d).unwrap();
+                        d
+                    }
+                    Compression::Deflate => {
+                        let mut d = Vec::new();
+                        std::io::Read::read_to_end(&mut flate2::read::ZlibDecoder::new(&chunk[..]), &mut d).unwrap();
+                        // Zeros in the padding; the pixels inside are the raster's.
+                        for (p, b) in d.as_chunks::<4>().0.iter().enumerate() {
+                            let (x, y, v) = (p % tile, p / tile, f32::from_le_bytes(*b));
+                            if x < vw && y < vh {
+                                let s = data.get_f64((y0 + y) * cols + x0 + x) as f32;
+                                assert!(v.to_bits() == s.to_bits(), "{case}: pixel {x},{y} of tile {k}");
+                            } else {
+                                assert!(v.to_bits() == 0, "{case}: padding {x},{y} of tile {k}");
+                            }
+                        }
+                        continue;
+                    }
+                    _ => chunk.clone(),
+                };
+                let d = lerc_reader::decode(&blob).unwrap();
+                let masks_padding = matches!(t, DataType::F32 | DataType::F64) && spp == 1;
+                let partial = vw < tile || vh < tile;
+                let values = d.pixels.to_f64();
+                for p in 0..tile * tile {
+                    let (x, y) = (p % tile, p / tile);
+                    let inside = x < vw && y < vh;
+                    let valid = d.mask.as_ref().is_none_or(|m| m[p] != 0);
+                    if !inside {
+                        assert_eq!(valid, !masks_padding, "{case}: padding {x},{y} of tile {k}");
+                        if valid {
+                            assert!((0..spp).all(|s| values[p * spp + s] == 0.0), "{case}: padding {x},{y} of tile {k}");
+                        }
+                        continue;
+                    }
+                    for s in 0..spp {
+                        let band = plane + s;
+                        let src = data.get_f64((band * rows + y0 + y) * cols + x0 + x);
+                        if src.is_nan() {
+                            assert!(!valid, "{case}: NaN at {x},{y} of tile {k}");
+                        } else {
+                            assert!(valid && values[p * spp + s] == src, "{case}: pixel {x},{y} of tile {k}");
+                        }
+                    }
+                }
+                // Blobs of whole tiles without NaN have no mask.
+                if !partial && !nan {
+                    assert!(d.mask.is_none(), "{case}: tile {k}");
+                }
+            }
+        }
     }
 
     #[test]
@@ -3570,13 +3763,13 @@ mod tests {
         for spp in [3, 4] {
             for length in [0, spp - 1, spp + 1, spp + 2] {
                 assert!(matches!(
-                    webp_encode(vec![0; length], &ChunkInfo { w: 1, h: 1, spp, t: DataType::U8 }, &CodecParams::default()),
+                    webp_encode(vec![0; length], &ChunkInfo { w: 1, h: 1, spp, t: DataType::U8, valid: (1, 1) }, &CodecParams::default()),
                     Err(Error::InvalidData(_))
                 ));
             }
         }
         for (w, h) in [(0, 1), (1, 0), (16384, 1), (1, 16384)] {
-            assert!(webp_encode(Vec::new(), &ChunkInfo { w, h, spp: 3, t: DataType::U8 }, &CodecParams::default()).is_err());
+            assert!(webp_encode(Vec::new(), &ChunkInfo { w, h, spp: 3, t: DataType::U8, valid: (w, h) }, &CodecParams::default()).is_err());
         }
     }
 
@@ -4663,6 +4856,102 @@ mod cog_option_tests {
         let p = dir.path().join("rows.tif");
         let o = TiffOptions::from_write_options(&with(&[], vec![2]), true, Some(-9999.0)).unwrap().unwrap();
         assert!(CogWriter::create(p.to_str().unwrap(), &r, &o).is_err());
+    }
+
+    #[test]
+    fn area_matched_report_is_the_valid_area_of_the_written_levels() {
+        // A diagonal river, a pond and a dry corner: levels that keep the valid area only roughly.
+        let (cols, rows) = (1500, 1100);
+        let wet = |x: usize, y: usize| (x as i64 - y as i64).abs() <= 2 || (x.abs_diff(1200) + y.abs_diff(300)) < 37;
+        let r = grid(cols, rows, DataType::F32, |x, y| if wet(x, y) { 1.0 + (x % 10) as f64 } else { -9999.0 });
+        let valid = (0..rows).flat_map(|y| (0..cols).map(move |x| (x, y))).filter(|(x, y)| wet(*x, *y)).count() as u64;
+        let read_valid = |p: &std::path::Path, i: usize| -> u64 {
+            let mut lazy = crate::open_raster_lazy(p.to_str().unwrap()).unwrap();
+            let (w, h) = lazy.overviews()[i];
+            let ds = lazy.read_window(crate::Window::full(w, h), &crate::WindowOptions { bands: vec![], overview: Some(i) }).unwrap();
+            match &ds.raster.data {
+                RasterData::F32(v) => v.iter().filter(|x| **x != -9999.0).count() as u64,
+                _ => unreachable!(),
+            }
+        };
+        let ds = crate::RasterDataset::new(r.clone(), true);
+        for (driver, overviews, method) in [
+            (crate::formats::RasterDriver::Cog, vec![], "area_matched"),
+            (crate::formats::RasterDriver::Cog, vec![], "area_matched_mode"),
+            (crate::formats::RasterDriver::GTiff, vec![2, 4], "area_matched"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let p = dir.path().join("am.tif");
+            let o = crate::RasterWriteOptions {
+                driver: Some(driver),
+                overviews,
+                overview_resampling: Some(method.into()),
+                ..Default::default()
+            };
+            let report = crate::write_raster_dataset_with_report(&ds, p.to_str().unwrap(), &o).unwrap().unwrap();
+            assert_eq!(report.method, method);
+            assert_eq!(report.factors, vec![2, 4]);
+            assert_eq!(report.base_valid_pixels, vec![valid]);
+            // Each ratio is what the written level holds, recomputed from the file.
+            for (i, f) in report.factors.iter().enumerate() {
+                let expected = (read_valid(&p, i) * (*f as u64).pow(2)) as f64 / valid as f64;
+                assert_eq!(report.area_ratios[0][i], expected, "{driver:?} {method} level {i}");
+            }
+            // And the file carries it, every value round-tripping.
+            let md = gdal_metadata(&p);
+            let item = |name: &str| -> String {
+                let open = format!(r#"<Item name="{name}" domain="OVERVIEW_REPORT">"#);
+                let start = md.find(&open).unwrap_or_else(|| panic!("{name} missing: {md}")) + open.len();
+                md[start..].split("</Item>").next().unwrap().to_string()
+            };
+            assert_eq!(item("OVERVIEW_FACTORS"), "2,4");
+            assert_eq!(item("OVERVIEW_BASE_VALID_PIXELS"), valid.to_string());
+            let ratios: Vec<f64> = item("OVERVIEW_AREA_RATIOS").split(',').map(|v| v.parse().unwrap()).collect();
+            assert_eq!(ratios, report.area_ratios[0]);
+            // The base image is untouched by the report's tags.
+            let back = crate::open_raster(p.to_str().unwrap()).unwrap();
+            assert_eq!(bits(&back.raster.data), bits(&r.data));
+        }
+        // No report for computed overviews of other methods, or for supplied levels.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("avg.tif");
+        let o = cog_options(&[]);
+        assert!(crate::write_raster_dataset_with_report(&ds, p.to_str().unwrap(), &o).unwrap().is_none());
+        assert!(!gdal_metadata(&p).contains("OVERVIEW_AREA_RATIOS"));
+    }
+
+    #[test]
+    fn area_matched_report_holds_every_band() {
+        let (cols, rows) = (1100, 700);
+        let cfg = wbraster::RasterConfig {
+            cols,
+            rows,
+            bands: 2,
+            x_min: 0.0,
+            y_min: 0.0,
+            cell_size: 1.0,
+            nodata: 0.0,
+            data_type: DataType::I16,
+            ..Default::default()
+        };
+        let n = cols * rows;
+        let v: Vec<i16> = (0..2 * n).map(|i| if i < n { ((i % cols) < 3) as i16 * 5 } else { ((i / cols) % 7 == 0) as i16 * 9 }).collect();
+        let r = Raster::from_data_native(cfg, RasterData::I16(v)).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("two.tif");
+        let o = crate::RasterWriteOptions {
+            driver: Some(crate::formats::RasterDriver::Cog),
+            overview_resampling: Some("area_matched".into()),
+            ..Default::default()
+        };
+        let report =
+            crate::write_raster_dataset_with_report(&crate::RasterDataset::new(r, true), p.to_str().unwrap(), &o).unwrap().unwrap();
+        assert_eq!(report.base_valid_pixels, vec![3 * rows as u64, 100 * cols as u64]);
+        assert_eq!(report.area_ratios.len(), 2);
+        let md = gdal_metadata(&p);
+        let band = |b: usize| report.area_ratios[b].iter().map(|r| format!("{r:?}")).collect::<Vec<_>>().join(",");
+        assert!(md.contains(&format!("{};{}", band(0), band(1))), "{md}");
+        assert!(md.contains(&format!(">{};{}<", 3 * rows, 100 * cols)), "{md}");
     }
 
     #[test]
