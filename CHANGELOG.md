@@ -17,6 +17,12 @@
   instead of holding a Float64 copy of the band and four Float64 output planes.
 - `dem_to_path` and `color_relief_to_path` read a DEM that is also the output whole first,
   instead of truncating it while it is read.
+- On Unix, an output that is a hard link to an input now counts as that input wherever an output
+  may replace its input: the DEM paths, `warp`, `mosaic`, `LazyRaster::write` and pansharpening
+  read the input whole first (or refuse, for a VRT output), as for the same path. On Windows, a
+  hard link is not detected.
+- `terrio dem` names `--max-memory`, not `max_memory_mib`, when it refuses a budget for an output
+  that is a hard link to the input.
 
 ### Formats
 
