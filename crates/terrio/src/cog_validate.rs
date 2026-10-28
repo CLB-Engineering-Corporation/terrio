@@ -70,7 +70,6 @@ struct Ifd {
     height: u64,
     subfile_type: u64,
     samples: u64,
-    planar: u64,
     /// Tile width and height, when tiled.
     tile: Option<(u64, u64)>,
     rows_per_strip: u64,
@@ -215,14 +214,16 @@ fn read_tiff<R: Read + Seek>(f: &mut R) -> Result<Option<Tiff>> {
         }
         let mut entries = vec![0u8; count as usize * entry_len];
         f.read_exact(&mut entries)?;
-        let mut ifd = Ifd { offset: next, samples: 1, planar: 1, rows_per_strip: u64::MAX, ..Default::default() };
+        let mut ifd = Ifd { offset: next, samples: 1, rows_per_strip: u64::MAX, ..Default::default() };
         let mut tile = (None, None);
         // (tag, type, offset, length) of each array stored outside its entry, and the inline values.
         let mut stored: Vec<(u16, u16, u64, usize)> = Vec::new();
         let mut values: Vec<(u16, u16, Vec<u8>)> = Vec::new();
         for entry in entries.chunks_exact(entry_len) {
             let tag = e.u16(&entry[0..2]);
-            if !matches!(tag, 254 | 256 | 257 | 273 | 277 | 278 | 279 | 284 | 322 | 323 | 324 | 325) {
+            // PlanarConfiguration (284) is not read: with separate planes, band 1's blocks come first
+            // in the offset array, so the first block search finds the same block.
+            if !matches!(tag, 254 | 256 | 257 | 273 | 277 | 278 | 279 | 322 | 323 | 324 | 325) {
                 continue;
             }
             let typ = e.u16(&entry[2..4]);
@@ -266,7 +267,6 @@ fn read_tiff<R: Read + Seek>(f: &mut R) -> Result<Option<Tiff>> {
                 257 => ifd.height = first,
                 277 => ifd.samples = first.max(1),
                 278 => ifd.rows_per_strip = first,
-                284 => ifd.planar = first,
                 322 => tile.0 = Some(first),
                 323 => tile.1 = Some(first),
                 273 | 324 => ifd.offsets = v,
@@ -327,7 +327,8 @@ pub fn validate_cog(path: &str, strict: bool) -> Result<CogValidation> {
             let mut ovr = p.clone().into_os_string();
             ovr.push(".ovr");
             let ovr = std::path::Path::new(&ovr);
-            // An unreadable sidecar still counts as one; GDAL would fail to open its overviews.
+            // A sidecar that does not parse still counts as one, with no images; GDAL would fail to
+            // open its overviews. One that cannot be opened is an error, as the file itself is.
             let sidecar = if ovr.is_file() {
                 Some(
                     read_tiff(&mut std::io::BufReader::new(std::fs::File::open(ovr)?))
@@ -366,7 +367,7 @@ fn validate(tiff: Option<Tiff>, sidecar: Option<Tiff>, strict: bool) -> CogValid
     if overviews.is_empty()
         && let Some(sc) = &sidecar
     {
-        overviews = sc.ifds.iter().filter(|i| !i.is_mask() && i.samples == main.samples).collect();
+        overviews = sc.ifds.iter().filter(|i| i.is_reduced() && !i.is_mask() && i.samples == main.samples).collect();
     }
 
     if external_ovr {
@@ -579,7 +580,9 @@ mod tests {
         crate::write_raster(&raster(1300, 700), &tiled, &crate::RasterWriteOptions { tile_size: Some(256), ..driver(GTiff, &[]) }).unwrap();
         std::fs::copy(&p, format!("{tiled}.ovr")).unwrap();
         let v = validate_cog(&tiled, false).unwrap();
-        assert_eq!(v.overview_factors.len(), 3, "{v:?}");
+        // The sidecar's full-resolution IFD is not an overview: only its two reduced images are.
+        assert_eq!(v.overview_factors, vec![2, 4], "{v:?}");
+        assert!(!v.errors.iter().any(|e| e.contains("Invalid Decimation")), "{v:?}");
         assert!(v.warnings.is_empty());
     }
 
@@ -662,7 +665,6 @@ mod tests {
             height: width,
             subfile_type,
             samples: 1,
-            planar: 1,
             tile: Some((256, 256)),
             rows_per_strip: u64::MAX,
             offsets: vec![data; (width as usize).div_ceil(256).pow(2)],
