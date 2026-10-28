@@ -86,10 +86,15 @@ fn missing_and_unsupported_layouts_are_errors() {
     let e = hdf.mesh_cells(&MeshCellOptions::default().with_meshes(["MissingValues"])).unwrap_err();
     assert!(matches!(e, terrio::Error::InvalidArgument(_)), "a mesh missing a dataset is not an empty mesh");
 
-    // A legacy names-only layout is Unsupported, not an empty file.
+    // A legacy names-only layout is Unsupported, not an empty file: its mesh layers are listed
+    // (the file stores 2D flow areas), and reading any of them is the engine's refusal.
     let legacy = open("coverage_mesh_nogroups.h5");
     assert!(matches!(legacy.mesh_names(), Err(terrio::Error::Unsupported(_))));
-    assert!(matches!(legacy.layer_names(), Err(terrio::Error::Unsupported(_))));
+    let listed = legacy.layer_names().unwrap();
+    assert!(listed.iter().any(|l| l == "mesh_cells"), "{listed:?}");
+    for layer in &listed {
+        assert!(matches!(legacy.read_layer(layer), Err(terrio::Error::Unsupported(_))), "{layer}");
+    }
     assert!(matches!(legacy.mesh_cells(&MeshCellOptions::default()), Err(terrio::Error::Unsupported(_))));
 
     // No 2D Flow Areas group: no mesh layer is listed, and asking for it is an error.
