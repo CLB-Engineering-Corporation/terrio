@@ -99,6 +99,16 @@
   as GDAL does: it took a value renormalised over the valid neighbours, which
   moved the edge of the data about a pixel into nodata areas. Several bands
   already behaved so, with unified nodata.
+- `terrio warp --wm MIB` sets the memory of a warp chunk, as `gdalwarp -wm` (default 64 MiB).
+  Python's `terrio.warp` takes it as `max_memory_mib`.
+- Python's `terrio.warp(path, dst=path)` (one source, no geolocation arrays) warps in chunks and
+  writes a strip at a time, as the command line does, and returns the result opened lazily from
+  `dst`; the pixels are those of the in-memory warp at the same chunk memory. On a 15,000 x
+  12,000 Float32 DEM warped to EPSG:3857, peak memory goes from 2,393 MiB to 1,210 MiB at the
+  default 64 MiB (594 MiB at 16 MiB).
+- Python's `terrio.mosaic(paths, dst=path)` writes through `mosaic_to_path` and returns the
+  mosaic opened lazily. `mosaic_to_path` also reads by window the mosaics of inputs resampled
+  with nearest neighbour on whole multiples of the output resolution.
 
 ### Shapefile
 

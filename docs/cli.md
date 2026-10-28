@@ -771,6 +771,12 @@ The target grid is always planned from full-resolution metadata before choosing 
 overviews. Downsampling remote COGs therefore fetches coarse tiles instead of full-resolution
 pixels. An unavailable explicit level falls back to the last available level, as GDAL does.
 
+A single input warped to a GeoTIFF or COG is warped in chunks of the output, each from a window
+of the source, and written a strip of rows at a time, as `gdalwarp` does. `--wm MIB` sets the
+memory of a chunk (default 64), as `gdalwarp -wm`; as with gdalwarp, another chunk size can change
+a few pixels. Python's `terrio.warp(path, dst=path, max_memory_mib=...)` does the same and returns
+the result opened lazily from `dst`.
+
 ```sh
 terrio warp scene.tif scene_4326.tif --rpc --to RPC_HEIGHT=120
 terrio warp scene.tif scene_utm.tif --rpc --to RPC_DEM=dem.tif --t-srs EPSG:32720 -r bilinear
@@ -827,6 +833,13 @@ terrio mosaic @filelist.txt OUTPUT [options]    # inputs listed in a file, one p
 `--resolution highest|lowest|average|user`, `--tr`, `--te`, `--tap`, `--separate`, `-b`,
 `--nodata`, `--srcnodata`, `--dstnodata`, `-r`, `--t-srs`. A `.vrt` output writes a GDAL VRT that
 references the inputs; other outputs hold the mosaicked pixels.
+
+Inputs in the output's CRS and resolution, on whole-pixel offsets, are copied by window and a
+GeoTIFF or COG output written a strip of rows at a time. So are inputs resampled with nearest
+neighbour (the default) when each input pixel covers a whole number of output pixels, such as
+`--resolution highest` over inputs at 1x and 2x the finest resolution. Other mosaics (reprojected,
+other resamplings, fractional source edges) read their inputs whole. Python's
+`terrio.mosaic(paths, dst=path)` writes the same way and returns the mosaic opened lazily.
 
 ## rasterize
 

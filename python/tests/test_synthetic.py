@@ -369,6 +369,39 @@ def test_dem_products(tmp_path):
         terrio.dem(r, "slope", multidirectional=True)
 
 
+def test_warp_and_mosaic_paths_are_streamed(tmp_path):
+    """A source path warped (or source paths mosaicked) to a path is read by window and written
+    a chunk at a time, with the values of the computation in memory, and returned lazily."""
+    rows, cols = np.mgrid[0:90, 0:70]
+    data = ((rows * 7 + cols * 13) % 251).astype("float32")
+    src = tmp_path / "src.tif"
+    terrio.Raster.from_array(data, TRANSFORM, crs="EPSG:32610", nodata=0).write(str(src))
+    kw = {"t_srs": "EPSG:4326", "resampling": "bilinear"}
+    whole = terrio.warp(terrio.open_raster(str(src)), **kw)
+    out = terrio.warp(str(src), dst=str(tmp_path / "w.tif"), **kw)
+    assert out.is_lazy
+    np.testing.assert_array_equal(out.read(), whole.read())
+    assert out.transform == pytest.approx(whole.transform) and out.nodata == whole.nodata
+    # A budget only changes the chunks.
+    small = terrio.warp(str(src), dst=str(tmp_path / "w2.tif"), max_memory_mib=0.01, **kw)
+    assert small.read().shape == whole.read().shape
+    with pytest.raises(terrio.InvalidArgumentError):
+        terrio.warp(str(src), max_memory_mib=0, **kw)
+    # Mosaic: a source at twice the resolution of the other.
+    coarse = terrio.Raster.from_array(
+        data[::2, ::2].copy(),
+        (TRANSFORM[0], TRANSFORM[1] * 2, 0.0, TRANSFORM[3], 0.0, TRANSFORM[5] * 2),
+        crs="EPSG:32610",
+        nodata=0,
+    )
+    coarse.write(str(tmp_path / "c.tif"))
+    srcs = [str(tmp_path / "c.tif"), str(src)]
+    ref = terrio.mosaic([terrio.open_raster(p) for p in srcs], resolution="highest")
+    m = terrio.mosaic(srcs, str(tmp_path / "m.tif"), resolution="highest")
+    assert m.is_lazy
+    np.testing.assert_array_equal(m.read(), ref.read())
+
+
 def test_calc_numpy_typing():
     """Checks that calc follows NumPy's typing rules, as gdal_calc.py does."""
     a = np.array([[200, 3], [0, 100]], dtype="uint8")
