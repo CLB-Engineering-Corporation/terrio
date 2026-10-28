@@ -17,6 +17,10 @@
   `average` grows a thin or ragged extent at every level. Needs a nodata value.
 - `RasterWriteOptions::metadata` (Python `Raster.write(metadata=...)`) sets dataset metadata items.
 - LERC is written too; `docs/formats.md` said it was read only.
+- LERC tiles are GDAL's by default: the `LERC_ENCODER` creation option (GeoTIFF and COG) selects
+  `lerc-writer`'s encoder profile, `GDAL` (default; the blobs GDAL writes, byte for byte for
+  floating-point and 16-bit data) or `COMPACT` (the smallest blobs, within the same
+  `MAX_Z_ERROR`). Needs the lerc-writer release with `EncoderProfile`.
 
 ### Formats
 
