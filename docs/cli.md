@@ -1012,6 +1012,25 @@ per band on the Landsat fixture, while direct GDAL mask reads and Terrio both co
 identical cases, three within the documented numeric tolerances, and this one
 mask-report difference.
 
+## validate-cog
+
+```sh
+terrio validate-cog dem.tif
+terrio validate-cog https://example.com/dem.tif --strict --json
+```
+
+Checks that a GeoTIFF is a Cloud Optimized GeoTIFF with the checks of rio-cogeo's
+`cog_validate`, the rasterio port of GDAL's `validate_cloud_optimized_geotiff.py`, and the same
+error and warning messages: a tiled full-resolution image and tiled overviews above 512 pixels,
+overviews of increasing decimation, IFDs before the image data (the main one within the first
+300 bytes), image data from the smallest overview to the full resolution, no `.ovr` sidecar and
+no `KNOWN_INCOMPATIBLE_EDITION=YES`. A large image without overviews is a warning; `--strict` makes
+warnings errors. Only headers and chunk offsets are read, so a remote file costs a few range
+requests. `--json` adds the IFD and first-block offsets, the overview factors, GDAL's structural
+metadata and layout notes (mask IFDs after image data, which do not affect validity). The exit
+status is 1 when the file is not a valid COG, as with GDAL's script. The command is also a
+read-only MCP tool.
+
 ## pixel-info
 
 `-o -` writes text formats to standard output; binary/vector formats require a file path.

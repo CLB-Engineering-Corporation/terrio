@@ -57,6 +57,10 @@ enum Command {
     /// or a vector dataset (like gdal raster pixel-info and gdallocationinfo).
     #[command(visible_alias = "locationinfo")]
     PixelInfo(cmd::pixel_info::Args),
+    /// Check that a GeoTIFF is a Cloud Optimized GeoTIFF, with the checks and messages of
+    /// rio-cogeo's cog_validate (GDAL's validate_cloud_optimized_geotiff.py): only headers and
+    /// chunk offsets are read. The exit status is 1 when the file is not a valid COG.
+    ValidateCog(cmd::validate_cog::Args),
     /// Write raster pixels as XYZ text: one line of coordinates and band values per pixel (like
     /// gdal2xyz.py).
     Xyz(cmd::xyz::Args),
@@ -264,6 +268,7 @@ fn run_on_this_thread(args: Vec<OsString>, terrio: Option<Vec<OsString>>) -> i32
         Command::Footprint(a) => cmd::processing::footprint(a),
         Command::Compare(a) => cmd::compare::run(a),
         Command::PixelInfo(a) => cmd::pixel_info::run(a),
+        Command::ValidateCog(a) => cmd::validate_cog::run(a),
         Command::Xyz(a) => cmd::xyz::run(a),
         Command::Sample(a) => cmd::processing::sample(a),
         Command::Contour(a) => cmd::processing::contour(a),

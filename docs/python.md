@@ -349,6 +349,16 @@ copy, sync, move and delete functions return a report (`copied`, `bytes`, `uncha
 `deleted`, `errors`). `/vsimem/` files last as long as the process. Locations, semantics and the
 refusals of dangerous deletions are those of [vsi](cli.md#vsi).
 
+## COG validation
+
+```python
+ok, errors, warnings = terrio.validate_cog("dem.tif")  # rio_cogeo.cog_validate's result
+terrio.validate_cog("https://example.com/dem.tif", strict=True)  # warnings fail too
+```
+
+The checks and messages of `rio_cogeo.cogeo.cog_validate`, read from the file's structure without
+GDAL, for local files, URLs and S3 objects (range requests). See [Rust](rust.md#reading-windows-lazily).
+
 ## Typing
 
 The package ships type stubs (`py.typed`), checked with `mypy --strict` and `stubtest`:
