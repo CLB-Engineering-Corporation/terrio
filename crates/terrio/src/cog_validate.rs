@@ -600,7 +600,7 @@ mod tests {
     /// A little-endian classic TIFF with one IFD at byte 8 of `(tag, type, count, value)`
     /// entries, followed by `data`, which starts at byte `10 + 12 * entries + 4`.
     fn crafted(entries: &[(u16, u16, u32, u32)], data: &[u8]) -> Vec<u8> {
-        let mut b = b"II* ".to_vec();
+        let mut b = b"II*\0".to_vec();
         b.extend(8u32.to_le_bytes());
         b.extend((entries.len() as u16).to_le_bytes());
         for (tag, typ, count, value) in entries {
