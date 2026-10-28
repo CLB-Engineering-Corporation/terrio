@@ -653,7 +653,11 @@ the layers, geometry types, feature counts, CRS, extent and fields of a vector d
 computes band minimum, maximum, mean and standard deviation over valid pixels. Remote GeoTIFFs are
 summarized from their header alone, and their overviews are listed. The subdatasets of netCDF,
 HDF5 and GeoPackage files are listed as `gdalinfo` lists them (`SUBDATASET_N_NAME` and
-`SUBDATASET_N_DESC`).
+`SUBDATASET_N_DESC`). A GeoTIFF or COG written with area-matched overviews
+(`--co OVERVIEW_RESAMPLING=AREA_MATCHED`) has an `Overview report:` (`overview_report` in the
+JSON): the method, the factors, the valid area each level keeps relative to the full resolution
+(per band, separated by `;`) and the valid pixel count, the `OVERVIEW_REPORT` metadata domain that
+GDAL lists with `gdalinfo -mdd OVERVIEW_REPORT`.
 
 `--hist` computes each band's histogram as `gdalinfo -hist` does, and prints it as it does
 (`256 buckets from -0.5 to 255.5:` and the counts; a `histogram` object of `count`, `min`, `max`

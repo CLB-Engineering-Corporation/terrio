@@ -59,6 +59,10 @@ pub struct RasterInfo {
     /// GDAL's `GEOLOCATION` metadata: where the longitude and latitude arrays of a swath are.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub geolocation: Vec<(String, String)>,
+    /// What the writer measured of area-matched overviews: the `OVERVIEW_REPORT` metadata domain
+    /// of a GeoTIFF or COG (see [`crate::OverviewReport`]).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub overview_report: Vec<(String, String)>,
 }
 
 /// A dataset inside a file (GDAL's subdatasets): a raster table of a GeoPackage, a netCDF
@@ -248,6 +252,7 @@ fn raster_info_at(ds: &RasterDataset, options: &InfoOptions, path: Option<&str>,
         metadata: r.metadata.iter().filter(|(k, _)| subdataset_index(k).is_none() && !k.starts_with(INTERNAL)).cloned().collect(),
         subdatasets: subdatasets_from_metadata(&r.metadata),
         geolocation: ds.geolocation.as_ref().map(|g| g.items()).unwrap_or_default(),
+        overview_report: Vec::new(),
     }
 }
 
@@ -322,12 +327,14 @@ fn lazy_raster_info_at(r: &mut LazyRaster, options: &InfoOptions, path: Option<&
     if let Some(ds) = r.dataset() {
         let mut info = raster_info_at(ds, options, path, None);
         info.overviews = overviews;
+        info.overview_report = r.overview_report();
         return Ok(info);
     }
     if options.histogram {
         let ds = r.read()?;
         let mut info = raster_info_at(&ds, options, path, Some(r));
         info.overviews = overviews;
+        info.overview_report = r.overview_report();
         return Ok(info);
     }
     if options.statistics {
@@ -339,6 +346,7 @@ fn lazy_raster_info_at(r: &mut LazyRaster, options: &InfoOptions, path: Option<&
             band.statistics = s;
         }
         info.overviews = overviews;
+        info.overview_report = r.overview_report();
         return Ok(info);
     }
     let crs = r.crs();
@@ -367,6 +375,7 @@ fn lazy_raster_info_at(r: &mut LazyRaster, options: &InfoOptions, path: Option<&
         metadata: r.metadata().into_iter().filter(|(k, _)| subdataset_index(k).is_none() && !k.starts_with(INTERNAL)).collect(),
         subdatasets: subdatasets_from_metadata(&r.metadata()),
         geolocation: Vec::new(),
+        overview_report: r.overview_report(),
     })
 }
 
@@ -688,6 +697,12 @@ impl Info {
                 if !r.geolocation.is_empty() {
                     let _ = writeln!(s, "Geolocation:");
                     for (k, v) in &r.geolocation {
+                        let _ = writeln!(s, "  {k}={v}");
+                    }
+                }
+                if !r.overview_report.is_empty() {
+                    let _ = writeln!(s, "Overview report:");
+                    for (k, v) in &r.overview_report {
                         let _ = writeln!(s, "  {k}={v}");
                     }
                 }

@@ -247,6 +247,7 @@ fn container_info(subs: Vec<(String, String)>) -> crate::info::RasterInfo {
         metadata: Vec::new(),
         subdatasets: subs.into_iter().map(|(name, description)| crate::info::Subdataset { name, description }).collect(),
         geolocation: Vec::new(),
+        overview_report: Vec::new(),
     }
 }
 

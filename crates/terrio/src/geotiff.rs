@@ -60,6 +60,9 @@ pub(crate) struct GeoTags {
     /// The `OVERVIEW_RESAMPLING` item of the `IMAGE_STRUCTURE` domain (COGs), which GDAL reports
     /// as the `RESAMPLING` metadata of overview bands.
     pub overview_resampling: Option<String>,
+    /// The items of the `OVERVIEW_REPORT` domain: what the writer measured of area-matched
+    /// overviews ([`crate::OverviewReport`]).
+    pub overview_report: Vec<(String, String)>,
 }
 
 impl GeoTags {
@@ -404,6 +407,15 @@ fn read_geo_tags_impl<R: Read + Seek>(mut f: R, compare_metadata: bool) -> Optio
     }
     out.metadata = ascii(GDAL_METADATA).map(crate::drivers::gtiff_write::parse_gdal_metadata).unwrap_or_default();
     out.band_metadata = ascii(GDAL_METADATA).map(crate::drivers::gtiff_write::parse_gdal_band_metadata).unwrap_or_default();
+    out.overview_report = ascii(GDAL_METADATA)
+        .map(|xml| {
+            crate::drivers::gtiff_write::gdal_metadata_items(xml)
+                .into_iter()
+                .filter(|i| i.attr("domain") == Some(crate::OVERVIEW_REPORT_DOMAIN) && i.attr("sample").is_none())
+                .filter_map(|i| Some((i.attr("name")?.to_string(), crate::drivers::gtiff_write::xml_unescape(&i.text))))
+                .collect()
+        })
+        .unwrap_or_default();
 
     if let Some(keys) = keys {
         apply_geokeys(&mut out, keys, doubles(GEO_DOUBLE_PARAMS), ascii(GEO_ASCII_PARAMS));

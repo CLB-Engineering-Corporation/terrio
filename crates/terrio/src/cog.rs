@@ -669,6 +669,15 @@ impl LazyRaster {
         }
     }
 
+    /// The overview report a GeoTIFF or COG with area-matched overviews carries (the items of
+    /// its `OVERVIEW_REPORT` metadata domain, see [`crate::OverviewReport`]); empty otherwise.
+    pub fn overview_report(&self) -> Vec<(String, String)> {
+        match &self.inner {
+            Inner::Tiff(t) => t.tags.overview_report.clone(),
+            Inner::Memory(_) | Inner::Source(..) => Vec::new(),
+        }
+    }
+
     /// The sizes `(width, height)` of the overviews, largest first.
     pub fn overviews(&self) -> Vec<(usize, usize)> {
         match &self.inner {

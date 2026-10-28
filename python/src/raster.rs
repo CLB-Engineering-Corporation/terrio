@@ -471,6 +471,17 @@ impl PyRaster {
     /// being ignored. `PREDICTOR=YES` is 3 for floating-point rasters and 2 for integers, as GDAL
     /// resolves it. `OVERVIEWS=FORCE_USE_EXISTING` needs the overviews supplied; `NONE` writes none.
     ///
+    /// Returns:
+    ///     dict | None: For area-matched GeoTIFF/COG overviews, what the writer measured:
+    ///     `method` (`"area_matched"` or `"area_matched_mode"`), `factors` (`[2, 4, ...]`),
+    ///     `area_ratios` (per band, per level: the kept cells times `factor**2` over the band's
+    ///     valid full-resolution pixels; 1.0 keeps the valid area exactly) and
+    ///     `base_valid_pixels` (per band). The file's metadata carries the same values in the
+    ///     `OVERVIEW_REPORT` domain (`OVERVIEW_METHOD`, `OVERVIEW_FACTORS`,
+    ///     `OVERVIEW_AREA_RATIOS`, `OVERVIEW_BASE_VALID_PIXELS`; rasterio:
+    ///     `tags(ns="OVERVIEW_REPORT")`), with the bands' values separated by `;`.
+    ///     `None` otherwise.
+    ///
     /// Raises:
     ///     TerrioError: If the raster cannot be written.
     #[pyo3(signature = (
@@ -479,9 +490,9 @@ impl PyRaster {
         mask=None, rpc=None, metadata=None
     ))]
     #[allow(clippy::too_many_arguments)]
-    fn write(
+    fn write<'py>(
         &mut self,
-        py: Python<'_>,
+        py: Python<'py>,
         path: &str,
         driver: Option<&str>,
         compress: Option<String>,
@@ -496,7 +507,7 @@ impl PyRaster {
         mask: Option<numpy::PyReadonlyArray2<'_, u8>>,
         rpc: Option<Vec<f64>>,
         metadata: Option<&Bound<'_, PyAny>>,
-    ) -> PyResult<()> {
+    ) -> PyResult<Option<Bound<'py, PyDict>>> {
         let mut options_ = write_options(driver, compress, tile_size, bigtiff)?;
         options_.gcps = parse_gcps(gcps);
         options_.rpc = rpc.unwrap_or_default();
@@ -525,7 +536,17 @@ impl PyRaster {
         options_.overview_resampling = overview_resampling;
         options_.metadata = metadata.map(string_pairs).transpose()?.unwrap_or_default();
         let options = options_;
-        py.detach(|| self.with_dataset(|ds| terrio::write_raster_dataset(ds, path, &options))).py()
+        let report = py.detach(|| self.with_dataset(|ds| terrio::write_raster_dataset_with_report(ds, path, &options))).py()?;
+        report
+            .map(|r| {
+                let d = PyDict::new(py);
+                d.set_item("method", r.method)?;
+                d.set_item("factors", r.factors)?;
+                d.set_item("area_ratios", r.area_ratios)?;
+                d.set_item("base_valid_pixels", r.base_valid_pixels)?;
+                Ok(d)
+            })
+            .transpose()
     }
 
     /// Encodes the raster in a file format, in memory.

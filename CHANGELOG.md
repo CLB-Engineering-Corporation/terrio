@@ -15,6 +15,14 @@
 - Area-matched overviews, `OVERVIEW_RESAMPLING=AREA_MATCHED` (`AREA_MATCHED_MODE` for categorical
   rasters): each level keeps as many valid cells as the full-resolution valid pixels fill, where
   `average` grows a thin or ragged extent at every level. Needs a nodata value.
+- Area-matched overviews report the valid area each level keeps (kept cells x f² over the valid
+  full-resolution pixels; 1.0 keeps it exactly) and the valid pixel count, per band: Rust
+  `write_raster_dataset_with_report` returns an `OverviewReport`, Python `Raster.write` returns it
+  as a dict (`None` otherwise, as before), and the file carries it in the `OVERVIEW_REPORT`
+  metadata domain, which GDAL and rasterio read and `terrio info` shows (`overview_report` in
+  the JSON).
+- Streaming writers (`terrio convert`, `dem`, `warp`... to a COG) gather the image and write it
+  whole when area-matched or supplied overviews are asked for, instead of refusing them.
 - `RasterWriteOptions::metadata` (Python `Raster.write(metadata=...)`) sets dataset metadata items.
 - LERC is written too; `docs/formats.md` said it was read only.
 

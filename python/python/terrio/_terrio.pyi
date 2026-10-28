@@ -249,7 +249,7 @@ class Raster:
         mask: NDArray[Any] | None = None,
         rpc: Sequence[float] | None = None,
         metadata: Mapping[str, Any] | Sequence[tuple[Any, Any]] | None = None,
-    ) -> None: ...
+    ) -> dict[str, Any] | None: ...
     def to_bytes(
         self,
         filename: str = "raster.tif",

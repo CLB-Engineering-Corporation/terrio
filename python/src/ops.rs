@@ -232,7 +232,8 @@ fn list_layers(py: Python<'_>, path: &str) -> PyResult<Vec<String>> {
 ///
 /// Returns:
 ///     dict: The summary: driver, size, bands, CRS, extent... for rasters (with the
-///     `subdatasets` of netCDF, HDF5 and GeoPackage files); driver and layers
+///     `subdatasets` of netCDF, HDF5 and GeoPackage files, and the `overview_report` pairs of
+///     a GeoTIFF or COG written with area-matched overviews); driver and layers
 ///     (fields, geometry type, feature count, CRS, extent) for vector datasets; header, CRS,
 ///     dimensions, VLRs and the COPC octree for point clouds (LAS, LAZ, COPC), with
 ///     classification and return counts when `stats` is true.

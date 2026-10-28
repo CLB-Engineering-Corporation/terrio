@@ -233,6 +233,10 @@ impl Tiff {
         }
         // Compressions only wbraster encodes are written whole.
         let Some(mut opts) = TiffOptions::from_write_options(options, cog, crate::dataset::tiff_nodata(header))? else { return Ok(None) };
+        // Supplied and area-matched COG overviews are built from the whole image: gathered.
+        if cog && (opts.area_matched.is_some() || !opts.supplied_overviews.is_empty()) {
+            return Ok(None);
+        }
         crate::dataset::ensure_writable_location(path)?;
         if !cog {
             return Ok(Some(Self::GeoTiff(GeoTiffWriter::create(path, header, options)?)));
