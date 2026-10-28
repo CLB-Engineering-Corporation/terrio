@@ -9,6 +9,11 @@
   (`N37W120.hgt`), `.hgt.zip` archives, and the NASADEM and water body variants.
   Tiles are written as Int16 with -32768 for nodata; a grid of another size is
   refused.
+- PMTiles and MBTiles written from a raster opened lazily (`terrio convert`, `Raster.write`)
+  warp a raster that is not on its zoom level's grid a chunk at a time, from windows of the
+  source, instead of reading it whole: the colour and alpha warps of GDAL's MBTiles driver run in
+  their own chunks, in step. The archive is byte-identical. A geographic raster reaching beyond
+  Web Mercator's latitudes is still read whole.
 
 ### Breaking changes
 
@@ -74,6 +79,15 @@
   as GDAL does: it took a value renormalised over the valid neighbours, which
   moved the edge of the data about a pixel into nodata areas. Several bands
   already behaved so, with unified nodata.
+- `terrio warp` and `warp_to_path` warp several inputs a chunk at a time too, each chunk reading
+  a window of its input, and write the output a strip of rows at a time: each pixel still takes
+  the inputs in order, so the output is the in-memory warp's, bit for bit. Python's
+  `terrio.warp(paths, dst=path)` does the same for several paths.
+- `terrio mosaic` and `mosaic_to_path` write every mosaic a strip at a time from windows of the
+  inputs, bit for bit as the mosaic in memory: inputs resampled by any method, at fractional
+  offsets or non-integer resolution ratios, now too (each strip computed with the rounding of the
+  whole mosaic, not a VRT's per-window rounding), and inputs in other CRSs, warped a chunk at a
+  time. Only an output that is one of the inputs reads them whole.
 
 ### Shapefile
 

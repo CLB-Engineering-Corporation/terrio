@@ -267,25 +267,29 @@ pub fn mosaic(sources: &[MosaicSource], o: &MosaicOptions) -> Result<RasterDatas
         if o.separate {
             return Err(Error::Unsupported("--separate with sources in different CRSs is not supported".into()));
         }
-        let wo = WarpOptions {
-            dst_srs: Some(dst),
-            resolution: match o.resolution {
-                ResolutionStrategy::User(x, y) => Some((x, y)),
-                _ => None,
-            },
-            extent: o.extent,
-            target_aligned_pixels: o.target_aligned_pixels,
-            resampling: o.resampling,
-            src_nodata: o.src_nodata.clone(),
-            dst_nodata: o.dst_nodata.clone(),
-            ..Default::default()
-        };
         let refs: Vec<&RasterDataset> = sources.iter().map(|s| s.ds).collect();
-        return warp(&refs, &wo);
+        return warp(&refs, &reprojecting(o, dst));
     }
     let vrt = build_vrt(sources, o, None)?;
     // Read from the datasets already in memory rather than reopening the files.
     vrt_from_memory(&vrt, sources)
+}
+
+/// The warp of a mosaic whose sources are reprojected (see [`mosaic`]).
+fn reprojecting(o: &MosaicOptions, dst: SpatialRef) -> WarpOptions {
+    WarpOptions {
+        dst_srs: Some(dst),
+        resolution: match o.resolution {
+            ResolutionStrategy::User(x, y) => Some((x, y)),
+            _ => None,
+        },
+        extent: o.extent,
+        target_aligned_pixels: o.target_aligned_pixels,
+        resampling: o.resampling,
+        src_nodata: o.src_nodata.clone(),
+        dst_nodata: o.dst_nodata.clone(),
+        ..Default::default()
+    }
 }
 
 /// Whether the sources are reprojected: some are in another CRS than the output's.
@@ -301,10 +305,11 @@ fn reprojected(sources: &[MosaicSource], o: &MosaicOptions) -> bool {
 /// Mosaics rasters as [`mosaic`] does and writes the mosaic to `path`. When every source is
 /// copied pixel for pixel (same CRS and resolution, whole-pixel offsets), they are read by windows
 /// and a GeoTIFF output written a strip of rows at a time: neither the sources nor the output are
-/// held whole. Sources in the output's CRS that are resampled with nearest neighbour (sources of
-/// different resolutions, the default resampling) are read the same way through the mosaic's
-/// VRT, whose windows give the pixels of the whole mosaic. Otherwise (reprojected sources, other
-/// resamplings, and when `path` is one of the sources) the sources are read whole.
+/// held whole. Resampled sources in the output's CRS (any resampling method) are read by the
+/// source rows each strip needs, and each strip computed as the whole mosaic computes it.
+/// Reprojected sources are warped a chunk at a time (each chunk reading its source window), each
+/// pixel taking its sources in order, as [`mosaic`] warps them whole. The sources are read whole
+/// only when `path` is one of them. The output is the in-memory mosaic's, bit for bit.
 ///
 /// ```no_run
 /// use terrio::ops::mosaic::{MosaicOptions, mosaic_to_path};
@@ -317,7 +322,18 @@ pub fn mosaic_to_path(paths: &[String], o: &MosaicOptions, path: &str, options: 
     let mut lazy = paths.iter().map(|p| crate::open_raster_lazy(p)).collect::<Result<Vec<_>>>()?;
     let headers: Vec<RasterDataset> = lazy.iter().map(|l| l.header()).collect();
     let sources: Vec<MosaicSource> = paths.iter().zip(&headers).map(|(p, ds)| MosaicSource { path: p.clone(), ds }).collect();
-    let whole = reprojected(&sources, o) || super::strips::overwrites(path, paths);
+    let overwrites = super::strips::overwrites(path, paths);
+    if reprojected(&sources, o) && !overwrites {
+        // Warped a chunk at a time, as `mosaic` warps the sources in memory (full resolution).
+        if o.separate {
+            return Err(Error::Unsupported("--separate with sources in different CRSs is not supported".into()));
+        }
+        let wo = reprojecting(o, o.dst_srs.clone().unwrap_or_else(|| headers[0].crs()));
+        let mut readers: Vec<&mut (dyn super::warp::WarpSource + Send)> =
+            lazy.iter_mut().map(|s| s as &mut (dyn super::warp::WarpSource + Send)).collect();
+        return super::warp::warp_sources_to_path(&mut readers, &wo, false, path, options);
+    }
+    let whole = reprojected(&sources, o) || overwrites;
     let plan = if whole { None } else { copy_plan(&sources, o)? };
     if plan.is_none() && !whole {
         // Resampled sources: each strip computed as the whole mosaic computes it.
@@ -800,6 +816,56 @@ mod tests {
             .filter(|e| e.file_name().to_string_lossy().ends_with(".vrt"))
             .collect();
         assert!(left.is_empty());
+    }
+
+    /// Sources in different CRSs, mosaicked to a path, are warped a chunk at a time with the
+    /// pixels of the mosaic warped whole; `separate` is refused as in memory.
+    #[test]
+    fn reprojected_mosaics_are_warped_by_chunk() {
+        let dir = tempfile::tempdir().unwrap();
+        let utm = |x0: f64, y1: f64, res: f64, n: usize, k: f64| {
+            let cfg = RasterConfig {
+                cols: n,
+                rows: n,
+                bands: 1,
+                x_min: x0,
+                y_min: y1 - res * n as f64,
+                cell_size: res,
+                cell_size_y: Some(res),
+                nodata: -9999.0,
+                data_type: DataType::F32,
+                crs: wbraster::CrsInfo::from_epsg(32610),
+                metadata: vec![],
+            };
+            let data = (0..n * n).map(|i| if i % 37 == 5 { -9999.0 } else { k + (i * 7 % 43) as f64 + 0.5 }).collect();
+            RasterDataset::new(Raster::from_data(cfg, data).unwrap(), true)
+        };
+        let a = utm(500000.0, 4000000.0, 30.0, 40, 0.0);
+        let seed = utm(500333.0, 3999500.0, 45.0, 25, 100.0);
+        let geo = SpatialRef::parse("EPSG:4326").unwrap();
+        let g = warp(&[&seed], &WarpOptions { dst_srs: Some(geo.clone()), ..Default::default() }).unwrap();
+        let paths = written(dir.path(), &[a, g]);
+        let read: Vec<RasterDataset> = paths.iter().map(|p| crate::open_raster(p).unwrap()).collect();
+        let srcs: Vec<MosaicSource> = paths.iter().zip(&read).map(|(p, ds)| MosaicSource { path: p.clone(), ds }).collect();
+        for dst_srs in [None, Some(geo)] {
+            for resampling in [Resampling::Nearest, Resampling::Bilinear, Resampling::Average] {
+                let o = MosaicOptions { dst_srs: dst_srs.clone(), resampling, ..Default::default() };
+                assert!(reprojected(&srcs, &o));
+                let whole = mosaic(&srcs, &o).unwrap();
+                let out = dir.path().join("out.tif");
+                mosaic_to_path(&paths, &o, out.to_str().unwrap(), &Default::default()).unwrap();
+                let back = crate::open_raster(out.to_str().unwrap()).unwrap();
+                assert_eq!(bits(&back), bits(&whole), "{resampling:?}");
+                assert_eq!(
+                    (back.geo_transform(), back.nodata(), back.raster.bands),
+                    (whole.geo_transform(), whole.nodata(), whole.raster.bands)
+                );
+            }
+        }
+        let separate = MosaicOptions { separate: true, ..Default::default() };
+        let out = dir.path().join("sep.tif");
+        assert!(mosaic_to_path(&paths, &separate, out.to_str().unwrap(), &Default::default()).is_err());
+        assert!(mosaic(&srcs, &separate).is_err());
     }
 
     /// GDAL's averaging works in chunks of about 1024 x 1024 source pixels, whose validity decides
