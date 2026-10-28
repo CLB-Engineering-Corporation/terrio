@@ -127,6 +127,10 @@
   pole may be given by `+o_lat_p`/`+o_lon_p`, by `+o_lon_c`/`+o_lat_c`/`+o_alpha`
   or by `+o_lon_1`/`+o_lat_1`/`+o_lon_2`/`+o_lat_2`, for rotated-pole grids too.
   PROJ's WKT2 `PROJ ob_tran o_proj=...` method is read.
+- `+proj=qsc` (quadrilateralized spherical cube) is computed as PROJ does, on
+  each of the six cube faces and on a sphere or an ellipsoid; it was refused.
+  GDAL's and ESRI's WKT1 `Quadrilateralized_Spherical_Cube` and WKT2
+  `Quadrilateralized Spherical Cube` are read, and the WKT1 form is written.
 
 ### Warp
 

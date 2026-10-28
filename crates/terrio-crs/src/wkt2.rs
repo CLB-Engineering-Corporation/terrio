@@ -318,6 +318,10 @@ pub(crate) fn to_proj(root: &Node) -> Result<Converted> {
         push("lat_1", p.get(SP1));
         push("lat_2", p.get(SP2));
         "eqdc"
+    } else if is(&["quadrilateralizedsphericalcube"], &[]) {
+        push("lat_0", lat_0());
+        push("lon_0", lon_0());
+        "qsc"
     } else if is(&["gnomonic"], &[]) {
         push("lat_0", lat_0());
         push("lon_0", lon_0());

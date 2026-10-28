@@ -101,6 +101,7 @@ pub(crate) fn build(name: &str, s: &mut Setup<'_>) -> Result<Option<Box<dyn Proj
         "robin" => Box::new(Robin),
         "moll" | "wag4" | "wag5" => Box::new(Moll::new(name)),
         "igh" => Box::new(Igh::new()?),
+        "qsc" => Box::new(Qsc::new(s)),
         "wintri" => Box::new(Wintri::new(s)?),
         "wink1" => Box::new(Wink1 { cosphi1: s.p.angle("lat_ts").unwrap_or(0.0).cos() }),
         "wink2" => Box::new(Wink2 { cosphi1: s.p.angle("lat_1").unwrap_or(0.0).cos() }),
@@ -3127,6 +3128,242 @@ impl Proj for Igh {
             _ => within(80.0, 180.0),
         };
         ok.then_some((lam, phi))
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Quadrilateralized spherical cube, as PROJ's qsc.cpp: one of the six cube faces, chosen by the
+// projection centre, with the ellipsoid shifted to the sphere by geocentric latitude.
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum QscFace {
+    Front,
+    Right,
+    Back,
+    Left,
+    Top,
+    Bottom,
+}
+
+#[derive(Debug)]
+struct Qsc {
+    face: QscFace,
+    /// The semi-minor axis on the unit semi-major axis; 1 on a sphere.
+    b: f64,
+    es: f64,
+}
+
+/// The four areas of a cube face, counterclockwise from the area of definition.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum QscArea {
+    A0,
+    A1,
+    A2,
+    A3,
+}
+
+/// The theta angle and area of a point on an equatorial face (PROJ's qsc_fwd_equat_face_theta).
+fn qsc_equat_face_theta(colat: f64, y: f64, x: f64) -> (f64, QscArea) {
+    if colat < 1e-10 {
+        return (0.0, QscArea::A0);
+    }
+    let theta = y.atan2(x);
+    if theta.abs() <= FORTPI {
+        (theta, QscArea::A0)
+    } else if theta > FORTPI && theta <= HALFPI + FORTPI {
+        (theta - HALFPI, QscArea::A1)
+    } else if theta > HALFPI + FORTPI || theta <= -(HALFPI + FORTPI) {
+        (if theta >= 0.0 { theta - PI } else { theta + PI }, QscArea::A2)
+    } else {
+        (theta + HALFPI, QscArea::A3)
+    }
+}
+
+/// PROJ's qsc_shift_longitude_origin.
+fn qsc_shift_longitude(longitude: f64, offset: f64) -> f64 {
+    let slon = longitude + offset;
+    if slon < -PI {
+        slon + 2.0 * PI
+    } else if slon > PI {
+        slon - 2.0 * PI
+    } else {
+        slon
+    }
+}
+
+impl Qsc {
+    fn new(s: &Setup<'_>) -> Self {
+        let face = if s.phi0 >= HALFPI - FORTPI / 2.0 {
+            QscFace::Top
+        } else if s.phi0 <= -(HALFPI - FORTPI / 2.0) {
+            QscFace::Bottom
+        } else if s.lam0.abs() <= FORTPI {
+            QscFace::Front
+        } else if s.lam0.abs() <= HALFPI + FORTPI {
+            if s.lam0 > 0.0 { QscFace::Right } else { QscFace::Left }
+        } else {
+            QscFace::Back
+        };
+        Self { face, b: (1.0 - s.ell.es).sqrt(), es: s.ell.es }
+    }
+}
+
+impl Proj for Qsc {
+    fn fwd(&self, lam: f64, phi: f64) -> Option<(f64, f64)> {
+        // The geodetic latitude as a geocentric latitude: the shift from the ellipsoid to the
+        // sphere. b is also 1 - f on the unit semi-major axis.
+        let lat = if self.es != 0.0 { (self.b * self.b * phi.tan()).atan() } else { phi };
+        let mut longitude = lam;
+        // colat is PROJ's phi: the angle from the face centre.
+        let (theta, colat, area);
+        match self.face {
+            QscFace::Top => {
+                colat = HALFPI - lat;
+                (theta, area) = if (FORTPI..=HALFPI + FORTPI).contains(&longitude) {
+                    (longitude - HALFPI, QscArea::A0)
+                } else if longitude > HALFPI + FORTPI || longitude <= -(HALFPI + FORTPI) {
+                    (if longitude > 0.0 { longitude - PI } else { longitude + PI }, QscArea::A1)
+                } else if longitude > -(HALFPI + FORTPI) && longitude <= -FORTPI {
+                    (longitude + HALFPI, QscArea::A2)
+                } else {
+                    (longitude, QscArea::A3)
+                };
+            }
+            QscFace::Bottom => {
+                colat = HALFPI + lat;
+                (theta, area) = if (FORTPI..=HALFPI + FORTPI).contains(&longitude) {
+                    (-longitude + HALFPI, QscArea::A0)
+                } else if (-FORTPI..FORTPI).contains(&longitude) {
+                    (-longitude, QscArea::A1)
+                } else if (-(HALFPI + FORTPI)..-FORTPI).contains(&longitude) {
+                    (-longitude - HALFPI, QscArea::A2)
+                } else {
+                    (if longitude > 0.0 { -longitude + PI } else { -longitude - PI }, QscArea::A3)
+                };
+            }
+            face => {
+                longitude = match face {
+                    QscFace::Right => qsc_shift_longitude(longitude, HALFPI),
+                    QscFace::Back => qsc_shift_longitude(longitude, PI),
+                    QscFace::Left => qsc_shift_longitude(longitude, -HALFPI),
+                    _ => longitude,
+                };
+                let (sinlat, coslat) = lat.sin_cos();
+                let (sinlon, coslon) = longitude.sin_cos();
+                let (q, r, s) = (coslat * coslon, coslat * sinlon, sinlat);
+                let (p, y, x) = match face {
+                    QscFace::Front => (q.acos(), s, r),
+                    QscFace::Right => (r.acos(), s, -q),
+                    QscFace::Back => ((-q).acos(), s, -r),
+                    _ => ((-r).acos(), s, q),
+                };
+                colat = p;
+                (theta, area) = qsc_equat_face_theta(colat, y, x);
+            }
+        }
+        // mu and nu for the area of definition: Eq. (3-21) of O'Neill and Laubscher (1976), with
+        // its typos corrected against Eq. (3-14), and t = tan(nu) from Eq. (3-38).
+        let mut mu = ((12.0 / PI) * (theta + (theta.sin() * FORTPI.cos()).acos() - HALFPI)).atan();
+        let t = ((1.0 - colat.cos()) / (mu.cos() * mu.cos()) / (1.0 - (1.0 / theta.cos()).atan().cos())).sqrt();
+        mu += match area {
+            QscArea::A1 => HALFPI,
+            QscArea::A2 => PI,
+            QscArea::A3 => PI + HALFPI,
+            _ => 0.0,
+        };
+        Some((t * mu.cos(), t * mu.sin()))
+    }
+
+    fn inv(&self, x: f64, y: f64) -> Option<(f64, f64)> {
+        let nu = x.hypot(y).atan();
+        let mut mu = y.atan2(x);
+        let area = if x >= 0.0 && x >= y.abs() {
+            QscArea::A0
+        } else if y >= 0.0 && y >= x.abs() {
+            mu -= HALFPI;
+            QscArea::A1
+        } else if x < 0.0 && -x >= y.abs() {
+            mu = if mu < 0.0 { mu + PI } else { mu - PI };
+            QscArea::A2
+        } else {
+            mu += HALFPI;
+            QscArea::A3
+        };
+        // phi and theta for the area of definition.
+        let t = (PI / 12.0) * mu.tan();
+        let theta = (t.sin() / (t.cos() - 1.0 / 2f64.sqrt())).atan();
+        let cosmu = mu.cos();
+        let tannu = nu.tan();
+        let cosphi = (1.0 - cosmu * cosmu * tannu * tannu * (1.0 - (1.0 / theta.cos()).atan().cos())).clamp(-1.0, 1.0);
+        let (lam, mut lat) = match self.face {
+            QscFace::Top => {
+                let lam = match area {
+                    QscArea::A0 => theta + HALFPI,
+                    QscArea::A1 => {
+                        if theta < 0.0 {
+                            theta + PI
+                        } else {
+                            theta - PI
+                        }
+                    }
+                    QscArea::A2 => theta - HALFPI,
+                    _ => theta,
+                };
+                (lam, HALFPI - cosphi.acos())
+            }
+            QscFace::Bottom => {
+                let lam = match area {
+                    QscArea::A0 => -theta + HALFPI,
+                    QscArea::A1 => -theta,
+                    QscArea::A2 => -theta - HALFPI,
+                    _ => {
+                        if theta < 0.0 {
+                            -theta - PI
+                        } else {
+                            -theta + PI
+                        }
+                    }
+                };
+                (lam, cosphi.acos() - HALFPI)
+            }
+            face => {
+                // Through cartesian coordinates on the unit sphere.
+                let mut q = cosphi;
+                let mut u = q * q;
+                let mut s = if u >= 1.0 { 0.0 } else { (1.0 - u).sqrt() * theta.sin() };
+                u += s * s;
+                let mut r = if u >= 1.0 { 0.0 } else { (1.0 - u).sqrt() };
+                // Into the area, then into the cube face.
+                match area {
+                    QscArea::A1 => (r, s) = (-s, r),
+                    QscArea::A2 => (r, s) = (-r, -s),
+                    QscArea::A3 => (r, s) = (s, -r),
+                    _ => {}
+                }
+                match face {
+                    QscFace::Right => (q, r) = (-r, q),
+                    QscFace::Back => (q, r) = (-q, -r),
+                    QscFace::Left => (q, r) = (r, -q),
+                    _ => {}
+                }
+                let lam = r.atan2(q);
+                let lam = match face {
+                    QscFace::Right => qsc_shift_longitude(lam, -HALFPI),
+                    QscFace::Back => qsc_shift_longitude(lam, -PI),
+                    QscFace::Left => qsc_shift_longitude(lam, HALFPI),
+                    _ => lam,
+                };
+                (lam, (-s).acos() - HALFPI)
+            }
+        };
+        // The shift from the sphere back to the ellipsoid.
+        if self.es != 0.0 {
+            let tanphi = lat.tan();
+            let xa = self.b / (tanphi * tanphi + self.b * self.b).sqrt();
+            let phi = ((1.0 - xa * xa).sqrt() / (self.b * xa)).atan();
+            lat = if lat < 0.0 { -phi } else { phi };
+        }
+        Some((lam, lat))
     }
 }
 

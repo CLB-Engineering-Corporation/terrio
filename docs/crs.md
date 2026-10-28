@@ -688,3 +688,25 @@ lenient, that applies rotated too: its `utm` accepts a sphere, which PROJ refuse
 The `seed-ob_tran-moll` fixture keeps its PROJ 9.9.0 oracle. A PROJ 9.8.1 corpus covers
 15 configurations and 4,680 samples (see Testing). Allowances are 1 mm projected and 1e-8
 degrees inverse.
+
+## Quadrilateralized spherical cube
+
+`+proj=qsc` is computed as PROJ 9.8.1 does (`qsc.cpp`): one face of a cube, chosen by the
+projection centre (`+lat_0` of at least 67.5 degrees north or south for the top or bottom face,
+otherwise `+lon_0` within 45 degrees of 0, 90, 180 or -90 for the front, right, back or left
+face). PROJ's face centres are those values exactly; for other centres, `+lon_0` stays the
+central meridian. On an ellipsoid, geodetic latitudes are converted to
+geocentric latitudes on a sphere of the semi-major axis, as in PROJ. The whole globe projects
+onto the plane of the face, with no refusals; `+units`, `+x_0` and `+y_0` apply. The inverse at
+the point opposite the face centre is sensitive to rounding: a change of 1e-15 in the northing
+moves its latitude by about 1e-6 degrees, in PROJ as in terrio, and so may differ between
+platforms.
+
+GDAL's and ESRI's WKT1 `Quadrilateralized_Spherical_Cube` and WKT2 `Quadrilateralized Spherical
+Cube` are read, and terrio writes the WKT1 form, as GDAL does. PROJJSON export refuses `qsc`, as
+for other projections without an EPSG method.
+
+The `method-qsc` fixture keeps its PROJ 9.9.0 oracle. A PROJ 9.8.1 corpus covers 16
+configurations and 4,288 samples (see Testing). Allowances are 1 mm projected and 1e-8 degrees
+inverse. At the point opposite the face centre the inverse is allowed 1e-5 degrees, and must
+project back within 1 mm.

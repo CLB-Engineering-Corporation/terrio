@@ -472,6 +472,12 @@ pub(crate) fn to_proj(root: &Node) -> Option<Converted> {
             push(&mut out, "lon_0", lon_0);
             push(&mut out, "h", get(&["satelliteheight", "height"]).map(|h| h * to_meter));
         }
+        // GDAL's and ESRI's quadrilateralized spherical cube.
+        "quadrilateralizedsphericalcube" => {
+            out.push("+proj=qsc".into());
+            push(&mut out, "lat_0", lat_0);
+            push(&mut out, "lon_0", lon_0);
+        }
         "orthographic" => {
             out.push("+proj=ortho".into());
             push(&mut out, "lat_0", lat_0);

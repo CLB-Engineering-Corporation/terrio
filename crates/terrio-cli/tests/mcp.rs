@@ -371,6 +371,27 @@ fn oblique_mollweide_coordinates_and_refusal_through_mcp() {
 }
 
 #[test]
+fn quadrilateralized_spherical_cube_coordinates_through_mcp() {
+    // rust-proj-capability's method-qsc fixture (PROJ 9.9.0), forward and back.
+    let target = "+proj=qsc +lat_0=0 +lon_0=0 +datum=WGS84 +units=m +no_defs";
+    let replies = session(&[
+        call(1, "crs", &["OGC:CRS84", "--to", target, "10", "10"]),
+        call(2, "crs", &[target, "--to", "OGC:CRS84", "1689641.80879759", "1701418.7180670935"]),
+    ]);
+    let values = |id: u64| -> Vec<f64> {
+        assert_eq!(replies[&id]["result"]["isError"], false);
+        replies[&id]["result"]["content"][0]["text"].as_str().unwrap().split_whitespace().filter_map(|v| v.parse().ok()).collect()
+    };
+    let forward = values(1);
+    assert_eq!(forward.len(), 2);
+    assert!((forward[0] - 1689641.80879759).abs() < 0.001);
+    assert!((forward[1] - 1701418.7180670935).abs() < 0.001);
+    let inverse = values(2);
+    assert_eq!(inverse.len(), 2);
+    assert!((inverse[0] - 10.0).abs() < 1e-8 && (inverse[1] - 10.0).abs() < 1e-8);
+}
+
+#[test]
 fn vector_geometry_tools_are_discoverable_and_execute() {
     let dir = tempfile::tempdir().unwrap();
     let input = dir.path().join("line.geojson");

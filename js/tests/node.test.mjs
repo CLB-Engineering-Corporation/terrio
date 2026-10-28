@@ -1780,6 +1780,35 @@ test("general oblique transformation matches PROJ", () => {
   }
 });
 
+test("quadrilateralized spherical cube matches PROJ", () => {
+  const reference = JSON.parse(readFileSync(new URL("../../crates/terrio-crs/tests/data/qsc_reference.json", import.meta.url), "utf8"));
+  for (const c of reference.cases) {
+    const samples = c.samples;
+    for (const target of [c.target, c.wkt2, c.wkt1, c.wkt1_esri]) {
+      const result = terrio.transformPoints(samples.map(s => s[0]), samples.map(s => s[1]), c.source, target);
+      for (let i = 0; i < samples.length; i++) for (let j = 0; j < 2; j++) {
+        assert.ok(Math.abs(result[j][i] - samples[i][2][j]) * c.metres_per_unit <= 0.001, `${c.name} forward ${i}/${j}`);
+      }
+    }
+    // PROJ refuses no qsc point (the generator checks it), so every sample has its values.
+    const pairs = samples.map(s => [s[2], s[3]]).concat(c.inverse_samples);
+    const inverse = terrio.transformPoints(pairs.map(p => p[0][0]), pairs.map(p => p[0][1]), c.target, c.source);
+    // At the antipode of the face centre the inverse goes through acos near 180 degrees and moves
+    // by about 1e-6 degrees with the last bit of the northing: it is checked by its projection.
+    const antipodal = new Set(c.antipodal_samples);
+    for (let i = 0; i < pairs.length; i++) {
+      const [lon, lat] = pairs[i][1];
+      const dlon = ((inverse[0][i] - lon + 540) % 360 - 180) * Math.cos(lat * Math.PI / 180);
+      const tolerance = antipodal.has(i) ? 1e-5 : 1e-8;
+      assert.ok(Math.abs(dlon) <= tolerance && Math.abs(inverse[1][i] - lat) <= tolerance, `${c.name} inverse ${i}`);
+      if (antipodal.has(i)) {
+        const again = terrio.transformPoints([inverse[0][i]], [inverse[1][i]], c.source, c.target);
+        for (let j = 0; j < 2; j++) assert.ok(Math.abs(again[j][0] - pairs[i][0][j]) * c.metres_per_unit <= 0.001, `${c.name} antipode ${i}`);
+      }
+    }
+  }
+});
+
 test("vector geometry operations: simplify, segmentize, hulls, swap-xy, set-geom-type, combine, sort", () => {
   const line = {
     type: "FeatureCollection",

@@ -1147,6 +1147,31 @@ def suite_ob_tran(ctx):
     return suite
 
 
+def suite_qsc(ctx):
+    """The quadrilateralized spherical cube on each face, as PROJ strings and as GDAL's WKT."""
+    suite = Suite("qsc", "Quadrilateralized spherical cube", "GDAL/PROJ",
+                  "16 spherical/WGS84 configurations (the six cube faces, centres between faces, units "
+                  "and false offsets) and 4,288 geographic samples over the whole globe and each side "
+                  "of the face and area edges, as PROJ strings, WKT2, WKT1 and ESRI WKT1, and inverse "
+                  "points on and beyond the face. Projected allowance 1 mm; inverse 1e-8 degrees, "
+                  "longitude weighted by cos(latitude); at the antipode of the face centre, 1e-5 degrees "
+                  "and 1 mm of projected residual.")
+    if missing_modules("osgeo"):
+        suite.skipped = "needs GDAL Python bindings"
+        return suite
+    code, out, err = run([sys.executable, str(SCRIPTS / "compare_qsc_with_gdal.py"), ctx.data, "--terrio", ctx.terrio, "--json"])
+    try:
+        cases = json.loads(out)
+    except json.JSONDecodeError:
+        suite.error = tail(err or out)
+        return suite
+    for case in cases:
+        suite.cases.append(Case("Quadrilateralized spherical cube", case["name"], case["status"], case["detail"]))
+    if code and not any(c.status == DIFFERS for c in suite.cases):
+        suite.error = tail(err or out)
+    return suite
+
+
 def suite_projjson(ctx):
     """PROJJSON units, axes and bound transformations, with and without IDs."""
     suite = Suite("projjson", "PROJJSON CRS definitions", "GDAL/PROJ",
@@ -1906,6 +1931,7 @@ SUITES = OrderedDict(
         ("perspective", suite_perspective),
         ("igh", suite_igh),
         ("ob_tran", suite_ob_tran),
+        ("qsc", suite_qsc),
         ("projjson", suite_projjson),
         ("projjson-export", suite_projjson_export),
         ("iau", suite_iau),
