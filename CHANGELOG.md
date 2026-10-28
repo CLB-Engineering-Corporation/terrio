@@ -39,6 +39,12 @@
   more as the image has more tiles; the threads decoding the chunks of larger
   windows of local files still each read the tables, as does moving to another
   overview. The tables kept take 16 bytes per chunk of each image read.
+- GeoTIFF and COG: LERC masks the padding of partial edge tiles of
+  floating-point bands (one band, or `INTERLEAVE=BAND`), as GDAL does, whatever
+  the nodata value. The padding was stored as valid zeros: on a 6705 x 4852
+  flood-depth COG, LERC with `MAX_Z_ERROR=0.01` shrinks by 3.5% (NaN nodata)
+  to 13% (-9999 nodata). Integer and pixel-interleaved LERC tiles, and the
+  other codecs, keep GDAL's zeros. Pixels inside the raster are unchanged.
 
 ### Remote I/O
 
