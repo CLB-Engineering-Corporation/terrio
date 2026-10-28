@@ -392,8 +392,13 @@ def test_dem_path_to_path_is_streamed(tmp_path):
             assert r.is_lazy
             np.testing.assert_array_equal(r.read(), whole.read())
             assert r.nodata == whole.nodata and r.count == whole.count
+            assert r.crs == whole.crs
+            assert r.transform == whole.transform
     with pytest.raises(terrio.InvalidArgumentError):
         terrio.dem(str(src), "slope", max_memory_mib=10)
+    # An output that is also the input is read whole: a budget cannot apply.
+    with pytest.raises(terrio.InvalidArgumentError):
+        terrio.dem(str(src), "slope", dst=str(src), max_memory_mib=10)
 
 
 def test_calc_numpy_typing():

@@ -76,7 +76,9 @@ pub struct Args {
     #[arg(long = "nearest-color-entry", alias = "nearest_color_entry")]
     nearest_color_entry: bool,
     /// About how much memory (MiB) the strips of rows in flight may take, which sets their
-    /// height (default 256). The output does not depend on it.
+    /// height (by default, strips of about 64 MiB of input values). The output does not depend on
+    /// it. Refused for a VRT output and for an output that is also the input, which are not
+    /// written in strips.
     #[arg(long = "max-memory", value_name = "MIB")]
     max_memory: Option<f64>,
     #[command(flatten)]
@@ -145,6 +147,12 @@ pub fn run(a: Args) -> terrio::Result<()> {
     if vrt && colors.is_none() {
         return Err(Error::InvalidArgument("VRT output is only supported for color-relief".into()));
     }
+    // Only outputs written a strip at a time take a memory budget, as in Python.
+    if a.max_memory.is_some() && (vrt || same_file(input, output)) {
+        return Err(Error::InvalidArgument(
+            "--max-memory does not apply to a VRT output or to an output that is also the input, which are not written in strips".into(),
+        ));
+    }
     // Terrain products a strip at a time, without holding the DEM or the output whole.
     let colors = match (colors, product) {
         // The DEM read whole first when it is also the output.
@@ -161,7 +169,7 @@ pub fn run(a: Args) -> terrio::Result<()> {
     // A color relief a strip at a time, without holding the DEM or the output whole.
     if !vrt && !same_file(input, output) {
         let mut src = open_lazy(input)?;
-        let map = ColorMap::parse_lazy(&text, &mut src, o.band, pam_statistics(input, o.band))?;
+        let map = ColorMap::parse_lazy(&text, &mut src, o.band, pam_statistics(input, o.band), o.max_memory_mib)?;
         return super::quiet(|| color_relief_to_path(&mut src, &map, &o, output, &a.out.options()?));
     }
     let ds = open(input)?;

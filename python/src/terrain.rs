@@ -64,7 +64,9 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
 ///     tile_size: GeoTIFF/COG tile size, for `dst`.
 ///     bigtiff: Write a BigTIFF, for `dst`.
 ///     max_memory_mib: With a `src` path and `dst`: about how much memory (MiB) the strips of
-///         rows in flight may take, which sets their height. By default 256 MiB.
+///         rows in flight may take, which sets their height. By default, strips of about 64 MiB
+///         of input values. Refused otherwise, and for a VRT `dst` or a `dst` that is `src`
+///         (read whole).
 ///
 /// Returns:
 ///     Raster: The result. When `src` and `dst` are paths, the DEM is read and the result written
@@ -182,7 +184,7 @@ fn dem(
                 (None, Some(file)) => {
                     let text = std::fs::read_to_string(file)
                         .map_err(|e| terrio::Error::InvalidArgument(format!("cannot read the color file '{file}': {e}")))?;
-                    let map = ColorMap::parse_lazy(&text, &mut lazy, band, pam_statistics(src_path, band))?;
+                    let map = ColorMap::parse_lazy(&text, &mut lazy, band, pam_statistics(src_path, band), max_memory_mib)?;
                     terrio::ops::dem::color_relief_to_path(&mut lazy, &map, &o, out_path, &options)?;
                 }
                 (None, None) => unreachable!("checked"),

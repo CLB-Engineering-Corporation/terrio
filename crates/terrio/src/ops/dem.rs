@@ -139,7 +139,8 @@ pub struct DemOptions {
     /// For the operations written to a path a strip of rows at a time ([`dem_to_path`],
     /// [`color_relief_to_path`]): about how much memory, in MiB, the strips in flight may take
     /// (read ahead, computed, being written), which sets their height (like `gdalwarp -wm`). By
-    /// default, 256 MiB. The values do not depend on it.
+    /// default, strips of about 64 MiB of input values, as `dem_to_path` always used (about
+    /// 300 to 550 MiB in flight for a Float32 DEM). The values do not depend on it.
     pub max_memory_mib: Option<f64>,
 }
 
@@ -1124,8 +1125,8 @@ pub fn dem(ds: &RasterDataset, product: DemProduct, o: &DemOptions) -> Result<Ra
 /// the DEM and writing a GeoTIFF output a strip of rows at a time: neither is held whole (other
 /// formats are written whole). The values are those of [`dem`].
 ///
-/// `path` must not be the file `src` reads, which writing it would truncate: read such a DEM
-/// whole with [`crate::open_raster`] and use [`dem`].
+/// A DEM that is also the output (`path` is the file `src` reads) is read whole first, so that
+/// writing does not truncate it; [`DemOptions::max_memory_mib`] is then refused.
 ///
 /// ```no_run
 /// use terrio::ops::dem::{DemOptions, DemProduct, dem_to_path};
@@ -1142,8 +1143,7 @@ pub fn dem_to_path(
     options: &crate::RasterWriteOptions,
 ) -> Result<()> {
     o.validate()?;
-    // A DEM that is also the output is read whole first.
-    if super::strips::overwrites(path, &src.input_paths()?) {
+    if overwrites_input(src, o, path)? {
         return crate::write_raster_dataset(&dem(&src.read()?, product, o)?, path, options);
     }
     let out_bytes = if product == DemProduct::Hillshade { 1 } else { 4 };
@@ -1151,24 +1151,40 @@ pub fn dem_to_path(
     dem_in_strips(src, product, o, path, options, rows)
 }
 
-/// The memory budget of the operations written a strip at a time, when none is given.
-const DEFAULT_MEMORY_MIB: f64 = 256.0;
+/// Whether `path` is the file `src` reads, which is then read whole first instead of in strips:
+/// a memory budget, which could not be honored, is refused.
+fn overwrites_input(src: &crate::LazyRaster, o: &DemOptions, path: &str) -> Result<bool> {
+    let overwrites = super::strips::overwrites(path, &src.input_paths()?);
+    if overwrites && o.max_memory_mib.is_some() {
+        return Err(Error::InvalidArgument(
+            "max_memory_mib does not apply to an output that is also the input, which is read whole".into(),
+        ));
+    }
+    Ok(overwrites)
+}
 
-/// The rows of the strips a DEM operation written a strip at a time processes, for an output of
-/// `out_bytes` bytes per pixel (all bands): as many rows as `max_memory_mib` (by default
-/// [`DEFAULT_MEMORY_MIB`]) holds. About three strips of input (read ahead, read, worked on) and three of
-/// output (computed, queued, being written) are in flight, with the `f64` values of one.
-fn strip_rows(src: &crate::LazyRaster, o: &DemOptions, out_bytes: usize) -> usize {
-    let (w, block) = (src.width().max(1), src.block_size().map(|b| b.1));
-    let value = src.data_type().size_bytes().max(4);
-    let mib = o.max_memory_mib.unwrap_or(DEFAULT_MEMORY_MIB);
-    let row = w * (3 * value + 8 + 4 + 3 * out_bytes);
-    let rows = ((mib * 1048576.0) as usize / row).max(1);
-    // Whole rows of the input's blocks, when they fit.
+/// The rows of the strips of a DEM read a strip at a time, `row` bytes in flight per row: as many
+/// as `max_memory_mib` holds, at least one, whole rows of the input's blocks when they fit; without
+/// a budget, about 64 MiB of input values ([`super::strips::strip_rows`]).
+fn budget_rows(src: &crate::LazyRaster, max_memory_mib: Option<f64>, row: usize) -> usize {
+    let block = src.block_size().map(|b| b.1);
+    let Some(mib) = max_memory_mib else {
+        return super::strips::strip_rows(src.width(), 1, src.data_type().size_bytes().max(4), block);
+    };
+    let rows = ((mib * 1048576.0) as usize / row.max(1)).max(1);
     match block.filter(|b| *b > 1 && rows >= *b) {
         Some(b) => rows / b * b,
         None => rows,
     }
+}
+
+/// The rows of the strips a DEM operation written a strip at a time processes, for an output of
+/// `out_bytes` bytes per pixel (all bands): as many rows as `max_memory_mib` holds (see
+/// [`budget_rows`]). About three strips of input values (read ahead, read, worked on) and three of
+/// output (computed, queued, being written) are in flight, with the `f64` values of one.
+fn strip_rows(src: &crate::LazyRaster, o: &DemOptions, out_bytes: usize) -> usize {
+    let value = src.data_type().size_bytes().max(4);
+    budget_rows(src, o.max_memory_mib, src.width().max(1) * (3 * value + 8 + 4 + 3 * out_bytes))
 }
 
 /// [`dem_to_path`] in strips of `rows` rows.
@@ -1259,10 +1275,21 @@ impl ColorMap {
     }
 
     /// [`ColorMap::parse`] for a DEM read by window: percentages, when there are some and no
-    /// `range` is given, are of the band's range read a strip of rows at a time.
-    pub fn parse_lazy(text: &str, src: &mut crate::LazyRaster, band: usize, range: Option<(f64, f64)>) -> Result<Self> {
+    /// `range` is given, are of the band's range read a strip of rows at a time (a pass over the
+    /// band before it is colored), the strips taking about `max_memory_mib` MiB (as
+    /// [`DemOptions::max_memory_mib`]).
+    pub fn parse_lazy(
+        text: &str,
+        src: &mut crate::LazyRaster,
+        band: usize,
+        range: Option<(f64, f64)>,
+        max_memory_mib: Option<f64>,
+    ) -> Result<Self> {
+        if max_memory_mib.is_some_and(|m| m.is_nan() || m <= 0.0) {
+            return Err(Error::InvalidArgument("invalid max_memory_mib".into()));
+        }
         let nodata = src.header().nodata();
-        Self::parse_with(text, nodata, range, || lazy_band_range(src, band))
+        Self::parse_with(text, nodata, range, || lazy_band_range(src, band, max_memory_mib))
     }
 
     fn parse_with(
@@ -1367,15 +1394,16 @@ fn band_range(ds: &RasterDataset, band: usize) -> Result<(f64, f64)> {
     Ok((lo, hi))
 }
 
-/// The minimum and maximum of the valid values of a band read by window, a strip of rows at a time.
-fn lazy_band_range(src: &mut crate::LazyRaster, band: usize) -> Result<(f64, f64)> {
+/// The minimum and maximum of the valid values of a band read by window, a strip of rows at a
+/// time: as many rows as `max_memory_mib` holds of the values read and their `f64` copy.
+fn lazy_band_range(src: &mut crate::LazyRaster, band: usize, max_memory_mib: Option<f64>) -> Result<(f64, f64)> {
     if band == 0 || band > src.band_count() {
         return Err(Error::InvalidArgument(format!("unable to fetch band #{band}")));
     }
     let header = src.header();
     let nodata = header.nodata();
     let (w, h) = (src.width(), src.height());
-    let rows = super::strips::strip_rows(w, 1, 8, src.block_size().map(|b| b.1));
+    let rows = budget_rows(src, max_memory_mib, w.max(1) * (src.data_type().size_bytes() + 8));
     let read = crate::WindowOptions { bands: vec![band], ..Default::default() };
     let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
     for y in (0..h).step_by(rows.max(1)) {
@@ -1752,13 +1780,13 @@ pub fn color_relief(ds: &RasterDataset, colors: &ColorMap, o: &DemOptions) -> Re
 /// Colors a DEM band with a color map as [`color_relief`] does and writes the result to `path`,
 /// reading the DEM and writing a GeoTIFF output a strip of rows at a time: neither is held whole
 /// (other formats are written whole). The values are those of [`color_relief`]. A DEM that is
-/// also the output is read whole first.
+/// also the output is read whole first, and [`DemOptions::max_memory_mib`] is then refused.
 ///
 /// ```no_run
 /// use terrio::ops::dem::{ColorMap, DemOptions, color_relief_to_path};
 ///
 /// let mut src = terrio::open_raster_lazy("dem.tif")?;
-/// let colors = ColorMap::parse_lazy("0 0 0 255\n1000 255 255 255\nnv 0 0 0 0", &mut src, 1, None)?;
+/// let colors = ColorMap::parse_lazy("0 0 0 255\n1000 255 255 255\nnv 0 0 0 0", &mut src, 1, None, None)?;
 /// let o = DemOptions { alpha: true, ..Default::default() };
 /// color_relief_to_path(&mut src, &colors, &o, "relief.tif", &Default::default())?;
 /// # Ok::<(), terrio::Error>(())
@@ -1771,7 +1799,7 @@ pub fn color_relief_to_path(
     options: &crate::RasterWriteOptions,
 ) -> Result<()> {
     o.validate()?;
-    if super::strips::overwrites(path, &src.input_paths()?) {
+    if overwrites_input(src, o, path)? {
         return crate::write_raster_dataset(&color_relief(&src.read()?, colors, o)?, path, options);
     }
     let rows = strip_rows(src, o, if o.alpha { 4 } else { 3 });
@@ -1875,7 +1903,10 @@ nv 10 20 30 0
             crate::write_raster_dataset(&ds, input.to_str().unwrap(), &Default::default()).unwrap();
             let map = ColorMap::parse(text, &ds, 1, None).unwrap();
             let mut lazy = crate::open_raster_lazy(input.to_str().unwrap()).unwrap();
-            assert_eq!(ColorMap::parse_lazy(text, &mut lazy, 1, None).unwrap(), map, "{dt:?}");
+            assert_eq!(ColorMap::parse_lazy(text, &mut lazy, 1, None, None).unwrap(), map, "{dt:?}");
+            // A row at a time.
+            assert_eq!(ColorMap::parse_lazy(text, &mut lazy, 1, None, Some(1e-9)).unwrap(), map, "{dt:?}");
+            assert!(ColorMap::parse_lazy(text, &mut lazy, 1, None, Some(0.0)).is_err());
             for (alpha, mode) in [(true, ColorSelection::Interpolate), (false, ColorSelection::Nearest), (true, ColorSelection::Exact)] {
                 let o = DemOptions { alpha, color_selection: mode, ..Default::default() };
                 let whole = color_relief(&ds, &map, &o).unwrap();
@@ -1910,6 +1941,8 @@ nv 10 20 30 0
         let mut src = crate::open_raster_lazy(input).unwrap();
         assert_eq!(strip_rows(&src, &DemOptions { max_memory_mib: Some(1e-9), ..Default::default() }, 4), 1);
         assert!(strip_rows(&src, &DemOptions { max_memory_mib: Some(1.0), ..Default::default() }, 4) > 30);
+        // Without a budget, the strips dem_to_path has always used.
+        assert_eq!(strip_rows(&src, &DemOptions::default(), 1), crate::ops::strips::strip_rows(40, 1, 4, src.block_size().map(|b| b.1)));
         assert!(
             dem_to_path(
                 &mut src,
@@ -1956,6 +1989,19 @@ nv 10 20 30 0
         let copy = copy.to_str().unwrap();
         std::fs::copy(input, copy).unwrap();
         let mut src = crate::open_raster_lazy(copy).unwrap();
+        // A budget cannot apply to a DEM read whole: refused, before the output is written.
+        let budget = DemOptions { max_memory_mib: Some(64.0), ..Default::default() };
+        assert!(dem_to_path(&mut src, DemProduct::Slope, &budget, copy, &Default::default()).is_err());
+        let map = ColorMap::parse_lazy(
+            "0 0 0 0
+300 255 255 255",
+            &mut src,
+            1,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(color_relief_to_path(&mut src, &map, &budget, copy, &Default::default()).is_err());
         dem_to_path(&mut src, DemProduct::Slope, &DemOptions::default(), copy, &Default::default()).unwrap();
         drop(src);
         assert_eq!(
