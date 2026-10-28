@@ -1196,6 +1196,30 @@ def suite_healpix(ctx):
     return suite
 
 
+def suite_isea(ctx):
+    """ISEA, as PROJ strings and as GDAL's and ESRI's WKT, and its inverse refusals."""
+    suite = Suite("isea", "Icosahedral Snyder Equal Area", "GDAL/PROJ",
+                  "14 configurations on the authalic sphere of WGS 84 and on WGS 84 (both orientations, "
+                  "central meridians, lat_0, azi, resolution and aperture, units and false offsets) and "
+                  "7,784 geographic samples, as PROJ strings, WKT2, WKT1 and ESRI WKT1; PROJ's inverse and "
+                  "its refusals. Projected allowance 1 mm; inverse 1e-8 degrees, longitude weighted by "
+                  "cos(latitude). Not compared with a PROJ whose isea differs from PROJ 9.8.1's.")
+    if missing_modules("osgeo"):
+        suite.skipped = "needs GDAL Python bindings"
+        return suite
+    code, out, err = run([sys.executable, str(SCRIPTS / "compare_isea_with_gdal.py"), ctx.data, "--terrio", ctx.terrio, "--json"])
+    try:
+        cases = json.loads(out)
+    except json.JSONDecodeError:
+        suite.error = tail(err or out)
+        return suite
+    for case in cases:
+        suite.cases.append(Case("ISEA", case["name"], case["status"], case["detail"]))
+    if code and not any(c.status == DIFFERS for c in suite.cases):
+        suite.error = tail(err or out)
+    return suite
+
+
 def suite_projjson(ctx):
     """PROJJSON units, axes and bound transformations, with and without IDs."""
     suite = Suite("projjson", "PROJJSON CRS definitions", "GDAL/PROJ",
@@ -1957,6 +1981,7 @@ SUITES = OrderedDict(
         ("ob_tran", suite_ob_tran),
         ("qsc", suite_qsc),
         ("healpix", suite_healpix),
+        ("isea", suite_isea),
         ("projjson", suite_projjson),
         ("projjson-export", suite_projjson_export),
         ("iau", suite_iau),

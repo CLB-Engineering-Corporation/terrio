@@ -739,3 +739,34 @@ other methods, as 1200/3937 m.
 The `method-healpix` and `method-rhealpix` fixtures keep their PROJ 9.9.0 oracles. A PROJ
 9.8.1 corpus covers 22 configurations and 6,600 samples (see Testing). Allowances are 1 mm
 projected and 1e-8 degrees inverse.
+
+## Icosahedral Snyder Equal Area
+
+`+proj=isea` is computed as PROJ 9.8.1 does (`isea.cpp`): Snyder's equal-area projection of the
+sphere onto the 20 faces of an icosahedron, unfolded in the plane. `+orient=isea` (the default)
+places the poles on edge midpoints and makes the equator symmetric; `+orient=pole` places a
+vertex at each pole. As in PROJ, `+lon_0` and `+lat_0` set the icosahedron's orientation, and
+`+lon_0` is also the central meridian; `+azi` rotates it. `+units`, `+x_0` and `+y_0` apply.
+`+mode=plane` is the default; `+mode=di`, `dd` and `hex`, which give grid addresses rather than
+coordinates, are refused. Invalid `+orient`, `+mode`, `+resolution` and `+aperture` values are
+refused, as in PROJ.
+
+As in PROJ 9.8.1, the inverse is defined only for the default grid (`+resolution=4`,
+`+aperture=3`, no `+azi`) whose origin, after any `+lon_0` and `+lat_0`, is exactly the default
+orientation's (which `+lon_0=11.25` keeps) or the pole orientation's (which
+`+lat_0=90 +lon_0=0` gives), and refuses points outside the unfolded icosahedron; elsewhere it
+is refused. On an ellipsoid the forward takes the geodetic latitude on a sphere of the
+semi-major axis, while the inverse uses the authalic radius without the authalic latitude, so
+the inverse does not return the projected point: on WGS 84, (147, -42) projects and unprojects
+to (147.166, -41.969), in PROJ as in terrio.
+
+GDAL's WKT1 (`custom_proj4`, which carries the PROJ string), ESRI's `PROJ_isea` (with
+`PROJ_isea_orient=pole` and other options in the method's name) and PROJ's WKT2 method
+`PROJ isea` (`PROJ isea orient=pole`) are read; terrio writes the WKT1 form, as GDAL does.
+PROJJSON export refuses `isea`, as for other projections without an EPSG method.
+
+Other PROJ versions differ: PROJ 9.4 has no inverse and a forward up to 2 mm different,
+and PROJ 9.9 replaced the method with a new implementation (another default origin, the
+authalic latitude on an ellipsoid, other parameters). The `method-isea` fixture, from PROJ
+9.9.0, is therefore not used. A PROJ 9.8.1 corpus covers 14 configurations and 7,784 samples
+(see Testing). Allowances are 1 mm projected and 1e-8 degrees inverse.

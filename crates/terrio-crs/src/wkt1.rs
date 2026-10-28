@@ -229,8 +229,8 @@ pub(crate) fn to_proj(root: &Node) -> Option<Converted> {
     let sp1 = angle(&["standardparallel1", "standardparallel", "latitudeof1ststandardparallel"]);
     let sp2 = angle(&["standardparallel2", "latitudeof2ndstandardparallel"]);
     let method = norm(root.child("PROJECTION")?.name()?);
-    // `x_0` and `y_0` are ESRI's names for them in `PROJ_healpix` and `PROJ_rhealpix`.
-    let proj_method = matches!(method.as_str(), "projhealpix" | "projrhealpix");
+    // `x_0` and `y_0` are ESRI's names for them in `PROJ_healpix`, `PROJ_rhealpix` and `PROJ_isea`.
+    let proj_method = matches!(method.as_str(), "projhealpix" | "projrhealpix") || method.starts_with("projisea");
     let fe = get(&["falseeasting", "eastingatfalseorigin", "eastingatprojectioncentre"])
         .or_else(|| if proj_method { get(&["x0"]) } else { None })
         .unwrap_or(0.0)
@@ -545,6 +545,33 @@ pub(crate) fn to_proj(root: &Node) -> Option<Converted> {
             push(&mut out, "lon_0", angle(&["lon0"]));
             push(&mut out, "north_square", get(&["northsquare"]));
             push(&mut out, "south_square", get(&["southsquare"]));
+        }
+        // ISEA, with its string-valued parameters in the method's name: `PROJ_isea_orient=pole`.
+        m if m.starts_with("projisea") => {
+            let raw = root.child("PROJECTION")?.name()?;
+            let flags = raw.get(..9)?.eq_ignore_ascii_case("PROJ_isea").then(|| &raw[9..])?;
+            out.push("+proj=isea".into());
+            let mut keys: Vec<&str> = Vec::new();
+            for flag in flags.split('_').skip(1) {
+                let (k, v) = flag.split_once('=')?;
+                if k.is_empty() || v.is_empty() || !k.bytes().chain(v.bytes()).all(|c| c.is_ascii_alphanumeric()) {
+                    return None;
+                }
+                // ISEA's string-valued parameters, each once; the others are PARAMETERs.
+                if !matches!(k, "orient" | "mode") || keys.contains(&k) {
+                    return None;
+                }
+                keys.push(k);
+                out.push(format!("+{k}={v}"));
+            }
+            if !flags.is_empty() && !flags.starts_with('_') {
+                return None;
+            }
+            push(&mut out, "lon_0", angle(&["lon0"]));
+            push(&mut out, "lat_0", angle(&["lat0"]));
+            push(&mut out, "azi", angle(&["azi"]));
+            push(&mut out, "resolution", get(&["resolution"]));
+            push(&mut out, "aperture", get(&["aperture"]));
         }
         // World projections of a central meridian, as terrio writes them.
         m => {

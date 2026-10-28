@@ -1848,6 +1848,33 @@ test("HEALPix and rHEALPix match PROJ", () => {
   }
 });
 
+test("ISEA matches PROJ", () => {
+  const reference = JSON.parse(readFileSync(new URL("../../crates/terrio-crs/tests/data/isea_reference.json", import.meta.url), "utf8"));
+  const near = (actual, [lon, lat]) => Math.abs(((actual[0] - lon + 540) % 360 - 180) * Math.cos(lat * Math.PI / 180)) <= 1e-8 && Math.abs(actual[1] - lat) <= 1e-8;
+  for (const c of reference.cases) {
+    const samples = c.samples;
+    for (const target of [c.target, c.wkt2, c.wkt1, c.wkt1_esri]) {
+      const result = terrio.transformPoints(samples.map(s => s[0]), samples.map(s => s[1]), c.source, target);
+      for (let i = 0; i < samples.length; i++) for (let j = 0; j < 2; j++) {
+        assert.ok(Math.abs(result[j][i] - samples[i][2][j]) * c.metres_per_unit <= 0.001, `${c.name} forward ${i}/${j}`);
+      }
+    }
+    // PROJ's inverse, which is not the forward's on an ellipsoid and is refused outside its
+    // default grid. As in crates/terrio-crs/tests/isea.rs.
+    const pairs = samples.map(s => [s[2], s[3]]).concat(c.inverse_samples);
+    const reversible = pairs.filter(([, e]) => e !== null);
+    if (reversible.length > 0) {
+      const inverse = terrio.transformPoints(reversible.map(p => p[0][0]), reversible.map(p => p[0][1]), c.target, c.source);
+      for (let i = 0; i < reversible.length; i++) {
+        assert.ok(near([inverse[0][i], inverse[1][i]], reversible[i][1]), `${c.name} inverse ${i}`);
+      }
+    }
+    for (const [point] of pairs.filter(([, e]) => e === null)) {
+      assert.throws(() => terrio.transformPoints([point[0]], [point[1]], c.target, c.source), undefined, `${c.name} inverse ${point}`);
+    }
+  }
+});
+
 test("vector geometry operations: simplify, segmentize, hulls, swap-xy, set-geom-type, combine, sort", () => {
   const line = {
     type: "FeatureCollection",

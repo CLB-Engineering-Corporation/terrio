@@ -387,11 +387,7 @@ pub(crate) fn to_proj(root: &Node) -> Result<Converted> {
             match k.as_str() {
                 "x_0" => fe = *v,
                 "y_0" => fn_ = *v,
-                // The figure, datum, units and axes come from the CRS, not from the method.
-                "proj" | "ellps" | "datum" | "a" | "b" | "rf" | "f" | "es" | "e" | "R" | "R_A" | "units" | "to_meter" | "towgs84"
-                | "nadgrids" | "geoidgrids" | "init" | "type" | "pm" | "axis" | "no_defs" | "wktext" | "over" => {
-                    return Err(bad(&format!("parameter '{k}' of the method 'PROJ {proj}'")));
-                }
+                k if RESERVED.contains(&k) => return Err(bad(&format!("parameter '{k}' of the method 'PROJ {proj}'"))),
                 _ => push(k, Some(*v)),
             }
         }
@@ -480,6 +476,38 @@ fn derived(root: &Node, conv: &Node) -> Result<Converted> {
     Ok(geog.converted(out.join(" ")))
 }
 
+/// PROJ parameters a `PROJ name` method may not take as PARAMETERs: the figure, datum, units and
+/// axes come from the CRS, not from the method.
+const RESERVED: [&str; 27] = [
+    "proj",
+    "ellps",
+    "datum",
+    "a",
+    "b",
+    "rf",
+    "f",
+    "es",
+    "e",
+    "R",
+    "R_A",
+    "R_C",
+    "units",
+    "to_meter",
+    "towgs84",
+    "nadgrids",
+    "geoidgrids",
+    "vunits",
+    "vto_meter",
+    "geoc",
+    "init",
+    "type",
+    "pm",
+    "axis",
+    "no_defs",
+    "wktext",
+    "over",
+];
+
 /// A PROJ projection and its parameters by their PROJ names.
 type ProjMethod = (String, Vec<(String, f64)>);
 
@@ -489,16 +517,36 @@ type ProjMethod = (String, Vec<(String, f64)>);
 fn proj_method(conv: &Node, method: &Node, ang: f64, to_meter: f64) -> Result<Option<ProjMethod>> {
     let Some(name) = method.name().and_then(|n| n.strip_prefix("PROJ ")) else { return Ok(None) };
     let word = |w: &str| !w.is_empty() && w.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_');
-    // PROJ's `ob_tran` names the rotated projection in the method: `PROJ ob_tran o_proj=moll`.
-    let name = match name.strip_prefix("ob_tran o_proj=") {
-        Some(o_proj) if word(o_proj) => format!("ob_tran +o_proj={o_proj}"),
-        _ if word(name) => name.to_string(),
+    // PROJ writes a projection's string-valued parameters in the method's name:
+    // `PROJ ob_tran o_proj=moll`, `PROJ isea orient=pole`.
+    let mut words = name.split(' ');
+    let mut name = match words.next() {
+        Some(w) if word(w) => w.to_string(),
         _ => return Ok(None),
     };
+    // The string-valued parameters each projection takes; the others are PARAMETERs.
+    let strings: &[&str] = match name.as_str() {
+        "ob_tran" => &["o_proj"],
+        "isea" => &["orient", "mode"],
+        _ => &[],
+    };
+    let mut keys: Vec<&str> = Vec::new();
+    for w in words {
+        match w.split_once('=') {
+            Some((k, v)) if word(k) && word(v) => {
+                if !strings.contains(&k) || keys.contains(&k) {
+                    return Err(bad(&format!("parameter '{k}' of the method 'PROJ {}'", method.name().unwrap_or(""))));
+                }
+                keys.push(k);
+                name.push_str(&format!(" +{k}={v}"));
+            }
+            _ => return Ok(None),
+        }
+    }
     let mut params = Vec::new();
     for n in conv.children("PARAMETER") {
         let key = n.name().unwrap_or("");
-        if key.is_empty() || !key.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_') {
+        if key.is_empty() || !key.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_') || keys.contains(&key) {
             return Err(bad(&format!("parameter '{key}' of the method 'PROJ {name}'")));
         }
         let v = n.num(1).ok_or_else(|| bad(&format!("parameter '{key}' without a value")))?;

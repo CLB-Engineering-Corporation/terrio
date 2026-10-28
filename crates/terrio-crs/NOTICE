@@ -20,6 +20,11 @@ The quadrilateralized spherical cube follows src/projections/qsc.cpp in PROJ 9.8
 The HEALPix and rHEALPix projections follow src/projections/healpix.cpp in PROJ 9.8.1
 (authors Alex Raichev and Michael Speth).
   Copyright (c) 2001, Thomas Flemming
+The Icosahedral Snyder Equal Area projection follows src/projections/isea.cpp in PROJ 9.8.1
+(forward by Nathan Wagner, in the public domain; inverse by Jerome Jacovella-St-Louis, adapted
+from Franz-Benjamin Mocnik's geogrid under the MIT licence, whose terms are those of PROJ's
+reproduced above).
+  Copyright (c) 2017-2019 Heidelberg University
 The normalized Cartesian inverse follows src/conversions/cart.cpp in PROJ 9.7.0.
   Copyright (c) 2016, Thomas Knudsen / SDFE
 
