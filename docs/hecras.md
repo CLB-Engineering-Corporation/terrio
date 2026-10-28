@@ -209,11 +209,11 @@ package's full module include it.
 
 ### One HDF5 reader
 
-terrio depends on `hdf5-reader` 0.9 (patched to `gpt-cmdr/netcdf-rust`), and the engine vendors
-a patched `hdf5-reader` 0.9.3 with refusal checks of its own. They become one when the reader
-changes the engine relies on are released upstream (roteiro-gis/netcdf-rust #102, #103 and
-#104), the engine depends on crates.io `hdf5-reader` instead of its vendored copy, and the
-engine's refusal policies move into checks of its own rather than reader patches.
+terrio and the engine use the same `hdf5-reader` 0.10 from crates.io (roteiro-gis/netcdf-rust),
+so a build with `hecras` compiles one HDF5 reader. The engine adds its own read policy on top
+(refusing filters without an encoded-size bound as intermediate decoding stages) instead of
+patching the reader. `cargo tree -d -e normal -p terrio --features hecras` lists the same
+duplicate crates as a build without `hecras`, and none of them is an HDF5 or NetCDF crate.
 
 ## Testing
 
