@@ -56,6 +56,11 @@
   `@FILE` stands for the paths listed in FILE, one per line, as GDAL's
   `--input @filelist.txt` does (#323). MCP tool calls refuse `@FILE`, so that a
   client cannot read a file back through the errors naming its lines.
+- `validate_cog` (Rust, Python) and `terrio validate-cog` (and MCP) check that a GeoTIFF is a
+  Cloud Optimized GeoTIFF with the checks and messages of rio-cogeo's `cog_validate` (GDAL's
+  `validate_cloud_optimized_geotiff.py`), reading only headers and chunk offsets: local files,
+  `/vsizip/` paths, and HTTP(S) or S3 URLs by range requests. The command exits with status 1
+  when the file is not a valid COG.
 
 ### Point clouds
 

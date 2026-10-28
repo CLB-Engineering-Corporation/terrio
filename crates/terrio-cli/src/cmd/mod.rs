@@ -34,6 +34,7 @@ pub mod sieve;
 pub mod tile_index;
 pub mod translate;
 pub mod update;
+pub mod validate_cog;
 pub mod vector_dataset;
 pub mod vector_geom;
 pub mod vector_grid;

@@ -16,6 +16,7 @@ __all__ = [
     "delete_overviews",
     "refresh_overviews",
     "update_raster",
+    "validate_cog",
     "__version__",
     "Raster",
     "GeoTiffWriter",
@@ -1771,6 +1772,7 @@ def refresh_overviews(
     external: bool = False,
     ignore_cog_layout_break: bool = False,
 ) -> list[tuple[int, int]]: ...
+def validate_cog(path: str | os.PathLike[str], *, strict: bool = False) -> tuple[bool, list[str], list[str]]: ...
 def update_raster(
     src: str | os.PathLike[str] | Raster,
     dst: str,
