@@ -108,6 +108,11 @@
   refused. GDAL's WKT1 `Interrupted_Goode_Homolosine`, ESRI's
   `Goode_Homolosine` with `Option` 1 and WKT2 `Interrupted Goode Homolosine`
   are read, and the first is written.
+- `+proj=ob_tran` with an `+o_proj` other than `longlat` (a projection on a
+  rotated sphere or ellipsoid) is computed as PROJ does; it was refused. The
+  pole may be given by `+o_lat_p`/`+o_lon_p`, by `+o_lon_c`/`+o_lat_c`/`+o_alpha`
+  or by `+o_lon_1`/`+o_lat_1`/`+o_lon_2`/`+o_lat_2`, for rotated-pole grids too.
+  PROJ's WKT2 `PROJ ob_tran o_proj=...` method is read.
 
 ### Warp
 
