@@ -60,6 +60,9 @@ struct ChunkInfo {
     h: usize,
     spp: usize,
     t: DataType,
+    /// The width and height of the part of the chunk inside the image: less than `w` x `h` in a
+    /// partial tile at the right or bottom edge, whose other pixels are padding.
+    valid: (usize, usize),
 }
 
 impl Compression {
@@ -155,7 +158,9 @@ fn deflate_at(data: &[u8], level: Option<u8>) -> Result<Vec<u8>> {
 
 /// Encodes a chunk (little-endian samples, interleaved) as a LERC blob of `spp` values per pixel,
 /// as GDAL's LERC codec does. Floating-point chunks of one sample with NaNs get a mask of the
-/// valid pixels.
+/// valid pixels. As in GDAL, a floating-point chunk of one sample (one band, or `INTERLEAVE=BAND`)
+/// also masks the padding of a partial edge tile, so the padding costs no LERC blocks; integer
+/// and pixel-interleaved chunks keep it as zeros.
 #[cfg(feature = "lerc")]
 fn lerc_encode(data: &[u8], c: &ChunkInfo, max_z_error: f64) -> Result<Vec<u8>> {
     let lerc = |e: lerc_core::Error| Error::InvalidData(format!("LERC: {e}"));
@@ -176,7 +181,13 @@ fn lerc_encode(data: &[u8], c: &ChunkInfo, max_z_error: f64) -> Result<Vec<u8>> 
             if v.chunks_exact(c.spp).any(|px| px.iter().any(|x| x.is_nan()) && !px.iter().all(|x| x.is_nan())) {
                 return Err(Error::Unsupported("LERC: NaN in some bands of a pixel only (write with INTERLEAVE=BAND)".into()));
             }
-            let valid: Vec<u8> = v.chunks_exact(c.spp).map(|px| u8::from(!px.iter().all(|x| x.is_nan()))).collect();
+            let (vw, vh) = c.valid;
+            let pad = c.spp == 1 && (vw < c.w || vh < c.h);
+            let valid: Vec<u8> = v
+                .chunks_exact(c.spp)
+                .enumerate()
+                .map(|(i, px)| u8::from((!pad || (i % c.w < vw && i / c.w < vh)) && !px.iter().all(|x| x.is_nan())))
+                .collect();
             let raster = lerc_writer::RasterView::new(w, h, d, &v).map_err(lerc)?;
             if valid.contains(&0) {
                 // Masked pixels: their values are not stored.
@@ -1315,7 +1326,8 @@ pub(crate) fn mask_image(mask: &[u8], cols: usize, rows: usize, block: (usize, u
                 }
             }
         }
-        compression.compress(buf, &ChunkInfo { w: chunk_w, h, spp: 1, t: DataType::U8 }, &CodecParams::default())
+        let valid = (chunk_w.min(cols - x0), h.min(rows - y0));
+        compression.compress(buf, &ChunkInfo { w: chunk_w, h, spp: 1, t: DataType::U8, valid }, &CodecParams::default())
     });
     let chunks = chunks.into_iter().collect::<Result<Vec<_>>>()?;
     let mut tags = vec![
@@ -1426,7 +1438,8 @@ impl<'a> Level<'a> {
                 with_data!(self.data.as_ref(), v => chunk_bytes(v, self.cols, self.rows, spp * parts, x0, y0, chunk_w, h))
             };
             apply_predictor(&mut buf, layout.predictor, chunk_w * chunk_spp, chunk_spp, size);
-            compression.compress(buf, &ChunkInfo { w: chunk_w, h, spp: chunk_spp, t }, codec)
+            let valid = (chunk_w.min(self.cols - x0), h.min(self.rows - y0));
+            compression.compress(buf, &ChunkInfo { w: chunk_w, h, spp: chunk_spp, t, valid }, codec)
         });
         let chunks = chunks.into_iter().collect::<Result<Vec<_>>>()?;
         let (bits, format) = sample_format(t);
@@ -3300,6 +3313,11 @@ mod tests {
             (67, 93, 2, DataType::U8, true, Max, true, Compression::Deflate),
             (35, 131, 1, DataType::I16, false, Mode, false, Compression::Deflate),
             (33, 129, 2, DataType::U8, false, Nearest, true, Compression::None),
+            // LERC masks the padding of partial edge tiles of floating-point bands.
+            #[cfg(feature = "lerc")]
+            (70, 50, 1, DataType::F32, false, Average, false, Compression::Lerc),
+            #[cfg(feature = "lerc")]
+            (73, 127, 2, DataType::F32, true, Nearest, false, Compression::LercDeflate),
         ] {
             let cfg = wbraster::RasterConfig {
                 cols,
@@ -3437,6 +3455,106 @@ mod tests {
         assert_eq!(b[5], 1.0);
     }
 
+    /// GDAL (3.12) masks the padding of a partial edge tile in a LERC blob of one floating-point
+    /// sample per pixel, whatever the nodata; integer and pixel-interleaved blobs keep the padding
+    /// as unmasked zeros. Every codec stores zeros there. The pixels inside are unchanged.
+    #[cfg(feature = "lerc")]
+    #[test]
+    fn partial_tiles_are_padded_as_gdal() {
+        let (cols, rows, tile) = (21, 19, 16);
+        for (t, bands, planar, compression, nan) in [
+            (DataType::F32, 1, false, Compression::Lerc, false),
+            (DataType::F32, 1, false, Compression::Lerc, true),
+            (DataType::F64, 1, false, Compression::LercDeflate, false),
+            (DataType::F32, 2, true, Compression::Lerc, true),
+            (DataType::F32, 2, false, Compression::Lerc, false),
+            (DataType::I16, 1, false, Compression::Lerc, false),
+            (DataType::U8, 1, false, Compression::Lerc, false),
+            (DataType::F32, 1, false, Compression::Deflate, true),
+        ] {
+            let n = cols * rows * bands;
+            let value = |i: usize| if nan && i % cols < 3 && (i / cols) % rows < 2 { f64::NAN } else { (i % 89) as f64 + 1.5 };
+            let data = match t {
+                DataType::F32 => RasterData::F32((0..n).map(|i| value(i) as f32).collect()),
+                DataType::F64 => RasterData::F64((0..n).map(value).collect()),
+                DataType::I16 => RasterData::I16((0..n).map(|i| (i % 89) as i16 - 7).collect()),
+                _ => RasterData::U8((0..n).map(|i| (i % 89) as u8 + 1).collect()),
+            };
+            let level = Level { cols, rows, bands, data: std::borrow::Cow::Owned(data.clone()) };
+            let layout = Layout {
+                tile: Some((tile as u32, tile as u32)),
+                rows_per_strip: None,
+                planar,
+                photometric: 1,
+                extra: if bands > 1 && !planar { vec![0; bands - 1] } else { Vec::new() },
+                predictor: 1,
+                parts: 1,
+            };
+            let img = level.image(t, compression, &CodecParams::default(), &layout).unwrap();
+            let (across, down) = (cols.div_ceil(tile), rows.div_ceil(tile));
+            let spp = if planar { 1 } else { bands };
+            assert_eq!(img.chunks.len(), across * down * bands / spp);
+            let case = format!("{t:?} x{bands} planar {planar} {compression:?} nan {nan}");
+            for (k, chunk) in img.chunks.iter().enumerate() {
+                let (plane, j) = (k / (across * down), k % (across * down));
+                let (x0, y0) = ((j % across) * tile, (j / across) * tile);
+                let (vw, vh) = ((cols - x0).min(tile), (rows - y0).min(tile));
+                let blob = match compression {
+                    Compression::LercDeflate => {
+                        let mut d = Vec::new();
+                        std::io::Read::read_to_end(&mut flate2::read::ZlibDecoder::new(&chunk[..]), &mut d).unwrap();
+                        d
+                    }
+                    Compression::Deflate => {
+                        let mut d = Vec::new();
+                        std::io::Read::read_to_end(&mut flate2::read::ZlibDecoder::new(&chunk[..]), &mut d).unwrap();
+                        // Zeros in the padding; the pixels inside are the raster's.
+                        for (p, b) in d.as_chunks::<4>().0.iter().enumerate() {
+                            let (x, y, v) = (p % tile, p / tile, f32::from_le_bytes(*b));
+                            if x < vw && y < vh {
+                                let s = data.get_f64((y0 + y) * cols + x0 + x) as f32;
+                                assert!(v.to_bits() == s.to_bits(), "{case}: pixel {x},{y} of tile {k}");
+                            } else {
+                                assert!(v.to_bits() == 0, "{case}: padding {x},{y} of tile {k}");
+                            }
+                        }
+                        continue;
+                    }
+                    _ => chunk.clone(),
+                };
+                let d = lerc_reader::decode(&blob).unwrap();
+                let masks_padding = matches!(t, DataType::F32 | DataType::F64) && spp == 1;
+                let partial = vw < tile || vh < tile;
+                let values = d.pixels.to_f64();
+                for p in 0..tile * tile {
+                    let (x, y) = (p % tile, p / tile);
+                    let inside = x < vw && y < vh;
+                    let valid = d.mask.as_ref().is_none_or(|m| m[p] != 0);
+                    if !inside {
+                        assert_eq!(valid, !masks_padding, "{case}: padding {x},{y} of tile {k}");
+                        if valid {
+                            assert!((0..spp).all(|s| values[p * spp + s] == 0.0), "{case}: padding {x},{y} of tile {k}");
+                        }
+                        continue;
+                    }
+                    for s in 0..spp {
+                        let band = plane + s;
+                        let src = data.get_f64((band * rows + y0 + y) * cols + x0 + x);
+                        if src.is_nan() {
+                            assert!(!valid, "{case}: NaN at {x},{y} of tile {k}");
+                        } else {
+                            assert!(valid && values[p * spp + s] == src, "{case}: pixel {x},{y} of tile {k}");
+                        }
+                    }
+                }
+                // Blobs of whole tiles without NaN have no mask.
+                if !partial && !nan {
+                    assert!(d.mask.is_none(), "{case}: tile {k}");
+                }
+            }
+        }
+    }
+
     #[test]
     fn writes_gdal_layouts_and_predictors() {
         for (bands, t, co) in [
@@ -3555,13 +3673,13 @@ mod tests {
         for spp in [3, 4] {
             for length in [0, spp - 1, spp + 1, spp + 2] {
                 assert!(matches!(
-                    webp_encode(vec![0; length], &ChunkInfo { w: 1, h: 1, spp, t: DataType::U8 }, &CodecParams::default()),
+                    webp_encode(vec![0; length], &ChunkInfo { w: 1, h: 1, spp, t: DataType::U8, valid: (1, 1) }, &CodecParams::default()),
                     Err(Error::InvalidData(_))
                 ));
             }
         }
         for (w, h) in [(0, 1), (1, 0), (16384, 1), (1, 16384)] {
-            assert!(webp_encode(Vec::new(), &ChunkInfo { w, h, spp: 3, t: DataType::U8 }, &CodecParams::default()).is_err());
+            assert!(webp_encode(Vec::new(), &ChunkInfo { w, h, spp: 3, t: DataType::U8, valid: (w, h) }, &CodecParams::default()).is_err());
         }
     }
 
