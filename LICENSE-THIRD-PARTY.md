@@ -10,7 +10,7 @@ LICENSE-THIRD-PARTY.md`, from `about.toml`.
 ## Overview
 
 - Apache License 2.0 (266)
-- MIT License (74)
+- MIT License (75)
 - ISC License (19)
 - BSD 3-Clause "New" or "Revised" License (14)
 - BSD 2-Clause "Simplified" License (8)
@@ -9503,6 +9503,7 @@ DEALINGS IN THE SOFTWARE.
 Used by:
 
 - [webp-rust 0.2.1](https://github.com/mith-mmk/webp-rust)
+- [webp-rust 0.3.2](https://github.com/mith-mmk/webp-rust)
 
 ```text
 MIT License
