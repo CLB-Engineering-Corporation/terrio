@@ -57,7 +57,7 @@ JPEG XL, with horizontal and floating-point predictors, tiled or striped, chunky
 (in GeoTIFFs, GeoPackage and tile archive tiles, and `.jpg` files) is decoded exactly as GDAL's
 libjpeg decodes it: the same integer IDCT, chroma upsampling and YCbCr conversion, so the pixels are
 GDAL's. Lossy JPEG XL can differ from libjxl's by 1 in a few pixels. LZMA is
-read, not written; LERC (lossless or within `MAX_Z_ERROR`, alone or with Deflate or Zstandard) and lossless JPEG XL are written too. Unsigned samples packed in 9 to 15 or 17 to 31 bits (GDAL's
+read, not written; LERC (lossless or within `MAX_Z_ERROR`, alone or with Deflate or Zstandard) and lossless JPEG XL are written too. LERC blobs are GDAL's by default (`LERC_ENCODER=GDAL`: the block choices of libLerc's codec v4, which GDAL calls), byte for byte for floating-point and 16-bit data; `LERC_ENCODER=COMPACT` writes `lerc-writer`'s smallest blobs, which may use Lerc2 v5 and are no larger, within the same `MAX_Z_ERROR`. Unsigned samples packed in 9 to 15 or 17 to 31 bits (GDAL's
 `NBITS`, as GDAL writes Sentinel-2's 15-bit bands) are read as UInt16 or UInt32, as GDAL reads them,
 in either bit order (`FillOrder`); packed signed samples and packed samples with a predictor are
 not supported (GDAL writes neither).

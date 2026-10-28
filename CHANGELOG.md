@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Cloud Optimized GeoTIFF
+
+- LERC tiles are GDAL's by default: the `LERC_ENCODER` creation option (GeoTIFF and COG) selects
+  `lerc-writer`'s encoder profile, `GDAL` (default; the blobs GDAL writes, byte for byte for
+  floating-point and 16-bit data) or `COMPACT` (the smallest blobs, within the same
+  `MAX_Z_ERROR`). Needs the lerc-writer release with `EncoderProfile`.
+
 ### Formats
 
 - SRTM HGT tiles are read and written (the `SRTMHGT` driver), as GDAL's SRTMHGT
