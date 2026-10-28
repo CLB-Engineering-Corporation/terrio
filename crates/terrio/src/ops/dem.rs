@@ -1633,6 +1633,10 @@ pub fn color_relief_vrt(
     vrt_path: Option<&str>,
 ) -> Result<super::vrt::VrtDataset> {
     use super::vrt::{VrtBand, VrtDataset, VrtSource};
+    // The VRT is written over the DEM it reads from: that would destroy the DEM, so it is refused.
+    if vrt_path.is_some_and(|p| super::strips::overwrites(p, &[src_path.to_string()])) {
+        return Err(Error::InvalidArgument("a VRT output cannot replace the DEM it is built from".into()));
+    }
     let r = &ds.raster;
     if o.band == 0 || o.band > r.bands {
         return Err(Error::InvalidArgument(format!("unable to fetch band #{}", o.band)));
@@ -2010,6 +2014,32 @@ nv 10 20 30 0
             crate::open_raster(copy).unwrap().raster.data.to_f64_vec(),
             dem(&ds, DemProduct::Slope, &DemOptions::default()).unwrap().raster.data.to_f64_vec()
         );
+    }
+
+    #[test]
+    fn a_vrt_cannot_replace_its_dem() {
+        let dir = tempfile::tempdir().unwrap();
+        let v: Vec<f64> = (0..40 * 30).map(|i| ((i * 53 % 211) as f64) * 1.5).collect();
+        let ds = dem_ds(v, 40, 30, DataType::F32, None, 5.0);
+        let input = dir.path().join("dem.tif");
+        let input = input.to_str().unwrap();
+        crate::write_raster_dataset(&ds, input, &Default::default()).unwrap();
+        let map = ColorMap::parse("0 0 0 0\n300 255 255 255", &ds, 1, None).unwrap();
+        let o = DemOptions::default();
+        assert!(color_relief_vrt(&ds, input, &map, &o, Some(input)).is_err());
+        #[cfg(unix)]
+        {
+            let link = dir.path().join("link.tif");
+            std::fs::hard_link(input, &link).unwrap();
+            assert!(color_relief_vrt(&ds, input, &map, &o, link.to_str()).is_err());
+        }
+        // The DEM is unchanged by the refusals.
+        assert_eq!(crate::open_raster(input).unwrap().raster.data.to_f64_vec(), ds.raster.data.to_f64_vec());
+        // A VRT beside the DEM is written.
+        let vrt = dir.path().join("relief.vrt");
+        let vrt = vrt.to_str().unwrap();
+        color_relief_vrt(&ds, input, &map, &o, Some(vrt)).unwrap().write(vrt).unwrap();
+        assert!(std::fs::read_to_string(vrt).unwrap().starts_with("<VRTDataset"));
     }
 
     #[test]
