@@ -34,6 +34,12 @@
   `@FILE` stands for the paths listed in FILE, one per line, as GDAL's
   `--input @filelist.txt` does (#323). MCP tool calls refuse `@FILE`, so that a
   client cannot read a file back through the errors naming its lines.
+- `terrio calc` reads its inputs by window and writes a strip of rows at a time, with the values
+  of the calculation in memory (`calc_to_path`; `--max-memory MIB`, 256 by default, sets the
+  strips' height and the evaluation threads). Inputs of other extents (`--extent union|intersect`,
+  `--projwin`) are aligned with the rounding of the whole read. Python's `terrio.calc(expr, dst,
+  A=path, ...)` does the same when every input is a path (`str` or `os.PathLike`), takes
+  `max_memory_mib`, and returns the result opened lazily from `dst`.
 
 ### Point clouds
 
