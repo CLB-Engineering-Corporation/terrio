@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+### Terrain
+
+- `terrio dem color-relief` and Python's `terrio.dem(path, ..., dst=path)` read the DEM and write
+  the output a strip of rows at a time, as `terrio dem` already did for the other products
+  (Rust: `color_relief_to_path`, and `ColorMap::parse_lazy` for color files with percentages).
+  A path-to-path `terrio.dem` now returns the result opened lazily from `dst` instead of in
+  memory; the pixels are unchanged. On a 15,000 x 12,000 Float32 DEM, a color relief with alpha
+  peaks at about 170 MiB instead of 7,569 MiB.
+- `--max-memory` (CLI), `max_memory_mib` (Python) and `DemOptions::max_memory_mib` set the strip
+  height from a memory budget (default 256 MiB), like `gdalwarp -wm`. The values do not depend on
+  it.
+- The in-memory `color_relief` colors the band directly into the Byte output, in parallel,
+  instead of holding a Float64 copy of the band and four Float64 output planes.
+- `dem_to_path` and `color_relief_to_path` read a DEM that is also the output whole first,
+  instead of truncating it while it is read.
+
 ### Formats
 
 - SRTM HGT tiles are read and written (the `SRTMHGT` driver), as GDAL's SRTMHGT

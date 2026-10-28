@@ -958,6 +958,7 @@ def dem(
     tile_size: int | None = None,
     bigtiff: bool = False,
     kernel_version: str = "3.12",
+    max_memory_mib: float | None = None,
 ) -> Raster:
     """Compute terrain; GDAL 3.13 hillshade rounding varies across CPUs/architectures."""
     ...

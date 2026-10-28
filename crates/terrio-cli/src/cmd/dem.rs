@@ -4,8 +4,8 @@ use super::rasterout::{OutputArgs, open, open_lazy, same_file};
 use terrio::Error;
 use terrio::formats::RasterDriver;
 use terrio::ops::dem::{
-    ColorMap, ColorSelection, DemOptions, DemProduct, GradientAlg, Shading, TriAlg, color_relief, color_relief_vrt, dem, dem_to_path,
-    pam_statistics,
+    ColorMap, ColorSelection, DemOptions, DemProduct, GradientAlg, Shading, TriAlg, color_relief, color_relief_to_path, color_relief_vrt,
+    dem, dem_to_path, pam_statistics,
 };
 
 #[derive(clap::Args)]
@@ -75,6 +75,10 @@ pub struct Args {
     /// Use the color of the nearest entry rather than interpolating (color-relief).
     #[arg(long = "nearest-color-entry", alias = "nearest_color_entry")]
     nearest_color_entry: bool,
+    /// About how much memory (MiB) the strips of rows in flight may take, which sets their
+    /// height (default 256). The output does not depend on it.
+    #[arg(long = "max-memory", value_name = "MIB")]
+    max_memory: Option<f64>,
     #[command(flatten)]
     out: OutputArgs,
 }
@@ -123,6 +127,7 @@ pub fn run(a: Args) -> terrio::Result<()> {
         } else {
             ColorSelection::Interpolate
         },
+        max_memory_mib: a.max_memory,
         ..Default::default()
     };
     if let Some(alg) = &a.alg {
@@ -151,9 +156,15 @@ pub fn run(a: Args) -> terrio::Result<()> {
         (Some(colors), None) => colors,
         _ => unreachable!("color-relief alone takes a color file"),
     };
-    let ds = open(input)?;
     let text =
         std::fs::read_to_string(colors).map_err(|e| Error::InvalidArgument(format!("cannot read the color file '{colors}': {e}")))?;
+    // A color relief a strip at a time, without holding the DEM or the output whole.
+    if !vrt && !same_file(input, output) {
+        let mut src = open_lazy(input)?;
+        let map = ColorMap::parse_lazy(&text, &mut src, o.band, pam_statistics(input, o.band))?;
+        return super::quiet(|| color_relief_to_path(&mut src, &map, &o, output, &a.out.options()?));
+    }
+    let ds = open(input)?;
     let map = ColorMap::parse(&text, &ds, o.band, pam_statistics(input, o.band))?;
     if vrt {
         return color_relief_vrt(&ds, input, &map, &o, Some(output))?.write(output);
