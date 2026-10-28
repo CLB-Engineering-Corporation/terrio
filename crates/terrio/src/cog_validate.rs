@@ -367,7 +367,10 @@ fn validate(tiff: Option<Tiff>, sidecar: Option<Tiff>, strict: bool) -> CogValid
     if overviews.is_empty()
         && let Some(sc) = &sidecar
     {
-        overviews = sc.ifds.iter().filter(|i| i.is_reduced() && !i.is_mask() && i.samples == main.samples).collect();
+        // Every image of the sidecar, reduced or not: GDAL opens a full-resolution or unflagged
+        // first image of a hand-made sidecar as an overview too (and rio-cogeo then reports a
+        // decimation of 1 for a full-resolution one). GDAL's own sidecars flag all as reduced.
+        overviews = sc.ifds.iter().filter(|i| !i.is_mask() && i.samples == main.samples).collect();
     }
 
     if external_ovr {
@@ -580,10 +583,18 @@ mod tests {
         crate::write_raster(&raster(1300, 700), &tiled, &crate::RasterWriteOptions { tile_size: Some(256), ..driver(GTiff, &[]) }).unwrap();
         std::fs::copy(&p, format!("{tiled}.ovr")).unwrap();
         let v = validate_cog(&tiled, false).unwrap();
-        // The sidecar's full-resolution IFD is not an overview: only its two reduced images are.
-        assert_eq!(v.overview_factors, vec![2, 4], "{v:?}");
-        assert!(!v.errors.iter().any(|e| e.contains("Invalid Decimation")), "{v:?}");
+        // GDAL takes every image of the sidecar as an overview, its full-resolution one included,
+        // which rio-cogeo reports as a decimation of 1.
+        assert_eq!(v.overview_factors, vec![1, 2, 4], "{v:?}");
+        assert!(v.errors.contains(&"Invalid Decimation 1 for overview level 0".to_string()), "{v:?}");
         assert!(v.warnings.is_empty());
+        // A hand-made sidecar: a half-size GeoTIFF, whose image is not flagged reduced.
+        let half = dir.path().join("half.tif").to_string_lossy().into_owned();
+        crate::write_raster(&raster(650, 350), &half, &crate::RasterWriteOptions { tile_size: Some(256), ..driver(GTiff, &[]) }).unwrap();
+        std::fs::copy(&half, format!("{tiled}.ovr")).unwrap();
+        let v = validate_cog(&tiled, false).unwrap();
+        assert_eq!(v.overview_factors, vec![2], "{v:?}");
+        assert!(v.warnings.is_empty(), "{v:?}");
     }
 
     #[test]
@@ -600,7 +611,7 @@ mod tests {
     /// A little-endian classic TIFF with one IFD at byte 8 of `(tag, type, count, value)`
     /// entries, followed by `data`, which starts at byte `10 + 12 * entries + 4`.
     fn crafted(entries: &[(u16, u16, u32, u32)], data: &[u8]) -> Vec<u8> {
-        let mut b = b"II* ".to_vec();
+        let mut b = b"II*\0".to_vec();
         b.extend(8u32.to_le_bytes());
         b.extend((entries.len() as u16).to_le_bytes());
         for (tag, typ, count, value) in entries {
