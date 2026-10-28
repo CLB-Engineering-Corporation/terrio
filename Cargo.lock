@@ -1475,14 +1475,12 @@ dependencies = [
 [[package]]
 name = "lerc-core"
 version = "0.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1a0c91e9f8d44d5a5440367be3b181fb33466753f78dfceffbfcb8d87281dc15"
+source = "git+https://github.com/gpt-cmdr/lerc-rust?rev=9c08d84549df627910201b8327c716804d92f6b1#9c08d84549df627910201b8327c716804d92f6b1"
 
 [[package]]
 name = "lerc-reader"
 version = "0.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "81a8e65e8b87181753724ad932f79c4a0a4ebc54516ce944c622bb9b07f3acc2"
+source = "git+https://github.com/gpt-cmdr/lerc-rust?rev=9c08d84549df627910201b8327c716804d92f6b1#9c08d84549df627910201b8327c716804d92f6b1"
 dependencies = [
  "lerc-core",
 ]
@@ -1490,8 +1488,7 @@ dependencies = [
 [[package]]
 name = "lerc-writer"
 version = "0.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a41bad33ee399c4d0d6d23da32d55be082f185ee813b3a1fdd9300d93a952ef9"
+source = "git+https://github.com/gpt-cmdr/lerc-rust?rev=9c08d84549df627910201b8327c716804d92f6b1#9c08d84549df627910201b8327c716804d92f6b1"
 dependencies = [
  "lerc-core",
 ]
