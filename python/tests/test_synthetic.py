@@ -402,6 +402,48 @@ def test_warp_and_mosaic_paths_are_streamed(tmp_path):
     np.testing.assert_array_equal(m.read(), ref.read())
 
 
+@pytest.mark.parametrize("resampling", ["near", "bilinear", "average"])
+def test_several_sources_warped_path_to_path_are_streamed(tmp_path, resampling):
+    """Overlapping source paths (one in another CRS) warped or mosaicked to a path are warped a
+    chunk at a time, each pixel taking its sources in order, bit for bit as in memory."""
+    rows, cols = np.mgrid[0:90, 0:70]
+    data = ((rows * 7 + cols * 13) % 251).astype("float32") + 0.5
+    data[40:44, 5:60] = -9999
+    a = tmp_path / "a.tif"
+    terrio.Raster.from_array(data, TRANSFORM, crs="EPSG:32610", nodata=-9999).write(str(a))
+    shifted = (TRANSFORM[0] + 611.0, 41.0, 0.0, TRANSFORM[3] - 377.0, 0.0, -41.0)
+    seed = terrio.Raster.from_array(data[:50, :40] + 1000, shifted, crs="EPSG:32610", nodata=-9999)
+    b = tmp_path / "b.tif"
+    terrio.warp(seed, t_srs="EPSG:4326").write(str(b))
+    srcs = [str(a), str(b)]
+    for kw in [{}, {"t_srs": "EPSG:32611"}]:
+        whole = terrio.warp([terrio.open_raster(p) for p in srcs], resampling=resampling, **kw)
+        for budget in [None, 0.002]:
+            out = terrio.warp(
+                srcs,
+                dst=str(tmp_path / "w.tif"),
+                resampling=resampling,
+                max_memory_mib=budget,
+                **kw,
+            )
+            assert out.is_lazy
+            if budget is None:
+                assert np.asarray(out.read()).tobytes() == np.asarray(whole.read()).tobytes()
+                assert out.transform == whole.transform and out.nodata == whole.nodata
+            else:
+                ref = terrio.warp(
+                    [terrio.open_raster(p) for p in srcs],
+                    resampling=resampling,
+                    max_memory_mib=budget,
+                    **kw,
+                )
+                assert np.asarray(out.read()).tobytes() == np.asarray(ref.read()).tobytes()
+    ref = terrio.mosaic([terrio.open_raster(p) for p in srcs], resampling=resampling)
+    m = terrio.mosaic(srcs, str(tmp_path / "m.tif"), resampling=resampling)
+    assert m.is_lazy
+    assert np.asarray(m.read()).tobytes() == np.asarray(ref.read()).tobytes()
+
+
 @pytest.mark.parametrize("resampling", ["near", "bilinear", "cubic", "average", "mode"])
 def test_resampled_mosaic_path_equals_the_whole_mosaic(tmp_path, resampling):
     """Sources at fractional offsets and resolutions are mosaicked to a path a strip at a time,
@@ -413,9 +455,13 @@ def test_resampled_mosaic_path_equals_the_whole_mosaic(tmp_path, resampling):
     for i, (dx, dy, res) in enumerate([(0.0, 0.0, 10.0), (37.3, -21.9, 14.6), (-12.7, 8.1, 6.3)]):
         t = (TRANSFORM[0] + dx, res, 0.0, TRANSFORM[3] + dy, 0.0, -res)
         path = str(tmp_path / f"s{i}.tif")
-        terrio.Raster.from_array(data[i:, : 70 - i].copy(), t, crs="EPSG:32610", nodata=-9999).write(path)
+        terrio.Raster.from_array(
+            data[i:, : 70 - i].copy(), t, crs="EPSG:32610", nodata=-9999
+        ).write(path)
         srcs.append(path)
-    ref = terrio.mosaic([terrio.open_raster(p) for p in srcs], resolution="highest", resampling=resampling)
+    ref = terrio.mosaic(
+        [terrio.open_raster(p) for p in srcs], resolution="highest", resampling=resampling
+    )
     out = terrio.mosaic(srcs, str(tmp_path / "m.tif"), resolution="highest", resampling=resampling)
     assert out.is_lazy
     a, b = np.asarray(out.read()), np.asarray(ref.read())

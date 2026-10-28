@@ -14,6 +14,11 @@
   reads only the header, a window reads only the rows it covers, and `info`
   decodes no pixels. Remote SRTM tiles are read with HTTP range requests, and
   `convert` to a GeoTIFF or COG writes these inputs a strip at a time.
+- PMTiles and MBTiles written from a raster opened lazily (`terrio convert`, `Raster.write`)
+  warp a raster that is not on its zoom level's grid a chunk at a time, from windows of the
+  source, instead of reading it whole: the colour and alpha warps of GDAL's MBTiles driver run in
+  their own chunks, in step. The archive is byte-identical. A geographic raster reaching beyond
+  Web Mercator's latitudes is still read whole.
 
 ### Breaking changes
 
@@ -109,6 +114,15 @@
 - Python's `terrio.mosaic(paths, dst=path)` writes through `mosaic_to_path` and returns the
   mosaic opened lazily. `mosaic_to_path` also reads by window the mosaics of inputs resampled
   with nearest neighbour on whole multiples of the output resolution.
+- `terrio warp` and `warp_to_path` warp several inputs a chunk at a time too, each chunk reading
+  a window of its input, and write the output a strip of rows at a time: each pixel still takes
+  the inputs in order, so the output is the in-memory warp's, bit for bit. Python's
+  `terrio.warp(paths, dst=path)` does the same for several paths.
+- `terrio mosaic` and `mosaic_to_path` write every mosaic a strip at a time from windows of the
+  inputs, bit for bit as the mosaic in memory: inputs resampled by any method, at fractional
+  offsets or non-integer resolution ratios, now too (each strip computed with the rounding of the
+  whole mosaic, not a VRT's per-window rounding), and inputs in other CRSs, warped a chunk at a
+  time. Only an output that is one of the inputs reads them whole.
 
 ### Shapefile
 
