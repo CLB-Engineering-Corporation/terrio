@@ -2473,6 +2473,63 @@ Parquet page indexes remain in the referenced partition files. The metadata file
 column/offset-index locations relative to each column's `file_path`, just as it retains the
 column data-page locations; it does not copy those payloads into `_metadata`.
 
+## GeoPackage repacking
+
+`terrio gpkg-repack survey.gpkg --json` compacts a native GeoPackage in place.
+The `gpkg-repack` MCP tool accepts the same arguments. JSON reports original and compacted
+byte/page counts and the preserved SQLite page size.
+
+Repacking rebuilds every B-tree from its encoded records, preserving rowids, SQL objects,
+application/user versions, text encodings, rasters and vector metadata. It supports expression,
+partial, descending and collated indexes, WITHOUT ROWID tables, overflow data, R-tree shadow
+tables, and auto-vacuum/incremental-vacuum pointer maps. Physical page layouts and final sizes
+can differ from SQLite VACUUM; the operation does not promise byte-identical files.
+
+Native changes use SQLite-compatible exclusive locks and a synced rollback journal. All original
+data pages, including unchanged pages and pages removed by truncation, are journaled before a
+full-image write. SQLite's unused lock-byte page is excluded because its page number is a
+super-journal marker. An interrupted rewrite can be recovered by SQLite.
+The database pathname is checked against the locked handle before journal creation. Do not
+rename or replace an open database or its parent directory during a transaction. On Unix,
+directory sync errors abort before database writes; filesystems without directory fsync are
+unsupported for this operation. Windows flushes the journal and database file handles; directory
+entry durability follows the platform. In-memory replacement refuses a concurrent change to its
+source image, allowing the caller to retry.
+A database locked by another process or with a nonempty WAL sidecar is refused. POSIX locks
+are process-scoped; callers must close/checkpoint same-process SQLite connections before
+repacking and must not access the database concurrently through them. Native symbolic-link or
+hard-linked dataset filenames, linked/special sidecars, reserved/encrypted page bytes, remote and archive paths
+are refused. This is storage maintenance, not a GeoPackage specification validator.
+
+Native in-place append/update also refuses hard-linked database targets: another alias
+may have its own WAL. It rejects linked or special journal/WAL/shared-memory sidecars before
+recovery; it never replays a journal through a symbolic link or hard-link alias.
+
+Unix directory-sync requirements also apply to existing native SQLite in-place edits and
+recovery, including append/update. Unreadable directories and filesystems rejecting directory
+fsync can fail before page writes. A sync failure after journal deletion explicitly reports
+that changes committed or recovery completed but durability is unconfirmed; callers must not
+blindly retry an append.
+Native append/update follows filename symlinks to their target and checks that target's WAL.
+
+Native repacking also accepts GeoPackage contents under opaque filenames such as `snapshot.zip`;
+explicit archive locations remain unsupported. On Unix, rollback journals inherit the database's
+permission bits, restricted further by the process umask. A nonempty WAL is refused before any
+rollback-journal recovery. Other format checks inspect the recovered header, so successful
+recovery can precede a format-specific refusal. If initial journal-directory synchronization
+fails, the unchanged database and synced rollback journal are retained for recovery after the
+filesystem issue is resolved; filesystems without directory synchronization are unsupported.
+
+The rollback journal can approach the original file size, plus per-page record headers.
+Peak database-plus-journal disk usage can approach twice the original size; write I/O includes
+both the journal and replacement database image. Reserve disk space accordingly.
+
+Repacking scans and rewrites the complete database. It owns one input image and builds
+one contiguous output image; encoded records/cells for the largest tree are also materialized.
+Memory depends on row shape/count and is not hard-capped. A local 2.01 GiB live-BLOB
+derivative used about 6.04 GiB peak RSS; its mostly deleted counterpart used about 2.06 GiB. WebAssembly uses `/vsimem/` paths or the bytes API. A bytes input must be a
+self-contained, recovered/checkpointed image; external journal/WAL files are not part of it.
+
 ## Multidimensional mosaics
 
 `terrio mdmosaic INPUT... OUTPUT [--array PATH_OR_NAME]` combines numeric

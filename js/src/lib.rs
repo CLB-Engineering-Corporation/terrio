@@ -13,6 +13,7 @@
 //! ```
 
 mod dataset_files;
+mod gpkg_maintenance;
 mod grid;
 mod inspection;
 mod manage;

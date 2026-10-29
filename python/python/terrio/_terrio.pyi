@@ -24,6 +24,8 @@ __all__ = [
     "dataset_files",
     "dataset_rename",
     "__version__",
+    "gpkg_repack",
+    "gpkg_repack_bytes",
     "Raster",
     "GeoTiffWriter",
     "Layer",
@@ -1866,6 +1868,8 @@ def blend(
     """Blends equal-sized Byte images, with GDAL operators and opacity 0..100."""
     ...
 
+def gpkg_repack(path: str | os.PathLike[str]) -> dict[str, Any]: ...
+def gpkg_repack_bytes(data: bytes) -> bytes: ...
 def mosaic_multidim(
     sources: Sequence[MultidimDataset | str | os.PathLike[str] | bytes | dict[str, bytes]],
     dst: str | os.PathLike[str] | None = None,

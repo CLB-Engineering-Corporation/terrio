@@ -1218,6 +1218,38 @@ results and one source-file open per call. The GDAL profile now uses direct
 local reads for full checking. Python uploaded-byte validation borrows immutable
 bytes instead of duplicating the full payload.
 
+## GeoPackage repacking
+
+`scripts/compare_gpkg_repack_with_gdal.py` is registered as `gpkg-repack`. GDAL 3.13.3
+repacking (SQLite VACUUM) is compared on Natural Earth vector and USGS raster derivatives.
+The suite checks all table records and SQL objects, rowids, text encoding, application/user
+versions, auto-vacuum mode, page size, GDAL features/fields/CRS, and every raster pixel/mask.
+R-tree and application triggers are exercised after repacking. Cases include WITHOUT ROWID,
+expression/partial/collated indexes, 512/4096/65536-byte pages, both UTF-16 encodings, mixed
+vector/raster files, and active/orphan-WAL and truncated-input refusal. An actual GDAL feature
+update committed to an orphan WAL also exercises append refusal and post-checkpoint preservation.
+Physical layouts/sizes may differ.
+
+`interrupted_repack_restores_truncated_pages` stops before/during/after database writes,
+checking exact recovery including truncated pages. Set `TERRIO_SQLITE_REFERENCE_PYTHON` to a
+Python interpreter with the standard sqlite3 module to additionally recover these journals
+with SQLite itself, for both rollback- and checkpointed-WAL file headers. Separate regressions
+check renamed database refusal before journal creation, directory-sync failure before page
+writes, planted journal links, and concurrent in-memory writes. The Python
+`test_repack_refuses_database_locked_by_another_process` holds an exclusive SQLite
+transaction in a separate process, verifies refusal without changing database bytes,
+and retries successfully after release. It runs on the native macOS/Windows CI matrix
+as well as Linux, exercising Windows byte-range locking when that matrix runs.
+
+A local repack memory check used a Natural Earth GeoPackage derivative with 2,048 one-MiB
+zero-filled BLOB rows and incremental auto-vacuum (2,155,819,008 bytes). Peak RSS measured
+per child process with `wait4` fell from 8.27 to 6.04 GiB when all rows were live, and from
+4.12 to 2.06 GiB after retaining every 128th BLOB row (19,722,240-byte compacted result).
+Both before/after implementations passed SQLite integrity checks and streamed hashes of
+every table value. These are single local observations, not a general memory bound; record
+materialization still depends on the largest tree and row shape. The large generated files
+are excluded from commits and CI.
+
 ## Multidimensional mosaic validation
 
 The multidimensional mosaic HTTP regression serves two chunked numeric Zarr

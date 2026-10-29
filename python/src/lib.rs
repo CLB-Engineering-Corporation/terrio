@@ -6,6 +6,7 @@ mod arrow;
 mod cli;
 mod dataset_files;
 mod focal;
+mod gpkg_maintenance;
 mod grid;
 mod inspection;
 mod manage;
@@ -100,6 +101,7 @@ fn _terrio(m: &Bound<'_, PyModule>) -> PyResult<()> {
     parquet_metadata::register(m)?;
     inspection::register(m)?;
     grid::register(m)?;
+    gpkg_maintenance::register(m)?;
     multidim::register(m)?;
     terrain::register(m)?;
     tile_index::register(m)?;
