@@ -119,7 +119,9 @@ def test_options_for_layers_the_file_does_not_store_are_errors():
     with pytest.raises(terrio.InvalidArgumentError, match="XS_SUMMARIES applies to cross_sections"):
         terrio.open_vector(pipes, options={"XS_SUMMARIES": "Maximum Water Surface"})
     with pytest.raises(terrio.InvalidArgumentError, match="STRUCTURE_SERIES applies to structures"):
-        terrio.open_vector(PLAN, options={"STRUCTURE_SERIES": "Structure Variables", "TIME_STEP": "0"})
+        terrio.open_vector(
+            PLAN, options={"STRUCTURE_SERIES": "Structure Variables", "TIME_STEP": "0"}
+        )
     with pytest.raises(terrio.InvalidArgumentError, match="CELL_SERIES"):
         terrio.info(pipes, options={"CELL_SERIES": "Water Surface", "TIME_STEP": "0"})
 
