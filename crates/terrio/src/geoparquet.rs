@@ -47,7 +47,7 @@
 //! let batch = RecordBatch::try_new(schema.clone(), vec![
 //!     Arc::new(Int64Array::from(vec![1, 2])),
 //!     Arc::new(BinaryArray::from_vec(vec![&point(0.0, 0.0), &point(5.0, 5.0)])),
-//! ])?;
+//! ]).map_err(|e| terrio::Error::InvalidData(e.to_string()))?;
 //! let layers = vec![ArrowLayer::new(Some("points".into()), schema, vec![Ok(batch)])];
 //! let mut options = GeoParquetWriteOptions::archive();
 //! options.crs = Some(serde_json::json!("EPSG:32633"));
@@ -764,10 +764,13 @@ pub fn hilbert_permutation(keys: &[Option<u32>]) -> Vec<usize> {
 // Writing
 // ---------------------------------------------------------------------------------------------
 
+/// Per-row bounds and the type names seen in a chunk of rows.
+type ScannedChunk = (Vec<Option<[f64; 4]>>, Vec<String>);
+
 /// The geometries of a batch: per-row bounds and the type names seen.
 fn scan_geometry(array: &BinaryArray, types: &mut Vec<String>) -> Result<Vec<Option<[f64; 4]>>> {
     const CHUNK: usize = 4096;
-    let parts = crate::par::map_range(array.len().div_ceil(CHUNK), |c| -> Result<(Vec<Option<[f64; 4]>>, Vec<String>)> {
+    let parts = crate::par::map_range(array.len().div_ceil(CHUNK), |c| -> Result<ScannedChunk> {
         let (start, end) = (c * CHUNK, ((c + 1) * CHUNK).min(array.len()));
         let mut bounds = Vec::with_capacity(end - start);
         let mut names: Vec<String> = Vec::new();

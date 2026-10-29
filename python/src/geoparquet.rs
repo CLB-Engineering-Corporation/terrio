@@ -20,10 +20,10 @@ fn arrow_of(obj: &Bound<'_, PyAny>) -> PyResult<(terrio::arrow::arrow_schema::Sc
     if let Some(x) = crate::arrow::read_capsules(obj)? {
         return Ok(x);
     }
-    if obj.hasattr("to_arrow")? {
-        if let Some(x) = crate::arrow::read_capsules(&obj.call_method0("to_arrow")?)? {
-            return Ok(x);
-        }
+    if obj.hasattr("to_arrow")?
+        && let Some(x) = crate::arrow::read_capsules(&obj.call_method0("to_arrow")?)?
+    {
+        return Ok(x);
     }
     Err(invalid("expected an object with __arrow_c_stream__ or __arrow_c_array__ (a pyarrow Table, ...)"))
 }
