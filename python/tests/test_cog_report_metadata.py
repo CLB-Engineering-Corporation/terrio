@@ -195,6 +195,8 @@ def test_nan_valid_area_matched_matches_ras2cng_bit_for_bit(tmp_path):
     )
     want, base_valid = ras2cng_mean_levels(a, -9999.0, len(report["factors"]))
     assert report["base_valid_pixels"] == [base_valid]
+    # The NaN under the numeric nodata, counted in the same pass (ras2cng's NaN check).
+    assert report["nan_pixels"] == [int(np.isnan(a).sum())]
     got = overviews(out)
     assert len(got) == len(want)
     for g, w in zip(got, want, strict=True):
@@ -208,6 +210,7 @@ def test_nan_valid_area_matched_matches_ras2cng_bit_for_bit(tmp_path):
         str(out), driver="COG", compress="DEFLATE", overview_resampling="area_matched"
     )
     assert report["base_valid_pixels"] == [int(((a != -9999.0) & ~np.isnan(a)).sum())]
+    assert report["nan_pixels"] == [int(np.isnan(a).sum())]
     assert not any(np.isnan(o).any() for o in overviews(out))
     # Under a NaN nodata, NaN stays nodata: the option changes nothing.
     b = np.where(a == -9999.0, np.float32(np.nan), a)

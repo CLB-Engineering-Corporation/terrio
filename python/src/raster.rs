@@ -493,7 +493,9 @@ impl PyRaster {
     ///     `method` (`"area_matched"` or `"area_matched_mode"`), `factors` (`[2, 4, ...]`),
     ///     `area_ratios` (per band, per level: the kept cells times `factor**2` over the band's
     ///     valid full-resolution pixels; 1.0 keeps the valid area exactly) and
-    ///     `base_valid_pixels` (per band). The file's metadata carries the same values in the
+    ///     `base_valid_pixels` (per band), and `nan_pixels` (per band: NaN samples under a
+    ///     numeric nodata, counted whether or not `area_matched_nan_valid` makes them valid;
+    ///     not stored in the file). The file's metadata carries the other values in the
     ///     `OVERVIEW_REPORT` domain (`OVERVIEW_METHOD`, `OVERVIEW_FACTORS`,
     ///     `OVERVIEW_AREA_RATIOS`, `OVERVIEW_BASE_VALID_PIXELS`; rasterio:
     ///     `tags(ns="OVERVIEW_REPORT")`), with the bands' values separated by `;`.
@@ -584,6 +586,7 @@ impl PyRaster {
                 d.set_item("factors", r.factors)?;
                 d.set_item("area_ratios", r.area_ratios)?;
                 d.set_item("base_valid_pixels", r.base_valid_pixels)?;
+                d.set_item("nan_pixels", r.nan_pixels)?;
                 Ok(d)
             })
             .transpose()

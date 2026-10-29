@@ -27,6 +27,9 @@ pub(crate) struct AreaMatchedBand<T> {
     pub(crate) area_ratios: Vec<f64>,
     /// The valid full-resolution pixels.
     pub(crate) base_valid: u64,
+    /// The full-resolution NaN samples under a numeric nodata, counted whether or not `nan_valid`
+    /// makes them valid (0 under a NaN nodata and on integer bands).
+    pub(crate) nan_pixels: u64,
 }
 
 /// One level's accumulators: per cell, the sum and count of valid full-resolution pixels, and the
@@ -65,7 +68,8 @@ fn block_mode(values: [f64; 4], valid: [bool; 4]) -> (f64, bool) {
 
 impl Accumulators {
     /// Level 1, from a band of `cols` x `rows` samples.
-    fn first<T: Pixel>(band: &[T], cols: usize, rows: usize, nodata: f64, nan_valid: bool, categorical: bool) -> (Self, u64) {
+    /// Returns the accumulators, the valid pixels and the NaN samples under a numeric nodata.
+    fn first<T: Pixel>(band: &[T], cols: usize, rows: usize, nodata: f64, nan_valid: bool, categorical: bool) -> (Self, u64, u64) {
         let (oc, or) = (cols.div_ceil(2), rows.div_ceil(2));
         let n = oc * or;
         let mut acc = Self {
@@ -77,6 +81,8 @@ impl Accumulators {
             mode_valid: if categorical { vec![false; n] } else { Vec::new() },
         };
         let mut base_valid = 0u64;
+        let mut nan_pixels = 0u64;
+        let numeric_nodata = !nodata.is_nan();
         for oy in 0..or {
             for ox in 0..oc {
                 let mut values = [0.0f64; 4];
@@ -85,6 +91,9 @@ impl Accumulators {
                     let (y, x) = (2 * oy + dy, 2 * ox + dx);
                     if y < rows && x < cols {
                         let v = band[y * cols + x].to_f64();
+                        if numeric_nodata && v.is_nan() {
+                            nan_pixels += 1;
+                        }
                         if valid(v, nodata, nan_valid) {
                             values[k] = v;
                             ok[k] = true;
@@ -100,7 +109,7 @@ impl Accumulators {
                 }
             }
         }
-        (acc, base_valid)
+        (acc, base_valid, nan_pixels)
     }
 
     /// The next (half-size) level.
@@ -247,12 +256,14 @@ pub(crate) fn area_matched_band<T: Pixel>(
     categorical: bool,
     integral: bool,
 ) -> AreaMatchedBand<T> {
-    let mut out = AreaMatchedBand { levels: Vec::with_capacity(count), area_ratios: Vec::with_capacity(count), base_valid: 0 };
+    let mut out =
+        AreaMatchedBand { levels: Vec::with_capacity(count), area_ratios: Vec::with_capacity(count), base_valid: 0, nan_pixels: 0 };
     if count == 0 {
         return out;
     }
-    let (mut acc, base_valid) = Accumulators::first(band, cols, rows, nodata, nan_valid, categorical);
+    let (mut acc, base_valid, nan_pixels) = Accumulators::first(band, cols, rows, nodata, nan_valid, categorical);
     out.base_valid = base_valid;
+    out.nan_pixels = nan_pixels;
     for k in 0..count {
         if k > 0 {
             acc = acc.reduce(categorical);
@@ -345,12 +356,15 @@ mod tests {
         let out = area_matched_band(&band, 4, 2, nd as f64, true, 1, false, false);
         // Five valid pixels (the NaN counts): round(5 / 4) = 1 cell, the fuller one, whose mean is NaN.
         assert_eq!(out.base_valid, 5);
+        assert_eq!(out.nan_pixels, 1);
         assert!(out.levels[0][0].is_nan());
         assert_eq!(out.levels[0][1], nd);
         assert_eq!(out.area_ratios, vec![4.0 / 5.0]);
         // By default the NaN is invalid: three valid pixels on the left, mean 2.
         let out = area_matched_band(&band, 4, 2, nd as f64, false, 1, false, false);
         assert_eq!(out.base_valid, 4);
+        // Counted the same way when NaN is not valid.
+        assert_eq!(out.nan_pixels, 1);
         assert_eq!(out.levels[0], vec![2.0, nd]);
         // The NaN reaches every coarser level holding the cell.
         let big: Vec<f32> = (0..64).map(|i| if i == 9 { f32::NAN } else { 1.0 }).collect();
@@ -361,6 +375,8 @@ mod tests {
         // A NaN nodata keeps NaN invalid.
         let out = area_matched_band(&[f32::NAN, 1.0, f32::NAN, f32::NAN], 2, 2, f64::NAN, true, 1, false, false);
         assert_eq!(out.base_valid, 1);
+        // NaN under a NaN nodata is nodata, not counted.
+        assert_eq!(out.nan_pixels, 0);
         // Integer bands have no NaN: unchanged.
         let ints: Vec<i16> = vec![1, 2, 0, 0, 2, 2, 0, 0];
         assert_eq!(

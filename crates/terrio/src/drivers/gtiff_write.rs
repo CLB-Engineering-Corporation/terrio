@@ -1353,6 +1353,7 @@ fn area_matched_levels(
         factors: (0..count).map(|k| 1usize << (k + 1)).collect(),
         area_ratios: Vec::with_capacity(raster.bands),
         base_valid_pixels: Vec::with_capacity(raster.bands),
+        nan_pixels: Vec::with_capacity(raster.bands),
     };
     macro_rules! levels {
         ($($variant:ident),*) => {
@@ -1373,6 +1374,7 @@ fn area_matched_levels(
                     for b in &mut bands {
                         report.area_ratios.push(std::mem::take(&mut b.area_ratios));
                         report.base_valid_pixels.push(b.base_valid);
+                        report.nan_pixels.push(b.nan_pixels);
                     }
                     (0..count)
                         .map(|k| {
@@ -1406,6 +1408,14 @@ pub struct OverviewReport {
     ///
     /// [`RasterWriteOptions::area_matched_nan_valid`]: crate::RasterWriteOptions::area_matched_nan_valid
     pub base_valid_pixels: Vec<u64>,
+    /// Per band, the full-resolution NaN samples under a numeric nodata, counted in the same pass
+    /// whether or not [`RasterWriteOptions::area_matched_nan_valid`] makes them valid; 0 under a
+    /// NaN nodata and on integer bands. A caller that must treat NaN as rasterio's mask does (as
+    /// valid) and did not ask for `area_matched_nan_valid` can refuse the file on a non-zero count.
+    /// Not stored in the file's metadata.
+    ///
+    /// [`RasterWriteOptions::area_matched_nan_valid`]: crate::RasterWriteOptions::area_matched_nan_valid
+    pub nan_pixels: Vec<u64>,
 }
 
 impl OverviewReport {
@@ -5196,9 +5206,11 @@ mod cog_option_tests {
             };
             let default = crate::write_raster_dataset_with_report(&ds, p.to_str().unwrap(), &o).unwrap().unwrap();
             assert_eq!(default.base_valid_pixels, vec![(wet - nans) as u64]);
+            assert_eq!(default.nan_pixels, vec![nans as u64]);
             o.area_matched_nan_valid = true;
             let report = crate::write_raster_dataset_with_report(&ds, p.to_str().unwrap(), &o).unwrap().unwrap();
             assert_eq!(report.base_valid_pixels, vec![wet as u64]);
+            assert_eq!(report.nan_pixels, vec![nans as u64]);
             // The first level holds NaN means, read back as NaN (LERC: masked pixels).
             let mut lazy = crate::open_raster_lazy(p.to_str().unwrap()).unwrap();
             let (w, h) = lazy.overviews()[0];

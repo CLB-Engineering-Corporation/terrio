@@ -29,6 +29,10 @@
   does: NaN adds to the coverage and the mean of a kept cell holding one is
   NaN, bit for bit as NumPy computes it. The default (NaN is never valid) is
   unchanged. LERC stores such NaN as masked pixels, which read back as NaN.
+- The area-matched `OverviewReport` (Python: the dict `Raster.write` returns)
+  also counts, per band, the NaN samples under a numeric nodata
+  (`nan_pixels`), from the same pass, whether or not `area_matched_nan_valid`
+  makes them valid.
 - SRTM HGT tiles and the other raw-layout rasters (EHdr, ENVI, SAGA, ERS,
   Idrisi, Surfer 6 binary grids) are read in place (#333): `open_raster_lazy`
   reads only the header, a window reads only the rows it covers, and `info`

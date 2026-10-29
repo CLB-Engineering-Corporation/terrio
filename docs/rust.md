@@ -130,6 +130,11 @@ NumPy builder computes it (a mode is never NaN). Under a NaN nodata it changes n
 stores NaN pixels as masked, as GDAL does, and they read back as NaN without their sign or
 payload; lossless codecs keep the bits.
 
+Either way the report's `nan_pixels` counts, per band, the NaN samples under a numeric nodata,
+from the same pass (it is not stored in the file). A caller that must treat NaN as rasterio's mask
+does, but writes without `area_matched_nan_valid`, can refuse the result on a non-zero count
+instead of scanning the raster first.
+
 Overviews computed elsewhere are written as they are with `RasterWriteOptions::overview_data`
 (GDAL's `OVERVIEWS=FORCE_USE_EXISTING`): the levels of factors 2, 4, 8…, each of the raster's
 bands and data type and `ceil(cols / f) x ceil(rows / f)` pixels.
