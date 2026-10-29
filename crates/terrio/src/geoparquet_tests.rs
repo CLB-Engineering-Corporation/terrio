@@ -330,3 +330,17 @@ fn path_writer_replaces_the_file() {
     assert_eq!(batch.num_rows(), 1);
     assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1, "no staged file is left behind");
 }
+
+#[test]
+fn open_sniffs_geoparquet_without_its_extension() {
+    // terrio's own driver reads it (wbvector's GeoParquet is not built).
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("cells.data");
+    let cells = layer("a", ("x", Arc::new(Int64Array::from(vec![7]))), vec![Some(point(1., 2.))]);
+    let options =
+        GeoParquetWriteOptions { crs: Some(json!({"id": {"authority": "EPSG", "code": 26918}})), ..GeoParquetWriteOptions::default() };
+    write_arrow_layers_to_path(vec![cells], path.to_str().unwrap(), &options).unwrap();
+    let crate::Dataset::Vector(ds) = crate::open(path.to_str().unwrap()).unwrap() else { panic!("not a vector dataset") };
+    assert_eq!(ds.layers[0].len(), 1);
+    assert_eq!(ds.layers[0].features[0].geometry, Some(wbvector::Geometry::point(1., 2.)));
+}

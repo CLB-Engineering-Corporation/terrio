@@ -108,7 +108,6 @@ parquet = [
     "dep:arrow-buffer",
     "dep:arrow-select",
     "dep:bytes",
-    "wbvector/geoparquet",
 ]
 ## HTTP(S), S3, GCS and Azure inputs, range reads of remote COGs and STAC (native builds only).
 remote = ["dep:ureq", "dep:hmac", "dep:sha2", "terrio-crs/grid-transport"]

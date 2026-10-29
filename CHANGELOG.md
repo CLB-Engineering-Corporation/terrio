@@ -12,6 +12,12 @@
   optional `hilbert_index` column, the ZSTD level, dictionaries on Utf8 columns only and chunk
   statistics without a page index. The `archive` profile reproduces ras2cng's archive files
   (rows, order, schema, row groups and `geo` metadata).
+- Arrow and Parquet move to major 59 (arrow 59.0, parquet 59.0, the versions
+  ras-commander-fast-hdf builds with), so the HEC-RAS engine's record batches pass to
+  `terrio::geoparquet` without conversion. wbvector's own GeoParquet support (parquet
+  58) is no longer built: terrio's GeoParquet driver already read and wrote `.parquet`,
+  and a GeoParquet file without that extension is now recognized by its `PAR1`
+  signature with terrio's driver.
 - SRTM HGT tiles are read and written (the `SRTMHGT` driver), as GDAL's SRTMHGT
   driver does: 3", 1" and 0.5" tiles georeferenced from their name
   (`N37W120.hgt`), `.hgt.zip` archives, and the NASADEM and water body variants.
