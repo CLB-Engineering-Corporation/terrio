@@ -754,6 +754,42 @@ def suite_dem_calc(ctx):
     )
 
 
+def suite_mdmosaic(ctx):
+    """Coordinate-aligned scientific mosaics against GDAL."""
+    suite = Suite("mdmosaic", "Multidimensional mosaics", "`gdal mdim mosaic`",
+                  "NOAA wind spatial/temporal tiles, gaps, overlap/nodata, nested selection, "
+                  "netCDF/Zarr snapshots, Float32-coordinate gaps, unindexed CF bounds and all ten numeric types: exact coordinate-aligned data values, "
+                  "types, nodata, units and axis names. Descending inputs are normalized for a GDAL "
+                  "3.13.3 invalid-VRT bug. Within tolerance: source group paths retained rather than flattened, "
+                  "and source coordinate values/types retained exactly; GDAL regenerated-grid rounding differences are accepted only where input samples prove the expected value, and gap coordinates must match the rounded reference.")
+    if missing_modules("osgeo", "numpy"):
+        suite.skipped = "needs osgeo and numpy"
+        return suite
+    if shutil.which("gdal") is None or run(["gdal", "mdim", "mosaic", "--help"])[0] != 0:
+        suite.skipped = "needs a GDAL release with the gdal mdim mosaic command"
+        return suite
+    _code, out, err = run([sys.executable, str(SCRIPTS / "compare_mdmosaic_with_gdal.py"), ctx.data, "--terrio", ctx.terrio, "--json"])
+    try:
+        results = json.loads(out)
+    except json.JSONDecodeError:
+        suite.error = tail(err or out)
+        return suite
+    for result in results:
+        if result.get("expected_rejection"):
+            suite.cases.append(Case("Multidimensional mosaics", result["name"], IDENTICAL if result.get("same_rejection") else DIFFERS,
+                                    "both reject; Terrio preserves the absent destination" if result.get("same_rejection") else "rejection differs"))
+            continue
+        classified = dict(result)
+        if result.get("permitted_coordinate_type_difference"):
+            classified["same_type"] = True
+        status, detail = classify_raster(classified)
+        differences = [result.get("path_difference"),result.get("coordinate_difference")]
+        if status in (IDENTICAL,TOLERANCE) and any(differences):
+            status, detail = TOLERANCE, "; ".join(filter(None,[detail,*differences]))
+        suite.cases.append(Case("Multidimensional mosaics", result["name"], status, detail))
+    return suite
+
+
 def suite_multidim(ctx):
     """Native groups, dimensions, slices and snapshots against GDAL MD and xarray."""
     suite = Suite(
@@ -775,6 +811,28 @@ def suite_multidim(ctx):
     return suite
 
 
+def suite_gpkg_repack(ctx):
+    suite = Suite("gpkg-repack", "GeoPackage storage repacking", "GDAL 3.13.3 / SQLite VACUUM",
+                "Natural Earth and USGS derivatives: all SQL records/objects/rowids, GDAL features and raster pixels/masks, types, CRS and metadata. Covers arbitrary indexes, WITHOUT ROWID, encodings, auto-vacuum, page sizes and mutation guards. Physical page layouts may differ.")
+    if missing_modules("osgeo"):
+        suite.skipped = "needs osgeo"
+        return suite
+    if shutil.which("gdal") is None or run(["gdal", "driver", "gpkg", "repack", "--help"])[0] != 0:
+        suite.skipped = "needs gdal driver gpkg repack"
+        return suite
+    code, out, err = run([sys.executable,str(SCRIPTS/"compare_gpkg_repack_with_gdal.py"),ctx.data,"--terrio",ctx.terrio,"--json"])
+    try:
+        results = json.loads(out)
+    except json.JSONDecodeError:
+        suite.error = tail(err or out)
+        return suite
+    for result in results:
+        suite.cases.append(Case("GeoPackage repack",result["name"],IDENTICAL if result["status"] == "identical" else DIFFERS,result["detail"]))
+    if code and not any(case.status == DIFFERS for case in suite.cases):
+        suite.error = tail(err or out)
+    return suite
+
+
 def suite_pansharpen(ctx):
     """Real Landsat panchromatic/spectral pairs against GDAL's weighted Brovey."""
     return suite_json_ops(
@@ -784,6 +842,138 @@ def suite_pansharpen(ctx):
         "extents. Compare every pixel, dimensions, type, nodata and geotransform; integer cases "
         "are exact, and Float32 allows 0.002 (one ULP at the scene's radiometric scale).", 1,
     )
+
+
+def suite_dataset_check(ctx):
+    suite = Suite("dataset-check", "Dataset content read checks", "`gdal dataset check` and GDAL all-level/mask reads (3.13.3)",
+                  "Real imagery, scientific arrays and vector files, plus derived grouped wind arrays and damaged compressed tiles/GeoJSON. Compare read success/failure status and all-level/mask sample counts, not checksums or pixel equality. A malformed GeoPackage geometry blob is accepted by both readers and is reported explicitly; successful reads cannot detect every mutation.")
+    if missing_modules("osgeo", "numpy") or shutil.which("gdal") is None:
+        suite.skipped = "needs GDAL 3.13 commands/bindings and NumPy"
+        return suite
+    from osgeo import gdal
+
+    if int(gdal.VersionInfo("VERSION_NUM")) < 3130000:
+        suite.skipped = "needs GDAL >= 3.13 for dataset check"
+        return suite
+    code, out, err = run([sys.executable, str(SCRIPTS / "compare_check_with_gdal.py"), ctx.data, "--terrio", ctx.terrio, "--json"])
+    try:
+        results = json.loads(out)
+    except json.JSONDecodeError:
+        suite.error = tail(err or out)
+        return suite
+    statuses = {"identical": IDENTICAL, "not compared": NOT_COMPARED}
+    for result in results:
+        suite.cases.append(Case("Dataset content check", result["name"], statuses.get(result["status"], DIFFERS), result["detail"]))
+    if code and not any(case.status == DIFFERS for case in suite.cases):
+        suite.error = tail(err or out)
+    return suite
+
+
+def suite_parquet_metadata(ctx):
+    suite = Suite("parquet-metadata", "Parquet metadata aggregation", "GDAL 3.13.3 / Arrow dataset reader",
+                  "Natural Earth partitions: row groups, column offsets/statistics, all values, CRS, geometry types and merged GeoParquet metadata; reference CRS loss explicitly reported.")
+    if missing_modules("osgeo", "pyarrow"):
+        suite.skipped = "needs osgeo and pyarrow"
+        return suite
+    code_help, _, _ = run(["gdal", "driver", "parquet", "create-metadata-file", "--help"])
+    if code_help:
+        suite.skipped = "needs GDAL 3.13+ with the Parquet metadata command"
+        return suite
+    code, out, err = run([sys.executable, str(SCRIPTS / "compare_parquet_metadata_with_gdal.py"), ctx.data, "--terrio", ctx.terrio, "--json"])
+    try:
+        results = json.loads(out)
+    except json.JSONDecodeError:
+        suite.error = tail(err or out)
+        return suite
+    statuses = {"identical": IDENTICAL, "tolerance": TOLERANCE}
+    for result in results:
+        suite.cases.append(Case("Parquet metadata", result["name"], statuses.get(result["status"], DIFFERS), result["detail"]))
+    if code and not any(case.status == DIFFERS for case in suite.cases):
+        suite.error = tail(err or out)
+    return suite
+
+
+def suite_dataset_files(ctx):
+    suite = Suite(
+        "dataset-files", "Dataset file management", "GDAL 3.13.3 dataset commands and recursive VSI copy",
+        "Real Landsat and Natural Earth derivatives: encoded bytes, owned companion files, "
+        "pixels/features, masks, overviews, types, CRS, transforms and metadata. VRT references "
+        "are rebased and CSV CRS .prj files retained rather than repeating GDAL's copy losses. "
+        "HTTP requests and transferred bytes are measured, with metadata-only overhead bounded.",
+    )
+    if missing_modules("osgeo") or shutil.which("gdal") is None:
+        suite.skipped = "needs osgeo and the gdal command"
+        return suite
+    code, out, err = run([
+        sys.executable, str(SCRIPTS / "compare_dataset_files_with_gdal.py"),
+        ctx.data, "--terrio", ctx.terrio, "--json",
+    ])
+    try:
+        results = json.loads(out)
+    except json.JSONDecodeError:
+        suite.error = tail(err or out)
+        return suite
+    statuses = {"identical": IDENTICAL, "tolerance": TOLERANCE}
+    for result in results:
+        suite.cases.append(Case("Dataset file management", result["name"],
+                                statuses.get(result["status"], DIFFERS), result["detail"]))
+    if code and not any(case.status == DIFFERS for case in suite.cases):
+        suite.error = tail(err or out)
+    return suite
+
+
+def suite_identify(ctx):
+    suite = Suite("identify", "Dataset identification", "`gdal dataset identify` / GDALIdentifyDriverEx (GDAL 3.13.3)",
+                  "Real Landsat, USGS, OPERA, SRTM, NOAA scientific data and vector files, plus derived raster encodings. Exact driver labels; generic JP2, KML and HDF5 label families are reported within tolerance. Companion-file formats use the explicit deep fallback. Unknown inputs must remain unknown; no pixel/feature values are decoded by the bounded header path.")
+    if missing_modules("osgeo"):
+        suite.skipped = "needs osgeo"
+        return suite
+    code, out, err = run([sys.executable, str(SCRIPTS / "compare_identify_with_gdal.py"), ctx.data, "--terrio", ctx.terrio, "--json"])
+    try:
+        results = json.loads(out)
+    except json.JSONDecodeError:
+        suite.error = tail(err or out)
+        return suite
+    statuses = {"identical":IDENTICAL,"tolerance":TOLERANCE,"not compared":NOT_COMPARED}
+    for result in results:
+        suite.cases.append(Case("Dataset identification",result["name"],statuses.get(result["status"],DIFFERS),result["detail"]))
+    if code and not any(case.status == DIFFERS for case in suite.cases):
+        suite.error = tail(err or out)
+    return suite
+
+
+def suite_cog_validate(ctx):
+    suite = Suite("cog-validate", "Cloud Optimized GeoTIFF validation", "`gdal driver cog validate` (GDAL 3.13.3)",
+                  "Real Landsat/DEM COGs, pixel/band/tile interleave, classic/BigTIFF, corrupt leaders/trailers, striped TIFFs and external overviews. Full checks on/off: exact validity, exit status, error/warning counts, IFD and first-block offsets. Diagnostic wording is not compared; no pixel decoding is performed.")
+    try:
+        missing = missing_modules("osgeo", "numpy", "osgeo_utils.samples.validate_cloud_optimized_geotiff")
+    except (ImportError, ModuleNotFoundError):
+        missing = ["osgeo_utils.samples.validate_cloud_optimized_geotiff"]
+    if missing:
+        suite.skipped = "needs " + ", ".join(missing)
+        return suite
+    if shutil.which("gdal") is None or run(["gdal", "driver", "cog", "validate", "--help"])[0] != 0:
+        suite.skipped = "needs a GDAL release with the gdal driver cog validate command"
+        return suite
+    from osgeo import gdal
+
+    if int(gdal.VersionInfo("VERSION_NUM")) < 3130000:
+        suite.skipped = "needs GDAL >= 3.13 for the cog validate reference"
+        return suite
+    suite.reference = f"`gdal driver cog validate` (GDAL {gdal.VersionInfo('RELEASE_NAME')})"
+    code, out, err = run([sys.executable, str(SCRIPTS / "compare_cog_validate_with_gdal.py"), ctx.data, "--terrio", ctx.terrio, "--json"])
+    try:
+        results = json.loads(out)
+    except json.JSONDecodeError:
+        suite.error = tail(err or out)
+        return suite
+    for result in results:
+        suite.cases.append(Case("COG validation", result["name"], IDENTICAL if result["status"] == "identical" else DIFFERS, result["detail"]))
+    if len(results) != 44:
+        suite.cases.append(Case("COG validation", "case count", DIFFERS, f"expected 44 results, got {len(results)}"))
+    if code and not any(case.status == DIFFERS for case in suite.cases):
+        suite.error = tail(err or out)
+    return suite
 
 
 def suite_vector_grid(ctx):
@@ -852,6 +1042,27 @@ def suite_raster_query(ctx):
         status = statuses.get(result["status"], DIFFERS)
         suite.cases.append(Case(result["operation"], result["name"], status, result.get("detail", "") if status != IDENTICAL else ""))
     return suite
+
+
+def suite_palette(ctx):
+    """Indexed colors on real Landsat and OPERA imagery."""
+    if missing_modules("osgeo", "numpy") or shutil.which("gdal") is None:
+        suite = Suite("palette", "Palette conversion", "GDAL 3.13", "Exact palettes and pixels.")
+        suite.skipped = "needs GDAL 3.13 commands/bindings and NumPy"
+        return suite
+    from osgeo import gdal
+
+    if int(gdal.VersionInfo("VERSION_NUM")) < 3130000 or run(["gdal", "raster", "rgb-to-palette", "--help"])[0] != 0:
+        suite = Suite("palette", "Palette conversion", "GDAL 3.13", "Exact palettes and pixels.")
+        suite.skipped = "needs GDAL >= 3.13 for rgb-to-palette"
+        return suite
+    return suite_json_ops(
+        ctx, "palette", "compare_palette_with_gdal.py", "Palette conversion",
+        "`gdal raster rgb-to-palette`, `gdal_translate -expand`, GDAL SetRasterColorTable",
+        "Landsat median cut and diffusion at 5/8 bits, supplied raster/text tables, "
+        "nodata, masks, alpha, OPERA expansion and attachment: exact pixels, palettes, "
+        "types, nodata, masks, CRS and georeferencing.", 1,
+    )
 
 
 def suite_blend(ctx):
@@ -1989,6 +2200,7 @@ SUITES = OrderedDict(
         ("indexes", suite_indexes),
         ("geolocation", suite_geolocation),
         ("dem-calc", suite_dem_calc),
+        ("gpkg-repack", suite_gpkg_repack),
         ("pansharpen", suite_pansharpen),
         ("vector-grid", suite_vector_grid),
         ("lineref", suite_lineref),
@@ -1997,9 +2209,16 @@ SUITES = OrderedDict(
         ("raster-query", suite_raster_query),
         ("raster-pixel", suite_raster_pixel),
         ("blend", suite_blend),
+        ("palette", suite_palette),
+        ("cog-validate", suite_cog_validate),
+        ("identify", suite_identify),
+        ("dataset-files", suite_dataset_files),
+        ("parquet-metadata", suite_parquet_metadata),
+        ("dataset-check", suite_dataset_check),
         ("focal", suite_focal),
         ("vector-ops", suite_vector_ops),
         ("multidim", suite_multidim),
+        ("mdmosaic", suite_mdmosaic),
         ("topology", suite_topology),
         ("vector-geom", suite_vector_geom),
         ("vector-dataset", suite_vector_dataset),

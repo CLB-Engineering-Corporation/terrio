@@ -447,3 +447,70 @@ implementations must return a standard `Response`. Object-store XML pagination i
 
 VSI listing bindings return structured flat entries. Nested tree presentation (`--tree`)
 is currently available through the CLI; JSON serialization flags apply to CLI output.
+
+`validateCog(bytes, {profile: "gdal", fullCheck: true})` checks uploaded TIFF
+structure without decoding pixels and returns `is_valid`, `errors`, `warnings`,
+`ifd_offsets`, `data_offsets`, `overview_factors`, `structural_metadata` and
+`layout_notes`. The default profile is `rio-cogeo`; `gdal` selects GDAL 3.13
+rules with full leader/trailer, row-order and interleaved-mask checks enabled
+for uploaded bytes unless `fullCheck: false` is supplied. External sidecars
+are unavailable for a standalone byte buffer.
+
+### GeoPackage maintenance
+
+`gpkgRepack(path)` compacts an uploaded `/vsimem/` GeoPackage in place and returns
+`bytes_before`, `bytes_after`, `page_size`, `pages_before` and `pages_after`.
+`gpkgRepackBytes(bytes)` returns a compacted `Uint8Array` copy of a self-contained image.
+Read the in-memory result with `vsiRead(path)`. Encoded records, indexes, rowids and schema SQL
+are retained. See [supported scope](cli.md#geopackage-repacking).
+
+### Multidimensional mosaics
+
+`mosaicMultidim(sources, {arrays})` builds a lazy coordinate-aligned
+`MultidimDataset` from dataset handles or uploaded scientific inputs. `arrays`
+selects numeric arrays by path or unambiguous name. Source handles can be freed
+after construction; mosaic views keep the source data alive. See
+[Multidimensional mosaics](cli.md#multidimensional-mosaics) for alignment,
+priority, Int64/UInt64 handling and snapshot formats.
+
+## Dataset file management
+
+`datasetFiles(path, {format})` returns the owned file set. `datasetCopy(source,
+destination, {format, overwrite, allowExternalReferences})` and `datasetRename(...)` return affected paths
+and copied bytes. `datasetDelete(pathOrArray, {format})` preflights the whole batch
+and returns one report per input. These APIs manage `/vsimem/` datasets; archive
+members may be copied out. HTTP/cloud mutation is unavailable in WebAssembly.
+VRT references stay in the source directory tree by default; enable
+`allowExternalReferences` only for trusted external assets. VRT deletion preserves
+referenced rasters. Reports contain `recovery_files`; leftovers indicate a committed
+operation whose staged cleanup needs attention. The CLI file-management section documents
+companion discovery, overwrite, staging and recovery behavior shared by these APIs.
+
+`parquetCreateMetadata(inputs, output, {overwrite: false})` creates a metadata-only Parquet
+file from an array of uploaded `/vsimem/` partition paths. It returns `files`, `row_groups`,
+`rows`, `bytes` and `omitted_metadata_keys`. Read the resulting bytes with `vsiRead(output)`.
+Schemas and CRS must agree; GeoParquet bounds/types are merged and Arrow schema metadata
+is regenerated. Direct and referenced input partitions are protected from overwrite.
+See [CLI supported scope](cli.md#parquet-metadata-files); no data pages are validated.
+
+### Indexed color conversion
+
+`rgbToPalette(source, {colorCount: 256, bitDepth: 5, dither: true, colorMap,
+outputNodata, mask})` returns an indexed Byte Dataset. Sources accept Dataset
+objects or uploaded raster bytes (`Uint8Array` or `{bytes, filename}`). `colorMap`
+accepts a palette Dataset/upload, color-file text, `{text, filename}`, or RGBA
+integer arrays; `mask` accepts a flat Uint8Array/array of validity bytes.
+`paletteToRgb(source, {rgba: true})` expands to RGBA (RGB by default), and
+`attachPalette(source, colorMap)` changes only the table.
+`readColorTable(source, filename)` reads integer RGBA entries from these same
+palette sources. Operations materialize the input/output. See
+[Palette conversion](cli.md#palette-conversion) for formats and validity rules.
+
+Raster `toBytes` preserves dataset masks for GeoTIFF/COG without `tSrs`.
+Other formats omit separate dataset masks. Reprojecting a raster
+with a separate dataset mask is refused explicitly; use an alpha band instead.
+
+Color-file text passed to palette APIs as a `Uint8Array` needs a filename hint
+or `{bytes, filename: "colors.txt"}`. Plain strings and `{text, filename}` also
+accept text tables. Tile-archive serialization rejects any raster with a
+dataset mask, including materialized palette results; use an explicit alpha band.

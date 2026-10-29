@@ -76,14 +76,55 @@ documented; additional feature scope belongs in separate tracking issues.
 [#289](https://github.com/opengeos/terrio/issues/289) tracks the remaining unified GDAL
 commands. Command-group progress:
 
+- [x] Palette conversion: RGB median cut, supplied palettes, RGB/RGBA expansion and
+      attachment across Rust, CLI/MCP, Python and JavaScript; real Landsat/OPERA
+      GDAL 3.13.3 comparisons registered as `palette`. Landed in
+      [#372](https://github.com/opengeos/terrio/pull/372).
+
+- [x] COG validation: GDAL 3.13 structural rules and full compressed-block checks,
+      uploaded TIFF bytes through Rust/Python/JavaScript, and CLI/MCP options.
+      Landed in [#374](https://github.com/opengeos/terrio/pull/374), with real-data
+      conformance and measured remote header/full-check I/O.
+
+- [ ] Multidimensional mosaics: lazy coordinate-aligned numeric arrays across
+      Rust, CLI/MCP, Python and JavaScript, with netCDF/Zarr output and real
+      NOAA wind comparisons registered as `mdmosaic`. Proposed in
+      [#373](https://github.com/opengeos/terrio/pull/373), pending review and merge.
+
 - [x] Vector geometry operations: simplify, segmentize, convex and concave hulls, swap XY,
       geometry-type conversion, grouped combine and spatial sort. Landed in
       [#306](https://github.com/opengeos/terrio/pull/306), through Rust, CLI/MCP, Python and
       JavaScript, with GDAL/GEOS comparisons and documented tolerances.
-- [ ] Vector gridding and linear referencing: every `gdal_grid` algorithm (search ellipses,
+- [x] Vector gridding and linear referencing: every `gdal_grid` algorithm (search ellipses,
       quadtree order, per-quadrant limits) as `terrio vector-grid`, and `ogrlineref` as
-      `terrio lineref`. Proposed in [#305](https://github.com/opengeos/terrio/pull/305), through Rust,
+      `terrio lineref`. Landed in [#305](https://github.com/opengeos/terrio/pull/305), through Rust,
       CLI/MCP, Python and JavaScript, with real-data comparisons registered in conformance.
+
+- [ ] GeoPackage repacking: encoded-record B-tree rebuilds, preserved rowids and SQL objects,
+      auto-vacuum maps and journaled native replacement through Rust, CLI/MCP, Python and
+      JavaScript. Proposed in [#384](https://github.com/opengeos/terrio/pull/384); real-data
+      comparisons are registered as `gpkg-repack`.
+
+- [x] Dataset identification: bounded 16 KiB headers, ordered input batches, recursive local
+      discovery and explicit companion-file reader fallback through Rust, CLI/MCP, Python and
+      JavaScript. Landed in [#375](https://github.com/opengeos/terrio/pull/375);
+      real-data GDAL comparisons are registered as `identify`.
+
+- [x] Dataset file management: encoded copies, renames and deletion of owned companions,
+      with staged replacement and source alias protection through Rust, CLI/MCP, Python and
+      WebAssembly. Landed in [#382](https://github.com/opengeos/terrio/pull/382);
+      real Landsat and Natural Earth comparisons are registered as `dataset-files`.
+
+- [x] Parquet metadata aggregation: explicit compatible partitions, relative column paths,
+      merged GeoParquet metadata and overwrite guards through Rust, CLI/MCP, Python and
+      JavaScript. Landed in [#382](https://github.com/opengeos/terrio/pull/382), including
+      [#383](https://github.com/opengeos/terrio/pull/383); real-data
+      and measured S3 range-read comparisons are registered as `parquet-metadata`.
+
+- [x] Dataset content checks: all exposed raster bands, vector layers, numeric scientific
+      arrays and point records, with optional raster overviews and masks. Rust, CLI/MCP,
+      Python and JavaScript share the checks. Landed in
+      [#378](https://github.com/opengeos/terrio/pull/378); conformance is registered as `dataset-check`.
 
 ## 0.1: Foundations
 

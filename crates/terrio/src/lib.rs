@@ -192,6 +192,7 @@ mod cog;
 mod cog_validate;
 pub mod crs;
 mod dataset;
+pub mod dataset_files;
 mod drivers;
 mod error;
 pub mod formats;
@@ -202,11 +203,13 @@ pub use drivers::hecras;
 #[cfg_attr(docsrs, doc(cfg(feature = "gdal")))]
 pub mod gdal_backend;
 mod geotiff;
+pub mod gpkg_maintenance;
 mod histogram;
 #[cfg(remote)]
 #[cfg_attr(docsrs, doc(cfg(feature = "remote")))]
 pub mod http;
 pub mod info;
+pub mod inspection;
 mod jpeg;
 mod memfs;
 pub mod memory;
@@ -215,6 +218,7 @@ pub mod multidim;
 mod ndarray_ext;
 pub mod ops;
 mod par;
+pub mod parquet_metadata;
 mod pixel;
 #[cfg(feature = "pointcloud")]
 #[cfg_attr(docsrs, doc(cfg(feature = "pointcloud")))]
@@ -235,6 +239,7 @@ pub mod raster {
     pub use wbraster::{CrsInfo, RasterError, ReprojectOptions, ResampleMethod};
 }
 pub mod catalog;
+pub mod check;
 pub mod stac;
 mod stacta;
 pub mod stream;
@@ -244,7 +249,9 @@ pub mod vsi;
 pub mod warnings;
 
 pub use cog::{LazyRaster, TiffReadLimits, Window, WindowOptions, open_raster_lazy};
-pub use cog_validate::{CogValidation, validate_cog};
+pub use cog_validate::{
+    CogValidation, CogValidationOptions, CogValidationProfile, validate_cog, validate_cog_bytes, validate_cog_with_options,
+};
 pub use dataset::{
     BandMetadata, Dataset, Gcp, Geolocation, RasterDataset, RasterWriteOptions, VectorDataset, VectorOpenOptions, VectorWriteOptions,
     geo_transform, is_north_up, list_layers, open, open_raster, open_raster_with_tiff_limits, open_vector, read_gcps, write_netcdf_groups,
