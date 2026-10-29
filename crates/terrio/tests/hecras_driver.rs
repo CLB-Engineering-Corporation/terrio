@@ -341,6 +341,17 @@ fn invalid_requests_fail_a_default_open() {
         let r = terrio::open_vector(&path, &options(pairs, &[]));
         assert!(r.is_err(), "{pairs:?}: {:?}", r.map(|d| d.layers.len()));
     }
+    // A row option nothing reads is an error up front, never a dataset without the mesh layers:
+    // TIME_STEP without a series, XS_PROFILE without XS_RESULTS, and both rows for XS_RESULTS.
+    for (pairs, layers) in [
+        (&[("TIME_STEP", "1")][..], &[][..]),
+        (&[("TIME_STEP", "1")], &["river_junctions"]),
+        (&[("XS_PROFILE", "0")], &[]),
+        (&[("XS_RESULTS", "Water Surface"), ("XS_PROFILE", "0"), ("TIME_STEP", "1")], &[]),
+    ] {
+        let e = terrio::open_vector(&path, &options(pairs, layers)).unwrap_err();
+        assert!(matches!(&e, terrio::Error::InvalidArgument(m) if m.contains("TIME_STEP") || m.contains("XS_PROFILE")), "{pairs:?}: {e}");
+    }
     // A valid request opens every layer.
     let ds = terrio::open_vector(&path, &options(&[("CELL_SERIES", "Water Surface"), ("TIME_STEP", "1")], &[])).unwrap();
     assert_eq!(ds.layers.len(), 9);

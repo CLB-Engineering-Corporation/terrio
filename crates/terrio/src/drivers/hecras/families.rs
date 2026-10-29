@@ -87,18 +87,6 @@ pub(crate) fn family_budget(metadata_max_bytes: usize, max_bytes: usize) -> usiz
     metadata_max_bytes.min(max_bytes)
 }
 
-/// `Reported` engine data as a value or an error. Unavailable (the family is not stored) is a
-/// caller error: the layer was asked for but the file has none.
-fn take<T: Clone>(r: Reported<T>, what: &str) -> crate::Result<T> {
-    match r.value() {
-        Some(v) if r.is_supported() => Ok(v.clone()),
-        _ => {
-            error::require(r.capability(), what)?;
-            Err(crate::Error::InvalidData(format!("HEC-RAS {what}: supported without a value")))
-        }
-    }
-}
-
 impl HecRasHdf {
     /// Whether the file stores the family: the engine reads it, within `max_bytes` per dataset,
     /// and reports anything but canonical absence. A family missing a dataset it needs (the
@@ -132,7 +120,7 @@ impl HecRasHdf {
         let mut builder = Builder::new(self, name, metadata_max_bytes)?;
         match family {
             Family::OneD(f, shape) => {
-                let data = take(s.one_d_line_family(f, max_bytes).map_err(error::from_engine)?, f.group_path())?;
+                let data = error::take(s.one_d_line_family(f, max_bytes).map_err(error::from_engine)?, f.group_path())?;
                 let table = data.attributes.as_ref().map(|a| &a.table);
                 let points = xy(&data.points, f.group_path())?;
                 builder.declare(table, if shape == Shape::Polygon { GeometryType::Polygon } else { GeometryType::LineString })?;
@@ -142,7 +130,7 @@ impl HecRasHdf {
                 }
             }
             Family::TwoD(f, shape) => {
-                let data = take(s.geometry_family(f, max_bytes).map_err(error::from_engine)?, f.group_path())?;
+                let data = error::take(s.geometry_family(f, max_bytes).map_err(error::from_engine)?, f.group_path())?;
                 let table = Some(&data.attributes.table);
                 let points = xy(&data.points, f.group_path())?;
                 builder.declare(table, if shape == Shape::Polygon { GeometryType::Polygon } else { GeometryType::LineString })?;
@@ -153,7 +141,7 @@ impl HecRasHdf {
             }
             Family::ReferencePoints => {
                 let data = s.reference_point_geometry(max_bytes).map_err(error::from_engine)?;
-                let data = take(data, "Geometry/Reference Points")?;
+                let data = error::take(data, "Geometry/Reference Points")?;
                 let table = Some(&data.attributes.table);
                 let points = xy(&data.points, "Geometry/Reference Points")?;
                 builder.declare(table, GeometryType::Point)?;
@@ -166,12 +154,16 @@ impl HecRasHdf {
                 }
             }
             Family::Points(f) => {
-                let data = take(self.point_data(f, max_bytes).map_err(error::from_engine)?, f.group())?;
+                let data = error::take(self.point_data(f, max_bytes).map_err(error::from_engine)?, f.group())?;
                 let table = Some(&data.attributes.table);
                 let points = xy(&data.points, f.group())?;
                 builder.declare(table, GeometryType::Point)?;
-                for (row, id) in data.features.iter().enumerate() {
-                    let [x, y] = *points.get(row).ok_or_else(|| crate::Error::InvalidData(format!("{name} row {row}: no stored point")))?;
+                // Each feature's point is the `Points` row of its own attribute row.
+                for id in &data.features {
+                    let [x, y] = *usize::try_from(id.row)
+                        .ok()
+                        .and_then(|r| points.get(r))
+                        .ok_or_else(|| crate::Error::InvalidData(format!("{name} row {}: no stored point", id.row)))?;
                     builder.push(id, Geometry::Point(Coord::xy(x, y)), table)?;
                 }
             }

@@ -135,10 +135,10 @@ other layers are not looked up. Lists are comma-separated stored names.
 | `FACE_ATTRIBUTES` | `MINIMUM_ELEVATION`, `NORMAL_AND_LENGTH`, `CELLS` | `minimum_elevation`, `normal_x`, `normal_y`, `length`, `cell_a`, `cell_b` |
 | `CELL_SERIES`, `FACE_SERIES` (with `TIME_STEP`) | stored time series at one output row (`Water Surface`, `Face Velocity`, `Depth` where stored) | `<variable>`: `water_surface` |
 | `CELL_MAXIMUM`, `CELL_MINIMUM`, `FACE_MAXIMUM`, `FACE_MINIMUM` | the engine's reduction of a stored series over every row (first occurrence; NaN propagates) | `<variable>_max`, `<variable>_max_row` (or `_min`, `_min_row`) |
-| `TIME_STEP` | the stored unsteady output row (zero-based) of the series options | |
+| `TIME_STEP` | the stored unsteady output row (zero-based) of the series options; without one of them it is an error | |
 | `XS_SUMMARIES` | stored `Summary Output/Cross Sections` variables to `cross_sections` | `<variable>`, `<variable>_time`, `<variable>_<row label>` |
 | `XS_RESULTS` (with `TIME_STEP` or `XS_PROFILE`) | stored cross-section results at an unsteady row or a steady profile (`Water Surface`, `Flow`, `Velocity Channel`, ...) | `<variable>` |
-| `XS_PROFILE` | the steady profile (zero-based) of `XS_RESULTS` | |
+| `XS_PROFILE` | the steady profile (zero-based) of `XS_RESULTS`; an error without `XS_RESULTS` or with `TIME_STEP` | |
 | `XS_GEOMETRY` | `STATION_ELEVATION`, `MANNINGS_N`, `INEFFECTIVE_AREAS`: the stored per-section tables of `Geometry/Cross Sections` | JSON fields: `station_elevation` (`[[station, elevation], ...]`), `mannings_n` (`[[station, n], ...]`), `ineffective_areas` (`[{"Left Sta": .., "Right Sta": .., "Elevation": .., "Permanent": ..}, ...]`); a NaN, which JSON cannot hold, is `null` |
 | `STRUCTURE_SERIES` (with `TIME_STEP`) | stored structure series (`Structure Variables`, ...) to `structures` | `<series>_<column label>` |
 | `BC_SERIES=YES` (with `TIME_STEP`) | each 2D boundary-condition line's stored series to `bc_lines` | one field per stored column label (`stage`, `flow`, ...); lines of an area that stores no series get nulls |

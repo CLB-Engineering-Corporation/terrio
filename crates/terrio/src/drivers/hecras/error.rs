@@ -5,7 +5,7 @@
 //! (`ErrorKind::as_str`, `UnsupportedCode::as_str`) at the start of the message, so a caller can
 //! still tell the engine's categories apart through terrio's string-carrying variants.
 
-use ras_commander_fast_hdf::{Capability, Error as EngineError, ErrorKind, UnsupportedCode};
+use ras_commander_fast_hdf::{Capability, Error as EngineError, ErrorKind, Reported, UnsupportedCode};
 
 /// The terrio error for an engine error.
 ///
@@ -39,6 +39,19 @@ pub fn require(capability: &Capability, what: &str) -> crate::Result<()> {
         Capability::Corrupt { reason } => Err(crate::Error::InvalidData(text(reason))),
         // Unsupported, Delegated and any later status: refuse.
         other => Err(crate::Error::Unsupported(text(other.reason().unwrap_or("not supported")))),
+    }
+}
+
+/// `Reported` engine data as a value, or its refusal as a terrio error ([`require`]). Unavailable
+/// (canonically absent) data is a caller error: the request asked for something the file does
+/// not store.
+pub fn take<T: Clone>(r: Reported<T>, what: &str) -> crate::Result<T> {
+    match r.value() {
+        Some(v) if r.is_supported() => Ok(v.clone()),
+        _ => {
+            require(r.capability(), what)?;
+            Err(crate::Error::InvalidData(format!("HEC-RAS {what}: supported without a value")))
+        }
     }
 }
 

@@ -80,6 +80,7 @@ pub(crate) fn read_bytes(bytes: Vec<u8>, name: &str, options: &VectorOpenOptions
 
 fn read_hdf(hdf: &HecRasHdf, path: &str, options: &VectorOpenOptions) -> Result<Vec<Layer>> {
     let o = &options.hecras;
+    check_rows(o)?;
     // Every layer's request is built before anything is read, so that an invalid request fails
     // the open instead of leaving layers out.
     let requests = LAYER_NAMES.iter().map(|name| Ok((*name, request(name, o)?))).collect::<Result<Vec<_>>>()?;
@@ -103,6 +104,9 @@ fn read_hdf(hdf: &HecRasHdf, path: &str, options: &VectorOpenOptions) -> Result<
         return Ok(layers);
     }
     let available = hdf.layer_names_within(metadata_max_bytes, max_bytes)?;
+    if available.is_empty() {
+        return Err(Error::Unsupported(format!("'{path}' stores no layer the HECRAS driver reads")));
+    }
     // An option for layers the file does not store would otherwise be dropped unnoticed.
     if let Some((option, targets)) = option_targets(o).into_iter().find(|(_, t)| !t.iter().any(|t| available.iter().any(|a| a == t))) {
         return Err(Error::InvalidArgument(format!(
@@ -126,6 +130,32 @@ fn read_hdf(hdf: &HecRasHdf, path: &str, options: &VectorOpenOptions) -> Result<
         return Err(Error::Unsupported(format!("'{path}': the engine refused every HEC-RAS layer (see the warnings)")));
     }
     Ok(layers)
+}
+
+/// Refuses a row option nothing reads: `TIME_STEP` without a series option, and `XS_PROFILE`
+/// without `XS_RESULTS` or together with `TIME_STEP` (the results are read at one row, steady or
+/// unsteady). Checked before anything is read, whichever layers are named.
+fn check_rows(o: &HecRasOpenOptions) -> Result<()> {
+    if o.xs_profile.is_some() && o.xs_results.is_empty() {
+        return Err(Error::InvalidArgument("XS_PROFILE selects the steady profile of XS_RESULTS, which is not set".into()));
+    }
+    if o.xs_profile.is_some() && o.time_step.is_some() {
+        return Err(Error::InvalidArgument("XS_RESULTS are read at TIME_STEP (unsteady) or XS_PROFILE (steady), not both".into()));
+    }
+    let series = !(o.cell_series.is_empty()
+        && o.face_series.is_empty()
+        && o.xs_results.is_empty()
+        && o.structure_series.is_empty()
+        && !o.bc_series
+        && o.reference_line_series.is_empty()
+        && o.reference_point_series.is_empty());
+    if o.time_step.is_some() && !series {
+        return Err(Error::InvalidArgument(
+            "TIME_STEP selects the output row of a series option (CELL_SERIES, FACE_SERIES, XS_RESULTS, STRUCTURE_SERIES, BC_SERIES, REFERENCE_LINE_SERIES, REFERENCE_POINT_SERIES), and none is set"
+                .into(),
+        ));
+    }
+    Ok(())
 }
 
 /// The options set in `o` that ask for something of particular layers, with those layers. An
@@ -347,4 +377,17 @@ fn mesh_options(o: &HecRasOpenOptions, cells: bool) -> Result<MeshOptions> {
     m.extremes =
         maximum.iter().map(|v| (v.clone(), Extreme::Maximum)).chain(minimum.iter().map(|v| (v.clone(), Extreme::Minimum))).collect();
     Ok(m)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_file_without_layers_says_so() {
+        // No `Geometry/2D Flow Areas` and no family: nothing to read, and nothing was refused.
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/hecras/coverage_mesh_nogeometry.h5");
+        let e = read(path, &VectorOpenOptions::default()).unwrap_err();
+        assert!(matches!(&e, Error::Unsupported(m) if m.contains("stores no layer")), "{e}");
+    }
 }

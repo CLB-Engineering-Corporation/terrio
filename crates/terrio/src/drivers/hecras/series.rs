@@ -25,7 +25,7 @@ use ras_commander_fast_hdf::hdf::structures::{StructureFamilyKind, StructureSeri
 use ras_commander_fast_hdf::hdf::structures_1d::OneDStructureKind;
 use ras_commander_fast_hdf::hdf::xs_geometry::OneDLineFamily;
 use ras_commander_fast_hdf::hdf::{DEFAULT_MAX_BYTES, DEFAULT_READ_MAX_BYTES, Identity, NumericArray, ResultMode, Slice};
-use ras_commander_fast_hdf::{Capability, ErrorKind, Reported};
+use ras_commander_fast_hdf::{Capability, ErrorKind};
 use std::collections::HashMap;
 
 const STRUCTURE_ATTRIBUTES: &str = "Geometry/Structures/Attributes";
@@ -122,13 +122,16 @@ impl HecRasHdf {
         for variable in &options.variables {
             let mut found = Vec::new();
             for g in &groups {
+                let Some(series) = g.series.iter().find(|s| &s.relative == variable) else { continue };
+                // A series this layer's rows cannot carry is an error, never left out.
                 if g.id.table != STRUCTURE_ATTRIBUTES {
-                    continue;
+                    return Err(crate::Error::Unsupported(format!(
+                        "structure {:?} stores {variable:?} but is identified by {}, not {STRUCTURE_ATTRIBUTES}",
+                        g.name, g.id.table
+                    )));
                 }
-                if let Some(series) = g.series.iter().find(|s| &s.relative == variable) {
-                    let array = g.read(self, series, options)?;
-                    found.push(values(g.id.clone(), series, array)?);
-                }
+                let array = g.read(self, series, options)?;
+                found.push(values(g.id.clone(), series, array)?);
             }
             if found.is_empty() {
                 return Err(crate::Error::InvalidArgument(format!("HEC-RAS not_found: no structure stores {variable:?}")));
@@ -154,7 +157,7 @@ impl HecRasHdf {
         let mut found = Vec::new();
         for area in self.mesh_names()? {
             let links = s.mesh_boundary_links(&area, options.metadata_max_bytes).map_err(error::from_engine)?;
-            let links = reported(links, &format!("{area} boundary-condition links"))?;
+            let links = error::take(links, &format!("{area} boundary-condition links"))?;
             error::require(&links.geometry_capability, &format!("{area} boundary-condition lines"))?;
             // An area that stores no boundary series (no group of them: canonically absent) has
             // none to join; another area's still join. Any other refusal fails the layer.
@@ -360,19 +363,9 @@ fn row_slice(row: u64) -> Slice {
     Slice::new(row, row.saturating_add(1), 1)
 }
 
-fn reported<T: Clone>(r: Reported<T>, what: &str) -> crate::Result<T> {
-    match r.value() {
-        Some(v) if r.is_supported() => Ok(v.clone()),
-        _ => {
-            error::require(r.capability(), what)?;
-            Err(crate::Error::InvalidData(format!("HEC-RAS {what}: supported without a value")))
-        }
-    }
-}
-
 /// One structure's series values with the engine's column labels.
 fn values(id: Identity, series: &StructureSeries, array: NumericArray) -> crate::Result<Values> {
-    let labels: Vec<Label> = reported(series.columns.clone(), &format!("{} column labels", series.path))?
+    let labels: Vec<Label> = error::take(series.columns.clone(), &format!("{} column labels", series.path))?
         .labels
         .into_iter()
         .map(|l| Label { name: l.name, unit: l.unit })

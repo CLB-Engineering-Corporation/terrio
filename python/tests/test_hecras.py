@@ -62,7 +62,10 @@ def test_info_takes_open_options():
         PLAN, layers=["mesh_cells"], options={"CELL_ATTRIBUTES": "MINIMUM_ELEVATION"}
     )
     assert summary["driver"] == "HECRAS"
-    assert "minimum_elevation" in str(summary["layers"][0])
+    layer = summary["layers"][0]
+    assert layer["name"] == "mesh_cells"
+    assert [f["name"] for f in layer["fields"]] == ["mesh_name", "cell_id", "minimum_elevation"]
+    assert layer["fields"][2]["field_type"] == "Float"
 
 
 def test_misuse_is_an_error():
@@ -81,11 +84,10 @@ def test_misuse_is_an_error():
 
 def test_raster_opens_keep_reading_hdf5():
     # A raster open of a HEC-RAS file still goes to the HDF5 raster driver, as before: it reads
-    # the file's arrays, or fails as that driver does, never through the HECRAS driver.
-    try:
-        terrio.open_raster(PLAN)
-    except terrio.TerrioError as e:
-        assert "HECRAS" not in str(e)
+    # one of the file's arrays, never through the HECRAS driver.
+    r = terrio.open_raster(PLAN)
+    assert isinstance(r, terrio.Raster)
+    assert "driver=HDF5" in repr(r)
 
 
 def test_left_out_layers_are_user_warnings():
