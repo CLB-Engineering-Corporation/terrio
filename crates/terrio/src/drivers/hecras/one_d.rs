@@ -66,7 +66,8 @@ impl CrossSectionOptions {
         self
     }
 
-    /// Joins a stored unsteady result variable at output row `row`.
+    /// Joins a stored unsteady result variable at output row `row`. Every result variable is
+    /// read in one mode at one row: this sets them for those already added too.
     pub fn with_unsteady(mut self, variable: impl Into<String>, row: u64) -> Self {
         self.results.push(variable.into());
         self.mode = ResultMode::Unsteady;
@@ -80,7 +81,8 @@ impl CrossSectionOptions {
         self
     }
 
-    /// Joins a stored steady result variable at profile index `profile`.
+    /// Joins a stored steady result variable at profile index `profile`. Every result variable
+    /// is read in one mode at one row: this sets them for those already added too.
     pub fn with_steady(mut self, variable: impl Into<String>, profile: u64) -> Self {
         self.results.push(variable.into());
         self.mode = ResultMode::Steady;
@@ -282,6 +284,7 @@ impl HecRasHdf {
             }
         };
         let values = numbers(selection.values.values, variable)?;
+        super::check_value_count(values.len(), rows as u64, n as u64, &format!("Summary Output/Cross Sections/{variable}"))?;
         let base = field_name(variable);
         let labels: Vec<Option<(String, Option<String>)>> = match (&v.row_labels, rows) {
             (Some(l), r) if l.len() == r => l.iter().map(|c| Some((c.name.clone(), c.unit.clone()))).collect(),

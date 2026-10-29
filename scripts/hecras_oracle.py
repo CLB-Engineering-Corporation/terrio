@@ -434,12 +434,20 @@ def main(root, out, files):
             row = time_row(f)
             results = f.get(f"{SERIES}/Cross Sections")
             if results is not None and row is not None and xs_rows:
-                stamp = f[f"{SERIES}/Time Date Stamp"][row]
-                one_d["unsteady"] = {"row": row, "label": text(stamp), "values": {v: digest(results[v][row]) for v in XS_RESULTS if v in results}}
+                # The engine labels the row with its date stamp when the plan stores one.
+                stamps = f.get(f"{SERIES}/Time Date Stamp")
+                stamp = None if stamps is None else text(stamps[row])
+                one_d["unsteady"] = {"row": row, "label": stamp, "values": {v: digest(results[v][row]) for v in XS_RESULTS if v in results}}
             steady = f.get(f"{STEADY}/Cross Sections")
             if steady is not None and xs_rows:
                 names = [text(n) for n in f[f"{STEADY}/Profile Names"][()]]
-                one_d["steady"] = {"row": 1, "label": names[1], "values": {v: digest(steady[v][1]) for v in XS_RESULTS if v in steady}}
+                # The second profile, or the only one of a single-profile plan.
+                profile = 1 if len(names) > 1 else 0
+                one_d["steady"] = {
+                    "row": profile,
+                    "label": names[profile],
+                    "values": {v: digest(steady[v][profile]) for v in XS_RESULTS if v in steady},
+                }
             if row is not None and "Time Date Stamp" in f.get(SERIES, {}):
                 entry["time_step"] = {"row": row, "date_stamp": text(f[f"{SERIES}/Time Date Stamp"][row]), "days": float(f[f"{SERIES}/Time"][row])}
             entry["one_d"] = one_d

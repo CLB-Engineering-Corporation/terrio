@@ -284,9 +284,13 @@ fn public_models_match_the_h5py_oracle() {
                 }
                 assert_eq!(offset, faces.layer.len());
 
-                // Perimeters (closed again for the oracle's ring digest).
-                let perimeters = hdf.mesh_perimeters(&MeshOptions::default()).unwrap();
-                for (name, f) in order.iter().zip(&perimeters.layer.features) {
+                // Perimeters (closed again for the oracle's ring digest). An area without a
+                // stored Perimeter makes the layer an error.
+                let perimeters = hdf.mesh_perimeters(&MeshOptions::default());
+                if meshes.values().any(|m| m["perimeter_sha256"].is_null()) {
+                    assert!(perimeters.is_err(), "{file}: a mesh stores no Perimeter, so mesh_perimeters must be an error");
+                }
+                for (name, f) in order.iter().zip(perimeters.iter().flat_map(|p| &p.layer.features)) {
                     let Some(Geometry::Polygon { exterior, .. }) = &f.geometry else { panic!() };
                     let mut ring: Vec<_> = exterior.coords().iter().map(|c| (c.x, c.y)).collect();
                     ring.push(ring[0]);
@@ -684,23 +688,26 @@ fn check_stored(hdf: &HecRasHdf, file: &str, want: &Value) -> usize {
     // The 2D flow area table on the perimeters, and the face points.
     let meshes = want["meshes"].as_object().unwrap();
     if !meshes.is_empty() {
-        let perimeters = hdf.mesh_perimeters(&MeshOptions::default()).unwrap();
-        let fields = perimeters.layer.schema.fields();
-        match stored.get("flow_areas") {
-            Some(areas) => {
-                for f in &perimeters.layer.features {
-                    let FieldValue::Text(mesh) = &f.attributes[0] else { panic!() };
-                    for column in areas[mesh].as_array().unwrap() {
-                        let (name, kind, sha) = (column[0].as_str().unwrap(), column[1].as_str().unwrap(), column[2].as_str().unwrap());
-                        let field = terrio_field(name);
-                        let i = fields.iter().position(|d| d.name == field).unwrap_or_else(|| panic!("{file} perimeters: no {field}"));
-                        assert_eq!(fields[i].field_type, field_type(kind), "{file} {mesh} {field}: field type");
-                        assert_eq!(values_digest(&[&f.attributes[i]], kind), sha, "{file} {mesh} {field}");
-                        checked += 1;
+        // An area without a stored Perimeter makes the layer an error (checked above).
+        if meshes.values().all(|m| !m["perimeter_sha256"].is_null()) {
+            let perimeters = hdf.mesh_perimeters(&MeshOptions::default()).unwrap();
+            let fields = perimeters.layer.schema.fields();
+            match stored.get("flow_areas") {
+                Some(areas) => {
+                    for f in &perimeters.layer.features {
+                        let FieldValue::Text(mesh) = &f.attributes[0] else { panic!() };
+                        for column in areas[mesh].as_array().unwrap() {
+                            let (name, kind, sha) = (column[0].as_str().unwrap(), column[1].as_str().unwrap(), column[2].as_str().unwrap());
+                            let field = terrio_field(name);
+                            let i = fields.iter().position(|d| d.name == field).unwrap_or_else(|| panic!("{file} perimeters: no {field}"));
+                            assert_eq!(fields[i].field_type, field_type(kind), "{file} {mesh} {field}: field type");
+                            assert_eq!(values_digest(&[&f.attributes[i]], kind), sha, "{file} {mesh} {field}");
+                            checked += 1;
+                        }
                     }
                 }
+                None => assert_eq!(fields.len(), 1, "{file}: no stored 2D flow area table, so only mesh_name"),
             }
-            None => assert_eq!(fields.len(), 1, "{file}: no stored 2D flow area table, so only mesh_name"),
         }
         let points = hdf.mesh_face_points(&MeshOptions::default()).unwrap();
         let mut offset = 0;

@@ -50,8 +50,9 @@ fn has_signature(path: &str) -> bool {
 }
 
 /// Whether bytes held in memory are a HEC-RAS geometry or plan file: an HDF5 signature and a
-/// root `File Type` in [`HEC_RAS_FILE_TYPES`], as [`is_hecras`] decides for files. The bytes are
-/// sniffed in place (an engine session would take ownership of a copy).
+/// root `File Type` in [`HEC_RAS_FILE_TYPES`], as [`is_hecras`] decides for files. Bytes without
+/// an HDF5 signature are rejected without a copy; the metadata of HDF5 bytes is read from a
+/// temporary copy (`hdf5::root_file_type_in`), freed before the file is opened.
 pub(crate) fn is_hecras_bytes(bytes: &[u8]) -> bool {
     crate::drivers::hdf5::root_file_type_in(bytes).is_some_and(|t| HEC_RAS_FILE_TYPES.contains(&t.as_str()))
 }
@@ -85,25 +86,30 @@ fn read_hdf(hdf: &HecRasHdf, path: &str, options: &VectorOpenOptions) -> Result<
     let request_of = |name: &str| requests.iter().find(|(n, _)| *n == name).map(|(_, r)| r);
     let (metadata_max_bytes, max_bytes) = limits(o);
     hdf.root_attributes_within(metadata_max_bytes)?;
-    let available = hdf.layer_names_within(metadata_max_bytes, max_bytes)?;
-    if options.layers.is_empty() {
-        // An option for layers the file does not store would otherwise be dropped unnoticed.
-        if let Some((option, targets)) = option_targets(o).into_iter().find(|(_, t)| !t.iter().any(|t| available.iter().any(|a| a == t))) {
-            return Err(Error::InvalidArgument(format!(
-                "{option} applies to {}, which '{path}' does not store (layers: {})",
-                targets.join(" and "),
-                available.join(", ")
-            )));
-        }
-    } else {
+    if !options.layers.is_empty() {
+        // Only the named layers are looked up; the whole listing is read only to name the
+        // layers in an error. A name given twice gives its layer once.
         let mut layers = Vec::with_capacity(options.layers.len());
-        for name in &options.layers {
-            match request_of(name).filter(|_| available.contains(name)) {
-                Some(r) => layers.push(r.read(hdf, name)?),
-                None => return Err(Error::InvalidArgument(format!("no layer named {name} (layers: {})", available.join(", ")))),
+        let mut seen = std::collections::HashSet::new();
+        for name in options.layers.iter().filter(|name| seen.insert(name.as_str())) {
+            match request_of(name) {
+                Some(r) if hdf.layer_stored_within(name, metadata_max_bytes, max_bytes)? => layers.push(r.read(hdf, name)?),
+                _ => {
+                    let available = hdf.layer_names_within(metadata_max_bytes, max_bytes)?;
+                    return Err(Error::InvalidArgument(format!("no layer named {name} (layers: {})", available.join(", "))));
+                }
             }
         }
         return Ok(layers);
+    }
+    let available = hdf.layer_names_within(metadata_max_bytes, max_bytes)?;
+    // An option for layers the file does not store would otherwise be dropped unnoticed.
+    if let Some((option, targets)) = option_targets(o).into_iter().find(|(_, t)| !t.iter().any(|t| available.iter().any(|a| a == t))) {
+        return Err(Error::InvalidArgument(format!(
+            "{option} applies to {}, which '{path}' does not store (layers: {})",
+            targets.join(" and "),
+            available.join(", ")
+        )));
     }
     let mut layers = Vec::with_capacity(available.len());
     for name in &available {
@@ -127,7 +133,7 @@ fn read_hdf(hdf: &HecRasHdf, path: &str, options: &VectorOpenOptions) -> Result<
 fn option_targets(o: &HecRasOpenOptions) -> Vec<(&'static str, &'static [&'static str])> {
     const CELLS: &[&str] = &[MESH_CELLS, MESH_CELL_POINTS];
     const MESH: &[&str] = &[MESH_CELLS, MESH_CELL_POINTS, MESH_FACES, MESH_FACE_POINTS, MESH_PERIMETERS];
-    let lists: [(&str, bool, &[&str]); 18] = [
+    let lists: [(&str, bool, &[&str]); 19] = [
         ("MESHES", !o.meshes.is_empty(), MESH),
         ("GEOMETRY_POLICY=QUARANTINE", o.quarantine, &[MESH_CELLS]),
         ("CELL_SUMMARIES", !o.cell_summaries.is_empty(), CELLS),
@@ -138,7 +144,8 @@ fn option_targets(o: &HecRasOpenOptions) -> Vec<(&'static str, &'static [&'stati
         ("FACE_SUMMARIES", !o.face_summaries.is_empty(), &[MESH_FACES]),
         ("FACE_ATTRIBUTES", !o.face_attributes.is_empty(), &[MESH_FACES]),
         ("FACE_SERIES", !o.face_series.is_empty(), &[MESH_FACES]),
-        ("FACE_MAXIMUM", !o.face_maximum.is_empty() || !o.face_minimum.is_empty(), &[MESH_FACES]),
+        ("FACE_MAXIMUM", !o.face_maximum.is_empty(), &[MESH_FACES]),
+        ("FACE_MINIMUM", !o.face_minimum.is_empty(), &[MESH_FACES]),
         ("XS_SUMMARIES", !o.xs_summaries.is_empty(), &["cross_sections"]),
         ("XS_RESULTS", !o.xs_results.is_empty(), &["cross_sections"]),
         ("XS_GEOMETRY", !o.xs_geometry.is_empty(), &["cross_sections"]),

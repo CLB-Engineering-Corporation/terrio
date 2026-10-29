@@ -688,7 +688,8 @@ https://github.com/gpt-cmdr/ras-commander-fast-hdf
   794b8f949f2179f0f9fcdb51417e3c97778c2358.
 
 results_mesh_xs.h5 is derived from coverage_mesh.h5 by
-scripts/make_hecras_fixture.py, and large_projection.h5 and
+scripts/make_hecras_fixture.py, results_two_areas.h5 from results_mesh_xs.h5 by
+scripts/make_hecras_area_fixture.py, and large_projection.h5 and
 large_root_attribute.h5 from pipes.h5 by scripts/make_hecras_root_fixtures.py.
 These fixtures are synthetic and contain no model data.
 

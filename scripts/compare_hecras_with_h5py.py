@@ -87,7 +87,11 @@ def main():
         cmd = [args.cargo, "test", "--release", "-p", "terrio", "--features", "hecras", "--test", "hecras_corpus", "--", "--nocapture"]
         p = subprocess.run(cmd, cwd=ROOT, env=env, capture_output=True, text=True, check=False)
     out = p.stdout + p.stderr
-    results = re.findall(r"^(OK|DIFF) (.+?)(?:: (.*))?$", out, re.M)
+    results = []
+    for status, line in re.findall(r"^(OK|DIFF) (.*)$", out, re.M):
+        # A file name can contain ": ": the longest listed name the line starts with is the file.
+        file = max((f for f in files if line == f or line.startswith(f + ": ")), key=len, default=line)
+        results.append((status, file, line[len(file) + 2 :] if line.startswith(file + ": ") else ""))
     for status, file, detail in results:
         print(f"{status} {file}" + (f": {detail}" if detail else ""))
     summary = re.search(r"^checked .*$", out, re.M)

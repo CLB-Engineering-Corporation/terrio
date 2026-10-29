@@ -1769,7 +1769,8 @@ def suite_hecras(ctx):
         s.skipped = f"needs {', '.join(missing + ([] if shutil.which('cargo') else ['cargo']))}"
         return s
     code, out, err = run([sys.executable, str(SCRIPTS / "compare_hecras_with_h5py.py"), corpus])
-    if code not in (0, 1):
+    # Exit 1 is a comparison with differences, which are DIFF lines; without one it is a failure.
+    if code not in (0, 1) or code == 1 and not re.search(r"^DIFF ", out, re.M):
         s.error = tail(err or out)
     for line in out.splitlines():
         m = re.match(r"^(OK|DIFF) (.+?)(?:: (.*))?$", line)
@@ -2206,18 +2207,20 @@ def main():
         ap.error(f"unknown suite(s) {', '.join(unknown)} (suites: {', '.join(SUITES)})")
     if not os.path.isdir(a.data):
         ap.error(f"{a.data} is not a directory")
-    if not os.path.exists(a.terrio):
+    # The HEC-RAS suite runs the library's tests through Cargo, not the CLI.
+    hecras_only = names == ["hecras"]
+    if not hecras_only and not os.path.exists(a.terrio):
         ap.error(f"{a.terrio} does not exist: run `cargo build --release` first, or pass --terrio")
 
     ctx = argparse.Namespace(
         data=a.data, terrio=os.path.abspath(a.terrio), remote=a.remote, max_details=a.max_details, hecras_data=a.hecras_data
     )
-    ctx.names = format_names(ctx.terrio)
+    ctx.names = {} if hecras_only else format_names(ctx.terrio)
     gdal_missing = missing_modules("osgeo", "numpy")
 
     def go(name):
         start = datetime.datetime.now()
-        if gdal_missing and name not in ("pointclouds", "crs", "vsi"):
+        if gdal_missing and name not in ("pointclouds", "crs", "vsi", "hecras"):
             fn = SUITES[name]
             s = Suite(name, name, "", fn.__doc__ or "")
             s.skipped = "needs the Python modules " + ", ".join(gdal_missing)

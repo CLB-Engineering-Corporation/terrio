@@ -472,9 +472,10 @@ pub(crate) fn root_file_type_in(bytes: &[u8]) -> Option<String> {
 const FILE_TYPE_MAX_BYTES: usize = 4096;
 
 /// The root group's `File Type` attribute, as h5py decodes it, when it is a single fixed-length
-/// string of at most 4 KiB (HEC-RAS writes a scalar fixed-length string). No other root attribute
-/// is decoded, and a `File Type` of any other type, shape or size is `None`, so detection never
-/// decodes more than a few bytes of metadata whatever the file stores.
+/// string of at most 4 KiB: a scalar, as HEC-RAS writes it, or a one-element array, which the
+/// HEC-RAS engine accepts too. No other root attribute is decoded, and a `File Type` of any other
+/// type, element count or size is `None`, so detection never decodes more than a few bytes of
+/// metadata whatever the file stores.
 #[cfg(feature = "hecras")]
 pub(crate) fn root_file_type(f: &Hdf5File) -> Option<String> {
     use hdf5_reader::messages::datatype::StringPadding;

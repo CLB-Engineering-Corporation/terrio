@@ -140,7 +140,8 @@ impl HecRasHdf {
 
     /// Reads the `bc_lines` layer and joins each line's stored boundary series at one output
     /// row: one field per stored column (`stage`, `flow`, ...), linked by the engine through the
-    /// exact `Name` and `SA-2D`. The per-face series are not line values and are not joined.
+    /// exact `Name` and `SA-2D`. The per-face series are not line values and are not joined. A
+    /// 2D flow area that stores no boundary series is passed over; its lines get nulls.
     pub fn bc_lines_at(&self, options: &FeatureSeriesOptions) -> crate::Result<SeriesLayer> {
         let mut layer = self.family_layer(
             "bc_lines",
@@ -155,6 +156,11 @@ impl HecRasHdf {
             let links = s.mesh_boundary_links(&area, options.metadata_max_bytes).map_err(error::from_engine)?;
             let links = reported(links, &format!("{area} boundary-condition links"))?;
             error::require(&links.geometry_capability, &format!("{area} boundary-condition lines"))?;
+            // An area that stores no boundary series (no group of them: canonically absent) has
+            // none to join; another area's still join. Any other refusal fails the layer.
+            if matches!(links.series_capability, Capability::Unavailable { .. }) && links.matched.is_empty() {
+                continue;
+            }
             error::require(&links.series_capability, &format!("{area} boundary-condition series"))?;
             let inventory = s.mesh_boundary_inventory(&area, options.metadata_max_bytes).map_err(error::from_engine)?;
             for m in &links.matched {

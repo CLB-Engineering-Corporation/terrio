@@ -95,6 +95,10 @@ fn layer_selection_and_joins_by_open_options() {
     );
     assert_eq!(field(cells, "water_surface"), [&FieldValue::Float(12.75), &FieldValue::Float(12.25)]);
     assert!(ds.layers[1].schema.fields().iter().any(|f| f.name == "face_velocity"));
+    // A layer named twice is read once, in the order first named, as other drivers select.
+    let o = options(&[], &["river_junctions", "mesh_cells", "river_junctions"]);
+    let names: Vec<_> = terrio::open_vector(&data("results_mesh_xs.h5"), &o).unwrap().layers.into_iter().map(|l| l.name).collect();
+    assert_eq!(names, ["river_junctions", "mesh_cells"]);
 }
 
 #[test]
@@ -119,6 +123,9 @@ fn misuse_is_an_error() {
     // A layer the file does not store.
     let e = terrio::open_vector(&path, &options(&[], &["structures"])).unwrap_err();
     assert!(matches!(&e, terrio::Error::InvalidArgument(m) if m.contains("layers:")), "{e}");
+    // ... and one this file stores no perimeter for, though it stores meshes.
+    let e = terrio::open_vector(&path, &options(&[], &["mesh_cells", "mesh_perimeters"])).unwrap_err();
+    assert!(matches!(&e, terrio::Error::InvalidArgument(m) if m.starts_with("no layer named mesh_perimeters")), "{e}");
     // Options for layers not read are ignored.
     assert!(terrio::open_vector(&path, &options(&[("FACE_SUMMARIES", "No Such Variable")], &["mesh_cells"])).is_ok());
 }
@@ -282,8 +289,9 @@ fn options_for_layers_the_file_does_not_store_are_errors() {
     // the option, never a dataset without them.
     // (file, options, the option the error names)
     type Case<'a> = (&'a str, &'a [(&'a str, &'a str)], &'a str);
-    let cases: [Case; 4] = [
+    let cases: [Case; 5] = [
         ("pipes.h5", &[("XS_SUMMARIES", "Maximum Water Surface")], "XS_SUMMARIES"),
+        ("pipes.h5", &[("FACE_MINIMUM", "Face Velocity")], "FACE_MINIMUM"),
         ("pipes.h5", &[("CELL_SERIES", "Water Surface"), ("TIME_STEP", "0")], "CELL_SERIES"),
         ("pipes.h5", &[("MESHES", "Good")], "MESHES"),
         ("results_mesh_xs.h5", &[("STRUCTURE_SERIES", "Structure Variables"), ("TIME_STEP", "0")], "STRUCTURE_SERIES"),

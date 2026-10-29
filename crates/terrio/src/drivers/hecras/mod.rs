@@ -135,6 +135,15 @@ pub(crate) fn numbers(values: ras_commander_fast_hdf::hdf::NumericValues, what: 
     })
 }
 
+/// An error unless the engine gave `values` values for `rows` rows of `elements` values each, so
+/// that slicing them by row cannot panic.
+pub(crate) fn check_value_count(values: usize, rows: u64, elements: u64, what: &str) -> crate::Result<()> {
+    if rows.checked_mul(elements) != Some(values as u64) {
+        return Err(crate::Error::InvalidData(format!("{what}: {values} values for {rows} rows of {elements}")));
+    }
+    Ok(())
+}
+
 /// The field type of values from [`numbers`] (all share one).
 pub(crate) fn kind_of(values: &[crate::FieldValue]) -> crate::FieldType {
     match values.first() {
@@ -222,6 +231,19 @@ impl HecRasHdf {
             }
         }
         Ok(names)
+    }
+
+    /// Whether the file stores layer `name`, as [`HecRasHdf::layer_names_within`] decides, from
+    /// that layer's data only. A name this crate does not know is not stored.
+    pub(crate) fn layer_stored_within(&self, name: &str, metadata_max_bytes: usize, max_bytes: usize) -> crate::Result<bool> {
+        match name {
+            MESH_CELLS | MESH_CELL_POINTS | MESH_FACES | MESH_FACE_POINTS => self.has_meshes(),
+            MESH_PERIMETERS => Ok(self.has_meshes()? && self.perimeters_stored(max_bytes)?),
+            _ => match families::FAMILY_LAYERS.iter().find(|(n, _)| *n == name) {
+                Some((_, family)) => self.family_present(*family, families::family_budget(metadata_max_bytes, max_bytes)),
+                None => Ok(false),
+            },
+        }
     }
 
     /// Reads a layer by name, with default options for mesh layers (every mesh, strict
@@ -377,6 +399,16 @@ impl HecRasHdf {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn value_counts_must_fill_every_row() {
+        assert!(super::check_value_count(6, 2, 3, "x").is_ok());
+        assert!(super::check_value_count(3, 1, 3, "x").is_ok());
+        for (values, rows, elements) in [(5, 2, 3), (7, 2, 3), (3, 2, 3), (1, u64::MAX, 2)] {
+            let e = super::check_value_count(values, rows, elements, "x").unwrap_err();
+            assert!(matches!(e, crate::Error::InvalidData(_)), "{values} {rows} {elements}: {e}");
+        }
+    }
+
     #[test]
     fn field_names_follow_stored_names() {
         assert_eq!(super::field_name("Maximum Water Surface"), "maximum_water_surface");

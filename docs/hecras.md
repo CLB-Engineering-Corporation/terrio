@@ -141,7 +141,7 @@ other layers are not looked up. Lists are comma-separated stored names.
 | `XS_PROFILE` | the steady profile (zero-based) of `XS_RESULTS` | |
 | `XS_GEOMETRY` | `STATION_ELEVATION`, `MANNINGS_N`, `INEFFECTIVE_AREAS`: the stored per-section tables of `Geometry/Cross Sections` | JSON fields: `station_elevation` (`[[station, elevation], ...]`), `mannings_n` (`[[station, n], ...]`), `ineffective_areas` (`[{"Left Sta": .., "Right Sta": .., "Elevation": .., "Permanent": ..}, ...]`); a NaN, which JSON cannot hold, is `null` |
 | `STRUCTURE_SERIES` (with `TIME_STEP`) | stored structure series (`Structure Variables`, ...) to `structures` | `<series>_<column label>` |
-| `BC_SERIES=YES` (with `TIME_STEP`) | each 2D boundary-condition line's stored series to `bc_lines` | one field per stored column label (`stage`, `flow`, ...) |
+| `BC_SERIES=YES` (with `TIME_STEP`) | each 2D boundary-condition line's stored series to `bc_lines` | one field per stored column label (`stage`, `flow`, ...); lines of an area that stores no series get nulls |
 | `REFERENCE_LINE_SERIES`, `REFERENCE_POINT_SERIES` (with `TIME_STEP`) | stored reference-line and reference-point variables | `<variable>` |
 | `MESHES` | only these 2D flow areas | |
 | `GEOMETRY_POLICY=STRICT\|QUARANTINE` | `QUARANTINE` leaves invalid cell polygons out of `mesh_cells` instead of failing | |
@@ -345,7 +345,8 @@ python scripts/compare_hecras_with_h5py.py <corpus>/fixtures   # the 7.0.1 compa
 ```
 
 - **Unit tests** run on synthetic files in `crates/terrio/tests/data/hecras` (written by
-  `scripts/make_hecras_fixture.py` and `scripts/make_hecras_root_fixtures.py`, or copied from the
+  `scripts/make_hecras_fixture.py`, `scripts/make_hecras_root_fixtures.py` and
+  `scripts/make_hecras_area_fixture.py`, or copied from the
   engine's committed synthetic fixtures; no model data).
 - **The comparison with h5py** reads a corpus directory, whose location is a parameter, and
   compares its HEC-RAS 7.0.1 files: every cell polygon, face polyline, perimeter ring and face

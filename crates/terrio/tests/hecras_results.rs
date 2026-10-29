@@ -197,6 +197,19 @@ fn bc_line_values_join_by_name_and_area() {
 }
 
 #[test]
+fn an_area_without_boundary_series_leaves_the_others_joined() {
+    // `results_two_areas.h5`: the same plan with a second 2D flow area, `Dry`, that stores no
+    // boundary series (see scripts/make_hecras_area_fixture.py).
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data/hecras/results_two_areas.h5");
+    let hdf = HecRasHdf::open_with_threads(path, 1).unwrap();
+    assert_eq!(hdf.mesh_names().unwrap(), ["Dry", "Good"]);
+    let x = hdf.bc_lines_at(&FeatureSeriesOptions::at_row(1)).unwrap();
+    assert_eq!(x.fields[0].fields, ["stage", "flow"]);
+    assert_eq!(column(&x.layer, "stage"), floats(&[12.5, 11.5]));
+    assert_eq!(column(&x.layer, "flow"), floats(&[7.5, 7.5]));
+}
+
+#[test]
 fn reference_point_values_join_by_the_engine_link() {
     let hdf = open();
     let x = hdf.reference_points_at(&FeatureSeriesOptions::at_row(1).with_variable("Water Surface")).unwrap();

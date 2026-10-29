@@ -396,7 +396,7 @@ impl HecRasHdf {
             let mut out = Vec::with_capacity(packed.cell_ids.len());
             for (row, &cell_id) in packed.cell_ids.iter().enumerate() {
                 let ring = slice(&packed.coordinates, &packed.offsets, row, mesh, "cell", cell_id)?;
-                out.push((cell_id, polygon(ring, mesh, "cell", cell_id)?, Vec::new()));
+                out.push((cell_id, polygon(ring, mesh, &format!("cell {cell_id}"))?, Vec::new()));
             }
             Ok(out)
         })
@@ -521,7 +521,7 @@ impl HecRasHdf {
             let p = self.session.read_mesh_perimeter(mesh, options.max_bytes).map_err(error::from_engine)?;
             let mut feature = Feature::new();
             feature.fid = layer.features.len() as u64;
-            feature.geometry = Some(polygon(&p.ring, mesh, "perimeter", 0)?);
+            feature.geometry = Some(polygon(&p.ring, mesh, "perimeter")?);
             feature.attributes = vec![FieldValue::Text(mesh.clone())];
             if let Some(table) = &table {
                 let row = flow_area_row(table, mesh)?;
@@ -634,14 +634,14 @@ fn slice<'a>(coordinates: &'a [[f64; 2]], offsets: &[u64], row: usize, mesh: &st
 }
 
 /// A closed engine ring (last vertex = first) as a terrio polygon, whose rings store no closing
-/// vertex.
-fn polygon(ring: &[[f64; 2]], mesh: &str, what: &str, id: i64) -> crate::Result<Geometry> {
+/// vertex. `what` names the ring in errors (`cell 3`, `perimeter`).
+fn polygon(ring: &[[f64; 2]], mesh: &str, what: &str) -> crate::Result<Geometry> {
     match ring {
         [first, .., last] if ring.len() >= 4 && first == last => {
             let coords = ring[..ring.len() - 1].iter().map(|p| Coord::xy(p[0], p[1])).collect();
             Ok(Geometry::Polygon { exterior: Ring::new(coords), interiors: Vec::new() })
         }
-        _ => Err(crate::Error::InvalidData(format!("HEC-RAS engine {what} {id} of {mesh}: not a closed ring of at least three vertices"))),
+        _ => Err(crate::Error::InvalidData(format!("HEC-RAS engine {what} of {mesh}: not a closed ring of at least three vertices"))),
     }
 }
 
@@ -738,6 +738,7 @@ mod results {
         };
         let elements = elements_of(elements, mesh, variable)?;
         let values = floats(array.values, &format!("{mesh} {variable}"))?;
+        super::super::check_value_count(values.len(), rows, elements as u64, &format!("{mesh} {variable}"))?;
         let field = field_name(variable);
         let fields = match (rows, v.time_of_extreme_row) {
             (1, _) => vec![(field, values)],

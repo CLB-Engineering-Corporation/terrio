@@ -237,8 +237,9 @@ pub(crate) fn declare_columns(layer: &mut Layer, columns: &[CompoundColumn]) -> 
             (MetadataValue::Float(_), _) => FieldType::Float,
             (MetadataValue::Bitfield(_), AttributeType::Bitfield { .. }) => FieldType::Blob,
             (MetadataValue::Unsupported { .. } | MetadataValue::Corrupt { .. }, _) => {
-                error::require(&column_capability(&column.value), &format!("{} column {:?}", layer.name, column.name))?;
-                unreachable!("require refuses unsupported and corrupt columns")
+                let what = format!("{} column {:?}", layer.name, column.name);
+                error::require(&column_capability(&column.value), &what)?;
+                return Err(crate::Error::InvalidData(format!("{what}: refused by the engine but reported as supported")));
             }
             _ => return Err(crate::Error::Unsupported(format!("{} column {:?}: unmapped value type", layer.name, column.name))),
         };
