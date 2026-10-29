@@ -2819,6 +2819,7 @@ dependencies = [
  "arrow-buffer",
  "arrow-ipc",
  "arrow-schema",
+ "arrow-select",
  "bitvec",
  "bytes",
  "delaunator",

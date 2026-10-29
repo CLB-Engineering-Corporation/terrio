@@ -46,6 +46,8 @@ arrow-schema = "58"
 # Arrow IPC streams of vector layers; already built for parquet.
 arrow-ipc = { version = "58", default-features = false }
 arrow-buffer = "58"
+# Reordering the rows of GeoParquet layers (Hilbert order); already built for parquet.
+arrow-select = "58"
 bytes = "1"
 quick-xml = "0.42"
 # OpenStreetMap PBF decoding, the version wbvector uses.
