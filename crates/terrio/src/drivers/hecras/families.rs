@@ -101,8 +101,10 @@ fn take<T: Clone>(r: Reported<T>, what: &str) -> crate::Result<T> {
 
 impl HecRasHdf {
     /// Whether the file stores the family: the engine reads it, within `max_bytes` per dataset,
-    /// and reports anything but canonical absence. Unsupported, corrupt or over-budget families
-    /// are listed, so that reading them shows the refusal; host I/O failures propagate.
+    /// and reports anything but canonical absence. A family missing a dataset it needs (the
+    /// engine's `NotFound`, such as packed-line `Info` without its `Parts`) is not listed.
+    /// Unsupported, corrupt or over-budget families are listed, so that reading them shows the
+    /// refusal; host I/O failures propagate.
     pub(crate) fn family_present(&self, family: Family, max_bytes: usize) -> crate::Result<bool> {
         use ras_commander_fast_hdf::ErrorKind;
         let s = &self.session;

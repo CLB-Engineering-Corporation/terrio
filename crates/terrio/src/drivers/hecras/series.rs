@@ -441,6 +441,12 @@ fn join(layer: &mut Layer, variable: &str, prefix: &str, found: Vec<Values>) -> 
                             label.name
                         )));
                     }
+                    if report.labels[k] != label.name {
+                        return Err(crate::Error::Unsupported(format!(
+                            "{variable}: columns {:?} and {:?} give the same field",
+                            report.labels[k], label.name
+                        )));
+                    }
                     k
                 }
                 None => {
@@ -473,4 +479,50 @@ fn join(layer: &mut Layer, variable: &str, prefix: &str, found: Vec<Values>) -> 
         }
     }
     Ok(report)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Feature;
+
+    /// A layer of `n` features whose first attribute is their source row, as family layers are.
+    fn layer(n: i64) -> Layer {
+        let mut layer = Layer::new("structures");
+        layer.add_field(FieldDef::new("source_row", crate::FieldType::Integer));
+        for row in 0..n {
+            let mut f = Feature::new();
+            f.fid = row as u64;
+            f.attributes = vec![FieldValue::Integer(row)];
+            layer.push(f);
+        }
+        layer
+    }
+
+    fn values(row: u64, label: &str, unit: &str, value: f64) -> Values {
+        Values {
+            id: Identity::new("plan.p01.hdf", STRUCTURE_ATTRIBUTES, row),
+            dataset: format!("series {row}"),
+            labels: vec![Label { name: label.into(), unit: Some(unit.into()) }],
+            values: vec![FieldValue::Float(value)],
+        }
+    }
+
+    #[test]
+    fn labels_that_give_one_field_must_be_the_same_label() {
+        // The same stored label on two features shares its field.
+        let mut l = layer(2);
+        let field = join(&mut l, "Structure Variables", "sv_", vec![values(0, "Flow", "cfs", 1.0), values(1, "Flow", "cfs", 2.0)]).unwrap();
+        assert_eq!(field.fields, ["sv_flow"]);
+        assert_eq!(field.labels, ["Flow"]);
+        // Distinct stored labels that normalize to one field are refused, as different units are.
+        let mut l = layer(2);
+        let e = join(&mut l, "Structure Variables", "sv_", vec![values(0, "Flow-Rate", "cfs", 1.0), values(1, "Flow Rate", "cfs", 2.0)])
+            .unwrap_err();
+        assert!(matches!(&e, crate::Error::Unsupported(m) if m.contains("same field")), "{e}");
+        let mut l = layer(2);
+        let e =
+            join(&mut l, "Structure Variables", "sv_", vec![values(0, "Flow", "cfs", 1.0), values(1, "Flow", "m3/s", 2.0)]).unwrap_err();
+        assert!(matches!(&e, crate::Error::Unsupported(m) if m.contains("different units")), "{e}");
+    }
 }
