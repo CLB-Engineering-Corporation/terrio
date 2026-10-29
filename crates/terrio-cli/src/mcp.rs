@@ -37,7 +37,7 @@ const INSTRUCTIONS: &str = "terrio reads, writes and converts geospatial rasters
 - Start with info (--json) to see what a dataset holds; formats lists the formats terrio reads and writes.";
 
 /// Commands that only read: they write no file.
-const READ_ONLY: &[&str] = &["info", "formats", "crs", "mdinfo", "mdread", "compare", "validate-cog", "identify", "check"];
+const READ_ONLY: &[&str] = &["info", "formats", "crs", "mdinfo", "mdread", "compare", "validate-cog", "identify", "dataset-files", "check"];
 
 type RpcError = (i64, String);
 
@@ -407,7 +407,15 @@ mod tests {
 
     fn request(s: &mut Server, method: &str, params: Value) -> Value {
         let msg = json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}).to_string();
-        serde_json::from_str(&s.handle(&msg).expect("a reply")).unwrap()
+        // Match run_as: the command catalog exceeds Windows' default test-thread stack.
+        std::thread::scope(|scope| {
+            std::thread::Builder::new()
+                .stack_size(crate::STACK_SIZE)
+                .spawn_scoped(scope, || serde_json::from_str(&s.handle(&msg).expect("a reply")).unwrap())
+                .unwrap()
+                .join()
+                .unwrap()
+        })
     }
 
     #[test]
