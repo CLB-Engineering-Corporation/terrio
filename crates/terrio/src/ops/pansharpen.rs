@@ -413,6 +413,7 @@ fn process_aligned(
             valid: valid.as_deref(),
             width: ds.raster.cols,
             height: ds.raster.rows,
+            row0: 0,
             src_type: ds.raster.data_type,
             src_rect: rect,
             dst_rect: [0.0, 0.0, grid.width as f64, grid.height as f64],
@@ -438,6 +439,7 @@ fn process_aligned(
                     (rect[0], rect[1], rect[2], rect[3]),
                     (grid.width, grid.height),
                     Some(geometry.origin),
+                    0..grid.height,
                 );
                 for (target, value) in out.iter_mut().zip(averaged) {
                     *target = convert_value(convert_value(value.unwrap_or(source_nodata.unwrap_or(0.0)), ds.raster.data_type), work);

@@ -29,12 +29,42 @@
   does: NaN adds to the coverage and the mean of a kept cell holding one is
   NaN, bit for bit as NumPy computes it. The default (NaN is never valid) is
   unchanged. LERC stores such NaN as masked pixels, which read back as NaN.
+- SRTM HGT tiles and the other raw-layout rasters (EHdr, ENVI, SAGA, ERS,
+  Idrisi, Surfer 6 binary grids) are read in place (#333): `open_raster_lazy`
+  reads only the header, a window reads only the rows it covers, and `info`
+  decodes no pixels. Remote SRTM tiles are read with HTTP range requests, and
+  `convert` to a GeoTIFF or COG writes these inputs a strip at a time.
+- PMTiles and MBTiles written from a raster opened lazily (`terrio convert`, `Raster.write`)
+  warp a raster that is not on its zoom level's grid a chunk at a time, from windows of the
+  source, instead of reading it whole: the colour and alpha warps of GDAL's MBTiles driver run in
+  their own chunks, in step. The archive is byte-identical. A geographic raster reaching beyond
+  Web Mercator's latitudes is still read whole.
+
+### Remote I/O
+
+- Signed S3 uploads of local files over 8 MiB sent over HTTPS read the file once
+  per attempt instead of twice (#335), as a retried, redirected or
+  region-rerouted request reads it again: they are signed with
+  `UNSIGNED-PAYLOAD`, as the AWS SDKs sign S3 uploads over HTTPS, and the body
+  is streamed. The signature no longer covers the body of these uploads; TLS
+  protects it in transit. Over plain HTTP, and for smaller or staged uploads,
+  the payload hash is signed as before.
 
 ### Breaking changes
 
+- Signed S3 uploads of local files over 8 MiB over HTTPS use `UNSIGNED-PAYLOAD`
+  (#335). An S3-compatible service, or a bucket policy, that refuses it now
+  rejects those uploads; they can be sent over plain HTTP to keep a signed
+  payload, with `AWS_HTTPS=NO`, or an `http://` `AWS_S3_ENDPOINT` when the
+  endpoint names its scheme (an `https://` endpoint ignores `AWS_HTTPS`). Plain
+  HTTP does not encrypt the request body or headers, including
+  `x-amz-security-token` for temporary credentials; use this workaround only
+  over a trusted connection.
 - `mosaic`, `warp`, `concat` and `filter merge` now treat an input beginning
   with `@` as a file list, so a file named `@name.tif` must be written
   `./@name.tif`.
+- WKT2 `Goode Homolosine` (PROJ's uninterrupted `goode`) is refused; it was read
+  as `igh`.
 
 ### Command line
 
@@ -42,6 +72,12 @@
   `@FILE` stands for the paths listed in FILE, one per line, as GDAL's
   `--input @filelist.txt` does (#323). MCP tool calls refuse `@FILE`, so that a
   client cannot read a file back through the errors naming its lines.
+- `terrio calc` reads its inputs by window and writes a strip of rows at a time, with the values
+  of the calculation in memory (`calc_to_path`; `--max-memory MIB`, 256 by default, sets the
+  strips' height and the evaluation threads). Inputs of other extents (`--extent union|intersect`,
+  `--projwin`) are aligned with the rounding of the whole read. Python's `terrio.calc(expr, dst,
+  A=path, ...)` does the same when every input is a path (`str` or `os.PathLike`), takes
+  `max_memory_mib`, and returns the result opened lazily from `dst`.
 
 ### Point clouds
 
@@ -56,6 +92,17 @@
   grid `origin`; H3 grids are not implemented. Hexagons, counts and boundaries (smoothed or not)
   are identical to PDAL 2.10's on autzen; points are assigned to hexagons as hexer assigns them
   (a port, attributed in `NOTICE`).
+- Reprojection (`terrio convert --t-srs`, `convert_points(t_srs=...)`,
+  `PointCloud.reproject`, `append_points`) now transforms `z` when the points'
+  CRS and the target CRS both have heights, as PDAL's `filters.reprojection`
+  does: vertical units, geoid models and vertical datum transformations apply.
+  It previously transformed only `x` and `y`, so 300 ftUS in
+  `EPSG:6588+6360` stayed 300 in `EPSG:6588+5703` (now 91.44018 m). The
+  vertical CRS a LAS file declares is now part of the CRS reprojected from
+  (it was dropped) unless a CRS is assigned with `--a-srs`, and LAS files
+  written with GeoKeys record a compound CRS's vertical CRS in
+  `VerticalCSTypeGeoKey`. When only the target has heights, `z` is kept and a
+  warning says so.
 
 ### CRS compatibility
 
@@ -86,6 +133,18 @@
   `EPSG:6318+6360` to `EPSG:6319` at 30 N, 97 W turns 328.0833 ftUS
   (100 m) into 73.4074 m, as PROJ 9.9.0, instead of 100 m.
 
+### Projections
+
+- `+proj=igh` (interrupted Goode homolosine) is computed as PROJ does; it was
+  refused. GDAL's WKT1 `Interrupted_Goode_Homolosine`, ESRI's
+  `Goode_Homolosine` with `Option` 1 and WKT2 `Interrupted Goode Homolosine`
+  are read, and the first is written.
+- `+proj=ob_tran` with an `+o_proj` other than `longlat` (a projection on a
+  rotated sphere or ellipsoid) is computed as PROJ does; it was refused. The
+  pole may be given by `+o_lat_p`/`+o_lon_p`, by `+o_lon_c`/`+o_lat_c`/`+o_alpha`
+  or by `+o_lon_1`/`+o_lat_1`/`+o_lon_2`/`+o_lat_2`, for rotated-pole grids too.
+  PROJ's WKT2 `PROJ ob_tran o_proj=...` method is read.
+
 ### Warp
 
 - With bilinear, cubic, cubic spline and Lanczos, an output pixel whose source
@@ -94,6 +153,15 @@
   as GDAL does: it took a value renormalised over the valid neighbours, which
   moved the edge of the data about a pixel into nodata areas. Several bands
   already behaved so, with unified nodata.
+- `terrio warp` and `warp_to_path` warp several inputs a chunk at a time too, each chunk reading
+  a window of its input, and write the output a strip of rows at a time: each pixel still takes
+  the inputs in order, so the output is the in-memory warp's, bit for bit. Python's
+  `terrio.warp(paths, dst=path)` does the same for several paths.
+- `terrio mosaic` and `mosaic_to_path` write every mosaic a strip at a time from windows of the
+  inputs, bit for bit as the mosaic in memory: inputs resampled by any method, at fractional
+  offsets or non-integer resolution ratios, now too (each strip computed with the rounding of the
+  whole mosaic, not a VRT's per-window rounding), and inputs in other CRSs, warped a chunk at a
+  time. Only an output that is one of the inputs reads them whole.
 
 ### Shapefile
 

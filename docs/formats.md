@@ -75,6 +75,19 @@ thread) and 1.7 GB, and the smallest overview 0.05 s (GDAL: 0.09 s, 1.1 s and 0.
 window and overview is identical to GDAL's. GeoTIFFs compressed with JPEG XL are read tile by tile
 the same way (JPEG XL files themselves are not a format terrio reads).
 
+Raw-layout rasters (SRTM HGT tiles, EHdr, ENVI, SAGA, ERS, Idrisi and Surfer 6 binary grids) are
+read in place, as GDAL's raw drivers read them: opening reads the header (for SRTM tiles, only the
+file's name and size), and a window reads each row it covers at its offset in the data file, of the
+bands asked for (pixel-interleaved files, BIP and Idrisi RGB, store the bands of a row together: a
+window of one band reads the row's samples of every band). `terrio info` reads no pixels unless
+asked for statistics, computed a strip of rows at a time, or a histogram, which reads the raster
+whole, and `terrio convert` to a GeoTIFF or COG writes them a strip at a time (when named with
+their formats' own extensions: an ENVI `.img` is read whole, then written). Remote SRTM tiles
+(HTTP(S) and `s3://`) are read with range requests; remote rasters of the other raw formats, and
+zipped tiles, are downloaded whole. A 512 x 512 window of a 0.5" tile (103.7 MB) reads 524,288
+bytes and peaks at 31 MB, where reading the tile whole peaked at 211 MB; over HTTP, a summary of a
+1" tile fetches its first 64 KiB block and a 300 x 20 window three more.
+
 netCDF variables are opened as `NETCDF:"file.nc":variable`, as in GDAL, and those below the
 root group by their path, `NETCDF:"file.nc":/group/variable`. A file of several variables opens
 its first and lists them all as subdatasets, as `gdalinfo` does: every variable of two or more
@@ -484,6 +497,15 @@ whose single tile covers the raster, or `--minzoom`. Creation options (`--co`): 
 (`PNG`, `JPEG`, `WEBP` lossless), `QUALITY`, `RESAMPLING`, `ZOOM_LEVEL_STRATEGY`, `MINZOOM`,
 `MAXZOOM`, `NAME`, `DESCRIPTION`, `TYPE`. Tile archives hold 1 to 4 Byte bands: convert other
 data types first (`terrio translate --ot Byte --scale`).
+
+A raster opened lazily (`terrio convert`, Python `open_raster(path, lazy=True).write(...)`) is
+tiled without being held whole. One already on its zoom level's grid (in EPSG:3857 at that
+resolution, on whole pixels, as `terrio warp --t-srs EPSG:3857 --tr RES --tap` writes it) is read a
+strip at a time. Others are warped to the zoom level a chunk at a time, from windows of the source:
+the colour bands and the alpha band are two warps, as GDAL's warper makes them, each in its own
+chunks, advanced together to the rows the pyramid needs. The tiles are those of the raster warped
+whole, byte for byte. Only a geographic raster reaching beyond Web Mercator's latitudes is read
+whole, since it is cut first.
 
 Vector layers are written as GDAL's MVT writer writes them: reprojected to EPSG:3857, cut into
 the tiles of zoom levels 0 to 5 (`--minzoom`, `--maxzoom`), each feature clipped to every tile it

@@ -186,6 +186,7 @@ pub fn translate(ds: &RasterDataset, o: &TranslateOptions) -> Result<RasterDatas
             valid: if complex || !nearest { valid.as_deref() } else { None },
             width: r.cols,
             height: r.rows,
+            row0: 0,
             src_type: r.data_type,
             src_rect: s,
             dst_rect: d,

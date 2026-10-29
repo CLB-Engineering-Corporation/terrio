@@ -540,7 +540,7 @@ fn method(p: &Params, to_meter: f64) -> Option<Method> {
 }
 
 /// World projections of a central meridian, by PROJ name, and their WKT 1 methods.
-pub(crate) const WORLD: [(&str, &str); 12] = [
+pub(crate) const WORLD: [(&str, &str); 13] = [
     ("vandg", "VanDerGrinten"),
     ("eqearth", "Equal_Earth"),
     ("moll", "Mollweide"),
@@ -553,6 +553,7 @@ pub(crate) const WORLD: [(&str, &str); 12] = [
     ("gall", "Gall_Stereographic"),
     ("aitoff", "Aitoff"),
     ("natearth", "Natural_Earth"),
+    ("igh", "Interrupted_Goode_Homolosine"),
 ];
 
 #[cfg(test)]

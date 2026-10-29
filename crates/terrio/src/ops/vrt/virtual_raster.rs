@@ -617,6 +617,7 @@ impl Reader {
             valid: valid.as_deref(),
             width: area.width,
             height: area.height,
+            row0: 0,
             src_type: if kernel.is_some() || mask_band { DataType::F64 } else { ds.raster.data_type },
             src_rect: [rect[0] - x0 as f64, rect[1] - y0 as f64, rect[2], rect[3]],
             dst_rect: [src.dst_rect[0] - window.x as f64, src.dst_rect[1] - window.y as f64, src.dst_rect[2], src.dst_rect[3]],

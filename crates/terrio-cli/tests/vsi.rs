@@ -18,6 +18,16 @@ struct Store {
     unsigned: usize,
     /// The time of writes: now, advancing with each write so that later writes are newer.
     clock: i64,
+    /// The connections accepted.
+    connections: usize,
+    /// Whether `DeleteObjects` is refused as not implemented, as some S3-compatible services do.
+    no_multi_delete: bool,
+    /// The keys (`bucket/key`) that `DeleteObjects` fails to delete.
+    undeletable: Vec<String>,
+    /// `DeleteObjects` requests without a `Content-MD5`, which S3 requires.
+    missing_md5: usize,
+    /// Whether `DeleteObjects` is refused with a 400 `MalformedXML`, which is not a refusal to implement it.
+    malformed_multi_delete: bool,
 }
 
 fn iso(secs: i64) -> String {
@@ -101,6 +111,7 @@ fn serve() -> (String, Arc<Mutex<Store>>) {
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(stream) = stream else { continue };
+            shared.lock().unwrap().connections += 1;
             let store = shared.clone();
             std::thread::spawn(move || {
                 let mut reader = BufReader::new(stream.try_clone().unwrap());
@@ -179,12 +190,41 @@ fn serve() -> (String, Arc<Mutex<Store>>) {
                             s.objects.remove(&path);
                             ("204 No Content", String::new(), Vec::new())
                         }
+                        "POST" if query.contains_key("delete") && s.no_multi_delete => {
+                            ("501 Not Implemented", String::new(), b"<Error><Code>NotImplemented</Code></Error>".to_vec())
+                        }
+                        "POST" if query.contains_key("delete") && s.malformed_multi_delete => {
+                            ("400 Bad Request", String::new(), b"<Error><Code>MalformedXML</Code></Error>".to_vec())
+                        }
+                        "POST" if query.contains_key("delete") => {
+                            if !headers.contains_key("content-md5") {
+                                s.missing_md5 += 1;
+                            }
+                            let xml = String::from_utf8(body).unwrap();
+                            let mut errors = String::new();
+                            for part in xml.split("<Key>").skip(1) {
+                                let escaped = part.split("</Key>").next().unwrap();
+                                let key = escaped.replace("&lt;", "<").replace("&gt;", ">").replace("&#10;", "\n").replace("&amp;", "&");
+                                let full = format!("{bucket}/{key}");
+                                if s.undeletable.contains(&full) {
+                                    errors += &format!(
+                                        "<Error><Key>{escaped}</Key><Code>AccessDenied</Code><Message>Access Denied</Message></Error>"
+                                    );
+                                } else {
+                                    s.objects.remove(&full);
+                                }
+                            }
+                            ("200 OK", String::new(), format!("<DeleteResult>{errors}</DeleteResult>").into_bytes())
+                        }
                         _ => ("405 Method Not Allowed", String::new(), Vec::new()),
                     };
                     let _ = key;
                     drop(s);
-                    let head = format!("HTTP/1.1 {status}\r\nContent-Length: {}\r\n{extra}\r\n", out.len());
-                    if stream.write_all(head.as_bytes()).and_then(|()| stream.write_all(&out)).is_err() {
+                    // One write: a body sent after its head would wait for the head's (delayed)
+                    // acknowledgement on a reused connection.
+                    let mut response = format!("HTTP/1.1 {status}\r\nContent-Length: {}\r\n{extra}\r\n", out.len()).into_bytes();
+                    response.extend_from_slice(&out);
+                    if stream.write_all(&response).is_err() {
                         return;
                     }
                 }
@@ -502,4 +542,108 @@ fn missing_destination_directory_error_names_the_missing_directory() {
     assert!(error.contains(destination.to_str().unwrap()));
     assert!(!destination.exists());
     assert_eq!(std::fs::read_to_string(source).unwrap(), "keep source");
+}
+
+#[test]
+fn recursive_deletes_send_up_to_1000_keys_per_request() {
+    let (endpoint, store) = serve();
+    let tmp = tempfile::tempdir().unwrap();
+    {
+        let mut s = store.lock().unwrap();
+        // Listed two keys per page by this server.
+        for i in 0..1500 {
+            s.objects.insert(format!("bkt/many/k{i:04}"), (b"x".to_vec(), 1));
+        }
+        s.objects.insert("bkt/many/sub/".into(), (Vec::new(), 1));
+        s.objects.insert("bkt/many/a&b <c>\nd".into(), (b"x".to_vec(), 1));
+        // XML cannot carry it: deleted alone, between the batches before and after it.
+        s.objects.insert("bkt/many/ctl\u{1}".into(), (b"x".to_vec(), 1));
+        s.objects.insert("bkt/many2/keep".into(), (b"k".to_vec(), 1));
+        s.log.clear();
+    }
+    let deleted = ok(&endpoint, tmp.path(), &["vsi", "delete", "-r", "--json", "s3://bkt/many"]);
+    assert_eq!(serde_json::from_str::<serde_json::Value>(&deleted).unwrap()["deleted"], 1502);
+    let s = store.lock().unwrap();
+    assert_eq!(s.objects.keys().collect::<Vec<_>>(), ["bkt/many2/keep"]);
+    // 1502 objects, then 2 directory markers: 4 batches and 1 DELETE, in key order (before: one
+    // DELETE per key, 1504).
+    let deletes: Vec<&String> = s.log.iter().filter(|l| l.starts_with("POST") || l.starts_with("DELETE")).collect();
+    assert_eq!(deletes.len(), 5, "{deletes:?}");
+    assert!(deletes[0].starts_with("POST") && deletes[1].starts_with("DELETE /bkt/many/ctl"), "{deletes:?}");
+    assert_eq!((s.missing_md5, s.unsigned), (0, 0));
+}
+
+#[test]
+fn recursive_delete_reports_keys_it_could_not_delete_and_falls_back_to_single_deletes() {
+    let (endpoint, store) = serve();
+    let tmp = tempfile::tempdir().unwrap();
+    let fill = |s: &mut Store| {
+        for key in ["a", "b", "c"] {
+            s.objects.insert(format!("bkt/dir/{key}"), (b"x".to_vec(), 1));
+        }
+    };
+    {
+        let mut s = store.lock().unwrap();
+        fill(&mut s);
+        s.undeletable.push("bkt/dir/b".into());
+    }
+    let out = terrio(&endpoint, tmp.path(), &["vsi", "delete", "-r", "s3://bkt/dir"]);
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("s3://bkt/dir/b") && stderr.contains("AccessDenied"), "{stderr}");
+    assert_eq!(keys(&store), ["bkt/dir/b"]);
+
+    // A service without DeleteObjects: one DELETE per key, as before.
+    {
+        let mut s = store.lock().unwrap();
+        s.objects.clear();
+        fill(&mut s);
+        s.no_multi_delete = true;
+        s.log.clear();
+    }
+    let deleted = ok(&endpoint, tmp.path(), &["vsi", "delete", "-r", "--json", "s3://bkt/dir"]);
+    assert_eq!(serde_json::from_str::<serde_json::Value>(&deleted).unwrap()["deleted"], 3);
+    assert!(keys(&store).is_empty());
+    let log = store.lock().unwrap().log.clone();
+    assert_eq!(log.iter().filter(|l| l.starts_with("POST")).count(), 1, "{log:?}");
+    assert_eq!(log.iter().filter(|l| l.starts_with("DELETE")).count(), 4, "{log:?}");
+}
+
+#[test]
+fn recursive_delete_fails_on_a_multi_delete_error_other_than_not_implemented() {
+    let (endpoint, store) = serve();
+    let tmp = tempfile::tempdir().unwrap();
+    {
+        let mut s = store.lock().unwrap();
+        for key in ["a", "b", "c"] {
+            s.objects.insert(format!("bkt/dir/{key}"), (b"x".to_vec(), 1));
+        }
+        s.malformed_multi_delete = true;
+        s.log.clear();
+    }
+    let out = terrio(&endpoint, tmp.path(), &["vsi", "delete", "-r", "s3://bkt/dir"]);
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("MalformedXML"), "{stderr}");
+    // Not a refusal to implement DeleteObjects: no fallback to one DELETE per key, nothing deleted.
+    assert_eq!(keys(&store).len(), 3);
+    let log = store.lock().unwrap().log.clone();
+    assert!(log.iter().all(|l| !l.starts_with("DELETE")), "{log:?}");
+}
+
+#[test]
+fn recursive_uploads_share_connections() {
+    let (endpoint, store) = serve();
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join("t/sub")).unwrap();
+    for i in 0..30 {
+        std::fs::write(tmp.path().join(format!("t/f{i:02}")), format!("file {i}")).unwrap();
+    }
+    std::fs::write(tmp.path().join("t/sub/g"), "g").unwrap();
+    ok(&endpoint, tmp.path(), &["vsi", "copy", "-r", "t", "s3://bkt/up", "-q"]);
+    let s = store.lock().unwrap();
+    assert_eq!(s.objects.len(), 33, "{:?}", s.objects.keys());
+    // 33 PUTs and the target's checks, 36 requests: the two checks of missing keys end their
+    // connections, the rest share one (before: a connection per request).
+    assert!(s.connections <= 3, "{} connections for {} requests: {:?}", s.connections, s.log.len(), s.log);
 }

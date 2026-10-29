@@ -1,9 +1,9 @@
 //! `terrio calc`.
 
-use super::rasterout::{OutputArgs, open};
+use super::rasterout::OutputArgs;
 use std::ffi::OsString;
 use terrio::Error;
-use terrio::ops::calc::{CalcExtent, CalcInput, CalcNodata, CalcOptions, calc};
+use terrio::ops::calc::{CalcExtent, CalcNodata, CalcOptions, CalcPathInput, calc_to_path};
 use terrio::ops::parse_data_type;
 
 #[derive(clap::Args)]
@@ -47,6 +47,10 @@ pub struct Args {
     /// Fail when the inputs' CRSs differ.
     #[arg(long = "projectionCheck", alias = "projection-check")]
     projection_check: bool,
+    /// About how much memory (MiB) the strips of rows in flight may take, which sets their height
+    /// and the evaluation threads (default 256). The output does not depend on it.
+    #[arg(long = "max-memory", value_name = "MIB")]
+    max_memory: Option<f64>,
     /// Accepted for compatibility with gdal_calc.py: outputs are always overwritten.
     #[arg(long, hide = true)]
     overwrite: bool,
@@ -128,11 +132,13 @@ pub fn run(a: Args) -> terrio::Result<()> {
         }
         bands.push((n, b));
     }
-    let datasets = named.iter().map(|(_, p)| open(p)).collect::<terrio::Result<Vec<_>>>()?;
-    let inputs: Vec<CalcInput> = named
+    let inputs: Vec<CalcPathInput> = named
         .iter()
-        .zip(&datasets)
-        .map(|((n, _), ds)| CalcInput { name: n.clone(), ds, band: bands.iter().rev().find(|(m, _)| m == n).map_or(1, |(_, b)| *b) })
+        .map(|(n, p)| CalcPathInput {
+            name: n.clone(),
+            path: p.clone(),
+            band: bands.iter().rev().find(|(m, _)| m == n).map_or(1, |(_, b)| *b),
+        })
         .collect();
     let nodata = match a.nodata.as_deref() {
         None => CalcNodata::Default,
@@ -148,10 +154,12 @@ pub fn run(a: Args) -> terrio::Result<()> {
         projwin: a.projwin.map(|v| (v[0], v[1], v[2], v[3])),
         all_bands: a.all_bands,
         projection_check: a.projection_check,
+        max_memory_mib: a.max_memory,
     };
     let _ = (a.overwrite, a.quiet);
-    let out = calc(&inputs, &o)?;
-    a.out.write(&out, &output)
+    // Read by window and written a strip of rows at a time (an output that is an input is
+    // computed whole first).
+    super::quiet(|| calc_to_path(&inputs, &o, &output, &a.out.options()?))
 }
 
 #[cfg(test)]

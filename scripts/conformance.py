@@ -14,7 +14,8 @@ Suites:
     histograms        ``terrio info --hist`` vs ``gdalinfo -hist`` (compare_hist_with_gdal.py)
     vector-roundtrip  vector files converted by terrio, read back by GDAL (compare_with_gdal.py)
     raster-roundtrip  raster drivers, GDAL writing and terrio reading and back (raster_roundtrip.py)
-    windows           windowed and overview reads of GeoTIFFs and JPEG 2000 (compare_windows_with_gdal.py)
+    windows           windowed and overview reads of GeoTIFFs, JPEG 2000 and raw-layout rasters
+                      (compare_windows_with_gdal.py)
     ops               translate, warp, mosaic vs GDAL's tools (compare_ops_with_gdal.py)
     catalogs          indexed real DEM mosaics and HTTP window I/O vs GDAL GTI
                       (compare_catalogs_with_gdal.py)
@@ -78,6 +79,8 @@ SCRIPTS = ROOT / "scripts"
 IDENTICAL = "identical"
 TOLERANCE = "within tolerance"
 DIFFERS = "differs"
+# A case whose reference values could not be computed (no coordinates to compare), reported apart.
+NOT_COMPARED = "not compared"
 
 
 @dataclasses.dataclass
@@ -87,7 +90,7 @@ class Case:
     Attributes:
         group: The format or operation the case belongs to, as the report groups them.
         name: The case's name.
-        status: ``identical``, ``within tolerance`` or ``differs``.
+        status: ``identical``, ``within tolerance``, ``not compared`` or ``differs``.
         detail: What differs, or how close the case is, when it is not identical.
     """
 
@@ -356,13 +359,14 @@ def suite_raster_roundtrip(ctx):
 
 
 def suite_windows(ctx):
-    """Windowed and overview reads of the GeoTIFFs and JPEG 2000 files, locally (and remote files
-    with --remote)."""
+    """Windowed and overview reads of the GeoTIFFs, JPEG 2000 files and raw-layout rasters, locally
+    (and remote files with --remote)."""
     s = Suite(
         "windows",
         "Windowed and overview reads",
         "GDAL reading the same windows",
-        "Windows of every GeoTIFF and JPEG 2000 file of the test data, at full resolution and from each "
+        "Windows of every GeoTIFF, JPEG 2000 file and raw-layout raster (SRTM HGT, EHdr, ENVI, SAGA, "
+        "ERS, Idrisi, Surfer 6) of the test data, at full resolution and from each "
         "overview (JPEG 2000 resolution levels), read "
         "in place by `terrio convert --srcwin --overview`: pixels identical, geotransforms within "
         "1e-9." + (" Remote: the same on public Cloud Optimized GeoTIFFs over HTTP." if ctx.remote else ""),
@@ -374,7 +378,12 @@ def suite_windows(ctx):
             m = re.match(r"^(.+?): (full|ovr \d+)\s+(\(.*?\)): (.*)$", line)
             if m:
                 level = "full resolution" if m[2] == "full" else "overviews"
-                fmt = "JPEG 2000" if m[1].endswith(".jp2") or "JPEG 2000" in m[1] else "GTiff"
+                if m[1].endswith(".jp2") or "JPEG 2000" in m[1]:
+                    fmt = "JPEG 2000"
+                elif m[1].endswith((".tif", ".tiff")) or mode == "remote":
+                    fmt = "GTiff"
+                else:
+                    fmt = "Raw layouts"
                 group = f"{fmt} {mode}, {level}"
                 ok = m[4].strip() == "ok"
                 s.cases.append(Case(group, f"{m[1]} {m[2]} {m[3]}", IDENTICAL if ok else DIFFERS, "" if ok else m[4]))
@@ -473,6 +482,35 @@ def suite_shapefile_archives(ctx):
         suite.cases.append(Case("Shapefile ZIP", result["name"], result["status"], result["detail"]))
     if code and not any(case.status == DIFFERS for case in suite.cases):
         suite.error = tail(err or out) or f"exit {code}"
+    return suite
+
+
+def suite_indexes(ctx):
+    """Footprint catalogs and GTI virtual mosaics against GDAL 3.13."""
+    suite = Suite("indexes", "Raster/vector indexes and GTI creation", "GDAL 3.13.3",
+                  "Real COG/DEM and vector catalogs: schema, CRS and text/integer fields exact; "
+                  "vertices within 1e-8 index CRS units, real fields within 1e-12 relative/absolute; GTI band metadata and shared-window pixels exact. Default GPKG rounding can add one border pixel; affines within 1e-12. Explicit-grid dimensions exact.")
+    missing = missing_modules("osgeo", "numpy")
+    if missing or shutil.which("gdal") is None:
+        suite.skipped = "needs GDAL 3.13 commands/bindings and NumPy"
+        return suite
+    from osgeo import gdal
+
+    if int(gdal.VersionInfo("VERSION_NUM")) < 3130000:
+        suite.skipped = "needs GDAL >= 3.13 for unified index commands"
+        return suite
+    code, out, err = run([sys.executable, str(SCRIPTS / "compare_indexes_with_gdal.py"), ctx.data,
+                          "--terrio", ctx.terrio, "--json"])
+    try:
+        results = json.loads(out)
+    except json.JSONDecodeError:
+        suite.error = tail(err or out) or f"comparison exited {code} without valid JSON"
+        return suite
+    for result in results:
+        status = {"identical": IDENTICAL, "tolerance": TOLERANCE, "not compared": NOT_COMPARED}.get(result["status"], DIFFERS)
+        suite.cases.append(Case("dataset indexes", result["name"], status, result["detail"]))
+    if not results or (code and not any(case.status == DIFFERS for case in suite.cases)):
+        suite.error = tail(err or out) or f"comparison exited {code} without complete results"
     return suite
 
 
@@ -814,6 +852,30 @@ def suite_raster_query(ctx):
     return suite
 
 
+def suite_blend(ctx):
+    """Raster image composition against GDAL 3.13."""
+    if missing_modules("osgeo"):
+        s = Suite("blend", "Raster blending", "`gdal raster blend`", "All ten operators need GDAL >= 3.13.")
+        s.skipped = "needs osgeo"
+        return s
+    from osgeo import gdal
+
+    if int(gdal.VersionInfo("VERSION_NUM")) < 3130000:
+        s = Suite("blend", "Raster blending", "`gdal raster blend`", "All ten operators need GDAL >= 3.13.")
+        s.skipped = "needs GDAL >= 3.13 for all ten blend operators"
+        return s
+    return suite_json_ops(
+        ctx, "blend", "compare_blend_with_gdal.py", "Raster blending",
+        "`gdal raster blend`",
+        "Landsat colors: all ten operators, 1–4 band inputs, zero/partial/full opacity, "
+        "alpha and byte boundaries, plus OPERA GeoTIFF/PNG palettes. Pixels, type, nodata, CRS, "
+        "geotransform and color interpretations. GDAL reference kernels use whole datasets for generic "
+        "operators and lazy GDALG bands for source-over/HSV; unsafe mixed-band and gray-alpha "
+        "reference inputs are normalized to RGBA (documented GDAL 3.13.3 bugs).",
+        1,
+    )
+
+
 def suite_raster_pixel(ctx):
     """Pixel-wise raster commands against GDAL's unified ``gdal raster`` commands."""
     return suite_json_ops(
@@ -1037,6 +1099,54 @@ def suite_perspective(ctx):
     return suite
 
 
+def suite_igh(ctx):
+    """The interrupted Goode homolosine, as PROJ strings and as GDAL's WKT, and its inverse refusals."""
+    suite = Suite("igh", "Interrupted Goode homolosine", "GDAL/PROJ",
+                  "8 spherical/WGS84 configurations (central meridians, units and false offsets) and "
+                  "5,120 geographic samples over every zone, the sinusoidal/Mollweide boundary and each "
+                  "side of the interruptions, as PROJ strings, WKT2, WKT1 and ESRI WKT1; inverse refusals "
+                  "in the interruptions and past the poles. Projected allowance 1 mm; inverse 1e-8 "
+                  "degrees, longitude weighted by cos(latitude).")
+    if missing_modules("osgeo"):
+        suite.skipped = "needs GDAL Python bindings"
+        return suite
+    code, out, err = run([sys.executable, str(SCRIPTS / "compare_igh_with_gdal.py"), ctx.data, "--terrio", ctx.terrio, "--json"])
+    try:
+        cases = json.loads(out)
+    except json.JSONDecodeError:
+        suite.error = tail(err or out)
+        return suite
+    for case in cases:
+        suite.cases.append(Case("Interrupted Goode homolosine", case["name"], case["status"], case["detail"]))
+    if code and not any(c.status == DIFFERS for c in suite.cases):
+        suite.error = tail(err or out)
+    return suite
+
+
+def suite_ob_tran(ctx):
+    """PROJ's general oblique transformation of projections other than longlat, and its refusals."""
+    suite = Suite("ob_tran", "General oblique transformation", "GDAL/PROJ",
+                  "15 spherical/WGS84 configurations of 8 rotated projections (moll, merc, eqc, sinu, ortho, "
+                  "robin, lcc, utm), with the pole given in each of PROJ's three forms and a transverse "
+                  "rotation, and 4,680 geographic samples, as PROJ strings, WKT2 and WKT1; forward and "
+                  "inverse refusals. Projected allowance 1 mm; inverse 1e-8 degrees, longitude weighted "
+                  "by cos(latitude).")
+    if missing_modules("osgeo"):
+        suite.skipped = "needs GDAL Python bindings"
+        return suite
+    code, out, err = run([sys.executable, str(SCRIPTS / "compare_ob_tran_with_gdal.py"), ctx.data, "--terrio", ctx.terrio, "--json"])
+    try:
+        cases = json.loads(out)
+    except json.JSONDecodeError:
+        suite.error = tail(err or out)
+        return suite
+    for case in cases:
+        suite.cases.append(Case("General oblique transformation", case["name"], case["status"], case["detail"]))
+    if code and not any(c.status == DIFFERS for c in suite.cases):
+        suite.error = tail(err or out)
+    return suite
+
+
 def suite_projjson(ctx):
     """PROJJSON units, axes and bound transformations, with and without IDs."""
     suite = Suite("projjson", "PROJJSON CRS definitions", "GDAL/PROJ",
@@ -1053,6 +1163,30 @@ def suite_projjson(ctx):
         return suite
     for case in cases:
         suite.cases.append(Case("PROJJSON", case["name"], case["status"], case["detail"]))
+    if code and not any(c.status == DIFFERS for c in suite.cases):
+        suite.error = tail(err or out)
+    return suite
+
+
+def suite_projjson_export(ctx):
+    """terrio's PROJJSON export against live PROJ's PROJJSON and GDAL reading it."""
+    suite = Suite("projjson-export", "PROJJSON export", "PROJ/GDAL",
+                  "`SpatialRef::to_projjson` of 52 CRSs compared with PROJ's PROJJSON by meaning and read by "
+                  "GDAL, which transforms points as from the original (vertical CRSs paired with WGS 84; "
+                  "no grids); every IAU_2015 CRS read by GDAL with its code's coordinates, per body; and "
+                  "7 misdescriptions refused for their reasons. Tolerance: 1e-8 degrees, 1 mm. Not compared: "
+                  "no point the original CRS transforms.")
+    if missing_modules("osgeo"):
+        suite.skipped = "needs GDAL Python bindings"
+        return suite
+    code, out, err = run([sys.executable, str(SCRIPTS / "compare_projjson_export_with_gdal.py"), "--json"])
+    try:
+        cases = json.loads(out)
+    except json.JSONDecodeError:
+        suite.error = tail(err or out)
+        return suite
+    for case in cases:
+        suite.cases.append(Case(case["group"], case["name"], case["status"], case["detail"]))
     if code and not any(c.status == DIFFERS for c in suite.cases):
         suite.error = tail(err or out)
     return suite
@@ -1741,6 +1875,7 @@ SUITES = OrderedDict(
         ("vrt", suite_vrt),
         ("overviews", suite_overviews),
         ("raster-manage", suite_raster_manage),
+        ("indexes", suite_indexes),
         ("geolocation", suite_geolocation),
         ("dem-calc", suite_dem_calc),
         ("pansharpen", suite_pansharpen),
@@ -1750,6 +1885,7 @@ SUITES = OrderedDict(
 
         ("raster-query", suite_raster_query),
         ("raster-pixel", suite_raster_pixel),
+        ("blend", suite_blend),
         ("focal", suite_focal),
         ("vector-ops", suite_vector_ops),
         ("multidim", suite_multidim),
@@ -1768,7 +1904,10 @@ SUITES = OrderedDict(
         ("crs", suite_crs),
         ("geocentric", suite_geocentric),
         ("perspective", suite_perspective),
+        ("igh", suite_igh),
+        ("ob_tran", suite_ob_tran),
         ("projjson", suite_projjson),
+        ("projjson-export", suite_projjson_export),
         ("iau", suite_iau),
         ("crs-grids", suite_crs_grids),
     ]
@@ -1782,12 +1921,13 @@ def tally(cases):
         cases: The cases.
 
     Returns:
-        A ``(total, identical, within tolerance, differing)`` tuple.
+        A ``(total, identical, within tolerance, not compared, differing)`` tuple.
     """
     n = len(cases)
     same = sum(1 for c in cases if c.status == IDENTICAL)
     tol = sum(1 for c in cases if c.status == TOLERANCE)
-    return n, same, tol, n - same - tol
+    unchecked = sum(1 for c in cases if c.status == NOT_COMPARED)
+    return n, same, tol, unchecked, n - same - tol - unchecked
 
 
 def versions(ctx):
@@ -1879,20 +2019,20 @@ def markdown(suites, ctx, vers):
         "",
         "## Summary",
         "",
-        "| Suite | Reference | Cases | Identical | Within tolerance | Differs |",
-        "|---|---|---:|---:|---:|---:|",
+        "| Suite | Reference | Cases | Identical | Within tolerance | Not compared | Differs |",
+        "|---|---|---:|---:|---:|---:|---:|",
     ]
-    totals = [0, 0, 0, 0]
+    totals = [0, 0, 0, 0, 0]
     for s in suites:
         link = f"[{s.title}](#{re.sub(r'[^a-z0-9 -]', '', s.title.lower()).replace(' ', '-')})"
         if s.skipped or s.error:
             note = f"skipped: {s.skipped}" if s.skipped else "could not run"
-            lines.append(f"| {link} | {s.reference} | {note} | | | |")
+            lines.append(f"| {link} | {s.reference} | {note} | | | | |")
             continue
-        n, same, tol, diff = tally(s.cases)
-        totals = [a + b for a, b in zip(totals, (n, same, tol, diff), strict=True)]
-        lines.append(f"| {link} | {s.reference} | {n:,} | {same:,} | {tol:,} | {diff:,} |")
-    lines.append(f"| **All** | | **{totals[0]:,}** | **{totals[1]:,}** | **{totals[2]:,}** | **{totals[3]:,}** |")
+        n, same, tol, unchecked, diff = tally(s.cases)
+        totals = [a + b for a, b in zip(totals, (n, same, tol, unchecked, diff), strict=True)]
+        lines.append(f"| {link} | {s.reference} | {n:,} | {same:,} | {tol:,} | {unchecked:,} | {diff:,} |")
+    lines.append("| **All** | | " + " | ".join(f"**{t:,}**" for t in totals) + " |")
     for s in suites:
         lines += ["", f"## {s.title}", "", s.criteria, ""]
         if s.skipped:
@@ -1901,13 +2041,13 @@ def markdown(suites, ctx, vers):
         if s.error:
             lines += ["The suite could not run:", "", "```text", s.error, "```"]
             continue
-        lines += ["| Format or operation | Cases | Identical | Within tolerance | Differs |", "|---|---:|---:|---:|---:|"]
+        lines += ["| Format or operation | Cases | Identical | Within tolerance | Not compared | Differs |", "|---|---:|---:|---:|---:|---:|"]
         groups = OrderedDict()
         for c in s.cases:
             groups.setdefault(c.group, []).append(c)
         for group, cases in groups.items():
-            n, same, tol, diff = tally(cases)
-            lines.append(f"| {md_escape(group)} | {n:,} | {same:,} | {tol:,} | {diff:,} |")
+            n, same, tol, unchecked, diff = tally(cases)
+            lines.append(f"| {md_escape(group)} | {n:,} | {same:,} | {tol:,} | {unchecked:,} | {diff:,} |")
         others = [c for c in s.cases if c.status != IDENTICAL]
         if others:
             limit = ctx.max_details
@@ -1971,11 +2111,11 @@ def main():
                 s = Suite(name, name, "", "")
                 s.error = f"{type(e).__name__}: {e}"
         s.seconds = (datetime.datetime.now() - start).total_seconds()
-        n, same, tol, diff = tally(s.cases)
+        n, same, tol, unchecked, diff = tally(s.cases)
         state = (
             f"skipped ({s.skipped})"
             if s.skipped
-            else ("ERROR" if s.error else f"{n} cases: {same} identical, {tol} within tolerance, {diff} differ")
+            else ("ERROR" if s.error else f"{n} cases: {same} identical, {tol} within tolerance, {unchecked} not compared, {diff} differ")
         )
         print(f"{name:<17} {state} [{s.seconds:.0f} s]", file=sys.stderr, flush=True)
         return s

@@ -251,9 +251,13 @@ fn webp_encode(data: Vec<u8>, chunk: &ChunkInfo, options: &CodecParams) -> Resul
     });
     let image = webp_rust::ImageBuffer { width: chunk.w, height: chunk.h, rgba };
     let encoded = if options.webp_lossless {
-        webp_rust::encode_lossless(&image, 2, None)
+        webp_rust::encode_lossless_with_config(&image, &webp_rust::LosslessEncodingConfig { z_level: 2 }, None)
     } else {
-        webp_rust::encode_lossy(&image, 0, options.webp_quality as usize, None)
+        webp_rust::encode_lossy_with_config(
+            &image,
+            &webp_rust::LossyEncodingConfig { quality: options.webp_quality as f32, method: 0, ..Default::default() },
+            None,
+        )
     }
     .map_err(|error| Error::InvalidData(format!("WebP: {error}")))?;
     let Some(alpha) = alpha else { return Ok(encoded) };
@@ -2484,10 +2488,7 @@ impl GeoTiffWriter {
         if !options.overviews.is_empty() {
             return Err(Error::Unsupported("overviews need the whole raster: build them after writing".into()));
         }
-        let mut options = options.clone();
-        if options.geo_transform.is_none() {
-            options.geo_transform = header.affine;
-        }
+        let mut options = options.inherited_from(header, Some(crate::formats::RasterDriver::GTiff));
         let with_mask = options.mask.take().is_some();
         let opts = TiffOptions::from_write_options(&options, false, crate::dataset::tiff_nodata(header))?.ok_or_else(|| {
             let name = options.compression.as_deref().unwrap_or_default();

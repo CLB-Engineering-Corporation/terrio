@@ -15,7 +15,7 @@ categories = ["science::geo"]
 wbprojection = { workspace = true, optional = true }
 geographiclib-rs.workspace = true
 serde.workspace = true
-serde_json = { workspace = true, features = ["float_roundtrip"] }
+serde_json = { workspace = true, features = ["float_roundtrip", "preserve_order"] }
 thiserror.workspace = true
 tiff.workspace = true
 ruzstd.workspace = true
