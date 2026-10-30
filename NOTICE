@@ -765,3 +765,9 @@ f7aa0b8880185d095c9886e85ed2cbf64e23cbdc.
   Copyright (c) 2024 William M. Katzenmeyer
 
   Licensed under the MIT permission and warranty terms reproduced above for GDAL.
+
+-------------------------------------------------------------------------------
+
+The original Rust SQLite page/overflow layout and pointer-map implementations in
+crates/terrio/src/drivers/sqlite_edit.rs and sqlite_repack.rs follow SQLite's
+file-format documentation: https://www.sqlite.org/fileformat2.html

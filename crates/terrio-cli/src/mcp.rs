@@ -405,11 +405,10 @@ mod tests {
         Server::new(vec!["terrio".into()], std::sync::mpsc::channel().0)
     }
 
-    /// `Server::handle` on a thread with run_as's stack: the command catalog exceeds the default
-    /// test-thread stack (Windows', and Linux's in debug builds).
-    fn handle(s: &mut Server, msg: &str) -> Option<String> {
+    fn handle(s: &mut Server, message: &str) -> Option<String> {
+        // Match run_as: the command catalog exceeds the default test-thread stack.
         std::thread::scope(|scope| {
-            std::thread::Builder::new().stack_size(crate::STACK_SIZE).spawn_scoped(scope, || s.handle(msg)).unwrap().join().unwrap()
+            std::thread::Builder::new().stack_size(crate::STACK_SIZE).spawn_scoped(scope, || s.handle(message)).unwrap().join().unwrap()
         })
     }
 
