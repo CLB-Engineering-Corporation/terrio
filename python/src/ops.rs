@@ -272,7 +272,8 @@ fn info<'py>(
     options: Option<std::collections::BTreeMap<String, String>>,
 ) -> PyResult<Bound<'py, PyAny>> {
     let info_options = terrio::info::InfoOptions { statistics: stats, histogram: hist };
-    let vector = layers.is_some() || options.is_some();
+    // An empty options mapping asks for nothing: a raster still gets its summary.
+    let vector = layers.is_some() || options.as_ref().is_some_and(|o| !o.is_empty());
     let mut open = VectorOpenOptions { layers: layers.unwrap_or_default(), ..Default::default() };
     set_open_options(&mut open, options)?;
     let summary = crate::with_warnings(py, || {

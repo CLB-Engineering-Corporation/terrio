@@ -343,7 +343,8 @@ struct VectorOpenOptions {
 /// (its extension tells the format when the content does not); `options` takes `layers` (names)
 /// and `openOptions`, the driver's open options by their GDAL names: the CSV options, the tile
 /// archive options and those of the HECRAS driver for HEC-RAS geometry and plan HDF files
-/// (`CELL_SUMMARIES`, `TIME_STEP`, ...).
+/// (`CELL_SUMMARIES`, `TIME_STEP`, ...). A list option takes a comma-separated string or an
+/// array of names.
 ///
 /// A HEC-RAS file is read whole from memory: it must fit in the module's memory (4 GiB at most
 /// for wasm32) and opening briefly needs about twice its size. Layers the engine refuses are
@@ -353,7 +354,14 @@ pub fn open_vector(bytes: Vec<u8>, filename: &str, options: JsValue) -> Result<D
     let o: VectorOpenOptions = parse_options(&options)?;
     let mut open = terrio::VectorOpenOptions { layers: o.layers.unwrap_or_default(), ..Default::default() };
     for (key, value) in o.open_options.unwrap_or_default() {
-        let value = value.as_str().map(str::to_string).unwrap_or_else(|| value.to_string());
+        // A list option may be given as an array of names, joined as its comma-separated form.
+        let value = match &value {
+            serde_json::Value::String(s) => s.clone(),
+            serde_json::Value::Array(items) => {
+                items.iter().map(|v| v.as_str().map_or_else(|| v.to_string(), str::to_string)).collect::<Vec<_>>().join(",")
+            }
+            other => other.to_string(),
+        };
         if !open.set(&key, &value).map_err(js_err)? {
             return Err(JsError::new(&format!("unknown open option '{key}'")));
         }

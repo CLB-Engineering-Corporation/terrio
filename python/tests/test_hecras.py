@@ -68,6 +68,14 @@ def test_info_takes_open_options():
     assert layer["fields"][2]["field_type"] == "Float"
 
 
+def test_info_with_empty_options_keeps_the_raster_summary(tmp_path):
+    import numpy as np
+
+    path = str(tmp_path / "small.tif")
+    terrio.Raster.from_array(np.zeros((1, 2, 2), dtype="uint8"), (0, 1, 0, 2, 0, -1)).write(path)
+    assert terrio.info(path, options={})["driver"] == terrio.info(path)["driver"]
+
+
 def test_misuse_is_an_error():
     # A series without TIME_STEP, and a value the file does not store: errors, never empty layers.
     with pytest.raises(terrio.TerrioError):

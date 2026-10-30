@@ -1547,6 +1547,12 @@ test("HEC-RAS plans from memory as vector layers, with open options", { skip: ne
   const cells = joined.toGeoJSON("mesh_cells");
   assert.deepEqual(cells.features.map((f) => f.properties.water_surface), [12.75, 12.25]);
   assert.deepEqual(cells.features.map((f) => f.properties.cell_id), [0, 1]);
+  // A list option may be an array of names.
+  const listed = terrio.openVector(plan, "results_mesh_xs.h5", {
+    layers: ["mesh_cells"],
+    openOptions: { CELL_SERIES: ["Water Surface"], TIME_STEP: 1 },
+  });
+  assert.deepEqual(listed.toGeoJSON("mesh_cells").features.map((f) => f.properties.water_surface), [12.75, 12.25]);
   // A value the file does not store is an error, never an empty layer.
   assert.throws(() => terrio.openVector(plan, "x.hdf", { layers: ["mesh_cells"], openOptions: { CELL_SERIES: "Depth", TIME_STEP: 0 } }));
   assert.throws(() => terrio.openVector(plan, "x.hdf", { openOptions: { NO_SUCH_OPTION: "1" } }));
