@@ -1170,9 +1170,10 @@ fn translate(
 ///         pixels. The values do not depend on it.
 ///
 /// Returns:
-///     Raster: The result. A single source path warped to a `dst` path is read by window and
-///     written a chunk of rows at a time (neither is held whole), and the result is returned
-///     opened lazily from `dst`; otherwise it is in memory.
+///     Raster: The result. Source paths warped to a `dst` path are returned opened lazily from
+///     `dst`; without a cutline, they are read by window and written a chunk of rows at a time
+///     (neither is held whole; several sources are drawn in order, as in memory). Otherwise
+///     the result is in memory.
 #[pyfunction]
 #[pyo3(signature = (
     src, dst=None, *, s_srs=None, t_srs=None, tr=None, te=None, te_srs=None, ts=None, dst_transform=None, tap=false,
@@ -1348,12 +1349,18 @@ fn warp(
         py.detach(|| terrio::ops::warp::warp_to_path(&[source], &o, path, &options)).py()?;
         return Ok(PyRaster { inner: py.detach(|| terrio::open_raster_lazy(path)).py()? });
     }
-    // A source path to a path: read by window and written a chunk of rows at a time.
-    if let (Some(path), [Arg::Path(source)], None) = (dst, args.as_slice(), geolocation) {
+    // Source paths to a path: read by window and written a chunk of rows at a time.
+    let paths: Option<Vec<String>> = args
+        .iter()
+        .map(|a| match a {
+            Arg::Path(p) => Some(p.clone()),
+            Arg::Raster(_) => None,
+        })
+        .collect();
+    if let (Some(path), Some(sources), None) = (dst, paths, geolocation) {
         let options = write_options(format, compress, tile_size, bigtiff)?;
-        let source = source.clone();
         let out = crate::with_warnings(py, || {
-            terrio::ops::warp::warp_to_path(std::slice::from_ref(&source), &o, path, &options)?;
+            terrio::ops::warp::warp_to_path(&sources, &o, path, &options)?;
             terrio::open_raster_lazy(path)
         })?;
         return Ok(PyRaster { inner: out });

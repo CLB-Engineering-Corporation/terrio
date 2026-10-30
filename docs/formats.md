@@ -504,6 +504,15 @@ whose single tile covers the raster, or `--minzoom`. Creation options (`--co`): 
 `MAXZOOM`, `NAME`, `DESCRIPTION`, `TYPE`. Tile archives hold 1 to 4 Byte bands: convert other
 data types first (`terrio translate --ot Byte --scale`).
 
+A raster opened lazily (`terrio convert`, Python `open_raster(path, lazy=True).write(...)`) is
+tiled without being held whole. One already on its zoom level's grid (in EPSG:3857 at that
+resolution, on whole pixels, as `terrio warp --t-srs EPSG:3857 --tr RES --tap` writes it) is read a
+strip at a time. Others are warped to the zoom level a chunk at a time, from windows of the source:
+the colour bands and the alpha band are two warps, as GDAL's warper makes them, each in its own
+chunks, advanced together to the rows the pyramid needs. The tiles are those of the raster warped
+whole, byte for byte. Only a geographic raster reaching beyond Web Mercator's latitudes is read
+whole, since it is cut first.
+
 Vector layers are written as GDAL's MVT writer writes them: reprojected to EPSG:3857, cut into
 the tiles of zoom levels 0 to 5 (`--minzoom`, `--maxzoom`), each feature clipped to every tile it
 touches with a buffer of 80 units (of 4096), quantized to the tile grid, polygons wound as the

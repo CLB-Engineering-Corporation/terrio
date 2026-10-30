@@ -7,7 +7,7 @@ use crate::{PyResultExt, invalid};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use terrio::RasterDataset;
-use terrio::ops::calc::{CalcExtent, CalcInput, CalcNodata, CalcOptions};
+use terrio::ops::calc::{CalcExtent, CalcInput, CalcNodata, CalcOptions, CalcPathInput};
 use terrio::ops::dem::{ColorMap, ColorSelection, DemOptions, DemProduct, GradientAlg, HillshadeBlend, Shading, TriAlg, pam_statistics};
 use terrio::ops::parse_data_type;
 use terrio::ops::proximity::{ProximityOptions, parse_values};
@@ -270,14 +270,17 @@ fn dem(
 ///     compress: GeoTIFF/COG compression, for `dst`.
 ///     tile_size: GeoTIFF/COG tile size, for `dst`.
 ///     bigtiff: Write a BigTIFF, for `dst`.
+///     max_memory_mib: With input paths and `dst`: about how much memory (MiB) the strips of
+///         rows hold (256 by default). Such a calculation is read and written a strip at a time,
+///         with the values of the calculation in memory.
 ///     **inputs: The inputs (paths or `Raster`s) and their bands (`<name>_band`, from 1).
 ///
 /// Returns:
-///     Raster: The result, in memory.
+///     Raster: The result, in memory; opened lazily from `dst` when the inputs are paths.
 #[pyfunction]
 #[pyo3(signature = (
     calc, dst=None, *, r#type=None, nodata=None, hide_nodata=false, extent=None, projwin=None, all_bands=None,
-    projection_check=false, format=None, compress=None, tile_size=None, bigtiff=false, **inputs
+    projection_check=false, format=None, compress=None, tile_size=None, bigtiff=false, max_memory_mib=None, **inputs
 ))]
 #[allow(clippy::too_many_arguments)]
 fn calc(
@@ -295,28 +298,46 @@ fn calc(
     compress: Option<String>,
     tile_size: Option<u32>,
     bigtiff: bool,
+    max_memory_mib: Option<f64>,
     inputs: Option<&Bound<'_, PyDict>>,
 ) -> PyResult<PyRaster> {
     let exprs: Vec<String> = match calc.extract::<String>() {
         Ok(s) => vec![s],
         Err(_) => calc.extract().map_err(|_| invalid("calc is an expression or a list of expressions"))?,
     };
-    let mut named: Vec<(String, RasterDataset)> = Vec::new();
+    let mut given: Vec<(String, Bound<'_, PyAny>)> = Vec::new();
     let mut bands: Vec<(String, usize)> = Vec::new();
     if let Some(inputs) = inputs {
         for (k, v) in inputs.iter() {
             let key: String = k.extract()?;
             match key.strip_suffix("_band") {
                 Some(name) if v.extract::<usize>().is_ok() => bands.push((name.to_string(), v.extract()?)),
-                _ => named.push((key, input_raster(py, &v)?)),
+                _ => given.push((key, v)),
             }
         }
     }
-    if named.is_empty() {
+    let vrt_out = match (format, dst) {
+        (Some(f), _) => f.eq_ignore_ascii_case("VRT"),
+        (None, Some(d)) => d.to_ascii_lowercase().ends_with(".vrt"),
+        (None, None) => false,
+    };
+    // Paths (`str` or `os.PathLike`); `None` when an input is a `Raster`.
+    let paths: Option<Vec<String>> = given.iter().map(|(_, v)| crate::ops::raster_path(v)).collect::<PyResult<Option<Vec<_>>>>()?;
+    let streamed = dst.is_some() && !vrt_out && !given.is_empty() && paths.is_some();
+    if max_memory_mib.is_some() && !streamed {
+        return Err(invalid("max_memory_mib applies when the inputs and dst are paths"));
+    }
+    let mut named: Vec<(String, RasterDataset)> = Vec::new();
+    if !streamed {
+        for (key, v) in &given {
+            named.push((key.clone(), input_raster(py, v)?));
+        }
+    }
+    if given.is_empty() {
         return Err(invalid("no input: pass rasters as keyword arguments, such as A=\"a.tif\""));
     }
     for (n, _) in &bands {
-        if !named.iter().any(|(m, _)| m == n) {
+        if !given.iter().any(|(m, _)| m == n) {
             return Err(invalid(format!("a band is given for {n}, which is not an input")));
         }
     }
@@ -328,6 +349,7 @@ fn calc(
         }
     };
     named.sort_by_key(|(n, _)| rank(n));
+    given.sort_by_key(|(n, _)| rank(n));
     let nodata = match nodata {
         None => CalcNodata::Default,
         Some(v) => match v.extract::<f64>() {
@@ -345,13 +367,25 @@ fn calc(
         projwin,
         all_bands,
         projection_check,
+        max_memory_mib,
     };
+    let band_of = |n: &str| bands.iter().rev().find(|(m, _)| m == n).map_or(1, |(_, b)| *b);
+    // Paths to a path: read and written a strip of rows at a time.
+    if let (true, Some(out_path), Some(_)) = (streamed, dst, &paths) {
+        let inputs: Vec<CalcPathInput> = given
+            .iter()
+            .map(|(n, v)| Ok(CalcPathInput { name: n.clone(), path: crate::ops::raster_path(v)?.unwrap_or_default(), band: band_of(n) }))
+            .collect::<PyResult<_>>()?;
+        let options = crate::raster::write_options(format, compress, tile_size, bigtiff)?;
+        let out = crate::with_warnings(py, || {
+            terrio::ops::calc::calc_to_path(&inputs, &o, out_path, &options)?;
+            terrio::open_raster_lazy(out_path)
+        })?;
+        return Ok(PyRaster { inner: out });
+    }
     let out = py
         .detach(|| {
-            let inputs: Vec<CalcInput> = named
-                .iter()
-                .map(|(n, ds)| CalcInput { name: n.clone(), ds, band: bands.iter().rev().find(|(m, _)| m == n).map_or(1, |(_, b)| *b) })
-                .collect();
+            let inputs: Vec<CalcInput> = named.iter().map(|(n, ds)| CalcInput { name: n.clone(), ds, band: band_of(n) }).collect();
             terrio::ops::calc::calc(&inputs, &o)
         })
         .py()?;

@@ -762,6 +762,7 @@ pub fn calc(expression: JsValue, inputs: JsValue, options: JsValue) -> Result<Da
         projwin: tuple4(a.projwin),
         all_bands: a.all_bands,
         projection_check: a.projection_check,
+        max_memory_mib: None,
     };
     let inputs: Vec<CalcInput> =
         named.iter().map(|(n, ds)| CalcInput { name: n.clone(), ds, band: a.bands.get(n).copied().unwrap_or(1) }).collect();

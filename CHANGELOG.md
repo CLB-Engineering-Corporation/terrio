@@ -23,6 +23,20 @@
   `[patch]` to a netcdf-rust branch is gone (its fix, roteiro-gis/netcdf-rust#95,
   is in 0.10).
 
+- GeoParquet from Arrow record batches (`terrio::geoparquet::write_arrow_layers`, Python
+  `terrio.write_geoparquet_layers`), keeping the Arrow column types, with archive layout options:
+  several layers in one file with a layer column and a union schema (identity columns
+  non-nullable), row groups ending at layer boundaries, a GeoParquet 1.1 `bbox` struct (or flat)
+  covering, Hilbert order within each layer bit-identical to DuckDB spatial's `ST_Hilbert` with an
+  optional `hilbert_index` column, the ZSTD level, dictionaries on Utf8 columns only and chunk
+  statistics without a page index. The `archive` profile reproduces ras2cng's archive files
+  (rows, order, schema, row groups and `geo` metadata).
+- Arrow and Parquet move to major 59 (arrow 59.0, parquet 59.0, the versions
+  ras-commander-fast-hdf builds with), so the HEC-RAS engine's record batches pass to
+  `terrio::geoparquet` without conversion. wbvector's own GeoParquet support (parquet
+  58) is no longer built: terrio's GeoParquet driver already read and wrote `.parquet`,
+  and a GeoParquet file without that extension is now recognized by its `PAR1`
+  signature with terrio's driver.
 - SRTM HGT tiles are read and written (the `SRTMHGT` driver), as GDAL's SRTMHGT
   driver does: 3", 1" and 0.5" tiles georeferenced from their name
   (`N37W120.hgt`), `.hgt.zip` archives, and the NASADEM and water body variants.
@@ -39,6 +53,11 @@
   reads only the header, a window reads only the rows it covers, and `info`
   decodes no pixels. Remote SRTM tiles are read with HTTP range requests, and
   `convert` to a GeoTIFF or COG writes these inputs a strip at a time.
+- PMTiles and MBTiles written from a raster opened lazily (`terrio convert`, `Raster.write`)
+  warp a raster that is not on its zoom level's grid a chunk at a time, from windows of the
+  source, instead of reading it whole: the colour and alpha warps of GDAL's MBTiles driver run in
+  their own chunks, in step. The archive is byte-identical. A geographic raster reaching beyond
+  Web Mercator's latitudes is still read whole.
 
 ### Remote I/O
 
@@ -72,6 +91,12 @@
   `@FILE` stands for the paths listed in FILE, one per line, as GDAL's
   `--input @filelist.txt` does (#323). MCP tool calls refuse `@FILE`, so that a
   client cannot read a file back through the errors naming its lines.
+- `terrio calc` reads its inputs by window and writes a strip of rows at a time, with the values
+  of the calculation in memory (`calc_to_path`; `--max-memory MIB`, 256 by default, sets the
+  strips' height and the evaluation threads). Inputs of other extents (`--extent union|intersect`,
+  `--projwin`) are aligned with the rounding of the whole read. Python's `terrio.calc(expr, dst,
+  A=path, ...)` does the same when every input is a path (`str` or `os.PathLike`), takes
+  `max_memory_mib`, and returns the result opened lazily from `dst`.
 
 ### Point clouds
 
@@ -147,6 +172,15 @@
   as GDAL does: it took a value renormalised over the valid neighbours, which
   moved the edge of the data about a pixel into nodata areas. Several bands
   already behaved so, with unified nodata.
+- `terrio warp` and `warp_to_path` warp several inputs a chunk at a time too, each chunk reading
+  a window of its input, and write the output a strip of rows at a time: each pixel still takes
+  the inputs in order, so the output is the in-memory warp's, bit for bit. Python's
+  `terrio.warp(paths, dst=path)` does the same for several paths.
+- `terrio mosaic` and `mosaic_to_path` write every mosaic a strip at a time from windows of the
+  inputs, bit for bit as the mosaic in memory: inputs resampled by any method, at fractional
+  offsets or non-integer resolution ratios, now too (each strip computed with the rounding of the
+  whole mosaic, not a VRT's per-window rounding), and inputs in other CRSs, warped a chunk at a
+  time. Only an output that is one of the inputs reads them whole.
 
 ### Shapefile
 

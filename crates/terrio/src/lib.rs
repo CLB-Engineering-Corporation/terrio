@@ -201,6 +201,9 @@ pub use drivers::hecras;
 #[cfg(feature = "gdal")]
 #[cfg_attr(docsrs, doc(cfg(feature = "gdal")))]
 pub mod gdal_backend;
+#[cfg(feature = "parquet")]
+#[cfg_attr(docsrs, doc(cfg(feature = "parquet")))]
+pub mod geoparquet;
 mod geotiff;
 mod histogram;
 #[cfg(remote)]
