@@ -126,7 +126,9 @@ the file does not store is an error, never an empty field. The options are check
 anything is read: an incomplete request (a series option without `TIME_STEP`, `XS_RESULTS`
 without `TIME_STEP` or `XS_PROFILE`) is an error whichever layers are read. With no layer named,
 an option whose layers the file does not store is an error; with layers named, options for the
-other layers are not looked up. Lists are comma-separated stored names.
+other layers are not looked up. Lists are comma-separated stored names, so a stored name that
+contains a comma (a 2D flow area or structure named `Area, A`) cannot be given. A key given
+twice keeps its last value.
 
 | Option | Joins | Fields |
 |---|---|---|

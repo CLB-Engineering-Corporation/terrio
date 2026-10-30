@@ -3,7 +3,7 @@
 #![cfg(feature = "hecras")]
 
 use std::path::PathBuf;
-use terrio::hecras::{GeometryPolicy, HecRasHdf, MESH_LAYERS, MeshCellOptions, MeshOptions, OmissionKind};
+use terrio::hecras::{GeometryPolicy, HecRasHdf, MESH_LAYERS, MeshOptions, OmissionKind};
 use terrio::{FieldValue, Geometry};
 
 fn fixture(name: &str) -> PathBuf {
@@ -24,7 +24,7 @@ fn good_mesh_becomes_polygons_with_identities_and_omissions() {
     let hdf = open("coverage_mesh.h5");
     // No `mesh_perimeters`: not every mesh of the fixture stores a Perimeter.
     assert_eq!(hdf.layer_names().unwrap(), MESH_LAYERS[..4].iter().map(|s| s.to_string()).collect::<Vec<_>>());
-    let cells = hdf.mesh_cells(&MeshCellOptions::default().with_meshes(["Good"])).unwrap();
+    let cells = hdf.mesh_cells(&MeshOptions::default().with_meshes(["Good"])).unwrap();
     let layer = &cells.layer;
     assert_eq!(layer.name, "mesh_cells");
     let fields: Vec<_> = layer.schema.fields().iter().map(|f| f.name.as_str()).collect();
@@ -52,7 +52,7 @@ fn good_mesh_becomes_polygons_with_identities_and_omissions() {
 #[test]
 fn cell_ids_repeat_across_meshes_and_stay_paired_with_mesh_names() {
     let hdf = open("coverage_mesh.h5");
-    let cells = hdf.mesh_cells(&MeshCellOptions::default().with_meshes(["Good", "F32Coords"])).unwrap();
+    let cells = hdf.mesh_cells(&MeshOptions::default().with_meshes(["Good", "F32Coords"])).unwrap();
     let keys: Vec<_> = cells.layer.features.iter().map(|f| (f.attributes[0].clone(), f.attributes[1].clone())).collect();
     assert_eq!(keys.len(), 4);
     assert_eq!(keys[0].1, keys[2].1, "cell 0 in both meshes");
@@ -65,25 +65,25 @@ fn cell_ids_repeat_across_meshes_and_stay_paired_with_mesh_names() {
 fn corrupt_meshes_fail_the_read_instead_of_giving_fewer_cells() {
     let hdf = open("coverage_mesh.h5");
     // Reading every mesh meets the fixture's broken ones: the whole read fails.
-    assert!(matches!(hdf.mesh_cells(&MeshCellOptions::default()), Err(terrio::Error::InvalidData(_))));
+    assert!(matches!(hdf.mesh_cells(&MeshOptions::default()), Err(terrio::Error::InvalidData(_))));
     for (mesh, needle) in [("NaNCoord", "nonfinite"), ("FaceIndexOutOfRange", "out of range")] {
-        let e = hdf.mesh_cells(&MeshCellOptions::default().with_meshes([mesh])).unwrap_err();
+        let e = hdf.mesh_cells(&MeshOptions::default().with_meshes([mesh])).unwrap_err();
         assert!(
             matches!(&e, terrio::Error::InvalidData(m) if m.starts_with("HEC-RAS structural_topology") && m.contains(needle)),
             "{mesh}: {e}"
         );
     }
     // Integer coordinates are refused by the engine, never coerced.
-    let e = hdf.mesh_cells(&MeshCellOptions::default().with_meshes(["IntCoords"])).unwrap_err();
+    let e = hdf.mesh_cells(&MeshOptions::default().with_meshes(["IntCoords"])).unwrap_err();
     assert!(matches!(&e, terrio::Error::InvalidData(m) if m.contains("coordinates must be floats")), "{e}");
 }
 
 #[test]
 fn missing_and_unsupported_layouts_are_errors() {
     let hdf = open("coverage_mesh.h5");
-    let e = hdf.mesh_cells(&MeshCellOptions::default().with_meshes(["NoSuchMesh"])).unwrap_err();
+    let e = hdf.mesh_cells(&MeshOptions::default().with_meshes(["NoSuchMesh"])).unwrap_err();
     assert!(matches!(&e, terrio::Error::InvalidArgument(m) if m.starts_with("HEC-RAS not_found")), "{e}");
-    let e = hdf.mesh_cells(&MeshCellOptions::default().with_meshes(["MissingValues"])).unwrap_err();
+    let e = hdf.mesh_cells(&MeshOptions::default().with_meshes(["MissingValues"])).unwrap_err();
     assert!(matches!(e, terrio::Error::InvalidArgument(_)), "a mesh missing a dataset is not an empty mesh");
 
     // A legacy names-only layout is Unsupported, not an empty file: its mesh layers are listed
@@ -95,18 +95,18 @@ fn missing_and_unsupported_layouts_are_errors() {
     for layer in &listed {
         assert!(matches!(legacy.read_layer(layer), Err(terrio::Error::Unsupported(_))), "{layer}");
     }
-    assert!(matches!(legacy.mesh_cells(&MeshCellOptions::default()), Err(terrio::Error::Unsupported(_))));
+    assert!(matches!(legacy.mesh_cells(&MeshOptions::default()), Err(terrio::Error::Unsupported(_))));
 
     // No 2D Flow Areas group: no mesh layer is listed, and asking for it is an error.
     let none = open("coverage_mesh_nogeometry.h5");
     assert!(none.layer_names().unwrap().is_empty());
-    assert!(matches!(none.mesh_cells(&MeshCellOptions::default()), Err(terrio::Error::InvalidArgument(_))));
+    assert!(matches!(none.mesh_cells(&MeshOptions::default()), Err(terrio::Error::InvalidArgument(_))));
 }
 
 #[test]
 fn byte_budgets_are_refusals() {
     let hdf = open("coverage_mesh.h5");
-    let mut options = MeshCellOptions::default().with_meshes(["Good"]);
+    let mut options = MeshOptions::default().with_meshes(["Good"]);
     options.max_bytes = 16;
     let e = hdf.mesh_cells(&options).unwrap_err();
     assert!(matches!(&e, terrio::Error::Unsupported(m) if m.contains("resource_limit")), "{e}");
@@ -115,9 +115,8 @@ fn byte_budgets_are_refusals() {
 #[test]
 fn quarantine_is_explicit() {
     let hdf = open("coverage_mesh.h5");
-    let strict = hdf.mesh_cells(&MeshCellOptions::default().with_meshes(["Good"])).unwrap();
-    let quarantine =
-        hdf.mesh_cells(&MeshCellOptions::default().with_meshes(["Good"]).with_policy(GeometryPolicy::QuarantineInvalid)).unwrap();
+    let strict = hdf.mesh_cells(&MeshOptions::default().with_meshes(["Good"])).unwrap();
+    let quarantine = hdf.mesh_cells(&MeshOptions::default().with_meshes(["Good"]).with_policy(GeometryPolicy::QuarantineInvalid)).unwrap();
     let parts = |l: &terrio::Layer| l.features.iter().map(|f| (f.geometry.clone(), f.attributes.clone())).collect::<Vec<_>>();
     assert_eq!(parts(&strict.layer), parts(&quarantine.layer));
     assert_eq!(strict.omitted, quarantine.omitted);
@@ -126,7 +125,7 @@ fn quarantine_is_explicit() {
 #[test]
 fn summaries_from_a_file_without_results_are_errors() {
     let hdf = open("coverage_mesh.h5");
-    let e = hdf.mesh_cells(&MeshCellOptions::default().with_meshes(["Good"]).with_summary("Maximum Water Surface")).unwrap_err();
+    let e = hdf.mesh_cells(&MeshOptions::default().with_meshes(["Good"]).with_summary("Maximum Water Surface")).unwrap_err();
     assert!(matches!(e, terrio::Error::InvalidArgument(_) | terrio::Error::Unsupported(_)), "{e}");
 }
 
@@ -139,7 +138,7 @@ fn missing_file_is_an_io_not_found_error() {
 #[test]
 fn the_layer_round_trips_through_terrio_drivers() {
     let hdf = open("coverage_mesh.h5");
-    let cells = hdf.mesh_cells(&MeshCellOptions::default().with_meshes(["Good"])).unwrap();
+    let cells = hdf.mesh_cells(&MeshOptions::default().with_meshes(["Good"])).unwrap();
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("cells.geojson");
     let path = path.to_str().unwrap();

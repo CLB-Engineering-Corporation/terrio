@@ -99,6 +99,9 @@ pub struct HecRasOpenOptions {
 impl HecRasOpenOptions {
     /// Sets an option by its name (see the fields). Returns `false` for names it does not know,
     /// and an error for a known name with an invalid value.
+    ///
+    /// A list value is split at every comma, so a stored name that contains a comma cannot be
+    /// given. Setting a key again replaces its earlier value.
     pub fn set(&mut self, key: &str, value: &str) -> Result<bool> {
         let list = || value.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect::<Vec<_>>();
         let number = |what: &str| -> Result<u64> {

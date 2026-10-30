@@ -48,9 +48,7 @@ mod mesh;
 mod one_d;
 mod series;
 
-pub use mesh::{
-    Extreme, JoinedField, MeshAttribute, MeshCellLayer, MeshCellOptions, MeshLayer, MeshOptions, OmittedCell, SummaryField, TimeStep,
-};
+pub use mesh::{Extreme, JoinedField, MeshAttribute, MeshLayer, MeshOptions, OmittedCell, SummaryField, TimeStep};
 pub use one_d::{CrossSectionField, CrossSectionLayer, CrossSectionOptions, CrossSectionTable};
 pub use ras_commander_fast_hdf::hdf::ResultMode;
 pub use ras_commander_fast_hdf::mesh::{GeometryPolicy, OmissionKind};

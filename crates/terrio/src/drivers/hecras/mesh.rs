@@ -42,9 +42,6 @@ pub struct MeshOptions {
     pub max_bytes: usize,
 }
 
-/// The former name of [`MeshOptions`].
-pub type MeshCellOptions = MeshOptions;
-
 impl Default for MeshOptions {
     fn default() -> Self {
         Self {
@@ -213,9 +210,6 @@ pub struct MeshLayer {
     pub time_step: Option<TimeStep>,
 }
 
-/// The former name of [`MeshLayer`].
-pub type MeshCellLayer = MeshLayer;
-
 /// The element a mesh layer has one feature per.
 #[derive(Clone, Copy, PartialEq)]
 pub(crate) enum Element {
@@ -344,11 +338,8 @@ impl HecRasHdf {
                 }
                 if reports.len() == i {
                     reports.push(declare(&mut layer, &column)?);
-                } else if reports[i].fields.iter().ne(column.fields.iter().map(|f| &f.0)) || reports[i].units != column.units {
-                    return Err(crate::Error::Unsupported(format!(
-                        "{}: meshes store it with different rows or units; it cannot be one field",
-                        column.source
-                    )));
+                } else {
+                    same_column(&layer, &reports[i], &column)?;
                 }
                 reports[i].datasets.push(column.dataset.clone());
                 columns.push(column);
@@ -559,6 +550,22 @@ fn declare(layer: &mut Layer, column: &Column) -> crate::Result<JoinedField> {
         units: column.units.clone(),
         datasets: Vec::new(),
     })
+}
+
+/// Checks that a later mesh's `column` fits the fields the first mesh declared (`report`): the
+/// same field names, types and units, so every value of a field is of the field's type.
+fn same_column(layer: &Layer, report: &JoinedField, column: &Column) -> crate::Result<()> {
+    let declared = |name: &str| layer.schema.fields().iter().find(|f| f.name == name).map(|f| f.field_type);
+    if report.fields.iter().ne(column.fields.iter().map(|f| &f.0))
+        || column.fields.iter().any(|(name, kind)| declared(name) != Some(*kind))
+        || report.units != column.units
+    {
+        return Err(crate::Error::Unsupported(format!(
+            "{}: meshes store it with different rows, types or units; it cannot be one field",
+            column.source
+        )));
+    }
+    Ok(())
 }
 
 /// A stored static mesh array as a column.
@@ -847,5 +854,32 @@ mod results {
             .unsteady_row_times(Slice::new(row, row.saturating_add(1), 1), options.metadata_max_bytes)
             .map_err(error::from_engine)?;
         Ok(TimeStep { row, days: t.days.and_then(|d| d.first().copied()), date_stamp: t.raw_strings.and_then(|d| d.into_iter().next()) })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn column(kind: FieldType, units: Option<&str>) -> Column {
+        Column {
+            source: "Cells Minimum Elevation".into(),
+            dataset: "Area/Cells Minimum Elevation".into(),
+            units: units.map(String::from),
+            elements: 0,
+            fields: vec![("minimum_elevation".into(), kind)],
+            values: vec![Vec::new()],
+        }
+    }
+
+    #[test]
+    fn a_join_stored_with_another_type_or_unit_in_a_later_mesh_is_refused() {
+        let mut layer = Layer::new("mesh_cells");
+        let report = declare(&mut layer, &column(FieldType::Float, Some("ft"))).unwrap();
+        assert!(same_column(&layer, &report, &column(FieldType::Float, Some("ft"))).is_ok());
+        for later in [column(FieldType::Integer, Some("ft")), column(FieldType::Float, Some("m"))] {
+            let e = same_column(&layer, &report, &later).unwrap_err();
+            assert!(matches!(e, crate::Error::Unsupported(_)), "{e}");
+        }
     }
 }
