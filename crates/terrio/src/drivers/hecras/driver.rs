@@ -9,11 +9,7 @@ use super::{
 use crate::{Error, HecRasOpenOptions, Layer, Result, VectorOpenOptions};
 use ras_commander_fast_hdf::hdf::metadata::HEC_RAS_FILE_TYPES;
 use ras_commander_fast_hdf::hdf::{DEFAULT_MAX_BYTES, DEFAULT_READ_MAX_BYTES};
-use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
-
-/// The HDF5 superblock signature.
-const SIGNATURE: &[u8; 8] = b"\x89HDF\r\n\x1a\n";
 
 /// Whether `path` is a HEC-RAS geometry or plan HDF file: an HDF5 signature (at offset 0, 512,
 /// 1024, ...) and a root `File Type` in [`HEC_RAS_FILE_TYPES`], a single fixed-length string as
@@ -25,28 +21,11 @@ const SIGNATURE: &[u8; 8] = b"\x89HDF\r\n\x1a\n";
 /// (plans before 6.4 can say `HEC-RAS Geometry`, and 6.4+ geometry files say `HEC-RAS Results`),
 /// so the layers come from what the file stores, never from `File Type`.
 pub(crate) fn is_hecras(path: &str) -> bool {
-    has_signature(path)
+    crate::drivers::hdf5::has_signature(Path::new(path))
         && crate::drivers::hdf5::open_file(Path::new(path))
             .ok()
             .and_then(|f| crate::drivers::hdf5::root_file_type(&f))
             .is_some_and(|t| HEC_RAS_FILE_TYPES.contains(&t.as_str()))
-}
-
-fn has_signature(path: &str) -> bool {
-    let Ok(mut f) = std::fs::File::open(path) else { return false };
-    let len = f.metadata().map(|m| m.len()).unwrap_or(0);
-    let mut offset = 0u64;
-    let mut buf = [0u8; 8];
-    while offset + 8 <= len {
-        if f.seek(SeekFrom::Start(offset)).is_err() || f.read_exact(&mut buf).is_err() {
-            return false;
-        }
-        if &buf == SIGNATURE {
-            return true;
-        }
-        offset = if offset == 0 { 512 } else { offset * 2 };
-    }
-    false
 }
 
 /// Whether bytes held in memory are a HEC-RAS geometry or plan file: an HDF5 signature and a

@@ -219,14 +219,14 @@ impl HecRasHdf {
             _ => Value::Null,
         };
         // Per stored Values row: a JSON array of numbers, or an object of stored columns.
-        let rows: Vec<Value> = match &selection.values {
+        let rows: Vec<Value> = match selection.values {
             XsGeometryValues::Numeric(array) => {
                 let width = match array.shape.as_slice() {
                     [_, c] if *c > 0 => *c as usize,
                     [0] => 1,
                     shape => return Err(bad(format!("shape {shape:?}, not (rows, columns)"))),
                 };
-                numbers(array.values.clone(), &dataset)?.chunks(width).map(|r| Value::Array(r.iter().map(number).collect())).collect()
+                numbers(array.values, &dataset)?.chunks(width).map(|r| Value::Array(r.iter().map(number).collect())).collect()
             }
             XsGeometryValues::Compound(compound) => {
                 let t = &compound.table;

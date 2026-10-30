@@ -602,6 +602,7 @@ fn attribute_column(
     };
     let elements = usize::try_from(elements).map_err(|_| crate::Error::Unsupported(format!("{dataset}: too many elements")))?;
     let flat = super::numbers(array.values, &dataset)?;
+    super::check_value_count(flat.len(), elements as u64, k as u64, &dataset)?;
     let kind = super::kind_of(&flat);
     let mut values = vec![Vec::with_capacity(elements); k];
     for (i, v) in flat.into_iter().enumerate() {
@@ -627,6 +628,7 @@ fn xy_rows(shape: &[u64], values: NumericValues, mesh: &str, what: &str) -> crat
         NumericValues::F32(v) => v.into_iter().map(f64::from).collect(),
         _ => return Err(crate::Error::Unsupported(format!("{mesh} {what}: coordinates are not floats"))),
     };
+    super::check_value_count(v.len(), shape[0], 2, &format!("{mesh} {what}"))?;
     Ok(v.as_chunks::<2>().0.to_vec())
 }
 
