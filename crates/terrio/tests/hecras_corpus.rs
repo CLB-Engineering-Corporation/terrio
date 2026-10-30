@@ -588,6 +588,9 @@ fn values_digest(values: &[&FieldValue], kind: &str) -> String {
         }),
         "float" => values.iter().for_each(|v| match v {
             FieldValue::Float(x) => bytes.extend(x.to_le_bytes()),
+            // The engine's Arrow layers hold a stored NaN as null. The digest still catches a
+            // null anywhere the file stores a number.
+            FieldValue::Null => bytes.extend(f64::NAN.to_le_bytes()),
             other => panic!("float column holds {other:?}"),
         }),
         other => panic!("column kind {other}"),

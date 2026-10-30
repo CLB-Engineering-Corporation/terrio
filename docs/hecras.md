@@ -115,6 +115,8 @@ files) is left out with a warning; damaged data and I/O errors fail the open. A 
   in `MeshLayer::omitted`. A family line with several parts is a MultiLineString; a polygon
   family feature with several parts is refused, because which parts are holes is not a proven
   layout. A structure stored without a centerline is a feature without geometry.
+- A family attribute stored as NaN is null: the engine's Arrow layers hold a NaN as null, so
+  the stored NaN bit pattern is not kept. Every other value is identical.
 - `mesh_cell_points` has every stored cell centre, ghost cells included (`is_ghost` true);
   `is_ghost` is null for a mesh whose physical cell count is not recorded.
 - Attributes are read without h5py, by the engine: compound `Attributes` tables column by
@@ -131,6 +133,8 @@ files) is left out with a warning; damaged data and I/O errors fail the open. A 
 
 These HEC-RAS datasets are left out on purpose:
 
+- A family with a line part of fewer than two points (one Spring_BLE breakline, HEC-RAS 6.1): the
+  engine's catalog refuses the whole layer. ras-commander skips that row instead.
 - Bitfield attribute columns: the engine's catalog does not map them to Arrow, so a family with
   one is refused (no tested file has one).
 - 2D flow areas stored as outlines only, with no computed mesh (`Polygon Info`/`Parts`/`Points`

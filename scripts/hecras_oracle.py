@@ -227,8 +227,8 @@ def values_digest(values, kind):
 
 
 def canonical_nan(values):
-    """Floats with every NaN as NumPy's NaN: terrio carries the per-section tables as JSON, which
-    holds a NaN as null, so the stored NaN bit pattern is not compared there."""
+    """Floats with every NaN as NumPy's NaN: terrio carries the per-section tables as JSON and the
+    family tables as the engine's Arrow layers, which hold a NaN as null, so the stored NaN bit pattern is not compared there."""
     v = np.asarray(values)
     return np.where(np.isnan(v), np.nan, v.astype("<f8")) if v.dtype.kind == "f" else v
 
@@ -271,7 +271,7 @@ def stored(f, mesh_names):
     for layer, path, geometry in ATTRIBUTE_TABLES:
         if path in f and path.replace("Attributes", geometry) in f:
             rows = f[path][()]
-            out["tables"][layer] = {"path": path, "rows": int(len(rows)), "columns": compound_columns(rows)}
+            out["tables"][layer] = {"path": path, "rows": int(len(rows)), "columns": compound_columns(rows, nan=True)}
     if "Geometry/Pipe Conduits/Polyline Info" in f:
         out["pipe_conduits_lines_sha256"] = lines_digest(packed_lines(f, "Geometry/Pipe Conduits", "Polyline"))
     if "Geometry/Pipe Nodes/Points" in f:

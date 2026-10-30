@@ -12,6 +12,9 @@ use ras_commander_fast_hdf::hdf::{DEFAULT_MAX_BYTES, DEFAULT_READ_MAX_BYTES, Num
 use ras_commander_fast_hdf::mesh::{GeometryPolicy, OmissionKind};
 use std::collections::HashMap;
 
+/// Per mesh, each drawn cell: its id, polygon and attribute values.
+type CellsByMesh = HashMap<String, Vec<(i64, Geometry, Vec<FieldValue>)>>;
+
 /// What to read into a mesh layer.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
@@ -302,7 +305,7 @@ impl HecRasHdf {
         canonical: &str,
         options: &MeshOptions,
         layer_options: LayerOptions,
-    ) -> crate::Result<(HashMap<String, Vec<(i64, Geometry, Vec<FieldValue>)>>, Vec<OmittedCell>)> {
+    ) -> crate::Result<(CellsByMesh, Vec<OmittedCell>)> {
         let layer_options = layer_options.with_budgets(options.max_bytes, options.metadata_max_bytes);
         let engine = self.engine_layer(canonical, &layer_options)?;
         let omitted = engine

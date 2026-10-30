@@ -23,7 +23,7 @@
   (`ras_commander_fast_hdf::arrow_layers`), which also names their fields: one source of
   HEC-RAS layer rules and names for terrio and ras2cng. `mesh_cell_points` keeps a null
   `is_ghost` for a mesh without a recorded cell count, a structure without a centerline is a
-  feature without geometry, and `MeshLayer::omitted` lists the cells left out of
+  feature without geometry, a family attribute stored as NaN is null, and `MeshLayer::omitted` lists the cells left out of
   `mesh_cells`. The typed engine API remains for joins, face points, quarantined cells and
   HEC-RAS 5.0 layouts without a 2D flow area table.
 - `terrio::hecras::archive` (Python `terrio.hecras.archive_layers` and
