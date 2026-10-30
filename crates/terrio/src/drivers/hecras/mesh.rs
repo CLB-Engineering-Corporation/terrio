@@ -2,13 +2,15 @@
 //! optional stored values joined by cell or face: summary results, static mesh arrays, time-step
 //! values and the engine's reductions of stored time series.
 
-use super::{HecRasHdf, MESH_CELL_POINTS, MESH_CELLS, MESH_FACE_POINTS, MESH_FACES, MESH_PERIMETERS, error, id_field};
+use super::{HecRasHdf, MESH_CELL_POINTS, MESH_CELLS, MESH_FACE_POINTS, MESH_FACES, MESH_PERIMETERS, engine_layers, error, id_field};
 use crate::vector::{Coord, Ring};
 use crate::{Feature, FieldDef, FieldType, FieldValue, Geometry, GeometryType, Layer};
+use ras_commander_fast_hdf::arrow_layers::LayerOptions;
 use ras_commander_fast_hdf::hdf::mesh_geometry::MeshGeometryField;
 use ras_commander_fast_hdf::hdf::metadata::{CompoundTable, MetadataValue};
 use ras_commander_fast_hdf::hdf::{DEFAULT_MAX_BYTES, DEFAULT_READ_MAX_BYTES, NumericValues};
 use ras_commander_fast_hdf::mesh::{GeometryPolicy, OmissionKind};
+use std::collections::HashMap;
 
 /// What to read into a mesh layer.
 #[derive(Debug, Clone)]
@@ -290,6 +292,53 @@ impl HecRasHdf {
         Ok(layer)
     }
 
+    /// An engine catalog mesh layer (`mesh_cells`, `mesh_cell_points`, `mesh_faces` or
+    /// `mesh_perimeters`), grouped by mesh name: per mesh, `(element id, geometry, values of the
+    /// fields after the identity)` in stored order, and the engine layer's omitted cells. Every
+    /// row has a geometry. The engine reads every mesh; a subset in [`MeshOptions::meshes`]
+    /// keeps its rows.
+    fn engine_mesh_rows(
+        &self,
+        canonical: &str,
+        options: &MeshOptions,
+        layer_options: LayerOptions,
+    ) -> crate::Result<(HashMap<String, Vec<(i64, Geometry, Vec<FieldValue>)>>, Vec<OmittedCell>)> {
+        let layer_options = layer_options.with_budgets(options.max_bytes, options.metadata_max_bytes);
+        let engine = self.engine_layer(canonical, &layer_options)?;
+        let omitted = engine
+            .omitted
+            .iter()
+            .map(|(mesh, d)| OmittedCell { mesh_name: mesh.clone(), cell_id: d.cell_id, kind: d.kind, reason: d.reason.clone() })
+            .collect();
+        let rows = engine_layers::rows(&engine)?;
+        let mesh_at = rows.index("mesh_name")?;
+        let id_at = match &engine.identity.1 {
+            Some(id) => Some(rows.index(id)?),
+            None => None,
+        };
+        let mut by_mesh: HashMap<String, Vec<(i64, Geometry, Vec<FieldValue>)>> = HashMap::new();
+        for (mut values, geometry) in rows.rows {
+            let bad = || crate::Error::InvalidData(format!("HEC-RAS engine {canonical}: a row without its identity or geometry"));
+            let id = match id_at.map(|i| &values[i]) {
+                Some(FieldValue::Integer(id)) => *id,
+                Some(_) => return Err(bad()),
+                None => 0,
+            };
+            let Some(FieldValue::Text(mesh)) = values.get(mesh_at).cloned() else { return Err(bad()) };
+            let extra = values.split_off(id_at.map_or(mesh_at, |i| i.max(mesh_at)) + 1);
+            by_mesh.entry(mesh).or_default().push((id, geometry.ok_or_else(bad)?, extra));
+        }
+        Ok((by_mesh, omitted))
+    }
+
+    /// Whether the mesh layers come from the engine's catalog: the file stores the 2D flow area
+    /// table (`Geometry/2D Flow Areas/Attributes`) the catalog lists meshes from, as
+    /// ras-commander does. Files without it (HEC-RAS 5.0 layouts, whose meshes the engine lists
+    /// from the group members) keep the engine's typed mesh reads.
+    fn catalog_meshes(&self, options: &MeshOptions) -> crate::Result<bool> {
+        Ok(self.flow_area_table(options)?.is_some())
+    }
+
     fn read_column(&self, mesh: &str, join: Join<'_>, element: Element, options: &MeshOptions) -> crate::Result<Column> {
         match join {
             Join::Attribute(attribute) => attribute_column(self, mesh, attribute, element, options),
@@ -382,8 +431,24 @@ impl HecRasHdf {
     /// Reads the 2D mesh cell polygons as the [`MESH_CELLS`] layer: `mesh_name`, `cell_id`, then
     /// the joined cell values ([`MeshOptions`]).
     ///
+    /// With [`GeometryPolicy::Strict`] (the default) the cells are the engine's `mesh_cells`
+    /// catalog layer: a cell with invalid geometry refuses the layer, and cells with no or too
+    /// few faces (ghost cells among them) are left out and reported in [`MeshLayer::omitted`].
+    /// [`GeometryPolicy::QuarantineInvalid`] assembles the polygons with the engine's typed mesh
+    /// API instead, which can also leave invalid cells out (the catalog layer never does), and so
+    /// do files without a 2D flow area table (HEC-RAS 5.0).
+    ///
     /// Every requested mesh must read completely: one corrupt or unsupported mesh fails the call.
     pub fn mesh_cells(&self, options: &MeshOptions) -> crate::Result<MeshLayer> {
+        if options.policy == GeometryPolicy::Strict && self.catalog_meshes(options)? {
+            let (mut by_mesh, omitted) = self.engine_mesh_rows(MESH_CELLS, options, LayerOptions::default())?;
+            let meshes = self.mesh_list(options)?;
+            let mut layer = self.element_layer(MESH_CELLS, GeometryType::Polygon, Element::Cell, &[], options, |mesh, _| {
+                Ok(by_mesh.remove(mesh).unwrap_or_default())
+            })?;
+            layer.omitted = omitted.into_iter().filter(|o| meshes.contains(&o.mesh_name)).collect();
+            return Ok(layer);
+        }
         self.element_layer(MESH_CELLS, GeometryType::Polygon, Element::Cell, &[], options, |mesh, omitted| {
             let named = self.session.read_topology_bounded(mesh, options.max_bytes).map_err(error::from_engine)?;
             let packed = named.topology.assemble_with_session(options.policy, &self.session).map_err(error::from_engine)?;
@@ -405,11 +470,19 @@ impl HecRasHdf {
     /// Reads every stored cell centre as the [`MESH_CELL_POINTS`] layer: `mesh_name`, `cell_id`,
     /// `is_ghost`, then the joined cell values ([`MeshOptions`]).
     ///
-    /// Ghost cells are the stored rows at and above the physical cell count the engine reads
-    /// from `Geometry/2D Flow Areas/Attributes`; files without that table (HEC-RAS 5.0) are
-    /// refused rather than guessed.
+    /// The rows are the engine's `mesh_cell_points` catalog layer with its ghost cells: ghost
+    /// cells are the stored rows at and above the physical cell count recorded in
+    /// `Geometry/2D Flow Areas/Attributes`; a mesh without a recorded count there has `is_ghost`
+    /// null rather than guessed. Files without that table (HEC-RAS 5.0) are read with the
+    /// engine's typed mesh API, which refuses them rather than guess the ghost cells.
     pub fn mesh_cell_points(&self, options: &MeshOptions) -> crate::Result<MeshLayer> {
         let extra = [("is_ghost", FieldType::Boolean)];
+        if self.catalog_meshes(options)? {
+            let (mut by_mesh, _) = self.engine_mesh_rows(MESH_CELL_POINTS, options, LayerOptions::default().with_ghost_cells(true))?;
+            return self.element_layer(MESH_CELL_POINTS, GeometryType::Point, Element::Cell, &extra, options, |mesh, _| {
+                Ok(by_mesh.remove(mesh).unwrap_or_default())
+            });
+        }
         self.element_layer(MESH_CELL_POINTS, GeometryType::Point, Element::Cell, &extra, options, |mesh, _| {
             let geometry = self.session.mesh_geometry(mesh, options.metadata_max_bytes).map_err(error::from_engine)?;
             let physical = geometry.mesh.physical_cells;
@@ -430,7 +503,16 @@ impl HecRasHdf {
     /// joined face values ([`MeshOptions`]). Lines are the engine's face polylines (start point,
     /// stored perimeter vertices, end point), as ras-commander's `get_mesh_cell_faces` builds
     /// them.
+    ///
+    /// The faces are the engine's `mesh_faces` catalog layer; files without a 2D flow area table
+    /// (HEC-RAS 5.0) are read with the engine's typed mesh API.
     pub fn mesh_faces(&self, options: &MeshOptions) -> crate::Result<MeshLayer> {
+        if self.catalog_meshes(options)? {
+            let (mut by_mesh, _) = self.engine_mesh_rows(MESH_FACES, options, LayerOptions::default())?;
+            return self.element_layer(MESH_FACES, GeometryType::LineString, Element::Face, &[], options, |mesh, _| {
+                Ok(by_mesh.remove(mesh).unwrap_or_default())
+            });
+        }
         self.element_layer(MESH_FACES, GeometryType::LineString, Element::Face, &[], options, |mesh, _| {
             let named = self.session.read_topology_bounded(mesh, options.max_bytes).map_err(error::from_engine)?;
             let lines = named.topology.face_lines().map_err(error::from_engine)?;
@@ -515,13 +597,29 @@ impl HecRasHdf {
         }
         let mut layer = self.new_layer(MESH_PERIMETERS, GeometryType::Polygon, None)?;
         let table = self.flow_area_table(options)?;
+        let mut by_mesh = match table {
+            Some(_) => Some(self.engine_mesh_rows(MESH_PERIMETERS, options, LayerOptions::default())?.0),
+            None => None,
+        };
         let columns = table.as_ref().map(|t| t.columns.as_slice()).unwrap_or_default();
         super::families::declare_columns(&mut layer, columns)?;
         for mesh in &meshes {
-            let p = self.session.read_mesh_perimeter(mesh, options.max_bytes).map_err(error::from_engine)?;
+            let geometry = match &mut by_mesh {
+                Some(by_mesh) => {
+                    by_mesh
+                        .remove(mesh)
+                        .and_then(|rows| rows.into_iter().next())
+                        .ok_or_else(|| crate::Error::InvalidArgument(format!("HEC-RAS: no 2D flow area named {mesh:?}")))?
+                        .1
+                }
+                None => {
+                    let p = self.session.read_mesh_perimeter(mesh, options.max_bytes).map_err(error::from_engine)?;
+                    polygon(&p.ring, mesh, "perimeter", 0)?
+                }
+            };
             let mut feature = Feature::new();
             feature.fid = layer.features.len() as u64;
-            feature.geometry = Some(polygon(&p.ring, mesh, "perimeter", 0)?);
+            feature.geometry = Some(geometry);
             feature.attributes = vec![FieldValue::Text(mesh.clone())];
             if let Some(table) = &table {
                 let row = flow_area_row(table, mesh)?;

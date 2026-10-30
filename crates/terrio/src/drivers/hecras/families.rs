@@ -3,27 +3,29 @@
 //! boundary-condition lines, breaklines, refinement regions, reference lines and points, and
 //! pipe-network conduits and nodes.
 //!
-//! The engine reads each family exactly (attribute table, Info/Parts/Points, one source
-//! identity per feature). This module only builds terrio features from them:
+//! Each layer is the engine's Arrow catalog layer of the same name
+//! (`ras_commander_fast_hdf::arrow_layers`), which owns every rule:
 //!
-//! - one feature per engine feature, in stored order, with `source_row` (the row of the family's
+//! - one feature per stored feature, in stored order, with `source_row` (the row of the family's
 //!   attribute table, or of its Info table when it has none) as the identity field;
-//! - every attribute-table column as a field named after the stored column (snake case), with
-//!   its stored values (text, integer, float; bitfields as bytes);
+//! - every attribute-table column as a field, named by the catalog for terrio (the stored name in
+//!   snake case), with its stored values (text, integer, float). Bitfield columns are refused;
 //! - a line with one part is a LineString, with several a MultiLineString; a polygon family's
 //!   single part is a Polygon. Multi-part polygons are refused: which parts are holes is not a
-//!   proven layout.
+//!   proven layout. A feature without drawn geometry has none.
+//!
+//! The typed family reads remain for listing (`family_present`) only; `declare_columns` and
+//! `column_value` translate the 2D flow area table joined to `mesh_perimeters`.
 
-use super::{HecRasHdf, error, field_name, id_field};
-use crate::vector::{Coord, Ring};
-use crate::{Feature, FieldDef, FieldType, FieldValue, Geometry, GeometryType, Layer};
+use super::{HecRasHdf, engine_layers, error, field_name};
+use crate::{Feature, FieldDef, FieldType, FieldValue, GeometryType, Layer};
+use ras_commander_fast_hdf::arrow_layers::LayerOptions;
 use ras_commander_fast_hdf::hdf::AttributeType;
+use ras_commander_fast_hdf::hdf::DEFAULT_MAX_BYTES;
 use ras_commander_fast_hdf::hdf::lines::GeometryFamily;
-use ras_commander_fast_hdf::hdf::metadata::{CompoundColumn, CompoundTable, MetadataValue};
+use ras_commander_fast_hdf::hdf::metadata::{CompoundColumn, MetadataValue};
 use ras_commander_fast_hdf::hdf::xs_geometry::{OneDLineFamily, OneDPointData};
-use ras_commander_fast_hdf::hdf::{DEFAULT_MAX_BYTES, Identity, NumericArray, NumericValues};
 use ras_commander_fast_hdf::{Capability, Reported};
-use std::ops::Range;
 
 /// The family layers, by layer name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,16 +43,6 @@ pub(crate) enum PointFamily {
     Junctions,
     PumpStations,
     PipeNodes,
-}
-
-impl PointFamily {
-    fn group(self) -> &'static str {
-        match self {
-            PointFamily::Junctions => "Geometry/Junctions",
-            PointFamily::PumpStations => "Geometry/Pump Stations",
-            PointFamily::PipeNodes => "Geometry/Pipe Nodes",
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,18 +71,6 @@ pub(crate) const FAMILY_LAYERS: &[(&str, Family)] = &[
     ("pipe_nodes", Family::Points(PointFamily::PipeNodes)),
 ];
 
-/// `Reported` engine data as a value or an error. Unavailable (the family is not stored) is a
-/// caller error: the layer was asked for but the file has none.
-fn take<T: Clone>(r: Reported<T>, what: &str) -> crate::Result<T> {
-    match r.value() {
-        Some(v) if r.is_supported() => Ok(v.clone()),
-        _ => {
-            error::require(r.capability(), what)?;
-            Err(crate::Error::InvalidData(format!("HEC-RAS {what}: supported without a value")))
-        }
-    }
-}
-
 impl HecRasHdf {
     /// Whether the file stores the family: the engine reads it and reports anything but
     /// canonical absence. Unsupported or corrupt families are listed, so that reading them shows
@@ -112,57 +92,25 @@ impl HecRasHdf {
         }
     }
 
-    /// Reads one family layer.
+    /// Reads one family layer: the engine's catalog layer of the same name
+    /// ([`super::engine_layers`]), in its stored order, with `source_row` and the stored
+    /// attribute columns under terrio's names. A feature HEC-RAS stores without drawn geometry
+    /// (some structures) is a feature without geometry.
     pub(crate) fn family_layer(&self, name: &str, family: Family) -> crate::Result<Layer> {
-        let s = &self.session;
-        let mut builder = Builder::new(self, name)?;
-        match family {
-            Family::OneD(f, shape) => {
-                let data = take(s.one_d_line_family(f, DEFAULT_MAX_BYTES).map_err(error::from_engine)?, f.group_path())?;
-                let table = data.attributes.as_ref().map(|a| &a.table);
-                let points = xy(&data.points, f.group_path())?;
-                builder.declare(table, if shape == Shape::Polygon { GeometryType::Polygon } else { GeometryType::LineString })?;
-                for feature in &data.features {
-                    let geometry = parts_geometry(&points, &feature.parts, shape, name, &feature.id)?;
-                    builder.push(&feature.id, geometry, table)?;
-                }
-            }
-            Family::TwoD(f, shape) => {
-                let data = take(s.geometry_family(f, DEFAULT_MAX_BYTES).map_err(error::from_engine)?, f.group_path())?;
-                let table = Some(&data.attributes.table);
-                let points = xy(&data.points, f.group_path())?;
-                builder.declare(table, if shape == Shape::Polygon { GeometryType::Polygon } else { GeometryType::LineString })?;
-                for feature in &data.features {
-                    let geometry = parts_geometry(&points, &feature.parts, shape, name, &feature.id)?;
-                    builder.push(&feature.id, geometry, table)?;
-                }
-            }
-            Family::ReferencePoints => {
-                let data = s.reference_point_geometry(DEFAULT_MAX_BYTES).map_err(error::from_engine)?;
-                let data = take(data, "Geometry/Reference Points")?;
-                let table = Some(&data.attributes.table);
-                let points = xy(&data.points, "Geometry/Reference Points")?;
-                builder.declare(table, GeometryType::Point)?;
-                for feature in &data.features {
-                    let [x, y] = *usize::try_from(feature.point_row)
-                        .ok()
-                        .and_then(|r| points.get(r))
-                        .ok_or_else(|| crate::Error::InvalidData(format!("{name} row {}: point row out of range", feature.id.row)))?;
-                    builder.push(&feature.id, Geometry::Point(Coord::xy(x, y)), table)?;
-                }
-            }
-            Family::Points(f) => {
-                let data = take(self.point_data(f).map_err(error::from_engine)?, f.group())?;
-                let table = Some(&data.attributes.table);
-                let points = xy(&data.points, f.group())?;
-                builder.declare(table, GeometryType::Point)?;
-                for (row, id) in data.features.iter().enumerate() {
-                    let [x, y] = *points.get(row).ok_or_else(|| crate::Error::InvalidData(format!("{name} row {row}: no stored point")))?;
-                    builder.push(id, Geometry::Point(Coord::xy(x, y)), table)?;
-                }
-            }
+        let engine = self.engine_layer(name, &LayerOptions::default())?;
+        let rows = engine_layers::rows(&engine)?;
+        let mut layer = Layer::new(name);
+        if let Some(wkt) = self.crs()? {
+            layer = layer.with_crs_wkt(wkt);
         }
-        Ok(builder.layer)
+        layer.geom_type = Some(family.geometry_type());
+        for field in rows.fields {
+            layer.add_field(field);
+        }
+        for (fid, (attributes, geometry)) in rows.rows.into_iter().enumerate() {
+            layer.push(Feature { fid: fid as u64, geometry, attributes });
+        }
+        Ok(layer)
     }
 
     fn point_data(&self, family: PointFamily) -> ras_commander_fast_hdf::Result<Reported<OneDPointData>> {
@@ -174,39 +122,14 @@ impl HecRasHdf {
     }
 }
 
-/// Builds a family layer: `source_row`, then one field per attribute-table column.
-struct Builder {
-    layer: Layer,
-}
-
-impl Builder {
-    fn new(hdf: &HecRasHdf, name: &str) -> crate::Result<Self> {
-        let mut layer = Layer::new(name);
-        if let Some(wkt) = hdf.crs()? {
-            layer = layer.with_crs_wkt(wkt);
+impl Family {
+    /// The declared geometry type of the layer (a line layer can hold MultiLineStrings).
+    fn geometry_type(self) -> GeometryType {
+        match self {
+            Family::OneD(_, Shape::Polygon) | Family::TwoD(_, Shape::Polygon) => GeometryType::Polygon,
+            Family::OneD(_, Shape::Line) | Family::TwoD(_, Shape::Line) => GeometryType::LineString,
+            Family::ReferencePoints | Family::Points(_) => GeometryType::Point,
         }
-        Ok(Self { layer })
-    }
-
-    fn declare(&mut self, table: Option<&CompoundTable>, geom: GeometryType) -> crate::Result<()> {
-        self.layer.geom_type = Some(geom);
-        self.layer.add_field(id_field("source_row", FieldType::Integer));
-        declare_columns(&mut self.layer, table.map(|t| t.columns.as_slice()).unwrap_or_default())
-    }
-
-    fn push(&mut self, id: &Identity, geometry: Geometry, table: Option<&CompoundTable>) -> crate::Result<()> {
-        let row = usize::try_from(id.row).map_err(|_| crate::Error::InvalidData("row overflow".into()))?;
-        let mut attributes =
-            vec![FieldValue::Integer(i64::try_from(id.row).map_err(|_| crate::Error::InvalidData("row overflow".into()))?)];
-        for column in table.map(|t| t.columns.as_slice()).unwrap_or_default() {
-            attributes.push(column_value(column, row, &self.layer.name)?);
-        }
-        let mut feature = Feature::new();
-        feature.fid = self.layer.features.len() as u64;
-        feature.geometry = Some(geometry);
-        feature.attributes = attributes;
-        self.layer.push(feature);
-        Ok(())
     }
 }
 
@@ -259,45 +182,4 @@ pub(crate) fn column_value(column: &CompoundColumn, row: usize, layer: &str) -> 
         }
         _ => return Err(crate::Error::Unsupported(format!("{layer} column {:?}: unmapped value type", column.name))),
     })
-}
-
-/// Rows of a stored `(n, 2)` float Points array (f32 widened exactly).
-fn xy(points: &NumericArray, what: &str) -> crate::Result<Vec<[f64; 2]>> {
-    if points.shape.len() != 2 || points.shape[1] != 2 {
-        return Err(crate::Error::Unsupported(format!("{what} Points: shape {:?}, not (rows, 2)", points.shape)));
-    }
-    Ok(match &points.values {
-        NumericValues::F64(v) => v.as_chunks::<2>().0.to_vec(),
-        NumericValues::F32(v) => v.as_chunks::<2>().0.iter().map(|c| [f64::from(c[0]), f64::from(c[1])]).collect(),
-        _ => return Err(crate::Error::Unsupported(format!("{what} Points: not floats"))),
-    })
-}
-
-fn parts_geometry(points: &[[f64; 2]], parts: &[Range<u64>], shape: Shape, layer: &str, id: &Identity) -> crate::Result<Geometry> {
-    let bad = |m: &str| crate::Error::InvalidData(format!("{layer} row {}: {m}", id.row));
-    let mut coords = Vec::with_capacity(parts.len());
-    for part in parts {
-        let range = usize::try_from(part.start).map_err(|_| bad("range"))?..usize::try_from(part.end).map_err(|_| bad("range"))?;
-        let slice = points.get(range).ok_or_else(|| bad("part outside Points"))?;
-        coords.push(slice.iter().map(|p| Coord::xy(p[0], p[1])).collect::<Vec<_>>());
-    }
-    match (shape, coords.len()) {
-        (_, 0) => Err(bad("no parts")),
-        (Shape::Line, 1) => Ok(Geometry::LineString(coords.pop().unwrap_or_default())),
-        (Shape::Line, _) => Ok(Geometry::MultiLineString(coords)),
-        (Shape::Polygon, 1) => {
-            let mut ring = coords.pop().unwrap_or_default();
-            if ring.len() > 1 && ring.first() == ring.last() {
-                ring.pop();
-            }
-            if ring.len() < 3 {
-                return Err(bad("polygon with fewer than three vertices"));
-            }
-            Ok(Geometry::Polygon { exterior: Ring::new(ring), interiors: Vec::new() })
-        }
-        (Shape::Polygon, n) => Err(crate::Error::Unsupported(format!(
-            "{layer} row {}: {n}-part polygon; which parts are holes is not a proven layout",
-            id.row
-        ))),
-    }
 }

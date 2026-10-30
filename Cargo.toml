@@ -69,7 +69,8 @@ ruzstd = "0.9"
 netcdf-reader = { version = "0.10", default-features = false, features = ["netcdf4"] }
 hdf5-reader = { version = "0.10", default-features = false }
 # HEC-RAS geometry and plan HDF files (the `hecras` feature): the read-only engine behind
-# ras-commander. It owns every HEC-RAS rule; terrio's driver only translates its values.
+# ras-commander. It owns every HEC-RAS rule, layer name and field name (its Arrow layer catalog);
+# terrio's driver only translates its values.
 ras-commander-fast-hdf = { version = "0.2.2", default-features = false, features = ["hdf", "mesh", "results"] }
 # The portable decoder: the same pixels on every platform, closer to libjpeg's than its SIMD paths.
 jpeg-decoder = { version = "0.3", default-features = false, features = ["platform_independent"] }
@@ -180,7 +181,9 @@ image-webp = { opt-level = 3 }
 lz4_flex = { opt-level = 3 }
 
 [patch.crates-io]
-# Engine PRs gpt-cmdr/ras-commander-fast-hdf#40 (File Type identification, pipe families), #42
-# (crates.io hdf5-reader 0.10, one HDF5 reader) and #43, combined on one branch, until a
-# release carries them. Temporary: `cargo publish` and upstream need a crates.io engine.
-ras-commander-fast-hdf = { git = "https://github.com/gpt-cmdr/ras-commander-fast-hdf", rev = "a77db011cfe309e5539accd8a6622d989578e1a8" }
+# The engine's Arrow layer API (gpt-cmdr/ras-commander-fast-hdf#52, with the consumer naming,
+# ghost cell points and stored time offsets of branch feat/arrow-layers-archive-t10 on top), which
+# already carries #40 (File Type identification, pipe families), #42 (crates.io hdf5-reader 0.10)
+# and #43, until a release carries them. Temporary: `cargo publish` and upstream need a crates.io
+# engine.
+ras-commander-fast-hdf = { git = "https://github.com/gpt-cmdr/ras-commander-fast-hdf", rev = "3c55dfe47e3023f7af30fe5310e122fa6a413a56" }

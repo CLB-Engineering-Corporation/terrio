@@ -191,7 +191,8 @@ fn family_layers_absent_from_a_file_are_errors_and_not_listed() {
     for family in terrio::hecras::family_layer_names() {
         assert!(!names.iter().any(|n| n == family), "{family}");
         let e = hdf.read_layer(family).unwrap_err();
-        assert!(matches!(&e, terrio::Error::InvalidArgument(m) if m.starts_with("HEC-RAS unavailable")), "{family}: {e}");
+        // The engine's catalog reports an absent family as `not_found`.
+        assert!(matches!(&e, terrio::Error::InvalidArgument(m) if m.starts_with("HEC-RAS not_found")), "{family}: {e}");
     }
     assert!(matches!(hdf.read_layer("no_such_layer"), Err(terrio::Error::InvalidArgument(_))));
     assert_eq!(hdf.read_layer("mesh_faces").map(|l| l.name).ok(), None, "every mesh is read, and the fixture has broken ones");

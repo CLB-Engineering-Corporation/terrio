@@ -1029,18 +1029,18 @@ checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
 
 [[package]]
 name = "hdf5-core"
-version = "0.10.0"
+version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "22475aa10742e8d3489c58fe12cafd9fd7f158d69b9e654c21396e44609a0c41"
+checksum = "a0299f0eb21c955433f590644a5178c5bb23665a8fef65fbdc0be1d81c26abe1"
 dependencies = [
  "thiserror 2.0.21",
 ]
 
 [[package]]
 name = "hdf5-reader"
-version = "0.10.0"
+version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "82a0a7c7edfcd0fee0ee51f3e0c4945d762cac9d9faea9970bc148b5f61baadc"
+checksum = "b86dd95f258700fce52515079812ca60707b87b6d8679178f4f2a308fc08ea0b"
 dependencies = [
  "flate2",
  "hdf5-core",
@@ -2261,9 +2261,12 @@ dependencies = [
 
 [[package]]
 name = "ras-commander-fast-hdf"
-version = "0.2.3"
-source = "git+https://github.com/gpt-cmdr/ras-commander-fast-hdf?rev=a77db011cfe309e5539accd8a6622d989578e1a8#a77db011cfe309e5539accd8a6622d989578e1a8"
+version = "0.2.4"
+source = "git+https://github.com/gpt-cmdr/ras-commander-fast-hdf?rev=3c55dfe47e3023f7af30fe5310e122fa6a413a56#3c55dfe47e3023f7af30fe5310e122fa6a413a56"
 dependencies = [
+ "arrow-array",
+ "arrow-buffer",
+ "arrow-schema",
  "flate2",
  "hdf5-reader",
  "ndarray",

@@ -53,6 +53,22 @@ every HEC-RAS rule: the HDF layouts, mesh, cell and cross-section identities, po
 CRS evidence, units and refusals. The driver translates its values into terrio layers, fields
 and errors.
 
+**One source of layer rules and names.** The mesh layers (`mesh_cells`, `mesh_cell_points`,
+`mesh_faces`, `mesh_perimeters`) and every family layer are the engine's Arrow catalog layers
+(`ras_commander_fast_hdf::arrow_layers`, `ReadOnlyHdfSession::read_layer`): the same rows, order,
+geometry and refusals ras2cng archives. Field names come from the catalog too
+(`ArrowLayer::with_consumer_names("terrio", layer)`: the stored name lower-snake-cased, and the
+catalog's explicit aliases such as `is_ghost`), so the driver renames nothing itself. The
+driver keeps the engine's typed API only for what the catalog does not provide:
+
+- `mesh_face_points`, and the 2D flow area table joined to `mesh_perimeters`;
+- every join (summaries, static mesh arrays, time-step values, series extremes; cross-section,
+  structure, boundary-condition and reference-line/point results and tables);
+- mesh cells under `GeometryPolicy::QuarantineInvalid` (the catalog refuses invalid cells);
+- files without a 2D flow area table (`Geometry/2D Flow Areas/Attributes`, HEC-RAS 5.0
+  layouts): the catalog lists meshes from that table, as ras-commander does;
+- listing (`layer_names`), which only asks whether each family is stored.
+
 **Detection.** A file is a HEC-RAS file when it has an HDF5 signature and a root `File Type`
 attribute of `HEC-RAS Geometry` or `HEC-RAS Results`, as the engine classifies it
 (`hec_ras_file_type`). The extension does not decide: HEC-RAS files share `.hdf` and `.h5` with
@@ -95,9 +111,12 @@ files) is left out with a warning; damaged data and I/O errors fail the open. A 
   attribute-table row, and keep every stored attribute column as a field named after it (lower
   case, other characters as `_`).
 - Cell polygons are the engine's: rings run clockwise from the first listed face. Cells the
-  engine does not draw (fewer than three faces, such as ghost cells) are left out. A family line
-  with several parts is a MultiLineString; a polygon family feature with several parts is
-  refused, because which parts are holes is not a proven layout.
+  engine does not draw (fewer than three faces, such as ghost cells) are left out and reported
+  in `MeshLayer::omitted`. A family line with several parts is a MultiLineString; a polygon
+  family feature with several parts is refused, because which parts are holes is not a proven
+  layout. A structure stored without a centerline is a feature without geometry.
+- `mesh_cell_points` has every stored cell centre, ghost cells included (`is_ghost` true);
+  `is_ghost` is null for a mesh whose physical cell count is not recorded.
 - Attributes are read without h5py, by the engine: compound `Attributes` tables column by
   column with their stored types (text, integers, floats; `f32` widened exactly), fixed-length
   strings decoded as h5py decodes them (padding removed, nothing else trimmed), and the root
@@ -112,8 +131,8 @@ files) is left out with a warning; damaged data and I/O errors fail the open. A 
 
 These HEC-RAS datasets are left out on purpose:
 
-- Structures stored without a centerline (an attribute row with no `Centerline` datasets, such
-  as some lateral structures): there is no geometry to draw.
+- Bitfield attribute columns: the engine's catalog does not map them to Arrow, so a family with
+  one is refused (no tested file has one).
 - 2D flow areas stored as outlines only, with no computed mesh (`Polygon Info`/`Parts`/`Points`
   under `Geometry/2D Flow Areas`): the engine refuses them, so the mesh layers are listed but
   refused.
@@ -123,6 +142,48 @@ These HEC-RAS datasets are left out on purpose:
   tables, not feature layers.
 - Values HEC-RAS does not store (depth where only water surface is stored, maxima of structure
   series): the driver joins stored values only and computes none.
+
+## Archive GeoParquet
+
+`terrio::hecras::archive` (features `hecras` and `parquet`) writes a geometry or plan HDF file
+straight to one archive GeoParquet file, as ras2cng archives a project, without terrio's
+`Layer` model or a GeoDataFrame in between:
+
+```rust,no_run
+use terrio::hecras::HecRasHdf;
+use terrio::hecras::archive::{ArchiveOptions, write_archive};
+use terrio::geoparquet::GeoParquetWriteOptions;
+
+let archive = HecRasHdf::open("Model.p01.hdf")?.archive_layers(&ArchiveOptions::default().with_geometry(false))?;
+for skip in &archive.skipped {
+    eprintln!("{} refused: {}", skip.layer, skip.reason); // fill these another way
+}
+write_archive(archive, Vec::new(), None, "Model.p01.parquet", &GeoParquetWriteOptions::archive())?;
+# Ok::<(), terrio::Error>(())
+```
+
+Python: `terrio.hecras.archive_layers(path, ...)` returns the layers as Arrow tables, and
+`terrio.hecras.write_archive(path, out, extra_layers=[(name, table), ...])` writes them, then
+the caller's layers (ras2cng's text geometry layers, values the engine refused), as one file.
+
+- Layer and field names are the catalog's `ras2cng` aliases (`mesh_areas`, `centerlines`,
+  `bc_line_id`, `bl_id`, ...); other fields keep their stored names. Geometry layers come in
+  ras2cng's order, then the catalog layers ras2cng's Python path does not write
+  (`mesh_cell_points`, `river_flow_paths`, `river_junctions`).
+- A plan's results are one layer per stored 2D summary variable, in name order, named by its
+  slug, each with the cell polygon or face line read once per file and joined by
+  `(mesh_name, cell_id|face_id)`.
+- Lossless by default: a structure without a centerline is a row with a null geometry, a timed
+  summary also keeps its stored offset (`<slug>_time_days`, days from the simulation start, in
+  the stored float type; `<slug>_time` is rounded to 100 ms), and `mesh_cell_points` keeps the
+  ghost cells (`is_ghost_cell`), which face cell indexes refer to.
+- A layer or variable the engine refuses does not abort the file: it is listed in
+  `HecRasArchive::skipped` (Python `skipped`) with the engine's reason. `Cell Last Iteration`
+  is one: it stores no element `Location`, so the engine does not prove its element domain.
+- The layout is `GeoParquetWriteOptions::archive()`: ZSTD 3, a `layer` column, row groups ending
+  at layer boundaries, a `bbox` struct covering, Hilbert order with `hilbert_index`, Utf8
+  dictionaries, chunk statistics. The CRS is the stored projection as PROJJSON (its text when
+  terrio cannot convert it); none is guessed.
 
 ## Open options
 

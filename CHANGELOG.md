@@ -19,6 +19,17 @@
   `File Type` is `HEC-RAS Geometry` or `HEC-RAS Results`; other HDF5 and
   NetCDF files are not affected. Compared with h5py on the HEC-RAS 7.0.1 files
   of a public corpus: every value identical. See `docs/hecras.md`.
+- The HECRAS driver reads its mesh and family layers through the engine's Arrow layer catalog
+  (`ras_commander_fast_hdf::arrow_layers`), which also names their fields: one source of
+  HEC-RAS layer rules and names for terrio and ras2cng. `mesh_cell_points` keeps a null
+  `is_ghost` for a mesh without a recorded cell count, a structure without a centerline is a
+  feature without geometry, and `MeshLayer::omitted` lists the cells left out of
+  `mesh_cells`. The typed engine API remains for joins, face points, quarantined cells and
+  HEC-RAS 5.0 layouts without a 2D flow area table.
+- `terrio::hecras::archive` (Python `terrio.hecras.archive_layers` and
+  `terrio.hecras.write_archive`): a HEC-RAS geometry or plan HDF file straight to an archive
+  GeoParquet file (ras2cng's layout), with the layers as Arrow tables so that a caller can add
+  its own; refused layers and variables are listed, not fatal. See `docs/hecras.md`.
 - `hdf5-reader` and `netcdf-reader` are the crates.io 0.10 releases; the
   `[patch]` to a netcdf-rust branch is gone (its fix, roteiro-gis/netcdf-rust#95,
   is in 0.10).

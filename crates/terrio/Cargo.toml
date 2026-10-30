@@ -117,10 +117,11 @@ avif = ["tiles", "dep:rusty_av1d"]
 ## NetCDF, HDF5 and HDF-EOS reading, netCDF writing.
 netcdf-hdf5 = ["dep:netcdf-reader", "dep:hdf5-reader"]
 ## HEC-RAS geometry (`.g##.hdf`) and plan (`.p##.hdf`) HDF files as vector layers (read only),
-## through the ras-commander-fast-hdf engine.
+## through the ras-commander-fast-hdf engine and its Arrow layers. With `parquet` too, the
+## direct HEC-RAS HDF to archive GeoParquet path (`hecras::archive`).
 ## Needs `netcdf-hdf5`: HEC-RAS files stay readable as HDF5 rasters, and in-memory opens find
 ## the root `File Type` with terrio's HDF5 reader.
-hecras = ["netcdf-hdf5", "dep:ras-commander-fast-hdf"]
+hecras = ["netcdf-hdf5", "dep:ras-commander-fast-hdf", "ras-commander-fast-hdf/arrow", "dep:arrow-array", "dep:arrow-schema"]
 ## OpenStreetMap PBF and XML.
 osm = ["dep:osmpbfreader", "wbvector/osmpbf"]
 ## LZMA-compressed GeoTIFFs.

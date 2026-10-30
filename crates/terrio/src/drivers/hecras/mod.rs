@@ -41,7 +41,11 @@
 //! # }
 //! ```
 
+#[cfg(feature = "parquet")]
+#[cfg_attr(docsrs, doc(cfg(feature = "parquet")))]
+pub mod archive;
 pub(crate) mod driver;
+mod engine_layers;
 pub mod error;
 mod families;
 mod mesh;
@@ -99,17 +103,11 @@ pub(crate) fn id_field(name: &str, kind: crate::FieldType) -> crate::FieldDef {
     f
 }
 
-/// A field name for a stored name: lower case, runs of other characters as `_`.
+/// A field name for a stored name: the engine catalog's naming rule for terrio (lower case,
+/// runs of other characters as `_`), so that the catalog is the one source of field names.
 pub(crate) fn field_name(stored: &str) -> String {
-    let mut out = String::new();
-    for c in stored.chars() {
-        if c.is_ascii_alphanumeric() {
-            out.push(c.to_ascii_lowercase());
-        } else if !out.ends_with('_') {
-            out.push('_');
-        }
-    }
-    out.trim_matches('_').to_string()
+    use ras_commander_fast_hdf::arrow_layers::{apply_naming_rule, naming_rule};
+    apply_naming_rule(naming_rule(engine_layers::CONSUMER), stored)
 }
 
 /// Stored numbers as field values: floats (`f32` widened exactly) or integers.
