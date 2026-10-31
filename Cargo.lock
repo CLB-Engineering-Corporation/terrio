@@ -1822,7 +1822,7 @@ checksum = "6a5b15d63a5ff39e378daed0e1340d3a5964703ea9712eb09a0dc66fade996f4"
 dependencies = [
  "libc",
  "ndarray",
- "num-complex 0.2.4",
+ "num-complex 0.4.6",
  "num-integer",
  "num-traits",
  "pyo3",
@@ -2261,8 +2261,8 @@ dependencies = [
 
 [[package]]
 name = "ras-commander-fast-hdf"
-version = "0.2.4"
-source = "git+https://github.com/gpt-cmdr/ras-commander-fast-hdf?rev=3c55dfe47e3023f7af30fe5310e122fa6a413a56#3c55dfe47e3023f7af30fe5310e122fa6a413a56"
+version = "0.3.0"
+source = "git+https://github.com/gpt-cmdr/ras-commander-fast-hdf?tag=v0.3.0#3a9e35eeedce91e6cc3b1ce43bd133aaeac52bb7"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
