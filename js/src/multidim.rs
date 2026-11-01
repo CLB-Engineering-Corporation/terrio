@@ -26,8 +26,8 @@ impl MdDataset {
     }
     /// Serialize a numeric snapshot as netCDF-4 bytes.
     #[wasm_bindgen(js_name=toBytes)]
-    pub fn to_bytes(&self) -> Result<Vec<u8>, JsError> {
-        self.inner.to_netcdf_bytes().map_err(js_err)
+    pub fn to_bytes(&self, deflate: Option<u32>) -> Result<Vec<u8>, JsError> {
+        self.inner.to_netcdf_bytes_with_options(&multidim::NetcdfWriteOptions { deflate }).map_err(js_err)
     }
     /// Serialize a numeric Zarr v2 snapshot as relative keys mapped to Uint8Array values.
     #[wasm_bindgen(js_name=toZarrStore)]

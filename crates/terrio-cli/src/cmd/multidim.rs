@@ -44,6 +44,9 @@ pub struct ConvertArgs {
     input: String,
     /// New .nc (netCDF-4) file or .zarr (Zarr v2) store; must not exist.
     output: String,
+    /// Shuffle and deflate chunked NetCDF arrays at level 0..=9 (not Zarr).
+    #[arg(long, value_parser = clap::value_parser!(u32).range(0..=9))]
+    deflate: Option<u32>,
 }
 fn invalid(message: impl std::fmt::Display) -> Error {
     Error::InvalidArgument(format!("multidim: {message}"))
@@ -134,7 +137,7 @@ pub fn read(args: ReadArgs) -> Result<()> {
     Ok(())
 }
 pub fn convert(args: ConvertArgs) -> Result<()> {
-    multidim::open(&args.input)?.write(&args.output)
+    multidim::open(&args.input)?.write_netcdf(&args.output, &multidim::NetcdfWriteOptions { deflate: args.deflate })
 }
 
 fn transpose_axis(dimensions: &[multidim::Dimension], name: &str) -> Result<usize> {
