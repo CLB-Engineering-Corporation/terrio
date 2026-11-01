@@ -56,6 +56,37 @@ fn dataset() -> Dataset {
     root.groups.push(child);
     Dataset { driver: "Memory".into(), root }
 }
+
+#[test]
+#[cfg(feature = "netcdf-hdf5")]
+fn compressed_cf_packing_retains_raw_uint16_and_typed_attributes() {
+    use terrio::multidim::NetcdfWriteOptions;
+    let mut root = Group::new("/");
+    let dim = Dimension { name: "flow".into(), path: "/flow".into(), size: 4, unlimited: false, indexing_variable: None };
+    let mut packed = Array::from_bytes(
+        ArrayInfo {
+            name: "depth".into(),
+            path: "/depth".into(),
+            data_type: DataType::U16,
+            dimensions: vec![dim],
+            chunks: Some(vec![2]),
+            attributes: json!({"_FillValue":65535}),
+            coordinates: vec![],
+        },
+        [50u16, 100, 65534, 65535].into_iter().flat_map(u16::to_le_bytes).collect(),
+    )
+    .unwrap();
+    packed.set_typed_attribute("scale_factor", json!(0.01f32 as f64), DataType::F32).unwrap();
+    packed.set_typed_attribute("add_offset", json!(0), DataType::F32).unwrap();
+    assert!(packed.set_typed_attribute("bad", json!(256), DataType::U8).is_err());
+    root.arrays.push(packed);
+    let ds = Dataset { driver: "Memory".into(), root };
+    let bytes = ds.to_netcdf_bytes_with_options(&NetcdfWriteOptions { deflate: Some(4) }).unwrap();
+    let read = terrio::multidim::open_bytes(&bytes).unwrap();
+    assert_eq!(read.array("depth").unwrap().read().unwrap().bytes, ds.array("depth").unwrap().read().unwrap().bytes);
+    assert_eq!(read.array("depth").unwrap().attribute_type("scale_factor"), Some(DataType::F32));
+    assert!(ds.to_netcdf_bytes_with_options(&NetcdfWriteOptions { deflate: Some(10) }).is_err());
+}
 #[test]
 fn native_typed_lazy_views_slice_index_and_transpose() {
     let ds = dataset();

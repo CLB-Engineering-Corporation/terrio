@@ -28,6 +28,13 @@ fn serialize_type<S: serde::Serializer>(t: &DataType, s: S) -> std::result::Resu
 }
 
 pub(crate) type AttributeTypes = std::collections::BTreeMap<String, DataType>;
+
+/// NetCDF-4 snapshot encoding. Applies to arrays with explicit chunks only.
+#[derive(Debug, Clone, Default)]
+pub struct NetcdfWriteOptions {
+    /// Shuffle followed by deflate at level 0..=9. None preserves uncompressed output.
+    pub deflate: Option<u32>,
+}
 #[cfg(feature = "zarr")]
 pub(crate) fn attribute_type_metadata(types: &AttributeTypes) -> Value {
     Value::Object(types.iter().map(|(name, dtype)| (name.clone(), Value::String(crate::info::gdal_type_name(*dtype).into()))).collect())
@@ -110,6 +117,11 @@ pub struct Group {
     pub groups: Vec<Group>,
 }
 impl Group {
+    /// Sets an attribute and its native numeric type (including scalar and vector attributes).
+    /// Values must be representable in that type; no array payload is modified.
+    pub fn set_typed_attribute(&mut self, name: &str, value: Value, dtype: DataType) -> Result<()> {
+        write::typed_attribute(&mut self.attributes, &mut self.attribute_types, name, value, dtype)
+    }
     /// Constructs an empty group at an absolute path.
     pub fn new(given: &str) -> Self {
         let p = if given.trim_matches('/').is_empty() { "/".into() } else { format!("/{}", given.trim_matches('/')) };
@@ -145,6 +157,24 @@ pub struct Dataset {
     pub root: Group,
 }
 impl Dataset {
+    /// Writes a new NetCDF-4 snapshot with explicit compression, without overwriting a file.
+    /// Coordinates, typed CF packing attributes and array chunks are retained.
+    pub fn write_netcdf(&self, destination: &str, options: &NetcdfWriteOptions) -> Result<()> {
+        write::write_with_options(self, destination, options)
+    }
+    /// Encodes a NetCDF-4 snapshot with explicit compression; packed numeric values stay raw.
+    pub fn to_netcdf_bytes_with_options(&self, options: &NetcdfWriteOptions) -> Result<Vec<u8>> {
+        write::validate(self)?;
+        write::validate_options(options)?;
+        #[cfg(feature = "netcdf-hdf5")]
+        {
+            write::netcdf_bytes(self, options)
+        }
+        #[cfg(not(feature = "netcdf-hdf5"))]
+        {
+            Err(Error::disabled("netcdf-hdf5"))
+        }
+    }
     /// Looks up an absolute array path (a root array may omit its leading slash).
     pub fn array(&self, given: &str) -> Result<Array> {
         let p = format!("/{}", given.trim_matches('/'));
@@ -160,7 +190,7 @@ impl Dataset {
         write::validate(self)?;
         #[cfg(feature = "netcdf-hdf5")]
         {
-            write::netcdf_bytes(self)
+            write::netcdf_bytes(self, &NetcdfWriteOptions::default())
         }
         #[cfg(not(feature = "netcdf-hdf5"))]
         {
@@ -212,6 +242,11 @@ impl std::fmt::Debug for Array {
     }
 }
 impl Array {
+    /// Sets a numeric attribute with its native type, for example Float32 CF scale/offset.
+    /// Values must be representable in that type; the packed payload is never rescaled.
+    pub fn set_typed_attribute(&mut self, name: &str, value: Value, dtype: DataType) -> Result<()> {
+        write::typed_attribute(&mut self.info.attributes, &mut self.attribute_types, name, value, dtype)
+    }
     /// Constructs an array from native little-endian row-major numeric bytes.
     pub fn from_bytes(info: ArrayInfo, bytes: Vec<u8>) -> Result<Self> {
         let shape: Vec<_> = info.dimensions.iter().map(|d| d.size).collect();

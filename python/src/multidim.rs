@@ -54,13 +54,15 @@ impl PyMdDataset {
         self.array(name)
     }
     /// Write a new .nc or .zarr numeric snapshot, preserving coordinates and source chunks.
-    fn write(&self, py: Python<'_>, destination: &Bound<'_, PyAny>) -> PyResult<()> {
+    #[pyo3(signature=(destination, *, deflate=None))]
+    fn write(&self, py: Python<'_>, destination: &Bound<'_, PyAny>, deflate: Option<u32>) -> PyResult<()> {
         let destination = path(destination)?;
-        py.detach(|| self.inner.write(&destination)).py()
+        py.detach(|| self.inner.write_netcdf(&destination, &multidim::NetcdfWriteOptions { deflate })).py()
     }
     /// Serialize a numeric snapshot as netCDF-4 bytes.
-    fn to_bytes<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
-        let bytes = py.detach(|| self.inner.to_netcdf_bytes()).py()?;
+    #[pyo3(signature=(*, deflate=None))]
+    fn to_bytes<'py>(&self, py: Python<'py>, deflate: Option<u32>) -> PyResult<Bound<'py, PyBytes>> {
+        let bytes = py.detach(|| self.inner.to_netcdf_bytes_with_options(&multidim::NetcdfWriteOptions { deflate })).py()?;
         Ok(PyBytes::new(py, &bytes))
     }
     /// Serialize a Zarr v2 snapshot as a dictionary of relative keys and bytes.

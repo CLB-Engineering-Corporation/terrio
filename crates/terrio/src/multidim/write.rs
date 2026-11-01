@@ -29,6 +29,26 @@ fn valid_fill(value: &Value, dtype: DataType) -> bool {
     })
 }
 
+pub(super) fn typed_attribute(attributes: &mut Value, types: &mut AttributeTypes, name: &str, value: Value, dtype: DataType) -> Result<()> {
+    let valid = match &value {
+        Value::Array(values) => !values.is_empty() && values.iter().all(|v| valid_fill(v, dtype)),
+        v => valid_fill(v, dtype),
+    };
+    if !valid {
+        return Err(bad(format!("attribute '{name}' is not representable in {dtype:?}")));
+    }
+    attributes.as_object_mut().ok_or_else(|| bad("attributes must be an object"))?.insert(name.into(), value);
+    types.insert(name.into(), dtype);
+    Ok(())
+}
+
+pub(super) fn validate_options(options: &NetcdfWriteOptions) -> Result<()> {
+    if options.deflate.is_some_and(|level| level > 9) {
+        return Err(bad("deflate level must be 0..=9"));
+    }
+    Ok(())
+}
+
 pub(super) fn validate(dataset: &Dataset) -> Result<()> {
     fn valid(path: &str) -> bool {
         path == "/"
@@ -96,8 +116,15 @@ pub(crate) fn default_chunks(shape: &[usize], dtype: DataType) -> Vec<usize> {
     chunks
 }
 pub(super) fn write(dataset: &Dataset, destination: &str) -> Result<()> {
+    write_with_options(dataset, destination, &NetcdfWriteOptions::default())
+}
+pub(super) fn write_with_options(dataset: &Dataset, destination: &str, options: &NetcdfWriteOptions) -> Result<()> {
     validate(dataset)?;
+    validate_options(options)?;
     if destination.to_ascii_lowercase().ends_with(".zarr") {
+        if options.deflate.is_some() {
+            return Err(bad("NetCDF deflate options require a .nc destination"));
+        }
         #[cfg(feature = "zarr")]
         {
             return crate::drivers::zarr::md_write(dataset, destination);
@@ -117,7 +144,7 @@ pub(super) fn write(dataset: &Dataset, destination: &str) -> Result<()> {
         if std::path::Path::new(destination).exists() {
             return Err(bad("destination already exists"));
         }
-        let bytes = netcdf_bytes(dataset)?;
+        let bytes = netcdf_bytes(dataset, options)?;
         #[cfg(not(target_family = "wasm"))]
         {
             use std::io::Write;
@@ -178,7 +205,7 @@ pub(crate) fn sample(value: &Value, t: DataType) -> Vec<u8> {
     }
 }
 #[cfg(feature = "netcdf-hdf5")]
-pub(super) fn netcdf_bytes(dataset: &Dataset) -> Result<Vec<u8>> {
+pub(super) fn netcdf_bytes(dataset: &Dataset, options: &NetcdfWriteOptions) -> Result<Vec<u8>> {
     use crate::drivers::hdf5_write::{self, Attr, H5Type, Values};
     use std::collections::BTreeMap;
     fn dtype(t: DataType) -> H5Type {
@@ -336,7 +363,10 @@ pub(super) fn netcdf_bytes(dataset: &Dataset) -> Result<Vec<u8>> {
                 .then(|| array.info.dimensions.iter().map(|d| if d.unlimited { u64::MAX } else { d.size as u64 }).collect()),
             data: array.read()?.bytes,
             fill,
-            storage: hdf5_write::Storage { chunks: chunks.map(|c| c.into_iter().map(|n| n as u64).collect()), deflate: None },
+            storage: hdf5_write::Storage {
+                deflate: chunks.as_ref().and(options.deflate),
+                chunks: chunks.map(|c| c.into_iter().map(|n| n as u64).collect()),
+            },
             attrs: attributes,
         });
     }
