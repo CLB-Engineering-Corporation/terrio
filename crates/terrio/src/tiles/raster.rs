@@ -867,7 +867,7 @@ fn pyramid_plan(
             zoom.saturating_sub(count)
         }
     };
-    let method = super::pyramid::Method::parse(o.resampling.as_deref());
+    let method = super::pyramid::Method::parse(o.overview_resampling.as_deref().or(o.resampling.as_deref()));
     let (maxx, miny) = (minx + width as f64 * res, maxy - height as f64 * res);
 
     // The bounds, as GDAL records them.
@@ -1442,7 +1442,7 @@ mod tests {
     ) -> Result<RasterTiles> {
         let res0 = 2.0 * MAX_GM / 256.0;
         let (plan, bounds) = pyramid_plan(level.w, level.h, zoom, minx, maxy, level.bands, o, format, bounds);
-        let method = o.resampling.as_deref().unwrap_or("bilinear").to_ascii_lowercase();
+        let method = o.overview_resampling.as_deref().or(o.resampling.as_deref()).unwrap_or("bilinear").to_ascii_lowercase();
         let method = match method.as_str() {
             "near" | "nearest" => "nearest",
             "average" => "average",
@@ -1651,6 +1651,101 @@ mod tests {
             .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
             .collect();
         assert!(left.is_empty());
+    }
+
+    /// Independent GDAL 3.13 MEM BuildOverviews reference, generated with the lwi-gdal
+    /// Python: Byte 4x4, rows [0,0,0,240] three times then [240,240,240,240], factor 2.
+    /// Opaque data only: this does not assert GDAL partial-alpha parity.
+    #[test]
+    fn overview_override_matches_gdal_313_opaque_reference() {
+        let values = vec![0, 0, 0, 240, 0, 0, 0, 240, 0, 0, 0, 240, 240, 240, 240, 240];
+        for (method, expected) in [("average", [0, 120, 120, 180]), ("bilinear", [0, 103, 103, 162])] {
+            let level = Pixels { w: 4, h: 4, bands: 1, data: values.clone(), alpha: vec![255; 16] };
+            let o = TileWriteOptions {
+                resampling: Some("bilinear".into()),
+                overview_resampling: Some(method.into()),
+                min_zoom: Some(1),
+                ..Default::default()
+            };
+            let rt = pyramid(level, 2, -MAX_GM, MAX_GM, &o, TileFormat::Png, None).unwrap();
+            let tile = rt.tiles.iter().find(|t| t.0 == 1).unwrap();
+            let image = decode_image(&tile.3).unwrap();
+            for (i, expected) in expected.into_iter().enumerate() {
+                let offset = ((i / 2) * image.w + i % 2) * image.channels;
+                assert_eq!(image.data[offset], expected, "{method} pixel {i}");
+                assert_eq!(image.data[offset + image.channels - 1], 255);
+            }
+        }
+    }
+
+    #[test]
+    fn overview_override_handles_small_and_offgrid_pyramids() {
+        for (w, h, gx, gy) in [(1, 1, 5, 9), (41, 27, 250, 255), (513, 259, 37, 211)] {
+            let zoom = 8;
+            let r = resolution(zoom, 256);
+            let (minx, maxy) = (-MAX_GM + gx as f64 * r, MAX_GM - gy as f64 * r);
+            for method in ["near", "average", "bilinear", "cubic"] {
+                let mut o = TileWriteOptions { resampling: Some("bilinear".into()), min_zoom: Some(6), ..Default::default() };
+                assert!(o.set("overview_resampling", method).unwrap());
+                assert_eq!(o.overview_resampling.as_deref(), Some(method));
+                let a = pyramid_reference(test_level(w, h, 3, 7), zoom, minx, maxy, &o, TileFormat::Png, None).unwrap();
+                let b = pyramid(test_level(w, h, 3, 7), zoom, minx, maxy, &o, TileFormat::Png, None).unwrap();
+                assert!(!a.tiles.is_empty());
+                assert!(sorted(a.tiles) == sorted(b.tiles), "{w}x{h} {method}");
+            }
+        }
+    }
+
+    /// Separate overview selection preserves base pixels and works through both archive writers,
+    /// including RGBA with holes and partial alpha, aligned and resampled source grids.
+    #[test]
+    fn overview_resampling_is_independent_and_lazy_matches_eager() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, ds) = aligned_raster(dir.path(), "rgba.tif", 4, 13);
+        let alpha = &ds.raster.data.to_f64_vec()[3 * 900 * 520..];
+        assert!(alpha.iter().any(|&v| v > 0.0 && v < 255.0));
+        for zoom in [13, 12] {
+            let defaults = TileWriteOptions {
+                resampling: Some("bilinear".into()),
+                max_zoom: Some(zoom),
+                min_zoom: Some(zoom - 2),
+                ..Default::default()
+            };
+            let baseline = make_tiles(&ds, &defaults).unwrap();
+            let explicit = TileWriteOptions { overview_resampling: Some("bilinear".into()), ..defaults.clone() };
+            assert!(sorted(make_tiles(&ds, &explicit).unwrap().tiles) == sorted(baseline.tiles.clone()));
+            let o = TileWriteOptions { overview_resampling: Some("average".into()), ..defaults };
+            let actual = make_tiles(&ds, &o).unwrap();
+            if zoom == 12 {
+                let nearest = TileWriteOptions { resampling: Some("near".into()), ..o.clone() };
+                let n = make_tiles(&ds, &nearest).unwrap();
+                let base = |t: &RasterTiles| sorted(t.tiles.iter().filter(|t| t.0 == zoom).cloned().collect());
+                assert!(base(&actual) != base(&n), "base resampling remains effective");
+            }
+            let at = |tiles: &RasterTiles, base: bool| sorted(tiles.tiles.iter().filter(|t| (t.0 == zoom) == base).cloned().collect());
+            assert!(at(&actual, true) == at(&baseline, true), "base z{zoom}");
+            assert!(at(&actual, false) != at(&baseline, false), "overview z{zoom}");
+            let w = warp_level(&ds, &o, None).unwrap();
+            let reference = pyramid_reference(w.level, w.zoom, w.minx, w.maxy, &o, TileFormat::Png, None).unwrap();
+            assert!(sorted(actual.tiles.clone()) == sorted(reference.tiles));
+            for (ext, kind) in [("pmtiles", super::super::ArchiveKind::PMTiles), ("mbtiles", super::super::ArchiveKind::MBTiles)] {
+                let out = dir.path().join(format!("mixed{zoom}.{ext}")).to_str().unwrap().to_string();
+                let options = crate::RasterWriteOptions {
+                    creation_options: vec![
+                        ("RESAMPLING".into(), "BILINEAR".into()),
+                        ("overview_resampling".into(), "AVERAGE".into()),
+                        ("MAXZOOM".into(), zoom.to_string()),
+                        ("MINZOOM".into(), (zoom - 2).to_string()),
+                    ],
+                    ..Default::default()
+                };
+                let expected = super::super::write_raster_archive(&actual, &o, &format!("mixed{zoom}"), kind).unwrap();
+                crate::open_raster_lazy(&path).unwrap().write(&out, &options).unwrap();
+                assert!(std::fs::read(&out).unwrap() == expected, "lazy {ext} z{zoom}");
+                crate::write_raster_dataset(&ds, &out, &options).unwrap();
+                assert!(std::fs::read(&out).unwrap() == expected, "eager {ext} z{zoom}");
+            }
+        }
     }
 
     /// A raster that is not on a zoom level's grid (another resolution, another CRS) is warped as

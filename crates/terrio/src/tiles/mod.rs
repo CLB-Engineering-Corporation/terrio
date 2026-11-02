@@ -179,9 +179,12 @@ pub struct TileWriteOptions {
     pub max_zoom: Option<u8>,
     /// Rasters: `AUTO` (the zoom level whose resolution is closest), `LOWER` or `UPPER`.
     pub zoom_level_strategy: String,
-    /// Rasters: the resampling of the reprojection and overviews (`near`, `bilinear` (default),
+    /// Rasters: the resampling of the reprojection and, unless overridden, overviews (`near`, `bilinear` (default),
     /// `cubic`, `average`...).
     pub resampling: Option<String>,
+    /// Rasters: lower zoom resampling; defaults to `resampling` (then bilinear).
+    /// Uses the existing pyramid kernels and alpha handling.
+    pub overview_resampling: Option<String>,
     /// Rasters: the tile format, `PNG` (default), `JPEG` or `WEBP` (lossless).
     pub tile_format: Option<String>,
     /// Rasters: JPEG quality (default 75).
@@ -214,6 +217,7 @@ impl Default for TileWriteOptions {
             max_zoom: None,
             zoom_level_strategy: "AUTO".into(),
             resampling: None,
+            overview_resampling: None,
             tile_format: None,
             quality: 75,
             name: None,
@@ -231,7 +235,7 @@ impl Default for TileWriteOptions {
 
 impl TileWriteOptions {
     /// Sets an option by GDAL's name (`MINZOOM`, `MAXZOOM`, `ZOOM_LEVEL_STRATEGY`, `RESAMPLING`,
-    /// `TILE_FORMAT`, `QUALITY`, `NAME`, `DESCRIPTION`, `TYPE`, `EXTENT`, `BUFFER`,
+    /// `OVERVIEW_RESAMPLING`, `TILE_FORMAT`, `QUALITY`, `NAME`, `DESCRIPTION`, `TYPE`, `EXTENT`, `BUFFER`,
     /// `SIMPLIFICATION`, `SIMPLIFICATION_MAX_ZOOM`, `MAX_SIZE`, `MAX_FEATURES`). Returns whether the
     /// key is one of them.
     pub fn set(&mut self, key: &str, value: &str) -> Result<bool> {
@@ -244,6 +248,7 @@ impl TileWriteOptions {
             "MAXZOOM" => self.max_zoom = Some(zoom(value)?),
             "ZOOM_LEVEL_STRATEGY" => self.zoom_level_strategy = value.to_ascii_uppercase(),
             "RESAMPLING" => self.resampling = Some(value.to_string()),
+            "OVERVIEW_RESAMPLING" => self.overview_resampling = Some(value.to_string()),
             "TILE_FORMAT" => self.tile_format = Some(value.to_ascii_uppercase()),
             "QUALITY" => self.quality = num(value)?.clamp(1.0, 100.0) as u8,
             "NAME" => self.name = Some(value.to_string()),

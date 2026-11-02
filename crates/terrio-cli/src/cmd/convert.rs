@@ -59,7 +59,7 @@ pub struct Args {
     #[arg(long = "dsco", value_name = "KEY=VALUE")]
     dataset_options: Vec<String>,
     /// A raster creation option, as GDAL names it: `KEY=VALUE` (Zarr: FORMAT=ZARR_V2|ZARR_V3;
-    /// netCDF: FORMAT=NC|NC2|NC5; PMTiles and MBTiles: TILE_FORMAT, RESAMPLING,
+    /// netCDF: FORMAT=NC|NC2|NC5; PMTiles and MBTiles: TILE_FORMAT, RESAMPLING, OVERVIEW_RESAMPLING,
     /// ZOOM_LEVEL_STRATEGY, MINZOOM, MAXZOOM, QUALITY, NAME, DESCRIPTION, TYPE).
     #[arg(long = "co", value_name = "KEY=VALUE")]
     raster_options: Vec<String>,

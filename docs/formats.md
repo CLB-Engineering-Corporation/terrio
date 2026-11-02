@@ -494,9 +494,20 @@ or `UPPER`), with an alpha band when the source has one or is not in EPSG:3857, 
 tile grid by whole pixels. Unlike `gdal_translate -of MBTiles`, the lower zoom levels are written
 too, as `gdaladdo` would add them (and as GDAL's PMTiles driver writes them): down to the level
 whose single tile covers the raster, or `--minzoom`. Creation options (`--co`): `TILE_FORMAT`
-(`PNG`, `JPEG`, `WEBP` lossless), `QUALITY`, `RESAMPLING`, `ZOOM_LEVEL_STRATEGY`, `MINZOOM`,
+(`PNG`, `JPEG`, `WEBP` lossless), `QUALITY`, `RESAMPLING`, `OVERVIEW_RESAMPLING`, `ZOOM_LEVEL_STRATEGY`, `MINZOOM`,
 `MAXZOOM`, `NAME`, `DESCRIPTION`, `TYPE`. Tile archives hold 1 to 4 Byte bands: convert other
 data types first (`terrio translate --ot Byte --scale`).
+
+`RESAMPLING` controls the base reprojection and, by default, lower zoom levels (default
+`bilinear`). Optional `OVERVIEW_RESAMPLING` overrides only the lower zoom levels, for example
+`--co RESAMPLING=BILINEAR --co OVERVIEW_RESAMPLING=AVERAGE`. Omit it to preserve existing
+behavior. It uses the existing tile pyramid methods: `near`/`nearest`, `average`, `bilinear`,
+and `cubic` (also used for `cubicspline` and `lanczos`); other names retain the pyramid's
+bilinear fallback. This control does not establish pixel or alpha equivalence with GDAL for
+all inputs. Rust callers can set `TileWriteOptions::overview_resampling` or the creation
+option; Python uses `write(..., options={"RESAMPLING": "BILINEAR",
+"OVERVIEW_RESAMPLING": "AVERAGE"})`, and JavaScript uses
+`toBytes("out.pmtiles", {creationOptions: {RESAMPLING: "BILINEAR", OVERVIEW_RESAMPLING: "AVERAGE"}})`.
 
 A raster opened lazily (`terrio convert`, Python `open_raster(path, lazy=True).write(...)`) is
 tiled without being held whole. One already on its zoom level's grid (in EPSG:3857 at that

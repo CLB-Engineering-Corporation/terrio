@@ -55,7 +55,7 @@ pub(crate) enum Method {
 }
 
 impl Method {
-    /// The method `RESAMPLING` names, as the pyramid maps it.
+    /// The selected overview resampling name, as the existing pyramid maps it.
     pub(crate) fn parse(resampling: Option<&str>) -> Self {
         match resampling.unwrap_or("bilinear").to_ascii_lowercase().as_str() {
             "near" | "nearest" => Self::Nearest,
