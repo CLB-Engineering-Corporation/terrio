@@ -269,3 +269,18 @@ including `locationName`, `sourceCrsFieldName`, `sourceCrsFormat`, `fetchMetadat
 `sourceLayerNames`/`sourceLayerIndexes`; the latter remain original zero-based layer
 numbers. Acceptance flags and `datasetNameOnly` match the CLI. Strings represent
 non-finite nodata, e.g. `["nan"]`.
+
+## Selective scientific package
+
+For a single-threaded NetCDF/HDF5 package using the existing `netcdf-hdf5`
+Cargo feature, see [Scientific WASM builds](../docs/scientific-wasm-build.md).
+`node build.mjs --no-default-features --features netcdf-hdf5 --out-dir pkg-scientific`
+builds only that module, with generated declarations and project license notices.
+Use a fresh output directory. This is a custom feature selection, not another
+published npm preset; `terrio-js/core` does not include NetCDF/HDF5.
+
+Packaging regressions run without Rust or WASM tools:
+
+```sh
+node --test js/tests/build*.test.mjs
+```
