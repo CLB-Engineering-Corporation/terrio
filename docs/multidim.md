@@ -165,3 +165,61 @@ no-clobber guarantee even when another process creates an empty destination.
 Named CLI transposition rejects ambiguous dimension names with an explicit error;
 use unique full dimension paths when available. Repeated identical dimension paths
 cannot be transposed by name.
+
+## JavaScript ownership and worker conformance
+
+`MultidimArray.read()` returns a JS-owned copy, not a borrowed view of WebAssembly
+linear memory. Each read has independent storage. Mutating or transferring its
+buffer does not change the source. A returned copy remains valid after subsequent
+reads, WebAssembly memory growth, and disposal of every dataset/array handle.
+Int64 and UInt64 copies remain BigInt typed arrays; do not convert them through Number.
+Packing attributes do not trigger scaling or masking: the fill sentinel remains a
+native sample. Decode CF conventions explicitly in the consumer if needed.
+
+Dataset, array, and derived view wrappers own Rust resources. Call `free()` on each
+wrapper in `finally` blocks, including intermediate selections. Derived views retain
+source storage through shared Rust ownership (Arc); they can still read after their
+parent dataset, array and intermediate views are freed. Releasing a dataset alone
+therefore need not release the encoded input. Do not call methods on freed wrappers.
+Releasing all wrappers allows reuse of allocations; it does not promise that the
+WebAssembly heap high-water mark shrinks.
+
+Pass bytes into a module worker, open and select there, free wrappers there, then
+transfer the JS-owned result buffer with `postMessage(result, [result.buffer])`.
+Transfer detaches the sender's buffer. WASM wrappers cannot be transferred. Worker
+termination cancels synchronous work by ending the worker; an AbortSignal alone
+cannot interrupt synchronous decoding. See `js/examples/scientific-worker.mjs` for
+a minimal single-threaded example using the existing `openMultidim` API.
+
+The independent fixture generator follows the h5netcdf/NumPy mechanism in
+`scripts/compare_multidim_with_gdal.py`:
+
+```sh
+python js/tests/scientific-fixtures.py
+node js/tests/scientific-browser.mjs js/pkg/terrio.js js/pkg/terrio_bg.wasm
+```
+
+The checked-in fixture is synthetic: a non-square Int16 packed cube with gzip
+chunks `(1,2,2)`, a fill sentinel, coordinate/calendar attributes, and UInt16,
+Int64, UInt64 and Float64 siblings. Expectations come from explicit source values,
+not a Terrio round trip. All comparisons are exact (including NaN identity).
+The runner takes a wasm-bindgen **web** module and matching WASM paths; adjust them
+to the scientific build output. It follows `PLAYWRIGHT_MODULE` and `BROWSERS` from
+`js/tests/browser.mjs`. Missing artifacts or features fail rather than skip.
+It runs on a plain origin without COOP/COEP, checks main-thread and worker reads,
+forces one page of memory growth, transfers inputs/results, checks detachment,
+repeats three jobs per worker, and verifies retained copies after termination.
+It reports fixture bytes and direct conformance elapsed time; this timing is not
+a decode benchmark or a retained-memory/leak measurement. Byte-based opens still
+receive the whole encoded file; these tests make no HTTP range-I/O claim.
+The runner also reports module initialization separately. Selective builds check
+that Zarr operations report the excluded feature clearly.
+
+The Rust ownership regressions include `crates/terrio/tests/data/multidim-userblock.h5`,
+written independently with h5py using a real 512-byte HDF5 userblock:
+
+```python
+import h5py
+with h5py.File('multidim-userblock.h5', 'w', userblock_size=512) as f:
+    f.create_dataset('sample', data=[-7, 0, 42], dtype='<i2')
+```
