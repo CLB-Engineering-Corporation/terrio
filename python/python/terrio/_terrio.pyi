@@ -2177,7 +2177,11 @@ def blend(
     tile_size: int | None = None,
     bigtiff: bool = False,
 ) -> Raster:
-    """Blends equal-sized Byte images, with GDAL operators and opacity 0..100."""
+    """Blends equal-sized Byte images, with GDAL operators and opacity 0..100.
+
+    From paths to ``dst`` (not one of the inputs), the inputs are read and the output written a
+    strip of rows at a time, and the result is returned lazily.
+    """
     ...
 
 def gpkg_repack(path: str | os.PathLike[str]) -> dict[str, Any]: ...

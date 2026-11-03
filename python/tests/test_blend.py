@@ -26,3 +26,40 @@ def test_blend_alpha_and_output(tmp_path):
     with pytest.raises(ValueError, match="opacity"):
         terrio.blend(base, overlay, opacity=101)
     assert out.nodata is None
+
+
+@pytest.mark.parametrize("operator", ["src-over", "hsv-value", "multiply", "color-burn"])
+def test_blend_path_to_path_streams_the_in_memory_blend(tmp_path, operator):
+    rng = np.random.default_rng(7)
+    transform = (500000, 2, 0, 4500000, 0, -2)
+    relief = rng.integers(0, 256, (4, 300, 70), dtype="uint8")
+    relief[3, :40] = 0
+    shade = rng.integers(0, 256, (1, 300, 70), dtype="uint8")
+    terrio.Raster.from_array(relief, transform, crs="EPSG:32615").write(
+        str(tmp_path / "relief.tif")
+    )
+    terrio.Raster.from_array(shade, transform, crs="EPSG:32615").write(str(tmp_path / "shade.tif"))
+    expected = terrio.blend(
+        str(tmp_path / "relief.tif"), str(tmp_path / "shade.tif"), operator=operator, opacity=60
+    )
+    out = terrio.blend(
+        str(tmp_path / "relief.tif"),
+        str(tmp_path / "shade.tif"),
+        str(tmp_path / "out.tif"),
+        operator=operator,
+        opacity=60,
+    )
+    np.testing.assert_array_equal(out.read(), expected.read())
+    assert out.transform == expected.transform
+    assert out.crs == expected.crs
+    assert out.nodata is None
+    # An output that is one of the inputs: the inputs are read whole first.
+    again = terrio.blend(
+        str(tmp_path / "relief.tif"),
+        str(tmp_path / "shade.tif"),
+        str(tmp_path / "relief.tif"),
+        operator=operator,
+        opacity=60,
+    )
+    np.testing.assert_array_equal(again.read(), expected.read())
+    np.testing.assert_array_equal(terrio.open(str(tmp_path / "relief.tif")).read(), expected.read())

@@ -98,6 +98,10 @@ impl StripWriter {
 
     /// A source mask is supplied with each strip instead of held in `options.mask`.
     pub fn create_masked(header: &RasterDataset, path: &str, options: &RasterWriteOptions, source_mask: bool) -> Result<Self> {
+        // PHOTOMETRIC=RGB and ALPHA=YES from the header's bands, as `crate::write_raster_dataset`
+        // takes them, so a streamed RGB(A) file is the file written whole.
+        let derived = crate::dataset::color_options(header, path, options);
+        let options = derived.as_ref().unwrap_or(options);
         let mut inherited = options.inherited_from(header, options.driver.or_else(|| RasterDriver::for_extension(path)));
         if source_mask {
             inherited.mask = Some(Vec::new());
