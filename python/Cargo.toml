@@ -35,3 +35,6 @@ arrow-array = { workspace = true, features = ["ffi"] }
 # The `terrio` command (`terrio.__main__`); not in the Pyodide wheel, where there is no shell.
 [target.'cfg(not(target_os = "emscripten"))'.dependencies]
 terrio-cli.workspace = true
+# ZSTD GeoParquet writing (`write_geoparquet_layers`, the ras2cng archive profile) through the
+# zstd C library; not in the Pyodide wheel, which is built without C.
+terrio = { workspace = true, features = ["parquet-zstd"] }

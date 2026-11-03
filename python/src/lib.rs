@@ -9,6 +9,7 @@ mod cog_writer;
 mod config;
 mod dataset_files;
 mod focal;
+mod geoparquet;
 mod gpkg_maintenance;
 mod grid;
 mod inspection;
@@ -263,6 +264,7 @@ fn _terrio(m: &Bound<'_, PyModule>) -> PyResult<()> {
     vector_geom::register(m)?;
     vsi::register(m)?;
     vector_dataset::register(m)?;
+    geoparquet::register(m)?;
     #[cfg(not(target_os = "emscripten"))]
     cli::register(m)?;
     Ok(())

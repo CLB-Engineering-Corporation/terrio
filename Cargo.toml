@@ -39,15 +39,19 @@ acadrust = { version = "=0.6.7", default-features = false }
 flatgeobuf = { version = "6", default-features = false }
 # The version flatgeobuf's generated code is built with.
 flatbuffers = "=24.12.23"
-# GeoParquet reading and writing (drivers/vector/geoparquet.rs).
-# Without its Zstandard (the zstd C library): terrio reads Zstandard pages itself
-# (drivers/vector/geoparquet_zstd.rs).
-parquet = { version = "58", default-features = false, features = ["arrow", "snap", "brotli", "flate2-zlib-rs", "lz4", "base64", "simdutf8"] }
-arrow-array = "58"
-arrow-schema = "58"
+# GeoParquet reading and writing (drivers/vector/geoparquet.rs and the `geoparquet` module of
+# Arrow layers). Without its Zstandard (the zstd C library) by default: terrio reads Zstandard
+# pages itself (drivers/vector/geoparquet_zstd.rs); terrio's opt-in `parquet-zstd` feature
+# enables it for ZSTD GeoParquet writing. The Arrow major matches ras-commander-fast-hdf's, so its
+# record batches pass to `terrio::geoparquet` without conversion.
+parquet = { version = "59", default-features = false, features = ["arrow", "snap", "brotli", "flate2-zlib-rs", "lz4", "base64", "simdutf8"] }
+arrow-array = "59"
+arrow-schema = "59"
 # Arrow IPC streams of vector layers; already built for parquet.
-arrow-ipc = { version = "58", default-features = false }
-arrow-buffer = "58"
+arrow-ipc = { version = "59", default-features = false }
+arrow-buffer = "59"
+# Reordering the rows of GeoParquet layers (Hilbert order); already built for parquet.
+arrow-select = "59"
 bytes = "1"
 quick-xml = "0.42"
 # Multi-byte DBF code pages (CP932, CP936, CP949, CP950) of shapefiles, with the differences of
