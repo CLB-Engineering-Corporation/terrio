@@ -142,7 +142,7 @@ enum Command {
     ///
     /// Samples one or more bands, transforming coordinates for each raster.
     #[command(visible_alias = "point-sample")]
-    Sample(cmd::processing::SampleArgs),
+    Sample(cmd::processing::PointSampleArgs),
     /// Trace contour lines from a raster band.
     ///
     /// Uses interval or fixed elevation levels.

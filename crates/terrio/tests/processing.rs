@@ -382,3 +382,100 @@ fn sampling_rounding_respects_precision_limits_and_zero_decimal_places() {
         assert_eq!(out.features[0].attributes[1], V::Float(expected));
     }
 }
+
+#[test]
+fn lazy_sampling_matches_eager_rotated_reprojected_points_and_edges() {
+    use terrio::ops::sample::{LazySampleInput, LazySampleOptions, sample_lazy};
+    for gt in [[0., 1., 0., 2., 0., -1.], [0., 1., 0.25, 0., 0.5, 1.]] {
+        let mut ds = raster(2, 2, 1, &[0., 2., 3., 4.], None);
+        ds.set_geo_transform(gt);
+        ds.raster.crs.epsg = Some(3857);
+        let t = terrio::crs::Transformer::new(&ds.crs(), &terrio::crs::SpatialRef::from_epsg(4326).unwrap()).unwrap();
+        let mut geometries = vec![];
+        for (col, row) in [(1.5, 0.5), (0.5, 1.5), (0.5, 0.5), (-0.1, 0.5), (2.1, 0.5), (0.5, 2.1)] {
+            let (x, y) = t.transform(gt[0] + gt[1] * col + gt[2] * row, gt[3] + gt[4] * col + gt[5] * row).unwrap();
+            geometries.push(Some(G::point(x, y)));
+        }
+        let p = layer(geometries);
+        let eager = sample(&p, &sample_inputs(&ds)).unwrap();
+        let mut lazy = terrio::LazyRaster::from(ds);
+        let out = sample_lazy(
+            &p,
+            &mut [LazySampleInput { field_name: "value".into(), raster: &mut lazy, band: 1 }],
+            &LazySampleOptions::default(),
+        )
+        .unwrap();
+        for (a, b) in out.features.iter().zip(&eager.features) {
+            assert_eq!(a.fid, b.fid);
+            assert_eq!(a.geometry, b.geometry);
+            assert_eq!(a.attributes, b.attributes);
+        }
+    }
+    // Exact half-open boundaries, without a CRS round trip.
+    let ds = raster(2, 2, 1, &[0., 2., 3., 4.], None);
+    let mut lazy = terrio::LazyRaster::from(ds);
+    let mut p = layer(vec![Some(G::point(0., 2.)), Some(G::point(2., 2.)), Some(G::point(0., 0.)), Some(G::point(1., 1.))]);
+    p.set_crs_epsg(None);
+    let out =
+        sample_lazy(&p, &mut [LazySampleInput { field_name: "value".into(), raster: &mut lazy, band: 1 }], &LazySampleOptions::default())
+            .unwrap();
+    assert_eq!(
+        out.features.iter().map(|f| f.attributes[1].clone()).collect::<Vec<_>>(),
+        vec![V::Float(0.), V::Null, V::Null, V::Float(4.)]
+    );
+}
+
+#[test]
+fn lazy_sampling_transform_policy_and_setup_errors() {
+    use terrio::ops::sample::{LazySampleInput, LazySampleOptions, sample_lazy};
+    let mut ds = raster(1, 1, 1, &[42.], None);
+    ds.raster.crs = terrio::crs::SpatialRef::parse("+proj=ortho +lat_0=0 +lon_0=0 +datum=WGS84 +units=m").unwrap().to_crs_info();
+    ds.set_geo_transform([-1., 2., 0., 1., 0., -2.]);
+    let mut lazy = terrio::LazyRaster::from(ds);
+    let p = layer(vec![Some(G::point(180., 0.)), Some(G::point(0., 0.))]);
+    let mut input = [LazySampleInput { field_name: "label".into(), raster: &mut lazy, band: 1 }];
+    let mut options = LazySampleOptions { status_suffix: Some("_status".into()), ..Default::default() };
+    let out = sample_lazy(&p, &mut input, &options).unwrap();
+    assert_eq!(out.schema.fields()[1].name, "label_2");
+    assert_eq!(out.schema.fields()[2].name, "label_2_status");
+    assert_eq!(out.features[0].attributes[1..], [V::Null, V::Text("transform-error".into())]);
+    assert_eq!(out.features[1].attributes[1..], [V::Float(42.), V::Text("valid".into())]);
+    options.strict_transform_errors = true;
+    assert!(sample_lazy(&p, &mut input, &options).is_err());
+    let mut bad = raster(1, 1, 1, &[1.], None);
+    bad.raster.crs.epsg = Some(999999);
+    let mut bad = terrio::LazyRaster::from(bad);
+    assert!(
+        sample_lazy(&p, &mut [LazySampleInput { field_name: "v".into(), raster: &mut bad, band: 1 }], &LazySampleOptions::default())
+            .is_err()
+    );
+}
+
+#[test]
+fn lazy_sampling_reads_internal_and_external_dataset_masks() {
+    use terrio::ops::sample::{LazySampleInput, LazySampleOptions, sample_lazy};
+    let dir = tempfile::tempdir().unwrap();
+    let ds = raster(2, 1, 1, &[0., 8.], None);
+    for internal in [true, false] {
+        let path = dir.path().join(if internal { "internal.tif" } else { "external.tif" });
+        let options = terrio::RasterWriteOptions { mask: internal.then(|| vec![255, 0]), ..Default::default() };
+        terrio::write_raster_dataset(&ds, path.to_str().unwrap(), &options).unwrap();
+        if !internal {
+            let mask = raster(2, 1, 1, &[255., 0.], None);
+            terrio::write_raster_dataset(
+                &mask,
+                &format!("{}.msk", path.display()),
+                &terrio::RasterWriteOptions { driver: Some(terrio::formats::RasterDriver::GTiff), ..Default::default() },
+            )
+            .unwrap();
+        }
+        let mut lazy = terrio::open_raster_lazy(path.to_str().unwrap()).unwrap();
+        assert!(lazy.has_mask());
+        let mut p = layer(vec![Some(G::point(0.5, 0.5)), Some(G::point(1.5, 0.5))]);
+        p.set_crs_epsg(None);
+        let options = LazySampleOptions { status_suffix: Some("_status".into()), ..Default::default() };
+        let out = sample_lazy(&p, &mut [LazySampleInput { field_name: "v".into(), raster: &mut lazy, band: 1 }], &options).unwrap();
+        assert_eq!(out.features[0].attributes[1..], [V::Float(0.), V::Text("valid".into())]);
+        assert_eq!(out.features[1].attributes[1..], [V::Null, V::Text("nodata".into())]);
+    }
+}

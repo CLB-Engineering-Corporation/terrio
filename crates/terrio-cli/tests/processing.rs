@@ -377,3 +377,51 @@ fn vector_grid_accepts_negative_search_axes_and_refuses_large_grids() {
     assert!(String::from_utf8_lossy(&result.stderr).contains("too large"));
     assert!(!d.join("large.tif").exists());
 }
+
+#[test]
+fn lazy_sample_multiband_multiraster_defers_output_reprojection() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    std::fs::write(d.join("points.geojson"), r#"{"type":"FeatureCollection","features":[{"type":"Feature","properties":{"site":7},"geometry":{"type":"Point","coordinates":[1.5,0.5]}}]}"#).unwrap();
+    let cfg = terrio::RasterConfig { cols: 2, rows: 1, bands: 2, data_type: terrio::DataType::F64, ..Default::default() };
+    let mut ds = terrio::RasterDataset::new(terrio::Raster::from_data(cfg, vec![0., 1.2345, 2., 3.4567]).unwrap(), false);
+    ds.raster.crs.epsg = Some(4326);
+    ds.set_geo_transform([0., 1., 0., 1., 0., -1.]);
+    for name in ["a.tif", "b.tif"] {
+        terrio::write_raster_dataset(&ds, d.join(name).to_str().unwrap(), &Default::default()).unwrap();
+    }
+    ok(
+        &[
+            "sample",
+            "points.geojson",
+            "sampled.gpkg",
+            "--lazy",
+            "--raster",
+            "a.tif",
+            "--raster",
+            "b.tif",
+            "--band",
+            "1,2",
+            "--status-suffix",
+            "_status",
+            "--t-srs",
+            "EPSG:3857",
+            "--decimal-places",
+            "2",
+        ],
+        d,
+    );
+    let out = first(&d.join("sampled.gpkg"));
+    let f = &out.features[0];
+    assert_eq!(f.attributes[0], terrio::FieldValue::Integer(7));
+    for (index, value) in [(1, 1.23), (3, 3.46), (5, 1.23), (7, 3.46)] {
+        assert_eq!(f.attributes[index], terrio::FieldValue::Float(value));
+        assert_eq!(f.attributes[index + 1], terrio::FieldValue::Text("valid".into()));
+    }
+    let Some(terrio::Geometry::Point(c)) = &f.geometry else { panic!() };
+    assert!(c.x > 100000. && c.y > 50000.);
+    assert_eq!(out.crs_epsg(), Some(3857));
+    assert!(
+        !run(&["sample", "points.geojson", "bad.gpkg", "--lazy", "--raster", "a.tif", "--sample-window-size", "0"], d).status.success()
+    );
+}

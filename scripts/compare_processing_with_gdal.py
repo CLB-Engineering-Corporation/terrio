@@ -228,7 +228,7 @@ def traditional(srs):
     return srs
 
 
-def compare_sample(terrio: Path, sources: list[Path], work: Path) -> None:
+def compare_sample(terrio: Path, sources: list[Path], work: Path, lazy: bool = False) -> None:
     rasters = [gdal.Open(str(p)) for p in sources]
     wgs84 = osr.SpatialReference()
     wgs84.ImportFromEPSG(4326)
@@ -260,12 +260,14 @@ def compare_sample(terrio: Path, sources: list[Path], work: Path) -> None:
             }
         )
     )
-    output = work / "samples.gpkg"
+    output = work / ("lazy_samples.gpkg" if lazy else "samples.gpkg")
     args = [
         arg
         for i, p in enumerate(sources)
         for arg in ("--raster", str(p), "--prefix", f"r{i}")
     ]
+    if lazy:
+        args.extend(["--lazy", "--status-suffix", "_status"])
     run(terrio, "sample", source, output, *args)
     result = features(output)
     assert len(result) == len(points)
@@ -279,13 +281,18 @@ def compare_sample(terrio: Path, sources: list[Path], work: Path) -> None:
             col, row = gdal.ApplyGeoTransform(inverse, x, y)
             col, row = math.floor(col), math.floor(row)
             expected = None
+            status = "outside"
             if 0 <= col < raster.RasterXSize and 0 <= row < raster.RasterYSize:
+                status = "nodata"
                 v = float(band.ReadAsArray(col, row, 1, 1)[0, 0])
                 if (
                     math.isfinite(v)
                     and band.GetMaskBand().ReadAsArray(col, row, 1, 1)[0, 0]
                 ):
                     expected = v
+                    status = "valid"
+            if lazy:
+                assert result[j][f"r{i}_b1_status"] == status
             got = result[j][f"r{i}_b1"]
             assert got == expected, (i, j, got, expected)
             assert result[j]["site"] == j
@@ -294,7 +301,7 @@ def compare_sample(terrio: Path, sources: list[Path], work: Path) -> None:
             valid_count += expected is not None
     assert valid_count > 0
     print(
-        f"PASS multi-raster sampling: {len(points)} points, {len(rasters)} rasters, {valid_count} valid samples; values/nulls identical"
+        f"PASS {'lazy' if lazy else 'eager'} multi-raster sampling: {len(points)} points, {len(rasters)} rasters, {valid_count} valid samples; values/nulls identical"
     )
 
 
@@ -303,11 +310,34 @@ def main() -> None:
     parser.add_argument("data", type=Path)
     parser.add_argument("--terrio", type=Path, default=Path("target/debug/terrio"))
     parser.add_argument("--only-footprint", action="store_true")
+    parser.add_argument("--only-sample", action="store_true")
     args = parser.parse_args()
     terrio, data = args.terrio.resolve(), args.data.resolve()
     print(f"GDAL {gdal.VersionInfo('--version')}")
     with tempfile.TemporaryDirectory(prefix="terrio-processing-") as tmp:
         work = Path(tmp)
+        if args.only_sample:
+            # Public COG fixture and derived rotated/masked copies. No private inputs.
+            source = data / "cog.tif"
+            compare_sample(terrio, [source], work)
+            compare_sample(terrio, [source], work, lazy=True)
+            for external in (False, True):
+                path = work / f"masked_{external}.tif"
+                with gdal.config_option("GDAL_TIFF_INTERNAL_MASK", "NO" if external else "YES"):
+                    ds = gdal.Translate(str(path), str(source), srcWin=[0, 0, 64, 64])
+                    gt = list(ds.GetGeoTransform())
+                    gt[2], gt[4] = gt[1] / 4, gt[5] / 4
+                    ds.SetGeoTransform(gt)
+                    band = ds.GetRasterBand(1)
+                    band.CreateMaskBand(gdal.GMF_PER_DATASET)
+                    mask = band.GetMaskBand().ReadAsArray()
+                    mask[::2, ::2] = 0
+                    band.GetMaskBand().WriteArray(mask)
+                    ds.FlushCache()
+                    ds.Close()
+                    ds = None
+                compare_sample(terrio, [source, path], work, lazy=True)
+            return
         if args.only_footprint:
             for name in ("dem.tif", "landsat.tif"):
                 compare_footprint(terrio, data / name, work)
