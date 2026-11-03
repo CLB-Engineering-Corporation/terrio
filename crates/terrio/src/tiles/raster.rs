@@ -821,6 +821,8 @@ fn warp_level(ds: &RasterDataset, o: &TileWriteOptions, grid: Option<Grid>) -> R
         d => d.to_f64_vec().into_iter().map(|v| v.clamp(0.0, 255.0) as u8).collect(),
     };
     // Fully transparent source pixels do not count, as with GDAL's source alpha.
+    // NaN is only a validity sentinel here. Keep double precision so the generic
+    // warper does not quantize interpolation to Float32 before Byte conversion.
     let color = if src_alpha {
         let a = &values[data_bands * sn..];
         let mut v = values[..data_bands * sn].to_vec();
@@ -830,7 +832,7 @@ fn warp_level(ds: &RasterDataset, o: &TileWriteOptions, grid: Option<Grid>) -> R
             }
         }
         wo.src_nodata = crate::ops::warp::Nodata::Values(vec![f64::NAN]);
-        with_bands(v, data_bands, DataType::F32)
+        with_bands(v, data_bands, DataType::F64)
     } else {
         with_bands(values[..data_bands * sn].to_vec(), data_bands, DataType::U8)
     };
@@ -1076,7 +1078,7 @@ fn aligned_level(header: &RasterDataset, o: &TileWriteOptions) -> Result<Option<
     Ok(Some((WarpPlanned { zoom: p.zoom, minx: p.sgt[0], maxy: p.sgt[3], width: p.width, height: p.height }, dx, dy)))
 }
 
-/// What [`LevelSource`] gives the warp: the data bands, as Byte, or as Float32 that is NaN where
+/// What [`LevelSource`] gives the warp: the data bands, as Byte, or as Float64 that is NaN where
 /// the alpha band is 0 (`masked`); the alpha band; or an alpha of 255 everywhere.
 #[cfg(not(target_family = "wasm"))]
 enum LevelBands {
@@ -1099,7 +1101,7 @@ impl<'a, 'r> LevelSource<'a, 'r> {
     fn new(src: &'a std::sync::Mutex<&'r mut crate::LazyRaster>, header: &RasterDataset, what: LevelBands) -> Self {
         // As `warp_level` builds the rasters it warps from the source.
         let (bands, t) = match what {
-            LevelBands::Data { bands, masked: true } => (bands, DataType::F32),
+            LevelBands::Data { bands, masked: true } => (bands, DataType::F64),
             LevelBands::Data { bands, masked: false } => (bands, DataType::U8),
             LevelBands::Alpha(_) | LevelBands::Opaque => (1, DataType::U8),
         };
@@ -1133,7 +1135,7 @@ impl crate::ops::warp::WarpSource for LevelSource<'_, '_> {
                 };
                 let a = &v[bands * n..(bands + 1) * n];
                 // Fully transparent source pixels do not count, as with GDAL's source alpha.
-                (RasterData::F32((0..bands * n).map(|i| if a[i % n] == 0 { f32::NAN } else { v[i] as f32 }).collect()), bands)
+                (RasterData::F64((0..bands * n).map(|i| if a[i % n] == 0 { f64::NAN } else { v[i] as f64 }).collect()), bands)
             }
             LevelBands::Alpha(band) => (read(vec![band])?.raster.data, 1),
             LevelBands::Opaque => (RasterData::U8(vec![255; n]), 1),
@@ -1510,6 +1512,50 @@ fn cut_tiles(l: &Pixels, z: u8, sx: i64, sy: i64, format: TileFormat, quality: u
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Independent GDAL 3.13.3 MBTiles Byte/bilinear samples from the opaque
+    /// EPSG:4326 fixture in compare_tile_rgba_with_gdal.py. These values lie
+    /// just below byte half-integers; staging masked colors as Float32 changes them.
+    #[test]
+    fn alpha_mask_staging_preserves_byte_bilinear_rounding() {
+        let (w, h) = (513, 377);
+        let mut values = Vec::new();
+        for b in 0..4 {
+            for y in 0..h {
+                for x in 0..w {
+                    values.push(match b {
+                        0 => ((x * 17 + y * 3) % 256) as u8,
+                        1 => ((x * 5 + y * 23) % 256) as u8,
+                        2 => ((x * 7 + y * 11) % 256) as u8,
+                        _ => 255,
+                    });
+                }
+            }
+        }
+        let ds = crate::drivers::common::make_raster(
+            w,
+            h,
+            4,
+            RasterData::U8(values),
+            [-88.1234567, 0.0001, 0.0, 33.1234567, 0.0, -0.0001],
+            SpatialRef::from_epsg(4326).unwrap().to_crs_info(),
+            None,
+        )
+        .unwrap();
+        let ds = RasterDataset::with_driver(ds, crate::formats::RasterDriver::GTiff, false);
+        let tiles = make_tiles(&ds, &TileWriteOptions { min_zoom: Some(14), ..Default::default() }).unwrap();
+        for (tx, tms_y, y, x, band, expected) in [
+            (4182, 9790, 238, 7, 2, 237),
+            (4183, 9789, 80, 146, 0, 172),
+            (4183, 9789, 181, 31, 0, 66),
+            (4183, 9790, 63, 39, 0, 144),
+            (4183, 9790, 135, 140, 0, 237),
+        ] {
+            let tile = tiles.tiles.iter().find(|(z, x, y, _)| *z == 14 && *x == tx && *y == (1 << 14) - 1 - tms_y).unwrap();
+            let image = decode_image(&tile.3).unwrap();
+            assert_eq!(image.data[(y * 256 + x) * image.channels + band], expected);
+        }
+    }
 
     /// The pyramid as terrio computed it before it streamed: every level held whole.
     fn pyramid_reference(
