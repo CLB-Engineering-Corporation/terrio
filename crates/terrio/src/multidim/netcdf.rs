@@ -244,6 +244,8 @@ fn owned_storage(bytes: Vec<u8>) -> hdf5_reader::storage::DynStorage {
 }
 pub(super) fn open_bytes_owned(bytes: Vec<u8>) -> Result<Dataset> {
     let classic = bytes.starts_with(b"CDF");
+    let driver = if classic { "netCDF" } else { "HDF5" };
+    crate::formats::check_driver_allowed(driver, "a file in memory", crate::formats::Kind::Raster)?;
     // Both metadata readers share retained storage, including any userblock.
     // The pinned BytesStorage converts Vec to Arc<[u8]>; avoid an extra Vec clone here.
     let storage = owned_storage(bytes);
