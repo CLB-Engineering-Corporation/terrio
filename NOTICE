@@ -1596,7 +1596,7 @@ The tile AVERAGE fractional footprint and accumulation arithmetic in
 crates/terrio/src/tiles/pyramid.rs and crates/terrio/src/tiles/raster.rs
 follows GDAL 3.13 gcore/overview.cpp
 (GDALResampleChunk_AverageOrRMS_T), with the source copyrights below.
-Source: https://github.com/OSGeo/gdal/blob/v3.13.0/gcore/overview.cpp
+Source: https://github.com/OSGeo/gdal/blob/v3.13.3/gcore/overview.cpp
 
 GDAL raster-management source copyrights (MIT):
 - gcore/overview.cpp: Copyright (c) 2000, Frank Warmerdam;
