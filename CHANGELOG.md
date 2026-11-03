@@ -15,9 +15,7 @@
 - Arrow and Parquet move to major 59 (arrow 59.0, parquet 59.0, the versions
   ras-commander-fast-hdf builds with), so the HEC-RAS engine's record batches pass to
   `terrio::geoparquet` without conversion. wbvector's own GeoParquet support (parquet
-  58) is no longer built: terrio's GeoParquet driver already read and wrote `.parquet`,
-  and a GeoParquet file without that extension is now recognized by its `PAR1`
-  signature with terrio's driver.
+  58) is no longer built: terrio's GeoParquet driver already read and wrote `.parquet`.
 
 - XLSX layout options beyond GDAL: `HEADER_ROWS`, `RANGE` and `FIRST_ROW` when reading, and
   `HEADER_STYLE`, `FREEZE_HEADER`, `AUTOFILTER`, `COLUMN_WIDTH`, `DATE_FORMAT`, `DATETIME_FORMAT`
@@ -246,6 +244,17 @@
   `File Type` is `HEC-RAS Geometry` or `HEC-RAS Results`; other HDF5 and
   NetCDF files are not affected. Compared with h5py on the HEC-RAS 7.0.1 files
   of a public corpus: every value identical. See `docs/hecras.md`.
+- The HECRAS driver reads its mesh and family layers through the engine's Arrow layer catalog
+  (`ras_commander_fast_hdf::arrow_layers`), which also names their fields: one source of
+  HEC-RAS layer rules and names for terrio and ras2cng. `mesh_cell_points` keeps a null
+  `is_ghost` for a mesh without a recorded cell count, a structure without a centerline is a
+  feature without geometry, a family attribute stored as NaN is null, and `MeshLayer::omitted` lists the cells left out of
+  `mesh_cells`. The typed engine API remains for joins, face points, quarantined cells and
+  HEC-RAS 5.0 layouts without a 2D flow area table.
+- `terrio::hecras::archive` (Python `terrio.hecras.archive_layers` and
+  `terrio.hecras.write_archive`): a HEC-RAS geometry or plan HDF file straight to an archive
+  GeoParquet file (ras2cng's layout), with the layers as Arrow tables so that a caller can add
+  its own; refused layers and variables are listed, not fatal. See `docs/hecras.md`.
 - `hdf5-reader` and `netcdf-reader` are the crates.io 0.10.1 releases; the
   `[patch]` to a netcdf-rust branch is gone (its fix, roteiro-gis/netcdf-rust#95,
   is in 0.10). The HEC-RAS engine uses the same `hdf5-reader`, so a build

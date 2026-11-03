@@ -1426,6 +1426,8 @@ https://github.com/gpt-cmdr/ras-commander-fast-hdf
 - pipes.h5 and terrain.h5:
   tests/fixtures/terrio_io/ at commit
   794b8f949f2179f0f9fcdb51417e3c97778c2358.
+- arrow_layers.h5: tests/fixtures/arrow_layers/ (generator
+  tests/generate_arrow_layers_fixture.py) of the v0.3.0 release.
 
 results_mesh_xs.h5 is derived from coverage_mesh.h5 by
 scripts/make_hecras_fixture.py, results_two_areas.h5 from results_mesh_xs.h5 by

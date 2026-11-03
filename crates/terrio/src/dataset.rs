@@ -1010,14 +1010,6 @@ fn open_local(path: &str, options: &VectorOpenOptions) -> Result<Dataset> {
     {
         return Ok(ds);
     }
-    // GeoParquet by its signature, with terrio's own driver.
-    #[cfg(feature = "parquet")]
-    if raster.is_err() {
-        let mut head = [0u8; 4];
-        if std::fs::File::open(path).and_then(|mut f| std::io::Read::read_exact(&mut f, &mut head)).is_ok() && &head == b"PAR1" {
-            return read_vector_local(path, VectorDriver::Parquet, options).map(Dataset::Vector);
-        }
-    }
     match raster {
         Ok(r) => Ok(Dataset::Raster(r)),
         Err(raster_err) if !wbvector_fallback_allowed() => Err(Error::Unsupported(format!(

@@ -113,6 +113,7 @@ path = [
     "crates/terrio/tests/data/hecras/coverage_mesh_nogeometry.h5",
     "crates/terrio/tests/data/hecras/pipes.h5",
     "crates/terrio/tests/data/hecras/terrain.h5",
+    "crates/terrio/tests/data/hecras/arrow_layers.h5",
 ]
 precedence = "override"
 SPDX-FileCopyrightText = "Copyright (c) 2024 CLB Engineering Corporation"
