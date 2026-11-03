@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- LERC tiles are GDAL's by default: the `LERC_ENCODER` creation option (GeoTIFF and COG) selects
+  `lerc-writer`'s encoder profile, `GDAL` (default; the blobs GDAL writes, byte for byte for
+  floating-point and 16-bit data) or `COMPACT` (the smallest blobs, within the same
+  `MAX_Z_ERROR`). lerc-core, lerc-reader and lerc-writer 0.5.2 (the release with `EncoderProfile`).
 - `terrio blend`, and Python's `terrio.blend` from paths to `dst`, read both inputs and write a
   GeoTIFF or COG a strip of rows at a time (Rust: `ops::blend::blend_to_path`), so memory no
   longer grows with the image: blending a 15,000 x 12,000 RGBA relief with its hillshade peaks
