@@ -552,7 +552,7 @@ impl TileSink for SpillSink {
 mod tests {
     use super::*;
 
-    /// Independent GDAL 3.13.0 MEM RGBA BuildOverviews("AVERAGE", [2])
+    /// Independent GDAL 3.13.3 MEM RGBA BuildOverviews("AVERAGE", [2])
     /// references. Odd dimensions exercise fractional footprints; varying alpha
     /// distinguishes a validity mask from density weighting.
     #[test]
