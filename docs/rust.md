@@ -56,8 +56,10 @@ COGs build factors 2, 4, 8, … until the image fits in one tile, unless
 `RasterWriteOptions::overviews` gives the factors: those levels are then built as for a GeoTIFF
 (each from the previous one, `ceil(cols / f) x ceil(rows / f)`) and written as the COG's, as
 GDAL's COG driver reuses overviews built on its source by `gdaladdo` (`OVERVIEWS=AUTO` or
-`FORCE_USE_EXISTING`; `NONE` or `IGNORE_EXISTING` with factors is refused rather than ignored). Each level reduces the original
-source blocks independently: `nearest` samples the block center (clamped at image edges), and
+`FORCE_USE_EXISTING`; `NONE` or `IGNORE_EXISTING` with factors is refused rather than ignored).
+
+Without explicit factors, the unmasked `SOURCE` policy reduces each automatic
+overview level from the original source blocks independently: `nearest` samples the block center (clamped at image edges), and
 `average` skips nodata and rounds only the final result. Categorical methods retain native
 sample precision, including UInt64 values above 2⁵³. With `ALPHA=YES`, color averages are
 weighted by the last band's alpha; alpha itself is averaged normally. Row-streamed COG output
@@ -121,7 +123,7 @@ terrio::write_raster_dataset(&ds, "depth_cog.tif", &options)?;
 ```
 
 Set `COG_OVERVIEW_POLICY=GDAL_3_13` to select the upstream recursive GDAL
-overview implementation, including alpha and dataset masks. This opt-in policy
+overview implementation with floor-sized levels, including alpha and dataset masks. This opt-in policy
 also supports `rms`, `bilinear`, `cubic`, `cubicspline`, `lanczos` and `gauss`.
 The fork keeps its `SOURCE` default and scientific area-matched/supplied-array
 extensions described above. Neither policy implies a performance advantage.

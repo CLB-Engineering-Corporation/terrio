@@ -225,7 +225,8 @@ fn taps(dst: usize, src_n: usize, ratio: f64, radius: f64, k: Weight) -> Result<
 
 /// Downsampling a level (the source, `sw` x `sh`) to the next one (`w` x `h`), a row at a time,
 /// as `gdaladdo` computes overviews: nearest, average, or a separable convolution whose kernel is
-/// stretched by the reduction factor, with the alpha band as the weights of every band.
+/// stretched by the reduction factor. Average uses alpha as binary validity and weights
+/// fractional source pixel areas; convolution uses alpha values as weights.
 struct Down {
     method: Method,
     nb: usize,
@@ -337,13 +338,39 @@ impl Down {
                     let x1 = (((x + 1) as f64 * self.rx - 1e-8).ceil() as usize).clamp(x0 + 1, sw);
                     let mut sa = 0.0;
                     let mut sv = [0.0f64; 4];
-                    for row in &rows {
+                    for (dy, row) in rows.iter().enumerate() {
+                        let sy = y0 + dy;
+                        let wy = if sy == y0 {
+                            if y1 == y0 + 1 { 1.0 } else { 1.0 - (y as f64 * self.ry - y0 as f64) }
+                        } else if sy + 1 == y1 {
+                            1.0 - (y1 as f64 - (y + 1) as f64 * self.ry)
+                        } else {
+                            1.0
+                        };
+                        let mut line_weight = 0.0;
+                        let mut line_values = [0.0; 4];
                         for sx in x0..x1 {
-                            let m = row[(nb - 1) * sw + sx] as f64;
-                            sa += m;
-                            for (b, v) in sv.iter_mut().enumerate().take(nb) {
-                                *v += m * row[b * sw + sx] as f64;
+                            // GDAL AVERAGE overview masks are binary validity, including
+                            // when the mask is a partial alpha band. Boundary pixels
+                            // contribute only the area covered by the destination pixel.
+                            if row[(nb - 1) * sw + sx] == 0 {
+                                continue;
                             }
+                            let wx = if sx == x0 {
+                                if x1 == x0 + 1 { 1.0 } else { 1.0 - (x as f64 * self.rx - x0 as f64) }
+                            } else if sx + 1 == x1 {
+                                1.0 - (x1 as f64 - (x + 1) as f64 * self.rx)
+                            } else {
+                                1.0
+                            };
+                            line_weight += wx;
+                            for (b, v) in line_values.iter_mut().enumerate().take(nb) {
+                                *v += wx * row[b * sw + sx] as f64;
+                            }
+                        }
+                        sa += line_weight * wy;
+                        for (v, line) in sv.iter_mut().zip(line_values) {
+                            *v += line * wy;
                         }
                     }
                     if sa > 0.0 {
@@ -647,3 +674,74 @@ impl TileSink for SpillSink {
 
 #[cfg(test)]
 pub(crate) mod memory_tests;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Independent GDAL 3.13.0 MEM RGBA BuildOverviews("AVERAGE", [2])
+    /// references. Odd dimensions exercise fractional footprints; varying alpha
+    /// distinguishes a validity mask from density weighting.
+    #[test]
+    fn average_matches_gdal_fractional_footprints_and_alpha_masks() {
+        let cases: &[(usize, usize, u8, &[u8])] = &[
+            (5, 3, 0, &[35, 62, 90, 220, 193, 165, 17, 31, 45, 255, 255, 255, 148, 176, 203, 107, 79, 52, 74, 88, 101, 255, 255, 255]),
+            (5, 3, 1, &[46, 61, 85, 209, 194, 170, 23, 30, 42, 255, 255, 255, 156, 164, 215, 99, 91, 40, 78, 81, 108, 255, 255, 255]),
+            (5, 3, 2, &[59, 57, 95, 196, 198, 160, 29, 28, 47, 78, 164, 173, 148, 159, 213, 107, 96, 42, 74, 79, 106, 149, 191, 93]),
+            (
+                7,
+                5,
+                0,
+                &[
+                    55, 84, 113, 142, 200, 171, 142, 113, 27, 42, 56, 71, 255, 255, 255, 255, 194, 92, 99, 128, 61, 163, 156, 127, 97, 46,
+                    49, 64, 255, 255, 255, 255, 180, 165, 84, 114, 75, 90, 171, 141, 90, 82, 42, 57, 255, 255, 255, 255,
+                ],
+            ),
+            (
+                7,
+                5,
+                1,
+                &[
+                    84, 67, 120, 149, 171, 188, 135, 106, 41, 34, 60, 74, 255, 255, 255, 255, 186, 59, 117, 109, 69, 196, 138, 146, 93, 29,
+                    58, 54, 255, 255, 255, 255, 203, 111, 79, 106, 52, 144, 177, 149, 101, 55, 39, 53, 255, 255, 255, 255,
+                ],
+            ),
+            (
+                7,
+                5,
+                2,
+                &[
+                    65, 81, 130, 130, 190, 174, 125, 125, 32, 40, 65, 64, 154, 129, 203, 90, 200, 129, 92, 143, 55, 126, 163, 112, 100, 64,
+                    46, 71, 171, 140, 135, 198, 159, 167, 103, 114, 96, 88, 152, 141, 79, 83, 51, 57, 80, 179, 131, 140,
+                ],
+            ),
+            (4, 4, 0, &[43, 77, 213, 179, 21, 38, 255, 255, 179, 213, 77, 43, 89, 106, 255, 255]),
+            (4, 4, 1, &[57, 77, 198, 179, 28, 38, 255, 255, 179, 198, 77, 57, 89, 99, 255, 255]),
+            (4, 4, 2, &[51, 77, 204, 179, 25, 38, 64, 191, 187, 213, 68, 43, 93, 106, 64, 191]),
+        ];
+        for &(sw, sh, mask, expected) in cases {
+            let w = sw.div_ceil(2);
+            let h = sh.div_ceil(2);
+            let down = Down::new(Method::Average, 4, sw, sh, w, h).unwrap();
+            let rows: Vec<Vec<u8>> = (0..sh)
+                .map(|y| {
+                    let values: Vec<u8> = (0..sw).map(|x| (((y * sw + x) * 17) % 256) as u8).collect();
+                    let mut row = values.clone();
+                    row.extend(values.iter().map(|v| 255 - v));
+                    row.extend(values.iter().map(|v| v / 2));
+                    row.extend((0..sw).map(|x| {
+                        let i = y * sw + x;
+                        match mask {
+                            1 if i % 3 == 0 => 0,
+                            2 => [0, 64, 127, 255][i % 4],
+                            _ => 255,
+                        }
+                    }));
+                    row
+                })
+                .collect();
+            let actual: Vec<u8> = (0..h).flat_map(|y| down.row(y, &|r| &rows[r], &|_| unreachable!()).unwrap()).collect();
+            assert_eq!(actual, expected, "{sw}x{sh}, mask {mask}");
+        }
+    }
+}

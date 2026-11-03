@@ -4388,47 +4388,52 @@ mod tests {
                     path
                 })
                 .collect();
-            for count in [1, 2] {
-                for resampling in [Resampling::Nearest, Resampling::Bilinear, Resampling::Cubic, Resampling::Average] {
-                    for memory_limit in [64.0 * 1024.0 * 1024.0, 2000.0, 500.0] {
-                        let o = WarpOptions {
-                            resampling,
-                            memory_limit,
-                            src_nodata: Nodata::Values(vec![-9999.0, -8888.0]),
-                            unified_src_nodata: Some(false),
-                            dst_nodata: Nodata::Values(vec![-9999.0]),
-                            ..Default::default()
-                        };
-                        let expected = warp_paths(&paths[..count], &o).unwrap();
-                        for slab in [1, 7, 100] {
-                            let mut lazy: Vec<_> = paths[..count].iter().map(|p| crate::open_raster_lazy(p).unwrap()).collect();
-                            let mut refs: Vec<&mut (dyn WarpSource + Send)> =
-                                lazy.iter_mut().map(|s| s as &mut (dyn WarpSource + Send)).collect();
-                            let actual = with_row_warp(&mut refs, &o, true, |rows| {
-                                let mut values = vec![Vec::new(); band_count];
-                                while rows.done_rows() < rows.height() {
-                                    let before = rows.done_rows();
-                                    let target = (before + slab).min(rows.height());
-                                    rows.advance(target, &mut |data, n| {
-                                        let pixels = data.to_f64_vec();
-                                        let band_pixels = n * expected.raster.cols;
-                                        for (band, out) in values.iter_mut().enumerate() {
-                                            out.extend_from_slice(&pixels[band * band_pixels..(band + 1) * band_pixels]);
+            for unified in [false, true] {
+                for output_type in [DataType::F64, DataType::F32, DataType::U8, DataType::I16] {
+                    for count in [1, 2] {
+                        for resampling in [Resampling::Nearest, Resampling::Bilinear, Resampling::Cubic, Resampling::Average] {
+                            for memory_limit in [64.0 * 1024.0 * 1024.0, 2000.0, 500.0] {
+                                let o = WarpOptions {
+                                    resampling,
+                                    memory_limit,
+                                    src_nodata: Nodata::Values(vec![-9999.0, -8888.0]),
+                                    unified_src_nodata: Some(unified),
+                                    output_type: Some(output_type),
+                                    dst_nodata: Nodata::Values(vec![128.0]),
+                                    ..Default::default()
+                                };
+                                let expected = warp_paths(&paths[..count], &o).unwrap();
+                                for slab in [1, 7, 100] {
+                                    let mut lazy: Vec<_> = paths[..count].iter().map(|p| crate::open_raster_lazy(p).unwrap()).collect();
+                                    let mut refs: Vec<&mut (dyn WarpSource + Send)> =
+                                        lazy.iter_mut().map(|s| s as &mut (dyn WarpSource + Send)).collect();
+                                    let actual = with_row_warp(&mut refs, &o, true, |rows| {
+                                        let mut values = vec![Vec::new(); band_count];
+                                        while rows.done_rows() < rows.height() {
+                                            let before = rows.done_rows();
+                                            let target = (before + slab).min(rows.height());
+                                            rows.advance(target, &mut |data, n| {
+                                                let pixels = data.to_f64_vec();
+                                                let band_pixels = n * expected.raster.cols;
+                                                for (band, out) in values.iter_mut().enumerate() {
+                                                    out.extend_from_slice(&pixels[band * band_pixels..(band + 1) * band_pixels]);
+                                                }
+                                                Ok(())
+                                            })?;
+                                            assert_eq!(rows.done_rows(), target, "advance must respect requested slab");
                                         }
-                                        Ok(())
-                                    })?;
-                                    assert_eq!(rows.done_rows(), target, "advance must respect requested slab");
+                                        Ok(values.into_iter().flatten().collect::<Vec<_>>())
+                                    })
+                                    .unwrap();
+                                    assert_eq!(
+                                        actual,
+                                        expected.raster.data.to_f64_vec(),
+                                        "bands={band_count} sources={count} unified={unified} type={output_type:?} {resampling:?} memory={memory_limit} slab={slab}"
+                                    );
+                                    assert!(actual.contains(&128.0));
+                                    assert!(actual.iter().any(|v| *v != 128.0));
                                 }
-                                Ok(values.into_iter().flatten().collect::<Vec<_>>())
-                            })
-                            .unwrap();
-                            assert_eq!(
-                                actual,
-                                expected.raster.data.to_f64_vec(),
-                                "bands={band_count} sources={count} {resampling:?} memory={memory_limit} slab={slab}"
-                            );
-                            assert!(actual.iter().any(|v| *v == -9999.0));
-                            assert!(actual.iter().any(|v| *v != -9999.0));
+                            }
                         }
                     }
                 }

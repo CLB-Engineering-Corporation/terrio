@@ -1589,3 +1589,22 @@ substitution relationships and property ordering from the published OGC CityGML
 text and documentation are not bundled. The schemas and standards are published
 by the Open Geospatial Consortium. See scripts/generate_citygml_writer_profiles.py
 for the reproducible extraction procedure.
+
+GDAL raster management and overview algorithms
+--------------------------------------------
+The tile AVERAGE fractional footprint and accumulation arithmetic in
+crates/terrio/src/tiles/pyramid.rs and crates/terrio/src/tiles/raster.rs
+follows GDAL 3.13 gcore/overview.cpp
+(GDALResampleChunk_AverageOrRMS_T), with the source copyrights below.
+Source: https://github.com/OSGeo/gdal/blob/v3.13.0/gcore/overview.cpp
+
+GDAL raster-management source copyrights (MIT):
+- gcore/overview.cpp: Copyright (c) 2000, Frank Warmerdam;
+  Copyright (c) 2007-2010, Even Rouault <even dot rouault at spatialys.com>
+- frmts/gtiff/gtiffdataset_write.cpp: Copyright (c) 1998, 2002, Frank Warmerdam;
+  Copyright (c) 2007-2015, Even Rouault
+- swig/python/gdal-utils/osgeo_utils/gdal_edit.py:
+  Copyright (c) 2011-2013, Even Rouault
+- swig/python/gdal-utils/osgeo_utils/gdalmove.py:
+  Copyright (c) 2012, Frank Warmerdam; Copyright (c) 2021, Idan Miara
+Licensed under the MIT permission and warranty terms reproduced above for GDAL.

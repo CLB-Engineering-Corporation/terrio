@@ -530,13 +530,35 @@ fn downsample(src: &Pixels, w: usize, h: usize, method: &str) -> Pixels {
                 let mut sa = 0.0;
                 let mut sv = [0.0f64; 4];
                 for sy in y0..y1 {
+                    let mut line_weight = 0.0;
+                    let mut line_values = [0.0; 4];
                     for sx in x0..x1 {
                         let i = sy * sw + sx;
-                        let m = src.alpha[i] as f64;
-                        sa += m;
-                        for (b, v) in sv.iter_mut().enumerate().take(nb) {
-                            *v += m * band(b, i);
+                        if src.alpha[i] == 0 {
+                            continue;
                         }
+                        let wx = if sx == x0 {
+                            if x1 == x0 + 1 { 1.0 } else { 1.0 - (x as f64 * rx - x0 as f64) }
+                        } else if sx + 1 == x1 {
+                            1.0 - (x1 as f64 - (x + 1) as f64 * rx)
+                        } else {
+                            1.0
+                        };
+                        line_weight += wx;
+                        for (b, v) in line_values.iter_mut().enumerate().take(nb) {
+                            *v += wx * band(b, i);
+                        }
+                    }
+                    let wy = if sy == y0 {
+                        if y1 == y0 + 1 { 1.0 } else { 1.0 - (y as f64 * ry - y0 as f64) }
+                    } else if sy + 1 == y1 {
+                        1.0 - (y1 as f64 - (y + 1) as f64 * ry)
+                    } else {
+                        1.0
+                    };
+                    sa += line_weight * wy;
+                    for (v, line) in sv.iter_mut().zip(line_values) {
+                        *v += line * wy;
                     }
                 }
                 if sa > 0.0 {
@@ -1735,6 +1757,15 @@ mod tests {
                 assert_eq!(image.data[offset + image.channels - 1], 255);
             }
         }
+    }
+
+    #[test]
+    fn tile_png_is_lossless() {
+        // All channel values, including RGB under zero and partial alpha, survive PNG.
+        let data: Vec<u8> = (0..256).flat_map(|i| [i as u8, (255 - i) as u8, (i / 2) as u8, i as u8]).collect();
+        let encoded = encode_png(16, 16, 4, &data).unwrap();
+        let decoded = decode_image(&encoded).unwrap();
+        assert_eq!(decoded.data, data);
     }
 
     #[test]
