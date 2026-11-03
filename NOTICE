@@ -631,6 +631,10 @@ Licensed under the MIT permission and warranty terms reproduced above for GDAL.
 
 GDAL raster management and overview algorithms
 --------------------------------------------
+The tile AVERAGE fractional footprint and accumulation arithmetic in
+crates/terrio/src/tiles/pyramid.rs follows GDAL 3.13 gcore/overview.cpp
+(GDALResampleChunk_AverageOrRMS_T), with the source copyrights below.
+
 The overview arithmetic and regeneration scheduling in ops/overview_kernel.rs and
 ops/overview.rs are adapted from GDAL 3.12 gcore/overview.cpp (including
 GDALRegenerateOverviewsEx/MultiBand, GDALComputeOvFactor and GDALOvLevelAdjust2).

@@ -1588,6 +1588,30 @@ def suite_tiles(ctx):
     return s
 
 
+def suite_tile_rgba(ctx):
+    """Strict full-channel synthetic tile comparisons against GDAL 3.13."""
+    s = Suite("tile-rgba", "RGBA tile arithmetic", "GDAL 3.13 Python API",
+              "EPSG:4326 opaque, masked, variable alpha and off-grid RGBA; base and overview pixels exact.")
+    code, version, err = run([sys.executable, "-c", "from osgeo import gdal; print(gdal.VersionInfo())"])
+    if code or not version.strip().startswith("313"):
+        s.skipped = "requires GDAL 3.13 Python bindings"
+        return s
+    code, out, err = run([sys.executable, str(SCRIPTS / "compare_tile_rgba_with_gdal.py"), "--terrio", ctx.terrio])
+    try:
+        report = json.loads(out)
+        for result in report["results"]:
+            for level in ("base", "pyramid"):
+                v = result[level]
+                exact = v["coverage_equal"] and v["channels"] == 0
+                s.cases.append(Case("RGBA", result["case"] + ": " + level,
+                                    IDENTICAL if exact else DIFFERS, json.dumps(v)))
+    except (ValueError, KeyError):
+        s.error = tail(err or out)
+    if code:
+        s.error = tail(err or out)
+    return s
+
+
 def suite_grib(ctx):
     """GRIB files, band by band, against GDAL's GRIB driver."""
     s = Suite(
@@ -1898,6 +1922,7 @@ SUITES = OrderedDict(
         ("gpkg", suite_gpkg),
         ("streams", suite_streams),
         ("tiles", suite_tiles),
+        ("tile-rgba", suite_tile_rgba),
         ("grib", suite_grib),
         ("pointclouds", suite_pointclouds),
         ("lazy-geotiff", suite_lazy_geotiff),

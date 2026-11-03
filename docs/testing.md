@@ -1032,3 +1032,19 @@ and `USGS_1_n40w106.tif` each used one GET and 65,536 served body bytes, matchin
 ordinary lazy info opens. Raster index construction never called the pixel source in
 its panic-on-read unit fixture. These observations apply to lazy-capable readers;
 formats whose reader lacks a metadata-only path may materialize the input.
+
+### Exact RGBA tile arithmetic (GDAL 3.13)
+
+`scripts/compare_tile_rgba_with_gdal.py --terrio target/debug/terrio --strict`
+compares decoded PNG channels, including RGB under alpha, for opaque, binary-mask,
+variable-alpha and off-grid EPSG:4326 fixtures. It reports base reprojection
+separately from the complete AVERAGE pyramid. Run with GDAL 3.13 Python, NumPy and
+Pillow; it invokes GDAL's Python API rather than an executable on PATH. Registered
+as `tile-rgba` in conformance. A difference fails strict comparison without a
+visible-only exception or nonzero tolerance.
+
+The Rust `average_matches_gdal_fractional_footprints_and_alpha_masks` regression
+contains nine independent GDAL 3.13 MEM overview references (odd/even dimensions,
+opaque/binary/partial alpha). AVERAGE weights fractional source-pixel overlap and
+uses nonzero alpha as validity, rather than alpha magnitude as density. This is
+overview behavior; source-alpha density during reprojection is a separate concern.
