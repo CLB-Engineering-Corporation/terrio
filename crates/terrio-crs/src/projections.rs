@@ -1,3 +1,69 @@
+// SPDX-FileCopyrightText: PROJ contributors
+// SPDX-FileCopyrightText: Copyright (c) 1995, Gerald Evenden
+// SPDX-FileCopyrightText: Copyright (c) 2003   Gerald I. Evenden
+// SPDX-FileCopyrightText: Changes to handle +over are: Copyright 2011-2014 Morelli Informatik
+// SPDX-FileCopyrightText: Copyright (c) 2003, 2006   Gerald I. Evenden
+// SPDX-FileCopyrightText: Copyright (c) 2001, Thomas Flemming, tf@ttqv.com
+// SPDX-FileCopyrightText: Copyright (c) 2004   Gerald I. Evenden
+// SPDX-FileCopyrightText: Copyright (c) 2012   Martin Raspaud
+// SPDX-FileCopyrightText: Copyright (c) 2011, 2012  Martin Lambers <marlam@marlam.de>
+// SPDX-FileCopyrightText: Copyright (c) 2017-2019 Heidelberg University
+// SPDX-FileCopyrightText: Copyright (c) 2018, Even Rouault <even dot rouault at spatialys dot com>
+// SPDX-FileCopyrightText: Copyright (c) 2025 Javier Jimenez Shaw
+// SPDX-FileCopyrightText: Copyright (c) 2026 Qiusheng Wu and Terrio contributors
+// SPDX-License-Identifier: MIT
+//
+// Derived from (translated to Rust and modified):
+//   PROJ 9.8.1:
+//     src/projections/tmerc.cpp
+//     src/projections/lcc.cpp
+//     src/projections/merc.cpp
+//     src/projections/aea.cpp
+//     src/projections/eqdc.cpp
+//     src/projections/laea.cpp
+//     src/projections/stere.cpp
+//     src/projections/sterea.cpp
+//     src/gauss.cpp
+//     src/projections/somerc.cpp
+//     src/projections/cass.cpp
+//     src/projections/poly.cpp
+//     src/projections/eqc.cpp
+//     src/projections/gn_sinu.cpp
+//     src/projections/bonne.cpp
+//     src/projections/mill.cpp
+//     src/projections/vandg.cpp
+//     src/projections/gnom.cpp
+//     src/projections/cea.cpp
+//     src/projections/eqearth.cpp
+//     src/projections/omerc.cpp
+//     src/projections/krovak.cpp
+//     src/projections/labrd.cpp
+//     src/projections/nzmg.cpp
+//     src/zpoly1.cpp
+//     src/projections/col_urban.cpp
+//     src/projections/aeqd.cpp
+//     src/projections/ortho.cpp
+//     src/projections/geos.cpp
+//     src/projections/robin.cpp
+//     src/projections/healpix.cpp
+//     src/projections/igh.cpp
+//     src/projections/qsc.cpp
+//     src/projections/isea.cpp
+//     src/projections/aitoff.cpp
+//     src/projections/wink1.cpp
+//     src/projections/wink2.cpp
+//     src/projections/gall.cpp
+//     src/projections/gstmerc.cpp
+//     src/projections/fouc_s.cpp
+//     src/projections/putp4p.cpp
+//     src/projections/sconics.cpp
+//     src/generic_inverse.cpp
+//     src/latitudes.cpp
+//     src/ell_set.cpp
+//     src/aasincos.cpp
+//   PROJ 5fa31c29f0a806568ed7bc76c1a557604db4a804:
+//     src/projections/moll.cpp
+
 //! The map projections EPSG CRSs use, ported from PROJ (<https://proj.org>, MIT licence) so that
 //! terrio's results match GDAL's. PROJ's copyright and permission notice is in `NOTICE`.
 //!
@@ -40,17 +106,32 @@ fn err(msg: &str) -> Error {
     Error::Crs(msg.to_string())
 }
 
+/// An integer parameter as PROJ's pj_param reads it: digits only (else an invalid value), then
+/// atoi, which reads a C long (saturating) and casts it to int; 0 when absent or empty.
+fn proj_int(p: &Params, method: &str, key: &str) -> Result<i32> {
+    let v = p.str(key).unwrap_or("");
+    if !v.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(err(&format!("{method}: invalid {key}, it should be an integer")));
+    }
+    Ok(if v.is_empty() { 0 } else { v.parse::<i64>().unwrap_or(i64::MAX) as i32 })
+}
+
 /// Builds the projection `name`. `Ok(None)` when terrio does not implement it.
 pub(crate) fn build(name: &str, s: &mut Setup<'_>) -> Result<Option<Box<dyn Proj>>> {
     Ok(Some(match name {
         "nsper" | "tpers" => Box::new(perspective::Perspective::new(s, name == "tpers")?),
-        "tmerc" | "etmerc" => Box::new(Tmerc::new(s.ell, s.k0, s.phi0)),
+        "tmerc" | "etmerc" => {
+            if let Some(zone) = utm_zone(s) {
+                s.lam0 = utm_lam0(zone);
+            }
+            Box::new(Tmerc::new(s.ell, s.k0, s.phi0))
+        }
         "utm" => {
             let zone = s.p.f64("zone").ok_or_else(|| err("utm needs +zone"))?;
             if !(1.0..=60.0).contains(&zone) {
                 return Err(err("invalid UTM zone"));
             }
-            s.lam0 = ((zone.trunc() - 1.0) * 6.0 - 180.0 + 3.0).to_radians();
+            s.lam0 = utm_lam0(zone.trunc() as u32);
             s.k0 = 0.9996;
             s.phi0 = 0.0;
             s.x0 = 500000.0;
@@ -100,7 +181,11 @@ pub(crate) fn build(name: &str, s: &mut Setup<'_>) -> Result<Option<Box<dyn Proj
         "geos" => Box::new(Geos::new(s)?),
         "robin" => Box::new(Robin),
         "moll" | "wag4" | "wag5" => Box::new(Moll::new(name)),
+        "healpix" => Box::new(Healpix::new(s, false)?),
+        "rhealpix" => Box::new(Healpix::new(s, true)?),
         "igh" => Box::new(Igh::new()?),
+        "qsc" => Box::new(Qsc::new(s)),
+        "isea" => Box::new(Isea::new(s)?),
         "wintri" => Box::new(Wintri::new(s)?),
         "wink1" => Box::new(Wink1 { cosphi1: s.p.angle("lat_ts").unwrap_or(0.0).cos() }),
         "wink2" => Box::new(Wink2 { cosphi1: s.p.angle("lat_1").unwrap_or(0.0).cos() }),
@@ -117,27 +202,241 @@ pub(crate) fn build(name: &str, s: &mut Setup<'_>) -> Result<Option<Box<dyn Proj
 }
 
 // ---------------------------------------------------------------------------------------------
-// Transverse Mercator: the "exact" Poder/Engsager algorithm PROJ uses by default.
+// Transverse Mercator: the "exact" Poder/Engsager algorithm PROJ uses by default, as PROJ 9.7.1
+// computes it (`src/projections/tmerc.cpp`: `setup_exact`, `clenS`, `exact_e_fwd`, `exact_e_inv`),
+// with its auxiliary latitude series (`src/latitudes.cpp`), so that the results are PROJ's to the
+// last bit.
 
 const ETMERC_ORDER: usize = 6;
 
-/// Clenshaw summation of a real series of sin(2kB) (PROJ's `gatg`).
-fn gatg(p: &[f64; ETMERC_ORDER], b: f64) -> f64 {
-    let cos_2b = (2.0 * b).cos();
-    let two_cos_2b = 2.0 * cos_2b;
-    let (mut h, mut h1, mut h2) = (0.0, p[ETMERC_ORDER - 1], 0.0);
-    for i in (0..ETMERC_ORDER - 1).rev() {
-        h = -h2 + two_cos_2b * h1 + p[i];
-        h2 = h1;
-        h1 = h;
-    }
-    b + h * (2.0 * b).sin()
+/// PROJ's auxiliary latitudes (`AuxLat`), by their index.
+#[derive(Clone, Copy, PartialEq, PartialOrd)]
+enum AuxLat {
+    Geographic = 0,
+    Rectifying = 3,
+    Conformal = 4,
 }
 
-/// Clenshaw summation of a complex series (PROJ's `clenS`); returns the real and imaginary parts.
-fn clen_s(a: &[f64; ETMERC_ORDER], arg_r: f64, arg_i: f64) -> (f64, f64) {
-    let (sin_r, cos_r) = arg_r.sin_cos();
-    let (sinh_i, cosh_i) = (arg_i.sinh(), arg_i.cosh());
+/// The matrices of `pj_auxlat_coeffs()` (Karney's series in the third flattening), concatenated
+/// as PROJ concatenates them; [`AUXLAT_PTRS`] gives where each conversion's starts.
+const AUXLAT_COEFFS: [f64; 150] = [
+    3.0 / 2.0,
+    -27.0 / 32.0,
+    269.0 / 512.0,
+    21.0 / 16.0,
+    -55.0 / 32.0,
+    6759.0 / 4096.0,
+    151.0 / 96.0,
+    -417.0 / 128.0,
+    1097.0 / 512.0,
+    -15543.0 / 2560.0,
+    8011.0 / 2560.0,
+    293393.0 / 61440.0,
+    2.0,
+    -2.0 / 3.0,
+    -2.0,
+    116.0 / 45.0,
+    26.0 / 45.0,
+    -2854.0 / 675.0,
+    7.0 / 3.0,
+    -8.0 / 5.0,
+    -227.0 / 45.0,
+    2704.0 / 315.0,
+    2323.0 / 945.0,
+    56.0 / 15.0,
+    -136.0 / 35.0,
+    -1262.0 / 105.0,
+    73814.0 / 2835.0,
+    4279.0 / 630.0,
+    -332.0 / 35.0,
+    -399572.0 / 14175.0,
+    4174.0 / 315.0,
+    -144838.0 / 6237.0,
+    601676.0 / 22275.0,
+    4.0 / 3.0,
+    4.0 / 45.0,
+    -16.0 / 35.0,
+    -2582.0 / 14175.0,
+    60136.0 / 467775.0,
+    28112932.0 / 212837625.0,
+    46.0 / 45.0,
+    152.0 / 945.0,
+    -11966.0 / 14175.0,
+    -21016.0 / 51975.0,
+    251310128.0 / 638512875.0,
+    3044.0 / 2835.0,
+    3802.0 / 14175.0,
+    -94388.0 / 66825.0,
+    -8797648.0 / 10945935.0,
+    6059.0 / 4725.0,
+    41072.0 / 93555.0,
+    -1472637812.0 / 638512875.0,
+    768272.0 / 467775.0,
+    455935736.0 / 638512875.0,
+    4210684958.0 / 1915538625.0,
+    -3.0 / 2.0,
+    9.0 / 16.0,
+    -3.0 / 32.0,
+    15.0 / 16.0,
+    -15.0 / 32.0,
+    135.0 / 2048.0,
+    -35.0 / 48.0,
+    105.0 / 256.0,
+    315.0 / 512.0,
+    -189.0 / 512.0,
+    -693.0 / 1280.0,
+    1001.0 / 2048.0,
+    1.0 / 2.0,
+    -2.0 / 3.0,
+    5.0 / 16.0,
+    41.0 / 180.0,
+    -127.0 / 288.0,
+    7891.0 / 37800.0,
+    13.0 / 48.0,
+    -3.0 / 5.0,
+    557.0 / 1440.0,
+    281.0 / 630.0,
+    -1983433.0 / 1935360.0,
+    61.0 / 240.0,
+    -103.0 / 140.0,
+    15061.0 / 26880.0,
+    167603.0 / 181440.0,
+    49561.0 / 161280.0,
+    -179.0 / 168.0,
+    6601661.0 / 7257600.0,
+    34729.0 / 80640.0,
+    -3418889.0 / 1995840.0,
+    212378941.0 / 319334400.0,
+    -2.0,
+    2.0 / 3.0,
+    4.0 / 3.0,
+    -82.0 / 45.0,
+    32.0 / 45.0,
+    4642.0 / 4725.0,
+    5.0 / 3.0,
+    -16.0 / 15.0,
+    -13.0 / 9.0,
+    904.0 / 315.0,
+    -1522.0 / 945.0,
+    -26.0 / 15.0,
+    34.0 / 21.0,
+    8.0 / 5.0,
+    -12686.0 / 2835.0,
+    1237.0 / 630.0,
+    -12.0 / 5.0,
+    -24832.0 / 14175.0,
+    -734.0 / 315.0,
+    109598.0 / 31185.0,
+    444337.0 / 155925.0,
+    -1.0 / 2.0,
+    2.0 / 3.0,
+    -37.0 / 96.0,
+    1.0 / 360.0,
+    81.0 / 512.0,
+    -96199.0 / 604800.0,
+    -1.0 / 48.0,
+    -1.0 / 15.0,
+    437.0 / 1440.0,
+    -46.0 / 105.0,
+    1118711.0 / 3870720.0,
+    -17.0 / 480.0,
+    37.0 / 840.0,
+    209.0 / 4480.0,
+    -5569.0 / 90720.0,
+    -4397.0 / 161280.0,
+    11.0 / 504.0,
+    830251.0 / 7257600.0,
+    -4583.0 / 161280.0,
+    108847.0 / 3991680.0,
+    -20648693.0 / 638668800.0,
+    -4.0 / 3.0,
+    -4.0 / 45.0,
+    88.0 / 315.0,
+    538.0 / 4725.0,
+    20824.0 / 467775.0,
+    -44732.0 / 2837835.0,
+    34.0 / 45.0,
+    8.0 / 105.0,
+    -2482.0 / 14175.0,
+    -37192.0 / 467775.0,
+    -12467764.0 / 212837625.0,
+    -1532.0 / 2835.0,
+    -898.0 / 14175.0,
+    54968.0 / 467775.0,
+    100320856.0 / 1915538625.0,
+    6007.0 / 14175.0,
+    24496.0 / 467775.0,
+    -5884124.0 / 70945875.0,
+    -23356.0 / 66825.0,
+    -839792.0 / 19348875.0,
+    570284222.0 / 1915538625.0,
+];
+
+/// Where the coefficients of the conversion from `auxin` to `auxout` start in
+/// [`AUXLAT_COEFFS`]: at `6 * auxout + auxin`.
+const AUXLAT_PTRS: [usize; 37] = [
+    0, 0, 0, 0, 12, 33, 54, 54, 54, 54, 54, 54, 54, 54, 54, 54, 54, 54, 54, 66, 66, 66, 66, 87, 87, 108, 108, 108, 129, 129, 129, 150, 150,
+    150, 150, 150, 150,
+];
+
+/// `sum(p[i] * x^i, i, 0, n)` by Horner's method (`pj_polyval`).
+fn polyval(x: f64, p: &[f64], n: usize) -> f64 {
+    let mut y = p[n];
+    for i in (0..n).rev() {
+        y = y * x + p[i];
+    }
+    y
+}
+
+/// The series converting the auxiliary latitude `auxin` to `auxout` (`pj_auxlat_coeffs`).
+fn auxlat_coeffs(n: f64, auxin: AuxLat, auxout: AuxLat) -> [f64; ETMERC_ORDER] {
+    let mut o = AUXLAT_PTRS[6 * auxout as usize + auxin as usize];
+    let (mut d, n2) = (n, n * n);
+    // Between the geographic, parametric, geocentric and rectifying latitudes, even powers only.
+    let even = auxin <= AuxLat::Rectifying && auxout <= AuxLat::Rectifying;
+    let mut f = [0.0; ETMERC_ORDER];
+    for (l, fl) in f.iter_mut().enumerate() {
+        let m = if even { (ETMERC_ORDER - l - 1) / 2 } else { ETMERC_ORDER - l - 1 };
+        *fl = d * polyval(if even { n2 } else { n }, &AUXLAT_COEFFS[o..=o + m], m);
+        o += m + 1;
+        d *= n;
+    }
+    f
+}
+
+/// `sum(f[k] * sin((2k + 2) zeta))` by Clenshaw summation, zeta given by its sine and cosine
+/// (`pj_clenshaw`).
+fn clenshaw(szeta: f64, czeta: f64, f: &[f64; ETMERC_ORDER]) -> f64 {
+    let (mut u0, mut u1) = (0.0, 0.0);
+    let x = 2.0 * (czeta - szeta) * (czeta + szeta);
+    for &fk in f.iter().rev() {
+        let t = x * u0 - u1 + fk;
+        u1 = u0;
+        u0 = t;
+    }
+    2.0 * szeta * czeta * u0
+}
+
+/// An auxiliary latitude converted by a series (`pj_auxlat_convert`).
+fn auxlat_convert(zeta: f64, f: &[f64; ETMERC_ORDER]) -> f64 {
+    auxlat_convert_sc(zeta, zeta.sin(), zeta.cos(), f)
+}
+
+/// [`auxlat_convert`] with the sine and cosine of the latitude given.
+fn auxlat_convert_sc(zeta: f64, szeta: f64, czeta: f64, f: &[f64; ETMERC_ORDER]) -> f64 {
+    zeta + clenshaw(szeta, czeta, f)
+}
+
+/// The rectifying radius, for a semi-major axis of 1 (`pj_rectifying_radius`).
+fn rectifying_radius(n: f64) -> f64 {
+    const C: [f64; 4] = [1.0, 1.0 / 4.0, 1.0 / 64.0, 1.0 / 256.0];
+    polyval(n * n, &C, 3) / (1.0 + n)
+}
+
+/// Clenshaw summation of a complex series of sin(2 zeta), zeta given by the sine, cosine,
+/// hyperbolic sine and cosine of twice its real and imaginary parts (`clenS`); returns the real
+/// and imaginary parts.
+fn clen_s(a: &[f64; ETMERC_ORDER], sin_r: f64, cos_r: f64, sinh_i: f64, cosh_i: f64) -> (f64, f64) {
     let r = 2.0 * cos_r * cosh_i;
     let i = -2.0 * sin_r * sinh_i;
     let (mut hr, mut hr1, mut hi, mut hi1) = (a[ETMERC_ORDER - 1], 0.0, 0.0, 0.0);
@@ -165,65 +464,40 @@ struct Tmerc {
 
 impl Tmerc {
     fn new(ell: Ell, k0: f64, phi0: f64) -> Self {
-        let f = ell.es / (1.0 + (1.0 - ell.es).sqrt());
-        let n = f / (2.0 - f);
-        let mut np = n;
-        let mut cgb = [0.0; 6];
-        let mut cbg = [0.0; 6];
-        let mut utg = [0.0; 6];
-        let mut gtu = [0.0; 6];
-        cgb[0] = n * (2.0 + n * (-2.0 / 3.0 + n * (-2.0 + n * (116.0 / 45.0 + n * (26.0 / 45.0 + n * (-2854.0 / 675.0))))));
-        cbg[0] = n * (-2.0 + n * (2.0 / 3.0 + n * (4.0 / 3.0 + n * (-82.0 / 45.0 + n * (32.0 / 45.0 + n * (4642.0 / 4725.0))))));
-        np *= n;
-        cgb[1] = np * (7.0 / 3.0 + n * (-8.0 / 5.0 + n * (-227.0 / 45.0 + n * (2704.0 / 315.0 + n * (2323.0 / 945.0)))));
-        cbg[1] = np * (5.0 / 3.0 + n * (-16.0 / 15.0 + n * (-13.0 / 9.0 + n * (904.0 / 315.0 + n * (-1522.0 / 945.0)))));
-        np *= n;
-        cgb[2] = np * (56.0 / 15.0 + n * (-136.0 / 35.0 + n * (-1262.0 / 105.0 + n * (73814.0 / 2835.0))));
-        cbg[2] = np * (-26.0 / 15.0 + n * (34.0 / 21.0 + n * (8.0 / 5.0 + n * (-12686.0 / 2835.0))));
-        np *= n;
-        cgb[3] = np * (4279.0 / 630.0 + n * (-332.0 / 35.0 + n * (-399572.0 / 14175.0)));
-        cbg[3] = np * (1237.0 / 630.0 + n * (-12.0 / 5.0 + n * (-24832.0 / 14175.0)));
-        np *= n;
-        cgb[4] = np * (4174.0 / 315.0 + n * (-144838.0 / 6237.0));
-        cbg[4] = np * (-734.0 / 315.0 + n * (109598.0 / 31185.0));
-        np *= n;
-        cgb[5] = np * (601676.0 / 22275.0);
-        cbg[5] = np * (444337.0 / 155925.0);
-
-        np = n * n;
-        let qn = k0 / (1.0 + n) * (1.0 + np * (1.0 / 4.0 + np * (1.0 / 64.0 + np / 256.0)));
-        utg[0] = n * (-0.5 + n * (2.0 / 3.0 + n * (-37.0 / 96.0 + n * (1.0 / 360.0 + n * (81.0 / 512.0 + n * (-96199.0 / 604800.0))))));
-        gtu[0] = n * (0.5 + n * (-2.0 / 3.0 + n * (5.0 / 16.0 + n * (41.0 / 180.0 + n * (-127.0 / 288.0 + n * (7891.0 / 37800.0))))));
-        utg[1] = np * (-1.0 / 48.0 + n * (-1.0 / 15.0 + n * (437.0 / 1440.0 + n * (-46.0 / 105.0 + n * (1118711.0 / 3870720.0)))));
-        gtu[1] = np * (13.0 / 48.0 + n * (-3.0 / 5.0 + n * (557.0 / 1440.0 + n * (281.0 / 630.0 + n * (-1983433.0 / 1935360.0)))));
-        np *= n;
-        utg[2] = np * (-17.0 / 480.0 + n * (37.0 / 840.0 + n * (209.0 / 4480.0 + n * (-5569.0 / 90720.0))));
-        gtu[2] = np * (61.0 / 240.0 + n * (-103.0 / 140.0 + n * (15061.0 / 26880.0 + n * (167603.0 / 181440.0))));
-        np *= n;
-        utg[3] = np * (-4397.0 / 161280.0 + n * (11.0 / 504.0 + n * (830251.0 / 7257600.0)));
-        gtu[3] = np * (49561.0 / 161280.0 + n * (-179.0 / 168.0 + n * (6601661.0 / 7257600.0)));
-        np *= n;
-        utg[4] = np * (-4583.0 / 161280.0 + n * (108847.0 / 3991680.0));
-        gtu[4] = np * (34729.0 / 80640.0 + n * (-3418889.0 / 1995840.0));
-        np *= n;
-        utg[5] = np * (-20648693.0 / 638668800.0);
-        gtu[5] = np * (212378941.0 / 319334400.0);
-
-        let z = gatg(&cbg, phi0);
-        let zb = -qn * (z + clen_s(&gtu, 2.0 * z, 0.0).0);
+        // The third flattening as PROJ derives it, from the angular eccentricity
+        // (`pj_calc_ellipsoid_params`).
+        let t = (ell.e.asin() / 2.0).tan();
+        let n = t * t;
+        let cgb = auxlat_coeffs(n, AuxLat::Conformal, AuxLat::Geographic);
+        let cbg = auxlat_coeffs(n, AuxLat::Geographic, AuxLat::Conformal);
+        let qn = k0 * rectifying_radius(n);
+        let utg = auxlat_coeffs(n, AuxLat::Rectifying, AuxLat::Conformal);
+        let gtu = auxlat_coeffs(n, AuxLat::Conformal, AuxLat::Rectifying);
+        let z = auxlat_convert(phi0, &cbg);
+        let zb = -qn * auxlat_convert(z, &gtu);
         Self { qn, zb, cgb, cbg, utg, gtu }
     }
 }
 
 impl Proj for Tmerc {
     fn fwd(&self, lam: f64, phi: f64) -> Option<(f64, f64)> {
-        let cn = gatg(&self.cbg, phi);
-        let (sin_cn, cos_cn) = cn.sin_cos();
-        let (sin_ce, cos_ce) = lam.sin_cos();
-        let cn = sin_cn.atan2(cos_ce * cos_cn);
-        let ce = (sin_ce * cos_cn).atan2(sin_cn.hypot(cos_cn * cos_ce));
-        let ce = ce.tan().asinh();
-        let (dcn, dce) = clen_s(&self.gtu, 2.0 * cn, 2.0 * ce);
+        let cn = auxlat_convert(phi, &self.cbg);
+        let (sin_cn, cos_cn) = (cn.sin(), cn.cos());
+        let (sin_ce, cos_ce) = (lam.sin(), lam.cos());
+        let cos_cn_cos_ce = cos_cn * cos_ce;
+        let cn = sin_cn.atan2(cos_cn_cos_ce);
+        let inv_denom_tan_ce = 1.0 / sin_cn.hypot(cos_cn_cos_ce);
+        let tan_ce = sin_ce * cos_cn * inv_denom_tan_ce;
+        let ce = super::math::asinh(tan_ce);
+        // sin(2 Cn), cos(2 Cn), sinh(2 Ce) and cosh(2 Ce), as PROJ derives them.
+        let two_inv_denom_tan_ce = 2.0 * inv_denom_tan_ce;
+        let two_inv_denom_tan_ce_square = two_inv_denom_tan_ce * inv_denom_tan_ce;
+        let tmp_r = cos_cn_cos_ce * two_inv_denom_tan_ce_square;
+        let sin_arg_r = sin_cn * tmp_r;
+        let cos_arg_r = cos_cn_cos_ce * tmp_r - 1.0;
+        let sinh_arg_i = tan_ce * two_inv_denom_tan_ce;
+        let cosh_arg_i = two_inv_denom_tan_ce_square - 1.0;
+        let (dcn, dce) = clen_s(&self.gtu, sin_arg_r, cos_arg_r, sinh_arg_i, cosh_arg_i);
         let (cn, ce) = (cn + dcn, ce + dce);
         if ce.abs() > 2.623395162778 {
             return None;
@@ -237,15 +511,45 @@ impl Proj for Tmerc {
         if ce.abs() > 2.623395162778 {
             return None;
         }
-        let (dcn, dce) = clen_s(&self.utg, 2.0 * cn, 2.0 * ce);
+        let (sin_arg_r, cos_arg_r) = ((2.0 * cn).sin(), (2.0 * cn).cos());
+        let exp_2_ce = (2.0 * ce).exp();
+        let half_inv_exp_2_ce = 0.5 / exp_2_ce;
+        let sinh_arg_i = 0.5 * exp_2_ce - half_inv_exp_2_ce;
+        let cosh_arg_i = 0.5 * exp_2_ce + half_inv_exp_2_ce;
+        let (dcn, dce) = clen_s(&self.utg, sin_arg_r, cos_arg_r, sinh_arg_i, cosh_arg_i);
         let (cn, ce) = (cn + dcn, ce + dce);
-        let ce = ce.sinh().atan();
-        let (sin_cn, cos_cn) = cn.sin_cos();
-        let (sin_ce, cos_ce) = ce.sin_cos();
-        let lam = sin_ce.atan2(cos_ce * cos_cn);
-        let cn = (sin_cn * cos_ce).atan2(sin_ce.hypot(cos_ce * cos_cn));
-        Some((lam, gatg(&self.cgb, cn)))
+        let (sin_cn, cos_cn) = (cn.sin(), cn.cos());
+        let sinh_ce = ce.sinh();
+        let ce = sinh_ce.atan2(cos_cn);
+        let modulus_ce = sinh_ce.hypot(cos_cn);
+        let rr = sin_cn.hypot(modulus_ce);
+        let cn = sin_cn.atan2(modulus_ce);
+        Some((ce, auxlat_convert_sc(cn, sin_cn / rr, modulus_ce / rr, &self.cgb)))
     }
+}
+
+/// The central meridian PROJ gives UTM zone `zone` (1 to 60): `+proj=utm` computes it from the
+/// zone, in radians, rather than from degrees.
+fn utm_lam0(zone: u32) -> f64 {
+    use std::f64::consts::PI;
+    (f64::from(zone - 1) + 0.5) * PI / 30.0 - PI
+}
+
+/// The UTM zone of a transverse Mercator in metres with UTM's origin, scale and false easting and
+/// northing, which PROJ writes as `+proj=utm` (`Conversion::isUTM()`), whatever its definition.
+fn utm_zone(s: &Setup<'_>) -> Option<u32> {
+    let metres = s.p.f64("to_meter").is_none_or(|v| v == 1.0) && s.p.str("units").is_none_or(|u| u == "m");
+    let zone = (s.lam0.to_degrees() + 183.0) / 6.0;
+    let utm = metres
+        && s.ell.es != 0.0
+        && s.phi0.abs() < 1e-10
+        && (s.k0 - 0.9996).abs() < 1e-10
+        && (s.x0 - 500000.0).abs() < 1e-10
+        && (s.y0.abs() < 1e-10 || (s.y0 - 10000000.0).abs() < 1e-10)
+        && zone > 0.9
+        && zone < 60.1
+        && (zone - zone.round()).abs() < 1e-10;
+    utm.then(|| zone.round() as u32)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -365,10 +669,14 @@ impl Merc {
 
 impl Proj for Merc {
     fn fwd(&self, lam: f64, phi: f64) -> Option<(f64, f64)> {
-        if (phi.abs() - HALFPI).abs() <= 1e-10 {
-            return None;
-        }
-        let y = if self.e == 0.0 { phi.tan().asinh() } else { phi.tan().asinh() - self.e * (self.e * phi.sin()).atanh() };
+        // PROJ's `merc_s_forward()` and `merc_e_forward()`, with the C library's asinh and atanh.
+        // PROJ 9.7.1 has no pole check: the poles map to a finite northing (asinh(tan(pi / 2))).
+        let y = if self.e == 0.0 {
+            super::math::asinh(phi.tan())
+        } else {
+            let (sphi, cphi) = (phi.sin(), phi.cos());
+            super::math::asinh(sphi / cphi) - self.e * super::math::atanh(self.e * sphi)
+        };
         Some((self.k0 * lam, self.k0 * y))
     }
 
@@ -1907,7 +2215,11 @@ impl Proj for EqEarth {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Hotine Oblique Mercator (variants A and B).
+// Hotine Oblique Mercator (variants A and B, and the two-point form).
+
+/// PROJ omerc.cpp's tolerance on the two points' latitudes.
+/// Checked against GDAL 3.12.2 / PROJ 9.8.1 and GDAL 3.13.3 / PROJ 9.9.0.
+const OMERC_TOL: f64 = 1e-7;
 
 #[derive(Debug)]
 struct Omerc {
@@ -1938,9 +2250,37 @@ impl Omerc {
         let no_off = p.has("no_uoff") || p.has("no_off");
         let (e, es, one_es) = (s.ell.e, s.ell.es, s.ell.one_es);
         let phi0 = s.phi0;
-        if alpha.is_none() && gamma.is_none() {
-            return Err(err("omerc: two-point form is not supported"));
-        }
+        // Without an azimuth or a rectified grid angle, the centre line runs through two points
+        // (`lon_1`/`lat_1`, `lon_2`/`lat_2`), as in PROJ 9.8.1's omerc.cpp, with its checks. A
+        // point left out is 0, as PROJ reads it; one that isn't a number is refused.
+        let points = if alpha.is_none() && gamma.is_none() {
+            if p.has("alpha") || p.has("gamma") {
+                return Err(err("omerc: invalid alpha or gamma"));
+            }
+            let angle = |key| {
+                let value = if p.has(key) { p.angle(key) } else { Some(0.0) };
+                value.filter(|v| v.is_finite()).ok_or_else(|| err("omerc: invalid two-point parameters"))
+            };
+            let (lam1, phi1, lam2, phi2) = (angle("lon_1")?, angle("lat_1")?, angle("lon_2")?, angle("lat_2")?);
+            if phi1.abs() > HALFPI - OMERC_TOL {
+                return Err(err("omerc: |lat_1| should be < 90°"));
+            }
+            if phi2.abs() > HALFPI - OMERC_TOL {
+                return Err(err("omerc: |lat_2| should be < 90°"));
+            }
+            if (phi1 - phi2).abs() <= OMERC_TOL {
+                return Err(err("omerc: lat_1 should be different from lat_2"));
+            }
+            if phi1.abs() <= OMERC_TOL {
+                return Err(err("omerc: lat_1 should be different from 0"));
+            }
+            if (phi0.abs() - HALFPI).abs() <= OMERC_TOL {
+                return Err(err("omerc: |lat_0| should be < 90°"));
+            }
+            Some((lam1, phi1, lam2, phi2))
+        } else {
+            None
+        };
         let com = one_es.sqrt();
         let (b, a, d, mut f, e_);
         if phi0.abs() > 1e-10 {
@@ -1968,15 +2308,44 @@ impl Omerc {
             f = 1.0;
             e_ = 1.0;
         }
-        let (gamma0, alpha_c, gamma) = match (alpha, gamma) {
-            (Some(alpha_c), g) => {
+        let (gamma0, alpha_c, gamma) = match (alpha, gamma, points) {
+            (Some(alpha_c), g, _) => {
                 let gamma0 = aasin(alpha_c.sin() / d);
+                s.lam0 = lamc - aasin(0.5 * (f - 1.0 / f) * gamma0.tan()) / b;
                 (gamma0, alpha_c, g.unwrap_or(alpha_c))
             }
-            (None, Some(g)) => (g, aasin(d * g.sin()), g),
-            (None, None) => unreachable!(),
+            (None, Some(g), _) => {
+                s.lam0 = lamc - aasin(0.5 * (f - 1.0 / f) * g.tan()) / b;
+                (g, aasin(d * g.sin()), g)
+            }
+            (None, None, Some((lam1, phi1, mut lam2, phi2))) => {
+                // The central meridian and the line's azimuth on the aposphere, from the two
+                // points; `lon_0` is ignored, as in PROJ.
+                let h = tsfn(phi1, phi1.sin(), e).powf(b);
+                let l = tsfn(phi2, phi2.sin(), e).powf(b);
+                let pp = (l - h) / (l + h);
+                if pp == 0.0 {
+                    return Err(err("omerc: invalid value for eccentricity"));
+                }
+                let j = (e_ * e_ - l * h) / (e_ * e_ + l * h);
+                let con = lam1 - lam2;
+                if con < -PI {
+                    lam2 -= 2.0 * PI;
+                } else if con > PI {
+                    lam2 += 2.0 * PI;
+                }
+                s.lam0 = adjlon(0.5 * (lam1 + lam2) - (j * (0.5 * b * (lam1 - lam2)).tan() / pp).atan() / b);
+                let ff = e_ / h;
+                let denom = ff - 1.0 / ff;
+                if denom == 0.0 {
+                    return Err(err("omerc: invalid value for eccentricity"));
+                }
+                let gamma0 = (2.0 * (b * adjlon(lam1 - s.lam0)).sin() / denom).atan();
+                let alpha_c = aasin(d * gamma0.sin());
+                (gamma0, alpha_c, alpha_c)
+            }
+            (None, None, None) => unreachable!(),
         };
-        s.lam0 = lamc - aasin(0.5 * (f - 1.0 / f) * gamma0.tan()) / b;
         let singam = gamma0.sin();
         let cosgam = gamma0.cos();
         let sinrot = gamma.sin();
@@ -1984,7 +2353,8 @@ impl Omerc {
         let rb = 1.0 / b;
         let arb = a * rb;
         let bra = 1.0 / arb;
-        let u_0 = if no_off {
+        // PROJ reads `no_off` only with an azimuth or a rectified grid angle.
+        let u_0 = if no_off && points.is_none() {
             0.0
         } else {
             let u = (arb * ((d * d - 1.0).sqrt() / alpha_c.cos()).atan()).abs();
@@ -3010,13 +3380,329 @@ impl Proj for Moll {
 
     fn inv(&self, x: f64, y: f64) -> Option<(f64, f64)> {
         let theta = aasin_checked(y / self.cy)?;
-        let lam = x / (self.cx * theta.cos());
-        // PROJ excludes the antimeridian itself from this inverse's domain.
-        if !lam.is_finite() || lam.abs() >= PI {
+        let mut lam = x / (self.cx * theta.cos());
+        // GDAL 3.13.3 / PROJ excludes the antimeridian. Test its elliptical image
+        // in projected coordinates: a fixed longitude tolerance amplifies y rounding
+        // near the poles. Eight ulps of the unit radius absorb coordinate rounding.
+        if !lam.is_finite() {
             return None;
+        }
+        let edge = 8.0 * (PI.next_up() - PI);
+        if lam.abs() >= PI - edge {
+            if (x / (self.cx * PI)).hypot(y / self.cy) > 1.0 + 8.0 * f64::EPSILON {
+                return None;
+            }
+            lam = PI.copysign(lam);
         }
         let twice = 2.0 * theta;
         Some((lam, aasin_checked((twice + twice.sin()) / self.cp)?))
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// HEALPix and rHEALPix, ported from PROJ's healpix.cpp (Raichev and Speth): the equal-area HEALPix
+// projection, cylindrical equal-area between the latitudes +-asin(2/3) and in four interrupted
+// polar caps beyond them, and rHEALPix, which combines each pole's caps into one square. On an
+// ellipsoid, as in PROJ, the latitude is the authalic one and the sphere has the authalic radius.
+
+/// PROJ's slack on the edges of the image.
+const HEALPIX_EPS: f64 = 1e-15;
+
+/// The rotations PROJ indexes by -3 to 3 (counterclockwise by that many right angles).
+fn healpix_rotation(index: i32) -> [[f64; 2]; 2] {
+    match index.rem_euclid(4) {
+        1 => [[0.0, -1.0], [1.0, 0.0]],
+        2 => [[-1.0, 0.0], [0.0, -1.0]],
+        3 => [[0.0, 1.0], [-1.0, 0.0]],
+        _ => [[1.0, 0.0], [0.0, 1.0]],
+    }
+}
+
+/// PROJ's `sign`: 1, -1 or 0.
+fn healpix_sign(v: f64) -> f64 {
+    if v > 0.0 {
+        1.0
+    } else if v < 0.0 {
+        -1.0
+    } else {
+        0.0
+    }
+}
+
+/// PROJ's `rotate`.
+fn healpix_rotate((x, y): (f64, f64), angle: f64) -> (f64, f64) {
+    (x * angle.cos() - y * angle.sin(), y * angle.cos() + x * angle.sin())
+}
+
+/// PROJ's `pnpoly`: whether the point is inside the polygon (or one of its vertices). As in
+/// PROJ, the edge from the last vertex back to the first is not counted.
+fn healpix_pnpoly(vert: &[(f64, f64)], x: f64, y: f64) -> bool {
+    if vert.iter().any(|&(vx, vy)| x == vx && y == vy) {
+        return true;
+    }
+    let mut counter = 0;
+    let mut p1 = vert[0];
+    for &p2 in &vert[1..] {
+        if y > p1.1.min(p2.1) && y <= p1.1.max(p2.1) && x <= p1.0.max(p2.0) && p1.1 != p2.1 {
+            let xinters = (y - p1.1) * (p2.0 - p1.0) / (p2.1 - p1.1) + p1.0;
+            if p1.0 == p2.0 || x <= xinters {
+                counter += 1;
+            }
+        }
+        p1 = p2;
+    }
+    counter % 2 == 1
+}
+
+/// PROJ's `healpix_sphere`: HEALPix on the unit sphere.
+fn healpix_sphere(lam: f64, phi: f64) -> (f64, f64) {
+    let phi0 = (2.0f64 / 3.0).asin();
+    if phi.abs() <= phi0 {
+        (lam, 3.0 * PI / 8.0 * phi.sin())
+    } else {
+        let sigma = (3.0 * (1.0 - phi.sin().abs())).sqrt();
+        let cn = (2.0 * lam / PI + 2.0).floor().min(3.0);
+        let lamc = -3.0 * FORTPI + HALFPI * cn;
+        (lamc + (lam - lamc) * sigma, healpix_sign(phi) * FORTPI * (2.0 - sigma))
+    }
+}
+
+/// PROJ's inverse of `healpix_sphere`.
+fn healpix_sphere_inverse(x: f64, y: f64) -> (f64, f64) {
+    if y.abs() <= FORTPI {
+        (x, (8.0 * y / (3.0 * PI)).asin())
+    } else if y.abs() < HALFPI {
+        let cn = (2.0 * x / PI + 2.0).floor().min(3.0);
+        let xc = -3.0 * FORTPI + HALFPI * cn;
+        let tau = 2.0 - 4.0 * y.abs() / PI;
+        (xc + (x - xc) / tau, healpix_sign(y) * (1.0 - tau * tau / 3.0).asin())
+    } else {
+        (-PI, healpix_sign(y) * HALFPI)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum HealpixRegion {
+    North,
+    South,
+    Equatorial,
+}
+
+/// The authalic latitude as PROJ 9.8.1 computes it on an ellipsoid.
+#[derive(Debug)]
+struct HealpixAuthalic {
+    /// Geodetic to authalic (`C[xi,phi]`), used when |n| < 0.01.
+    forward: Option<[f64; 6]>,
+    /// Authalic to geodetic (`C[phi,xi]`).
+    apa: [f64; 6],
+    e: f64,
+    one_es: f64,
+    qp: f64,
+}
+
+impl HealpixAuthalic {
+    /// PROJ's `pj_authalic_lat`.
+    fn forward(&self, phi: f64) -> f64 {
+        match &self.forward {
+            Some(c) => authlat(phi, c),
+            None => (qsfn(phi.sin(), self.e, self.one_es) / self.qp).clamp(-1.0, 1.0).asin(),
+        }
+    }
+
+    /// PROJ's `pj_authalic_lat_inverse`.
+    fn inverse(&self, beta: f64) -> f64 {
+        authlat_inverse(beta, &self.apa, self.e, self.one_es, self.qp)
+    }
+}
+
+#[derive(Debug)]
+struct Healpix {
+    /// rHEALPix's north and south polar square positions (0 to 3); `None` for HEALPix.
+    squares: Option<(i32, i32)>,
+    /// HEALPix's rotation of the image (`+rot_xy`), in radians.
+    rot_xy: f64,
+    /// `None` on a sphere.
+    authalic: Option<HealpixAuthalic>,
+    /// The authalic radius on the unit semi-major axis (1 on a sphere).
+    scale: f64,
+}
+
+impl Healpix {
+    fn new(s: &Setup<'_>, rhealpix: bool) -> Result<Self> {
+        let squares = if rhealpix {
+            let int = |key: &str| proj_int(s.p, "rhealpix", key);
+            let (north, south) = (int("north_square")?, int("south_square")?);
+            if !(0..=3).contains(&north) {
+                return Err(err("rhealpix: invalid north_square, it should be in [0,3]"));
+            }
+            if !(0..=3).contains(&south) {
+                return Err(err("rhealpix: invalid south_square, it should be in [0,3]"));
+            }
+            Some((north, south))
+        } else {
+            None
+        };
+        let rot_xy = if rhealpix { 0.0 } else { s.p.angle("rot_xy").unwrap_or(0.0) };
+        let (authalic, scale) = if s.ell.es != 0.0 {
+            let (e, one_es) = (s.ell.e, s.ell.one_es);
+            let b = one_es.sqrt();
+            let n = (1.0 - b) / (1.0 + b);
+            let qp = qsfn(1.0, e, one_es);
+            let forward = (n.abs() < 0.01).then(|| authset_forward(s.ell.es));
+            (Some(HealpixAuthalic { forward, apa: authset(s.ell.es), e, one_es, qp }), (0.5 * qp).sqrt())
+        } else {
+            (None, 1.0)
+        };
+        Ok(Self { squares, rot_xy, authalic, scale })
+    }
+
+    /// PROJ's `in_image`.
+    fn in_image(&self, x: f64, y: f64) -> bool {
+        let e = HEALPIX_EPS;
+        match self.squares {
+            None => {
+                let verts = [
+                    (-PI - e, FORTPI),
+                    (-3.0 * FORTPI, HALFPI + e),
+                    (-HALFPI, FORTPI + e),
+                    (-FORTPI, HALFPI + e),
+                    (0.0, FORTPI + e),
+                    (FORTPI, HALFPI + e),
+                    (HALFPI, FORTPI + e),
+                    (3.0 * FORTPI, HALFPI + e),
+                    (PI + e, FORTPI),
+                    (PI + e, -FORTPI),
+                    (3.0 * FORTPI, -HALFPI - e),
+                    (HALFPI, -FORTPI - e),
+                    (FORTPI, -HALFPI - e),
+                    (0.0, -FORTPI - e),
+                    (-FORTPI, -HALFPI - e),
+                    (-HALFPI, -FORTPI - e),
+                    (-3.0 * FORTPI, -HALFPI - e),
+                    (-PI - e, -FORTPI),
+                    (-PI - e, FORTPI),
+                ];
+                healpix_pnpoly(&verts, x, y)
+            }
+            Some((north, south)) => {
+                let (north, south) = (north as f64, south as f64);
+                let verts = [
+                    (-PI - e, FORTPI + e),
+                    (-PI + north * HALFPI - e, FORTPI + e),
+                    (-PI + north * HALFPI - e, 3.0 * FORTPI + e),
+                    (-PI + (north + 1.0) * HALFPI + e, 3.0 * FORTPI + e),
+                    (-PI + (north + 1.0) * HALFPI + e, FORTPI + e),
+                    (PI + e, FORTPI + e),
+                    (PI + e, -FORTPI - e),
+                    (-PI + (south + 1.0) * HALFPI + e, -FORTPI - e),
+                    (-PI + (south + 1.0) * HALFPI + e, -3.0 * FORTPI - e),
+                    (-PI + south * HALFPI - e, -3.0 * FORTPI - e),
+                    (-PI + south * HALFPI - e, -FORTPI - e),
+                    (-PI - e, -FORTPI - e),
+                ];
+                healpix_pnpoly(&verts, x, y)
+            }
+        }
+    }
+
+    /// PROJ's `get_cap`: the polar cap's number, its tip and the region of a point of the HEALPix
+    /// image (forward), or of the rHEALPix image (inverse).
+    fn cap(x: f64, y: f64, north: i32, south: i32, inverse: bool) -> (i32, f64, f64, HealpixRegion) {
+        let e = HEALPIX_EPS;
+        if !inverse {
+            let (region, c) = if y > FORTPI {
+                (HealpixRegion::North, HALFPI)
+            } else if y < -FORTPI {
+                (HealpixRegion::South, -HALFPI)
+            } else {
+                return (0, x, y, HealpixRegion::Equatorial);
+            };
+            let (cn, cx) = if x < -HALFPI {
+                (0, -3.0 * FORTPI)
+            } else if x < 0.0 {
+                (1, -FORTPI)
+            } else if x < HALFPI {
+                (2, FORTPI)
+            } else {
+                (3, 3.0 * FORTPI)
+            };
+            (cn, cx, c, region)
+        } else if y > FORTPI {
+            let cx = -3.0 * FORTPI + north as f64 * HALFPI;
+            let x = x - north as f64 * HALFPI;
+            // The HEALPix cap that the point moves to when the polar square is taken apart.
+            let cn = if y >= -x - FORTPI - e && y < x + 5.0 * FORTPI - e {
+                (north + 1) % 4
+            } else if y > -x - FORTPI + e && y >= x + 5.0 * FORTPI - e {
+                (north + 2) % 4
+            } else if y <= -x - FORTPI + e && y > x + 5.0 * FORTPI + e {
+                (north + 3) % 4
+            } else {
+                north
+            };
+            (cn, cx, HALFPI, HealpixRegion::North)
+        } else if y < -FORTPI {
+            let cx = -3.0 * FORTPI + south as f64 * HALFPI;
+            let x = x - south as f64 * HALFPI;
+            let cn = if y <= x + FORTPI + e && y > -x - 5.0 * FORTPI + e {
+                (south + 1) % 4
+            } else if y < x + FORTPI - e && y <= -x - 5.0 * FORTPI + e {
+                (south + 2) % 4
+            } else if y >= x + FORTPI - e && y < -x - 5.0 * FORTPI - e {
+                (south + 3) % 4
+            } else {
+                south
+            };
+            (cn, cx, -HALFPI, HealpixRegion::South)
+        } else {
+            (0, x, y, HealpixRegion::Equatorial)
+        }
+    }
+
+    /// PROJ's `combine_caps`: HEALPix to rHEALPix (forward) or back (inverse).
+    fn combine_caps(x: f64, y: f64, north: i32, south: i32, inverse: bool) -> (f64, f64) {
+        let (cn, cx, cy, region) = Self::cap(x, y, north, south, inverse);
+        if region == HealpixRegion::Equatorial {
+            return (cx, cy);
+        }
+        let pole = if region == HealpixRegion::North { north } else { south };
+        // Forward, rotate about the cap's tip and move it to the polar square; inverse, undo it.
+        let turn = if (region == HealpixRegion::North) != inverse { cn - pole } else { -(cn - pole) };
+        let r = healpix_rotation(turn);
+        let (vx, vy) = (x - cx, y - cy);
+        let (dx, dy) = (r[0][0] * vx + r[0][1] * vy, r[1][0] * vx + r[1][1] * vy);
+        let ax = -3.0 * FORTPI + (if inverse { cn } else { pole }) as f64 * HALFPI;
+        let ay = if region == HealpixRegion::North { HALFPI } else { -HALFPI };
+        (dx + ax, dy + ay)
+    }
+}
+
+impl Proj for Healpix {
+    fn fwd(&self, lam: f64, phi: f64) -> Option<(f64, f64)> {
+        let phi = self.authalic.as_ref().map_or(phi, |a| a.forward(phi));
+        let (x, y) = healpix_sphere(lam, phi);
+        let (x, y) = match self.squares {
+            None => healpix_rotate((x, y), -self.rot_xy),
+            Some((north, south)) => Self::combine_caps(x, y, north, south, false),
+        };
+        Some((x * self.scale, y * self.scale))
+    }
+
+    fn inv(&self, x: f64, y: f64) -> Option<(f64, f64)> {
+        let (x, y) = (x / self.scale, y / self.scale);
+        let (x, y) = match self.squares {
+            None => healpix_rotate((x, y), self.rot_xy),
+            Some(_) => (x, y),
+        };
+        if !self.in_image(x, y) {
+            return None;
+        }
+        let (x, y) = match self.squares {
+            None => (x, y),
+            Some((north, south)) => Self::combine_caps(x, y, north, south, true),
+        };
+        let (lam, phi) = healpix_sphere_inverse(x, y);
+        Some((lam, self.authalic.as_ref().map_or(phi, |a| a.inverse(phi))))
     }
 }
 
@@ -3127,6 +3813,659 @@ impl Proj for Igh {
             _ => within(80.0, 180.0),
         };
         ok.then_some((lam, phi))
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Quadrilateralized spherical cube, as PROJ's qsc.cpp: one of the six cube faces, chosen by the
+// projection centre, with the ellipsoid shifted to the sphere by geocentric latitude.
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum QscFace {
+    Front,
+    Right,
+    Back,
+    Left,
+    Top,
+    Bottom,
+}
+
+#[derive(Debug)]
+struct Qsc {
+    face: QscFace,
+    /// The semi-minor axis on the unit semi-major axis; 1 on a sphere.
+    b: f64,
+    es: f64,
+}
+
+/// The four areas of a cube face, counterclockwise from the area of definition.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum QscArea {
+    A0,
+    A1,
+    A2,
+    A3,
+}
+
+/// The theta angle and area of a point on an equatorial face (PROJ's qsc_fwd_equat_face_theta).
+fn qsc_equat_face_theta(colat: f64, y: f64, x: f64) -> (f64, QscArea) {
+    if colat < 1e-10 {
+        return (0.0, QscArea::A0);
+    }
+    let theta = y.atan2(x);
+    if theta.abs() <= FORTPI {
+        (theta, QscArea::A0)
+    } else if theta > FORTPI && theta <= HALFPI + FORTPI {
+        (theta - HALFPI, QscArea::A1)
+    } else if theta > HALFPI + FORTPI || theta <= -(HALFPI + FORTPI) {
+        (if theta >= 0.0 { theta - PI } else { theta + PI }, QscArea::A2)
+    } else {
+        (theta + HALFPI, QscArea::A3)
+    }
+}
+
+/// PROJ's qsc_shift_longitude_origin.
+fn qsc_shift_longitude(longitude: f64, offset: f64) -> f64 {
+    let slon = longitude + offset;
+    if slon < -PI {
+        slon + 2.0 * PI
+    } else if slon > PI {
+        slon - 2.0 * PI
+    } else {
+        slon
+    }
+}
+
+impl Qsc {
+    fn new(s: &Setup<'_>) -> Self {
+        let face = if s.phi0 >= HALFPI - FORTPI / 2.0 {
+            QscFace::Top
+        } else if s.phi0 <= -(HALFPI - FORTPI / 2.0) {
+            QscFace::Bottom
+        } else if s.lam0.abs() <= FORTPI {
+            QscFace::Front
+        } else if s.lam0.abs() <= HALFPI + FORTPI {
+            if s.lam0 > 0.0 { QscFace::Right } else { QscFace::Left }
+        } else {
+            QscFace::Back
+        };
+        Self { face, b: (1.0 - s.ell.es).sqrt(), es: s.ell.es }
+    }
+}
+
+impl Proj for Qsc {
+    fn fwd(&self, lam: f64, phi: f64) -> Option<(f64, f64)> {
+        // The geodetic latitude as a geocentric latitude: the shift from the ellipsoid to the
+        // sphere. b is also 1 - f on the unit semi-major axis.
+        let lat = if self.es != 0.0 { (self.b * self.b * phi.tan()).atan() } else { phi };
+        let mut longitude = lam;
+        // colat is PROJ's phi: the angle from the face centre.
+        let (theta, colat, area);
+        match self.face {
+            QscFace::Top => {
+                colat = HALFPI - lat;
+                (theta, area) = if (FORTPI..=HALFPI + FORTPI).contains(&longitude) {
+                    (longitude - HALFPI, QscArea::A0)
+                } else if longitude > HALFPI + FORTPI || longitude <= -(HALFPI + FORTPI) {
+                    (if longitude > 0.0 { longitude - PI } else { longitude + PI }, QscArea::A1)
+                } else if longitude > -(HALFPI + FORTPI) && longitude <= -FORTPI {
+                    (longitude + HALFPI, QscArea::A2)
+                } else {
+                    (longitude, QscArea::A3)
+                };
+            }
+            QscFace::Bottom => {
+                colat = HALFPI + lat;
+                (theta, area) = if (FORTPI..=HALFPI + FORTPI).contains(&longitude) {
+                    (-longitude + HALFPI, QscArea::A0)
+                } else if (-FORTPI..FORTPI).contains(&longitude) {
+                    (-longitude, QscArea::A1)
+                } else if (-(HALFPI + FORTPI)..-FORTPI).contains(&longitude) {
+                    (-longitude - HALFPI, QscArea::A2)
+                } else {
+                    (if longitude > 0.0 { -longitude + PI } else { -longitude - PI }, QscArea::A3)
+                };
+            }
+            face => {
+                longitude = match face {
+                    QscFace::Right => qsc_shift_longitude(longitude, HALFPI),
+                    QscFace::Back => qsc_shift_longitude(longitude, PI),
+                    QscFace::Left => qsc_shift_longitude(longitude, -HALFPI),
+                    _ => longitude,
+                };
+                let (sinlat, coslat) = lat.sin_cos();
+                let (sinlon, coslon) = longitude.sin_cos();
+                let (q, r, s) = (coslat * coslon, coslat * sinlon, sinlat);
+                let (p, y, x) = match face {
+                    QscFace::Front => (q.acos(), s, r),
+                    QscFace::Right => (r.acos(), s, -q),
+                    QscFace::Back => ((-q).acos(), s, -r),
+                    _ => ((-r).acos(), s, q),
+                };
+                colat = p;
+                (theta, area) = qsc_equat_face_theta(colat, y, x);
+            }
+        }
+        // mu and nu for the area of definition: Eq. (3-21) of O'Neill and Laubscher (1976), with
+        // its typos corrected against Eq. (3-14), and t = tan(nu) from Eq. (3-38).
+        let mut mu = ((12.0 / PI) * (theta + (theta.sin() * FORTPI.cos()).acos() - HALFPI)).atan();
+        let t = ((1.0 - colat.cos()) / (mu.cos() * mu.cos()) / (1.0 - (1.0 / theta.cos()).atan().cos())).sqrt();
+        mu += match area {
+            QscArea::A1 => HALFPI,
+            QscArea::A2 => PI,
+            QscArea::A3 => PI + HALFPI,
+            _ => 0.0,
+        };
+        Some((t * mu.cos(), t * mu.sin()))
+    }
+
+    fn inv(&self, x: f64, y: f64) -> Option<(f64, f64)> {
+        let nu = x.hypot(y).atan();
+        let mut mu = y.atan2(x);
+        let area = if x >= 0.0 && x >= y.abs() {
+            QscArea::A0
+        } else if y >= 0.0 && y >= x.abs() {
+            mu -= HALFPI;
+            QscArea::A1
+        } else if x < 0.0 && -x >= y.abs() {
+            mu = if mu < 0.0 { mu + PI } else { mu - PI };
+            QscArea::A2
+        } else {
+            mu += HALFPI;
+            QscArea::A3
+        };
+        // phi and theta for the area of definition.
+        let t = (PI / 12.0) * mu.tan();
+        let theta = (t.sin() / (t.cos() - 1.0 / 2f64.sqrt())).atan();
+        let cosmu = mu.cos();
+        let tannu = nu.tan();
+        let cosphi = (1.0 - cosmu * cosmu * tannu * tannu * (1.0 - (1.0 / theta.cos()).atan().cos())).clamp(-1.0, 1.0);
+        let (lam, mut lat) = match self.face {
+            QscFace::Top => {
+                let lam = match area {
+                    QscArea::A0 => theta + HALFPI,
+                    QscArea::A1 => {
+                        if theta < 0.0 {
+                            theta + PI
+                        } else {
+                            theta - PI
+                        }
+                    }
+                    QscArea::A2 => theta - HALFPI,
+                    _ => theta,
+                };
+                (lam, HALFPI - cosphi.acos())
+            }
+            QscFace::Bottom => {
+                let lam = match area {
+                    QscArea::A0 => -theta + HALFPI,
+                    QscArea::A1 => -theta,
+                    QscArea::A2 => -theta - HALFPI,
+                    _ => {
+                        if theta < 0.0 {
+                            -theta - PI
+                        } else {
+                            -theta + PI
+                        }
+                    }
+                };
+                (lam, cosphi.acos() - HALFPI)
+            }
+            face => {
+                // Through cartesian coordinates on the unit sphere.
+                let mut q = cosphi;
+                let mut u = q * q;
+                let mut s = if u >= 1.0 { 0.0 } else { (1.0 - u).sqrt() * theta.sin() };
+                u += s * s;
+                let mut r = if u >= 1.0 { 0.0 } else { (1.0 - u).sqrt() };
+                // Into the area, then into the cube face.
+                match area {
+                    QscArea::A1 => (r, s) = (-s, r),
+                    QscArea::A2 => (r, s) = (-r, -s),
+                    QscArea::A3 => (r, s) = (s, -r),
+                    _ => {}
+                }
+                match face {
+                    QscFace::Right => (q, r) = (-r, q),
+                    QscFace::Back => (q, r) = (-q, -r),
+                    QscFace::Left => (q, r) = (r, -q),
+                    _ => {}
+                }
+                let lam = r.atan2(q);
+                let lam = match face {
+                    QscFace::Right => qsc_shift_longitude(lam, -HALFPI),
+                    QscFace::Back => qsc_shift_longitude(lam, -PI),
+                    QscFace::Left => qsc_shift_longitude(lam, HALFPI),
+                    _ => lam,
+                };
+                (lam, (-s).acos() - HALFPI)
+            }
+        };
+        // The shift from the sphere back to the ellipsoid.
+        if self.es != 0.0 {
+            let tanphi = lat.tan();
+            let xa = self.b / (tanphi * tanphi + self.b * self.b).sqrt();
+            let phi = ((1.0 - xa * xa).sqrt() / (self.b * xa)).atan();
+            lat = if lat < 0.0 { -phi } else { phi };
+        }
+        Some((lam, lat))
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Icosahedral Snyder Equal Area, as PROJ's isea.cpp (Nathan Wagner's forward; the inverse by
+// Jerome Jacovella-St-Louis after Franz-Benjamin Mocnik's geogrid): the sphere on the 20 faces of
+// an icosahedron, unfolded in the plane. As in PROJ, the forward takes the geodetic latitude on
+// the unit sphere, while the inverse uses the authalic radius on an ellipsoid; the inverse is
+// defined only for PROJ's default grid (aperture 3, resolution 4, no azimuth) in its two
+// orientations.
+
+const ISEA_E_RAD: f64 = 0.91843818701052843323;
+const ISEA_F_RAD: f64 = 0.18871053078356206978;
+/// g: the spherical distance from a face centre to its vertices.
+const ISEA_SDC2VOS: f64 = 0.6523581397843681859886783;
+/// tan(g).
+const ISEA_TANG: f64 = 0.76393202250021030358019673567;
+const ISEA_TAN30: f64 = 0.57735026918962576450914878;
+const ISEA_COT_THETA: f64 = 1.0 / ISEA_TAN30;
+/// cos and sin of G (36 degrees), and cos(g).
+const ISEA_COS_G: f64 = 0.80901699437494742410229341718281905886;
+const ISEA_SIN_G: f64 = 0.587785252292473129168705954639072768597652;
+const ISEA_COS_SDC2VOS: f64 = 0.7946544722917661229596057297879189448539;
+const ISEA_SIN_G_COS_SDC2VOS: f64 = ISEA_SIN_G * ISEA_COS_SDC2VOS;
+const ISEA_SQRT3: f64 = 1.73205080756887729352744634150587236694280525381038;
+const ISEA_TABLE_G: f64 = ISEA_TANG * (ISEA_SQRT3 / 2.0);
+const ISEA_TABLE_H: f64 = 0.25 * ISEA_TANG;
+/// R' / R.
+const ISEA_RPRIME_OVER_R: f64 = 0.9103832815095032;
+const ISEA_STD_LAT: f64 = 1.01722196792335072101;
+const ISEA_STD_LONG: f64 = 0.19634954084936207740;
+const ISEA_DEG120: f64 = 2.09439510239319549229;
+const ISEA_D2R: f64 = PI / 180.0;
+
+/// The centres of the icosahedron's faces (latitude, longitude).
+const ISEA_FACES: [(f64, f64); 20] = [
+    (ISEA_E_RAD, ISEA_D2R * -144.0),
+    (ISEA_E_RAD, ISEA_D2R * -72.0),
+    (ISEA_E_RAD, ISEA_D2R * 0.0),
+    (ISEA_E_RAD, ISEA_D2R * 72.0),
+    (ISEA_E_RAD, ISEA_D2R * 144.0),
+    (ISEA_F_RAD, ISEA_D2R * -144.0),
+    (ISEA_F_RAD, ISEA_D2R * -72.0),
+    (ISEA_F_RAD, ISEA_D2R * 0.0),
+    (ISEA_F_RAD, ISEA_D2R * 72.0),
+    (ISEA_F_RAD, ISEA_D2R * 144.0),
+    (-ISEA_F_RAD, ISEA_D2R * -108.0),
+    (-ISEA_F_RAD, ISEA_D2R * -36.0),
+    (-ISEA_F_RAD, ISEA_D2R * 36.0),
+    (-ISEA_F_RAD, ISEA_D2R * 108.0),
+    (-ISEA_F_RAD, ISEA_D2R * 180.0),
+    (-ISEA_E_RAD, ISEA_D2R * -108.0),
+    (-ISEA_E_RAD, ISEA_D2R * -36.0),
+    (-ISEA_E_RAD, ISEA_D2R * 36.0),
+    (-ISEA_E_RAD, ISEA_D2R * 108.0),
+    (-ISEA_E_RAD, ISEA_D2R * 180.0),
+];
+
+/// PROJ's safeArcSin and safeArcCos.
+fn isea_asin(t: f64) -> f64 {
+    const E: f64 = 1e-15;
+    if t.abs() < E {
+        0.0
+    } else if (t - 1.0).abs() < E {
+        HALFPI
+    } else if (t + 1.0).abs() < E {
+        -HALFPI
+    } else {
+        t.asin()
+    }
+}
+
+fn isea_acos(t: f64) -> f64 {
+    const E: f64 = 1e-15;
+    if t.abs() < E {
+        HALFPI
+    } else if (t + 1.0).abs() < E {
+        PI
+    } else if (t - 1.0).abs() < E {
+        0.0
+    } else {
+        t.acos()
+    }
+}
+
+/// A longitude brought into [-pi, pi] as PROJ's isea does, strictly (`adjlon` keeps values within
+/// pi + 1e-12 as they are).
+fn isea_normalize_lon(lon: f64) -> f64 {
+    let mut lon = lon % (2.0 * PI);
+    while lon > PI {
+        lon -= 2.0 * PI;
+    }
+    while lon < -PI {
+        lon += 2.0 * PI;
+    }
+    lon
+}
+
+/// The planar frame of the inverse, for an icosahedron of radius R on the ellipsoid's authalic
+/// sphere (PROJ's pj_isea_data::initialize).
+#[derive(Debug)]
+struct IseaPlane {
+    /// The orientation reverted after the inverse: (latitude, longitude), and its latitude's
+    /// cosine and sine.
+    orientation: (f64, f64),
+    cos_lat: f64,
+    sin_lat: f64,
+    r2: f64,
+    rprime_2x: f64,
+    rprime_tang: f64,
+    rprime2_tan2g: f64,
+    center_to_base: f64,
+    tri_width: f64,
+    y_offsets: [f64; 4],
+    xo: f64,
+    yo: f64,
+    sx: f64,
+    sy: f64,
+}
+
+#[derive(Debug)]
+struct Isea {
+    o_lat: f64,
+    o_lon: f64,
+    o_az: f64,
+    face_sin_cos: [(f64, f64); 20],
+    /// The semi-major axis in metres, by which the inverse scales its input.
+    a: f64,
+    plane: Option<IseaPlane>,
+}
+
+impl Isea {
+    fn new(s: &Setup<'_>) -> Result<Self> {
+        let (mut o_lat, mut o_lon) = (ISEA_STD_LAT, ISEA_STD_LONG);
+        // A flag without a value is invalid, as in PROJ.
+        let option = |key: &str| s.p.has(key).then(|| s.p.str(key).unwrap_or(""));
+        match option("orient") {
+            None | Some("isea") => {}
+            Some("pole") => (o_lat, o_lon) = (HALFPI, 0.0),
+            Some(_) => return Err(err("isea: invalid orient, only isea or pole are supported")),
+        }
+        // PROJ refuses `+azi=30x` (and reads a bare `+azi` as 0).
+        if option("azi").is_some_and(|v| !v.is_empty()) && s.p.angle("azi").is_none() {
+            return Err(err("isea: invalid azi, it should be an angle"));
+        }
+        let o_az = s.p.angle("azi").unwrap_or(0.0);
+        // As in PROJ, `lon_0` both moves the central meridian and rotates the icosahedron.
+        if let Some(lon) = s.p.angle("lon_0") {
+            o_lon = lon;
+        }
+        if let Some(lat) = s.p.angle("lat_0") {
+            o_lat = lat;
+        }
+        match option("mode") {
+            None | Some("plane") => {}
+            // Grid addresses, not coordinates.
+            Some("di" | "dd" | "hex") => return Err(err("isea: only mode=plane is supported")),
+            Some(_) => return Err(err("isea: invalid mode, only plane, di, dd or hex are supported")),
+        }
+        let resolution = if s.p.has("resolution") { proj_int(s.p, "isea", "resolution")? } else { 4 };
+        let aperture = if s.p.has("aperture") { proj_int(s.p, "isea", "aperture")? } else { 3 };
+        // PROJ compares the orientation exactly: a tolerance would define an inverse PROJ refuses.
+        let orientation = if o_az != 0.0 || aperture != 3 || resolution != 4 {
+            None
+        } else if o_lat == ISEA_STD_LAT && o_lon == ISEA_STD_LONG {
+            // The poles on edge midpoints, the equator symmetric.
+            Some(((ISEA_E_RAD + ISEA_F_RAD) / 2.0, ISEA_D2R * -11.25))
+        } else if o_lat == HALFPI && o_lon == 0.0 {
+            Some((0.0, 0.0))
+        } else {
+            None
+        };
+        let a = s.ell.a;
+        let plane = orientation.map(|orientation| {
+            let (r2, rprime) = if s.ell.e > 0.0 {
+                let (a2, b) = (a * a, a * s.ell.one_es.sqrt());
+                let c2 = b * b;
+                let e = s.ell.e;
+                let surface = PI * (2.0 * a2 + c2 / e * ((1.0 + e) / (1.0 - e)).ln());
+                let r2 = surface / (4.0 * PI);
+                (r2, ISEA_RPRIME_OVER_R * r2.sqrt())
+            } else {
+                (a * a, ISEA_RPRIME_OVER_R * a)
+            };
+            let rprime_tang = rprime * ISEA_TANG;
+            let center_to_base = rprime_tang / 2.0;
+            let tri_width = rprime_tang * ISEA_SQRT3;
+            IseaPlane {
+                orientation,
+                cos_lat: orientation.0.cos(),
+                sin_lat: orientation.0.sin(),
+                r2,
+                rprime_2x: 2.0 * rprime,
+                rprime_tang,
+                rprime2_tan2g: rprime_tang * rprime_tang,
+                center_to_base,
+                tri_width,
+                y_offsets: [-2.0 * center_to_base, -4.0 * center_to_base, -5.0 * center_to_base, -7.0 * center_to_base],
+                xo: 2.5 * tri_width,
+                yo: -1.5 * center_to_base,
+                sx: 1.0 / tri_width,
+                sy: 1.0 / (3.0 * center_to_base),
+            }
+        });
+        Ok(Self { o_lat, o_lon, o_az, face_sin_cos: ISEA_FACES.map(|(lat, _)| (lat.sin(), lat.cos())), a, plane })
+    }
+
+    /// Snyder's forward on the face that holds the point (PROJ's isea_snyder_forward).
+    fn snyder_forward(&self, lat: f64, lon: f64) -> Option<(usize, f64, f64)> {
+        let (sin_lat, cos_lat) = lat.sin_cos();
+        for (i, &(_, center_lon)) in ISEA_FACES.iter().enumerate() {
+            let (sin_c, cos_c) = self.face_sin_cos[i];
+            let dlon = lon - center_lon;
+            let cos_lat_cos_lon = cos_lat * dlon.cos();
+            let z = isea_acos(sin_c * sin_lat + cos_c * cos_lat_cos_lon);
+            if z > ISEA_SDC2VOS + 0.000005 {
+                continue;
+            }
+            let mut az = (cos_lat * dlon.sin()).atan2(cos_c * sin_lat - sin_c * cos_lat_cos_lon);
+            az -= if (5..=9).contains(&i) || i == 15 || i == 16 {
+                PI
+            } else if i >= 17 {
+                -PI
+            } else {
+                0.0
+            };
+            if az < 0.0 {
+                az += 2.0 * PI;
+            }
+            let mut multiples = 0.0;
+            while az < 0.0 {
+                az += ISEA_DEG120;
+                multiples -= 1.0;
+            }
+            while az > ISEA_DEG120 + f64::EPSILON {
+                az -= ISEA_DEG120;
+                multiples += 1.0;
+            }
+            let (sin_az, cos_az) = az.sin_cos();
+            let q = ISEA_TANG.atan2(cos_az + sin_az * ISEA_COT_THETA);
+            if z > q + 0.000005 {
+                continue;
+            }
+            let h = (sin_az * ISEA_SIN_G_COS_SDC2VOS - cos_az * ISEA_COS_G).acos();
+            let ag = az + ISEA_D2R * 36.0 + h - PI;
+            let mut azprime = (2.0 * ag).atan2(ISEA_RPRIME_OVER_R * ISEA_RPRIME_OVER_R * ISEA_TANG * ISEA_TANG - 2.0 * ag * ISEA_COT_THETA);
+            let dprime = ISEA_RPRIME_OVER_R * ISEA_TANG / (azprime.cos() + azprime.sin() * ISEA_COT_THETA);
+            let f = dprime / (2.0 * ISEA_RPRIME_OVER_R * (q / 2.0).sin());
+            let rho = 2.0 * ISEA_RPRIME_OVER_R * f * (z / 2.0).sin();
+            azprime += ISEA_DEG120 * multiples;
+            return Some((i, rho * azprime.sin(), rho * azprime.cos()));
+        }
+        // PROJ exits here: no face holds the point.
+        None
+    }
+
+    /// The point in the frame of the icosahedron (PROJ's isea_ctran with Snyder's ctran).
+    fn rotate(&self, lat: f64, lon: f64) -> (f64, f64) {
+        let (alpha, beta) = (self.o_lat, self.o_lon + PI);
+        let dlambda = lon - beta;
+        let (sin_p, cos_p) = lat.sin_cos();
+        let (sin_a, cos_a) = alpha.sin_cos();
+        let (sin_dl, cos_dl) = dlambda.sin_cos();
+        let sin_phip = sin_a * sin_p - cos_a * cos_p * cos_dl;
+        let lp_b = (cos_p * sin_dl).atan2(sin_a * cos_p * cos_dl + cos_a * sin_p);
+        let lambdap = isea_normalize_lon(lp_b + beta);
+        let lon = isea_normalize_lon(lambdap - (-self.o_az + self.o_lon));
+        (isea_asin(sin_phip), lon)
+    }
+
+    /// Unprojects a point of the plane, in metres from the frame's origin (PROJ's
+    /// ISEAPlanarProjection::cartesianToGeo).
+    fn cartesian_to_geo(&self, g: &IseaPlane, x: f64, y: f64) -> Option<(f64, f64)> {
+        const EPSILON: f64 = 1e-11;
+        let (sr, cr) = (-(ISEA_SQRT3 / 2.0), 0.5);
+        let mut px = x;
+        if px < 0.0 || (px < g.tri_width / 2.0 && y < 0.0 && y * cr < px * sr) {
+            px += 5.0 * g.tri_width;
+        }
+        let yp = -(px * sr + y * cr);
+        let mut x = (px * cr - y * sr + yp * (1.0 / ISEA_SQRT3)) * g.sx;
+        let mut y_ = yp * g.sy;
+        if x < 0.0 || (y_ > x && x < 5.0 - EPSILON) {
+            x += EPSILON;
+        } else if x > 5.0 || (y_ < x && x > EPSILON) {
+            x -= EPSILON;
+        }
+        if y_ < 0.0 || (x > y_ && y_ < 6.0 - EPSILON) {
+            y_ += EPSILON;
+        } else if y_ > 6.0 || (x < y_ && y_ > EPSILON) {
+            y_ -= EPSILON;
+        }
+        if !((0.0..=5.0).contains(&x) && (0.0..=6.0).contains(&y_)) {
+            return None;
+        }
+        let ix = (x as i32).clamp(0, 4);
+        let iy = (y_ as i32).clamp(0, 5);
+        if iy != ix && iy != ix + 1 {
+            return None;
+        }
+        let top = x - ix as f64 > y_ - iy as f64;
+        let rhombus = ix + iy;
+        // The upper row of rhombi holds faces 0 to 4 and 5 to 9, the lower 10 to 14 and 15 to 19.
+        let column = (rhombus / 2) as usize;
+        let face = match (rhombus % 2 == 0, top) {
+            (true, true) => column,
+            (true, false) => column + 5,
+            (false, true) => column + 10,
+            (false, false) => column + 15,
+        };
+        let (fy, fx) = (face / 5, face % 5);
+        let rx = px - (2 * fx + fy / 2 + 1) as f64 * g.tri_width / 2.0;
+        let ry = y - (g.y_offsets[fy] + 3.0 * g.center_to_base);
+        let (lat, mut lon) = self.icosahedron_to_sphere(g, face, rx, ry)?;
+        if lon < -PI - EPSILON {
+            lon += 2.0 * PI;
+        } else if lon > PI + EPSILON {
+            lon -= 2.0 * PI;
+        }
+        Some((lat, lon))
+    }
+
+    /// PROJ's ISEAPlanarProjection::icosahedronToSphere.
+    fn icosahedron_to_sphere(&self, g: &IseaPlane, face: usize, x: f64, y: f64) -> Option<(f64, f64)> {
+        const PRECISION: f64 = ISEA_D2R * 1e-11;
+        const AZ_MAX: f64 = ISEA_D2R * 120.0;
+        const WEST_VERTEX_LON: f64 = ISEA_D2R * -144.0;
+        let mut az = x.atan2(y);
+        let rho = (x * x + y * y).sqrt();
+        let mut az_adjustment = if face <= 4 || (10..=14).contains(&face) { 0.0 } else { ISEA_D2R * 180.0 };
+        az += az_adjustment;
+        while az < 0.0 {
+            az_adjustment += AZ_MAX;
+            az += AZ_MAX;
+        }
+        while az > AZ_MAX {
+            az_adjustment -= AZ_MAX;
+            az -= AZ_MAX;
+        }
+        let (sin_az, cos_az) = az.sin_cos();
+        let cot_az = cos_az / sin_az;
+        let area = g.rprime2_tan2g / (2.0 * (cot_az + ISEA_COT_THETA));
+        let target = area / g.r2 - WEST_VERTEX_LON;
+        let mut delta = 10.0 * PRECISION;
+        let mut az_earth = az;
+        // Newton's method, as in PROJ; the cap only guards against a loop that does not end.
+        let mut iterations = 0;
+        while delta.abs() > PRECISION {
+            iterations += 1;
+            if iterations > 100 {
+                return None;
+            }
+            let (sin_e, cos_e) = az_earth.sin_cos();
+            let h = (sin_e * ISEA_SIN_G_COS_SDC2VOS - cos_e * ISEA_COS_G).acos();
+            let f = target - h - az_earth;
+            let f2 = (cos_e * ISEA_SIN_G_COS_SDC2VOS + sin_e * ISEA_COS_G) / h.sin() - 1.0;
+            delta = -f / f2;
+            az_earth += delta;
+        }
+        let (sin_e, cos_e) = az_earth.sin_cos();
+        let q = ISEA_TANG.atan2(cos_e + sin_e * ISEA_COT_THETA);
+        let d = g.rprime_tang / (cos_az + sin_az * ISEA_COT_THETA);
+        let f = d / (g.rprime_2x * (q / 2.0).sin());
+        let z = 2.0 * (rho / (g.rprime_2x * f)).asin();
+        az_earth -= az_adjustment;
+        let (sin_lat0, cos_lat0) = self.face_sin_cos[face];
+        let (sin_z, cos_z) = z.sin_cos();
+        let cos_lat0_sin_z = cos_lat0 * sin_z;
+        let lat = isea_asin(sin_lat0 * cos_z + cos_lat0_sin_z * az_earth.cos());
+        let lon = ISEA_FACES[face].1 + (az_earth.sin() * cos_lat0_sin_z).atan2(cos_z - sin_lat0 * lat.sin());
+        // PROJ's revertOrientation.
+        let precision_per_definition = ISEA_D2R * 1e-5;
+        let lon =
+            if lat < ISEA_D2R * -90.0 + precision_per_definition || lat > ISEA_D2R * 90.0 - precision_per_definition { 0.0 } else { lon };
+        let (o_lat, o_lon) = g.orientation;
+        if o_lat != 0.0 || o_lon != 0.0 {
+            let (sin_lat, cos_lat) = lat.sin_cos();
+            let (sin_lon, cos_lon) = lon.sin_cos();
+            let cos_lon_cos_lat = cos_lon * cos_lat;
+            Some((
+                (sin_lat * g.cos_lat - cos_lon_cos_lat * g.sin_lat).asin(),
+                (sin_lon * cos_lat).atan2(cos_lon_cos_lat * g.cos_lat + sin_lat * g.sin_lat) - o_lon,
+            ))
+        } else {
+            Some((lat, lon))
+        }
+    }
+}
+
+impl Proj for Isea {
+    fn fwd(&self, lam: f64, phi: f64) -> Option<(f64, f64)> {
+        let (lat, lon) = self.rotate(phi, lam);
+        let (tri, mut x, mut y) = self.snyder_forward(lat, lon)?;
+        // Faces 5 to 9 and 15 to 19 point down: turn them half a turn, then move the face to its
+        // place in the plane (PROJ's isea_tri_plane).
+        if (tri / 5) % 2 == 1 {
+            x = -x;
+            y = -y;
+        }
+        let mut cx = ISEA_TABLE_G * ((tri % 5) as f64 - 2.0) * 2.0;
+        if tri > 9 {
+            cx += ISEA_TABLE_G;
+        }
+        let cy = match tri / 5 {
+            0 => 5.0 * ISEA_TABLE_H,
+            1 => ISEA_TABLE_H,
+            2 => -ISEA_TABLE_H,
+            _ => -5.0 * ISEA_TABLE_H,
+        };
+        Some((x + cx * ISEA_RPRIME_OVER_R, y + cy * ISEA_RPRIME_OVER_R))
+    }
+
+    fn inv(&self, x: f64, y: f64) -> Option<(f64, f64)> {
+        let g = self.plane.as_ref()?;
+        // The inverse's origin differs from the forward's.
+        let (lat, lon) = self.cartesian_to_geo(g, x * self.a + g.xo, y * self.a + g.yo)?;
+        Some((lon, lat))
     }
 }
 
@@ -3554,6 +4893,34 @@ mod benchmark_regressions {
                 let expected = 1.0 / srat(e * phi0.sin(), 0.5 * e);
                 assert!(gauss.k.is_finite() && (gauss.k - expected).abs() < 1e-14);
                 assert!((chi - phi0).abs() < 1e-15 && radius.is_finite());
+            }
+        }
+    }
+
+    /// Edge policy deliberately differs from GDAL 3.13.3's strict PROJ domain.
+    #[test]
+    fn mollweide_and_wagner_snap_antimeridian_roundoff() {
+        for name in ["moll", "wag4", "wag5"] {
+            let p = Moll::new(name);
+            for sign in [-1.0, 1.0] {
+                for ulps in [-4.0, 0.0, 4.0] {
+                    let lam = sign * (PI + ulps * (PI.next_up() - PI));
+                    let actual = p.inv(p.cx * lam, 0.0).unwrap();
+                    assert_eq!(actual, (sign * PI, 0.0), "{name}");
+                }
+                // High auxiliary latitudes amplify an ulp of y into many ulps of longitude.
+                for theta in if name == "moll" { [1.2_f64, 1.4, 1.5] } else { [0.8, 0.9, 1.0] } {
+                    let x = p.cx * sign * PI * theta.cos();
+                    let y = p.cy * theta.sin();
+                    for rounded_y in [y.next_down(), y, y.next_up()] {
+                        let actual = p.inv(x, rounded_y).unwrap();
+                        assert!((actual.0 - sign * PI).abs() < 1e-12, "{name}: {theta}");
+                    }
+                    assert!(p.inv(x * (1.0 + 1e-10), y).is_none(), "{name}: {theta}");
+                }
+                assert!(p.inv(p.cx * sign * (PI + 1e-12), 0.0).is_none());
+                let inside = sign * (PI - 1e-12);
+                assert!((p.inv(p.cx * inside, 0.0).unwrap().0 - inside).abs() < 1e-15);
             }
         }
     }

@@ -14,6 +14,7 @@
 //
 // Usage: node js/build.mjs [--target web|nodejs|bundler] [--out-dir pkg] [--profile wasm-release]
 //        [--no-threads] [--no-memory64]
+//        [--no-default-features --features netcdf-hdf5] (one selective module)
 // (run from the repository's root; the output directory is relative to js/, as wasm-pack's is).
 
 import { execFileSync } from "node:child_process";
@@ -25,6 +26,8 @@ import { parseArgs } from "node:util";
 
 const { values } = parseArgs({
   options: {
+    "no-default-features": { type: "boolean", default: false },
+    features: { type: "string" },
     target: { type: "string", default: "web" },
     "out-dir": { type: "string", default: "pkg" },
     profile: { type: "string", default: "wasm-release" },
@@ -32,10 +35,16 @@ const { values } = parseArgs({
     "no-memory64": { type: "boolean", default: false },
   },
 });
+const selective = values["no-default-features"] || values.features !== undefined;
+if (!["web", "nodejs", "bundler"].includes(values.target)) throw new Error("target must be web, nodejs or bundler");
+if (selective && !values["no-default-features"]) throw new Error("selective builds require --no-default-features");
+if (selective && /(^|[,\s])(?:[^,\s/]+\/)?threads([,\s]|$)/.test(values.features ?? "")) {
+  throw new Error("selective builds are single-threaded; use the standard threaded build instead");
+}
 /** The nightly Rust the threaded module is built with, pinned so that builds repeat. */
 const NIGHTLY = process.env.TERRIO_JS_NIGHTLY ?? "nightly-2026-10-15";
-const threads = values.target === "web" && !values["no-threads"];
-const memory64 = values.target === "web" && !values["no-memory64"];
+const threads = !selective && values.target === "web" && !values["no-threads"];
+const memory64 = !selective && values.target === "web" && !values["no-memory64"];
 const crate = fileURLToPath(new URL(".", import.meta.url));
 const out = join(crate, values["out-dir"]);
 const profile = values.profile === "release" ? ["--release"] : ["--profile", values.profile];
@@ -48,8 +57,11 @@ function wasmPack(outDir, extra, cargo = [], env = undefined) {
   execFileSync(command[0], all, { stdio: "inherit", env: env ? { ...process.env, ...env } : process.env });
 }
 
-wasmPack(out, []);
-wasmPack(join(out, "core"), ["--no-pack"], ["--no-default-features", "--features", "core"]);
+// Refuse an existing package for selective output so stale variants cannot be shipped.
+if (selective && existsSync(out)) throw new Error("selective output directory must not exist; choose a fresh --out-dir");
+const selectedCargo = selective ? ["--no-default-features", ...(values.features ? ["--features", values.features] : []), "--locked"] : [];
+wasmPack(out, [], selectedCargo);
+if (!selective) wasmPack(join(out, "core"), ["--no-pack"], ["--no-default-features", "--features", "core"]);
 if (threads) {
   // Shared memory (up to 4 GB, as without threads), and the thread-local storage symbols
   // wasm-bindgen sets up each thread with; the target's own flags (.cargo/config.toml) are
@@ -65,15 +77,19 @@ if (threads) {
 }
 if (memory64) buildMemory64(join(out, "memory64"));
 // wasm-pack ignores everything in its output directories; npm must still pack them.
-for (const sub of ["core", "threads"]) rmSync(join(out, sub, ".gitignore"), { force: true });
+for (const sub of (selective ? [] : ["core", "threads"])) rmSync(join(out, sub, ".gitignore"), { force: true });
 // The loader, which picks a module.
-for (const f of ["load.js", "load.d.ts"]) copyFileSync(join(crate, f), join(out, f));
+for (const f of (selective ? [] : ["load.js", "load.d.ts"])) copyFileSync(join(crate, f), join(out, f));
 
 const path = join(out, "package.json");
 const pkg = JSON.parse(readFileSync(path, "utf8"));
-const module = (dir) => [`${dir}terrio_bg.wasm`, `${dir}terrio.js`, `${dir}terrio.d.ts`];
+const module = (dir) => [`${dir}terrio_bg.wasm`, `${dir}terrio_bg.wasm.d.ts`, `${dir}terrio.js`, `${dir}terrio.d.ts`];
 // The threaded module's worker script is a wasm-bindgen snippet, in `threads/snippets/`.
-const files = [...module("core/"), ...(threads ? ["threads/"] : []), ...(memory64 ? module("memory64/") : []), "load.js", "load.d.ts"];
+const files = [...module(""), ...(existsSync(join(out, "snippets")) ? ["snippets/"] : []), ...(selective ? [] : module("core/")), ...(threads ? ["threads/"] : []), ...(memory64 ? module("memory64/") : []), ...(selective ? [] : ["load.js", "load.d.ts"])];
+// Carry project attribution alongside generated glue, declarations and WASM.
+const notices = ["LICENSE", "NOTICE", "LICENSE-THIRD-PARTY.md"];
+for (const name of notices) copyFileSync(join(crate, "..", name), join(out, name));
+files.push(...notices);
 pkg.files = [...new Set([...(pkg.files ?? []), ...files])];
 // The worker script runs on its own when loaded: bundlers must keep it whole.
 if (threads) pkg.sideEffects = [...new Set([...(pkg.sideEffects ?? []), "./threads/snippets/*"])];
@@ -81,10 +97,10 @@ const entry = (dir, name = "terrio") => ({ types: `./${dir}${name}.d.ts`, defaul
 // The files stay importable by their paths (`terrio-js/terrio_bg.wasm`), as without `exports`.
 pkg.exports = {
   ".": entry(""),
-  "./core": entry("core/"),
+  ...(!selective ? { "./core": entry("core/") } : {}),
   ...(threads ? { "./threads": entry("threads/") } : {}),
   ...(memory64 ? { "./memory64": entry("memory64/") } : {}),
-  "./load": entry("", "load"),
+  ...(!selective ? { "./load": entry("", "load") } : {}),
   "./package.json": "./package.json",
   "./*": "./*",
 };
@@ -97,19 +113,14 @@ for (const f of ["terrio_bg.wasm", "core/terrio_bg.wasm", "threads/terrio_bg.was
 /**
  * The crates that do not build for wasm64-unknown-unknown as published, and the edits that make
  * them: they treat wasm32 as WebAssembly. `tar` (wbraster's) leaves out its path conversions
- * (https://github.com/alexcrichton/tar-rs, `cfg(target_arch = "wasm32")`), `zstd-sys` (Arrow's
- * Zstandard, for GeoParquet) its libc shim, `arrow-buffer` its alignment constant, and acadrust
- * its mmap/thread target guards. Copies of
- * the locked versions are edited (replacing `target_arch = "wasm32"` with `target_family =
- * "wasm"`) for this build only, through cargo's `--config patch...`.
+ * (https://github.com/alexcrichton/tar-rs, `cfg(target_arch = "wasm32")`), `arrow-buffer`
+ * its alignment constant, and acadrust its mmap/thread target guards. Copies of the locked
+ * versions are edited (replacing `target_arch = "wasm32"` with `target_family = "wasm"`) for this
+ * build only, through cargo's `--config patch...`.
  */
 function wasm64Patches() {
   return {
     tar: (dir) => readdirSync(join(dir, "src")).filter((f) => f.endsWith(".rs")).map((f) => [join("src", f), /target_arch = "wasm32"/g, 'target_family = "wasm"']),
-    "zstd-sys": () => [
-      ["src/lib.rs", /#\[cfg\(target_arch = "wasm32"\)\]/g, '#[cfg(target_family = "wasm")]'],
-      ["build.rs", /target == "wasm32-unknown-unknown"/g, 'target == "wasm32-unknown-unknown" || target == "wasm64-unknown-unknown"'],
-    ],
     // acadrust uses wasm32-specific guards for mmap and thread spawning.
     acadrust: (dir) => ["Cargo.toml", ...readdirSync(join(dir, "src"), { recursive: true }).filter((f) => f.endsWith(".rs")).map((f) => join("src", f))]
       .filter((f) => /target_arch = "wasm32"/.test(readFileSync(join(dir, f), "utf8")))
@@ -123,33 +134,6 @@ function wasmPackTool(prefix, file) {
   const cache = process.env.WASM_PACK_CACHE ?? (process.platform === "darwin" ? join(homedir(), "Library", "Caches", ".wasm-pack") : join(homedir(), ".cache", ".wasm-pack"));
   const found = existsSync(cache) ? readdirSync(cache).filter((d) => d.startsWith(prefix)).map((d) => join(cache, d, file)) : [];
   return found.filter((f) => existsSync(f));
-}
-
-/**
- * The C compiler for wasm64 (Zstandard's C sources): a clang of LLVM 20 or later, whose indirect
- * calls index a 64-bit table as Rust's do (an older clang wraps the index to 32 bits, and the
- * module it links fails to validate). CC_wasm64_unknown_unknown, else the first suitable of
- * `clang`, `clang-20`... on PATH.
- */
-function wasm64Clang() {
-  // The versioned names tried, newest first: clang-29 down to clang-20.
-  const versions = Array.from({ length: 10 }, (_, i) => 29 - i);
-  const major = (cc) => {
-    try {
-      return Number(/clang version (\d+)/.exec(execFileSync(cc, ["--version"]).toString())?.[1] ?? 0);
-    } catch {
-      return 0;
-    }
-  };
-  const given = process.env.CC_wasm64_unknown_unknown;
-  const candidates = given ? [given] : ["clang", ...versions.map((v) => `clang-${v}`)];
-  const seen = candidates.map((c) => [c, major(c)]);
-  const cc = seen.find(([, v]) => v >= 20)?.[0];
-  if (!cc) {
-    const found = seen.filter(([, v]) => v > 0).map(([c, v]) => `${c} (${v})`);
-    throw new Error(`the memory64 module needs clang 20 or later (CC_wasm64_unknown_unknown, or clang-20 on PATH); found: ${found.join(", ") || "none"}`);
-  }
-  return cc;
 }
 
 /**
@@ -196,7 +180,7 @@ function buildMemory64(outDir) {
     execFileSync("rustup", ["run", NIGHTLY, "cargo", "build", "-p", "terrio-js", "--target", target, ...profile, "-Z", "build-std=panic_abort,std", ...patches], {
       cwd: crate,
       stdio: "inherit",
-      env: { ...process.env, RUSTFLAGS: rustflags.join(" "), CARGO_TARGET_DIR: targetDir, CC_wasm64_unknown_unknown: wasm64Clang() },
+      env: { ...process.env, RUSTFLAGS: rustflags.join(" "), CARGO_TARGET_DIR: targetDir },
     });
   } finally {
     writeFileSync(lockPath, lock);

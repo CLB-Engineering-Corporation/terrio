@@ -3,8 +3,8 @@
 //! names).
 
 use crate::ops::input_layers;
-use crate::vector::PyLayer;
-use crate::{PyResultExt, invalid};
+use crate::vector::{PyLayer, PyVectorDataset};
+use crate::{Detach, PyResultExt, invalid};
 use pyo3::prelude::*;
 use terrio::Layer;
 use terrio::ops::vector_geom::{
@@ -14,6 +14,12 @@ use terrio::ops::vector_geom::{
 /// Registers the functions in the module.
 pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(simplify, m)?)?;
+    m.add_function(wrap_pyfunction!(clip_vector, m)?)?;
+    m.add_function(wrap_pyfunction!(layer_algebra, m)?)?;
+
+    m.add_function(wrap_pyfunction!(check_coverage, m)?)?;
+    m.add_function(wrap_pyfunction!(simplify_coverage, m)?)?;
+    m.add_function(wrap_pyfunction!(clean_coverage, m)?)?;
     m.add_function(wrap_pyfunction!(segmentize, m)?)?;
     m.add_function(wrap_pyfunction!(convex_hull, m)?)?;
     m.add_function(wrap_pyfunction!(concave_hull, m)?)?;
@@ -25,7 +31,7 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
 }
 
 /// The single layer an operation works on: `src`'s only layer, or the one named `layer`.
-fn one_layer(py: Python<'_>, src: &Bound<'_, PyAny>, layer: Option<String>) -> PyResult<Layer> {
+pub(crate) fn one_layer(py: Python<'_>, src: &Bound<'_, PyAny>, layer: Option<String>) -> PyResult<Layer> {
     let mut layers = input_layers(py, src, layer.clone().map(|l| vec![l]))?;
     match layers.len() {
         1 => Ok(layers.remove(0)),
@@ -39,8 +45,8 @@ fn one_layer(py: Python<'_>, src: &Bound<'_, PyAny>, layer: Option<String>) -> P
 
 fn run(py: Python<'_>, src: &Bound<'_, PyAny>, layer: Option<String>, op: GeometryOp) -> PyResult<PyLayer> {
     let input = one_layer(py, src, layer)?;
-    let inner = py.detach(|| vector_geom::apply(&input, &op)).py()?;
-    Ok(PyLayer { inner })
+    let inner = py.detach_result(|| vector_geom::apply(&input, &op)).py()?;
+    Ok(PyLayer::from(inner))
 }
 
 /// Simplifies geometries, preserving their topology, as `gdal vector simplify` (GEOS's
@@ -200,8 +206,8 @@ fn combine(
         add_extra_fields: ExtraFields::parse(add_extra_fields).py()?,
     };
     let input = one_layer(py, src, layer)?;
-    let inner = py.detach(|| vector_geom::combine(&input, &options)).py()?;
-    Ok(PyLayer { inner })
+    let inner = py.detach_result(|| vector_geom::combine(&input, &options)).py()?;
+    Ok(PyLayer::from(inner))
 }
 
 /// Sorts features by the position of their geometries, as `gdal vector sort`.
@@ -218,6 +224,247 @@ fn combine(
 fn sort(py: Python<'_>, src: &Bound<'_, PyAny>, method: &str, layer: Option<String>) -> PyResult<PyLayer> {
     let method = SortMethod::parse(method).py()?;
     let input = one_layer(py, src, layer)?;
-    let inner = py.detach(|| vector_geom::sort(&input, method));
-    Ok(PyLayer { inner })
+    let inner = py.detach_value(|| vector_geom::sort(&input, method))?;
+    Ok(PyLayer::from(inner))
+}
+
+/// Clips vector features to a bbox, polygon geometry, or vector/raster template.
+///
+/// Args:
+///     src: Vector path, Layer, VectorDataset or GeoJSON; choose one layer with layer.
+///     bbox: xmin,ymin,xmax,ymax in the input CRS unless crs is supplied.
+///     geometry: Polygon/multipolygon WKT or GeoJSON text. GeoJSON defaults to WGS84.
+///     like: Vector/raster path, a Raster, or in-memory vector data. Polygon features
+///         are unioned; raster bounds use metadata without reading lazy raster pixels.
+///     crs: CRS of bbox/geometry, transforming the clip region rather than input data.
+///     layer: Input layer to use when src has several.
+///     like_layer: Template layer to union.
+///     like_where: OGR SQL WHERE subset for template features; exclusive with like_sql.
+///     like_sql: Supported SELECT subset for the vector template.
+///
+/// Returns:
+///     Layer: Clipped features with retained attributes and CRS, and sequential IDs.
+///         Points/line cuts retain/interpolate Z/M; new polygon topology is XY.
+#[pyfunction]
+#[pyo3(signature=(src, *, bbox=None, geometry=None, like=None, crs=None, layer=None, like_layer=None, like_where=None, like_sql=None))]
+#[allow(clippy::too_many_arguments)]
+fn clip_vector(
+    py: Python<'_>,
+    src: &Bound<'_, PyAny>,
+    bbox: Option<[f64; 4]>,
+    geometry: Option<String>,
+    like: Option<&Bound<'_, PyAny>>,
+    crs: Option<String>,
+    layer: Option<String>,
+    like_layer: Option<String>,
+    like_where: Option<String>,
+    like_sql: Option<String>,
+) -> PyResult<PyLayer> {
+    use terrio::ops::vector_clip::{ClipRegion, ClipTemplateOptions};
+    if usize::from(bbox.is_some()) + usize::from(geometry.is_some()) + usize::from(like.is_some()) != 1 {
+        return Err(invalid("provide exactly one of bbox, geometry or like"));
+    }
+    if like.is_none() && (like_layer.is_some() || like_where.is_some() || like_sql.is_some()) {
+        return Err(invalid("like_layer/where/sql require like"));
+    }
+    if like.is_some() && crs.is_some() {
+        return Err(invalid("crs applies only to bbox/geometry"));
+    }
+    let crs = crs.as_deref().map(terrio::crs::SpatialRef::parse).transpose().py()?;
+    let template = ClipTemplateOptions { layer: like_layer, where_clause: like_where, sql: like_sql };
+    let region = if let Some(bbox) = bbox {
+        ClipRegion::bbox(bbox, crs).py()?
+    } else if let Some(text) = geometry {
+        ClipRegion::parse(&text, crs).py()?
+    } else {
+        let like = like.unwrap();
+        if let Ok(raster) = like.cast::<crate::raster::PyRaster>() {
+            if template.layer.is_some() || template.where_clause.is_some() || template.sql.is_some() {
+                return Err(invalid("like_layer/where/sql require a vector template"));
+            }
+            ClipRegion::from_raster(&raster.borrow().inner.header()).py()?
+        } else if let Some(layers) = clip_inline_geojson(like) {
+            ClipRegion::from_layers(&layers?, &template).py()?
+        } else if let Ok(path) = like.extract::<std::path::PathBuf>() {
+            let path = path.to_str().ok_or_else(|| invalid("template path must be UTF-8"))?;
+            native_clip_template(py, path, &template)?
+        } else {
+            ClipRegion::from_layers(&input_layers(py, like, None)?, &template).py()?
+        }
+    };
+    let input = if let Some(layers) = clip_inline_geojson(src) {
+        let mut layers = layers?;
+        if let Some(name) = layer {
+            layers = terrio::ops::vector_filter::select_layers(layers, &[name]).py()?;
+        }
+        if layers.len() != 1 {
+            return Err(invalid("clip_vector needs one input layer; select it with layer"));
+        }
+        layers.remove(0)
+    } else if let Ok(path) = src.extract::<std::path::PathBuf>() {
+        let path = path.to_str().ok_or_else(|| invalid("input path must be UTF-8"))?;
+        let mut layers = py
+            .detach_result(|| {
+                terrio::ops::vector_filter::open_layers(
+                    path,
+                    &terrio::VectorOpenOptions { layers: layer.into_iter().collect(), ..Default::default() },
+                )
+            })
+            .py()?;
+        if layers.len() != 1 {
+            return Err(invalid("clip_vector needs one input layer; select it with layer"));
+        }
+        layers.remove(0)
+    } else {
+        one_layer(py, src, layer)?
+    };
+    Ok(PyLayer::from(py.detach_result(|| terrio::ops::vector_clip::clip(&input, &region)).py()?))
+}
+
+fn clip_inline_geojson(value: &Bound<'_, PyAny>) -> Option<PyResult<Vec<Layer>>> {
+    let text = value.extract::<String>().ok()?;
+    if !text.trim_start().starts_with('{') || std::path::Path::new(&text).is_file() {
+        return None;
+    }
+    Some(terrio::memory::open_vector_bytes(text.into_bytes(), "input.geojson", &Default::default()).map(|v| v.layers).py())
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn native_clip_template(
+    py: Python<'_>,
+    path: &str,
+    template: &terrio::ops::vector_clip::ClipTemplateOptions,
+) -> PyResult<terrio::ops::vector_clip::ClipRegion> {
+    py.detach_result(|| terrio::ops::vector_clip::ClipRegion::from_path(path, template)).py()
+}
+#[cfg(target_family = "wasm")]
+fn native_clip_template(
+    _: Python<'_>,
+    _: &str,
+    _: &terrio::ops::vector_clip::ClipTemplateOptions,
+) -> PyResult<terrio::ops::vector_clip::ClipRegion> {
+    Err(invalid("template paths are unavailable in WebAssembly; pass a Raster or vector data"))
+}
+
+/// Find invalid boundary segments in a polygon coverage.
+///
+/// Args:
+///     src: Vector path, dataset, layer or GeoJSON. Polygons must individually be valid.
+///     maximum_gap_width: Largest narrow-gap width to flag, in input CRS units; zero disables it.
+///     include_valid: Emit empty MultiLineStrings for valid features, preserving correspondence.
+///     layer: Select a single layer when the input has multiple layers.
+///
+/// Returns:
+///     Layer: Invalid MultiLineStrings with CRS retained, empty attributes and sequential IDs.
+#[pyfunction]
+#[pyo3(signature = (src, *, maximum_gap_width=0.0, include_valid=false, layer=None))]
+fn check_coverage(
+    py: Python<'_>,
+    src: &Bound<'_, PyAny>,
+    maximum_gap_width: f64,
+    include_valid: bool,
+    layer: Option<String>,
+) -> PyResult<PyLayer> {
+    let input = one_layer(py, src, layer)?;
+    let options = terrio::ops::coverage::CoverageCheckOptions { maximum_gap_width, include_valid };
+    let inner = py.detach_result(|| terrio::ops::coverage::check_coverage(&input, &options)).py()?;
+    Ok(PyLayer::from(inner))
+}
+
+/// Simplify shared polygon coverage boundaries without creating gaps or overlaps.
+///
+/// Args:
+///     src: Polygonal vector input forming a valid coverage, or multiple layers.
+///     tolerance: Square root of the triangle-area threshold, in input CRS units.
+///     preserve_boundary: Retain exterior/hole boundaries.
+///     layer: Select one layer and return a Layer; mutually exclusive with active_layer.
+///     active_layer: Simplify this layer and copy the others, returning a VectorDataset.
+///
+/// Returns:
+///     Layer or VectorDataset: Simplified coverage with attributes/CRS and sequential IDs.
+#[pyfunction]
+#[pyo3(signature = (src, tolerance, *, preserve_boundary=false, layer=None, active_layer=None))]
+fn simplify_coverage(
+    py: Python<'_>,
+    src: &Bound<'_, PyAny>,
+    tolerance: f64,
+    preserve_boundary: bool,
+    layer: Option<String>,
+    active_layer: Option<String>,
+) -> PyResult<Py<PyAny>> {
+    let options = terrio::ops::coverage_simplify::CoverageSimplifyOptions { tolerance, preserve_boundary };
+    if let Some(active) = active_layer {
+        if layer.is_some() {
+            return Err(invalid("layer and active_layer are mutually exclusive"));
+        }
+        let input = input_layers(py, src, None)?;
+        let layers = py.detach_result(|| terrio::ops::coverage_simplify::simplify_coverage_layers(&input, &options, Some(&active))).py()?;
+        let dataset = terrio::VectorDataset::new(layers, terrio::formats::VectorDriver::GeoJSON);
+        return Ok(Py::new(py, PyVectorDataset::new(py, dataset)?)?.into_any());
+    }
+    let input = one_layer(py, src, layer)?;
+    let inner = py.detach_result(|| terrio::ops::coverage_simplify::simplify_coverage(&input, &options)).py()?;
+    Ok(Py::new(py, PyLayer::from(inner))?.into_any())
+}
+
+/// Planar XY layer algebra. All seven operations accept polygon, line, point and
+/// collection inputs. CRS must match. Returns a new Layer with sequential IDs.
+/// Intersection/union/sym-difference/identity include both schemas; update,
+/// clip and erase use input fields only. Sources are materialized in memory.
+#[pyfunction]
+#[pyo3(signature=(src, method, operation, *, layer=None, method_layer=None, keep_lower_dimension_geometries=true, input_prefix=None, method_prefix=None))]
+#[allow(clippy::too_many_arguments)]
+fn layer_algebra(
+    py: Python<'_>,
+    src: &Bound<'_, PyAny>,
+    method: &Bound<'_, PyAny>,
+    operation: &str,
+    layer: Option<String>,
+    method_layer: Option<String>,
+    keep_lower_dimension_geometries: bool,
+    input_prefix: Option<String>,
+    method_prefix: Option<String>,
+) -> PyResult<PyLayer> {
+    let op = operation.parse().py()?;
+    let a = one_layer(py, src, layer)?;
+    let b = one_layer(py, method, method_layer)?;
+    let options = terrio::ops::layer_algebra::LayerAlgebraOptions { keep_lower_dimension_geometries, input_prefix, method_prefix };
+    let inner = py.detach_result(|| terrio::ops::layer_algebra::layer_algebra(&a, &b, op, &options)).py()?;
+    Ok(PyLayer::from(inner))
+}
+
+/// Snap and node polygon coverage boundaries, assigning overlaps and filling enclosed narrow gaps.
+/// Distances use planar input CRS units. Negative snapping_distance selects the default;
+/// zero disables proximity snapping. Topology is XY; Z survives/interpolates and M
+/// is dropped on cleaned layers. With active_layer, return a
+/// VectorDataset containing the cleaned selection and unchanged inactive layers.
+#[pyfunction]
+#[pyo3(signature = (src, *, snapping_distance=-1.0, merge_strategy="longest-border", maximum_gap_width=0.0, layer=None, active_layer=None))]
+#[allow(clippy::too_many_arguments)]
+fn clean_coverage(
+    py: Python<'_>,
+    src: &Bound<'_, PyAny>,
+    snapping_distance: f64,
+    merge_strategy: &str,
+    maximum_gap_width: f64,
+    layer: Option<String>,
+    active_layer: Option<String>,
+) -> PyResult<Py<PyAny>> {
+    let options = terrio::ops::coverage_clean::CoverageCleanOptions {
+        snapping_distance,
+        merge_strategy: merge_strategy.parse().py()?,
+        maximum_gap_width,
+    };
+    if let Some(active) = active_layer {
+        if layer.is_some() {
+            return Err(invalid("layer and active_layer are mutually exclusive"));
+        }
+        let input = input_layers(py, src, None)?;
+        let layers = py.detach_result(|| terrio::ops::coverage_clean::clean_coverage_layers(&input, Some(&active), &options)).py()?;
+        let dataset = terrio::VectorDataset::new(layers, terrio::formats::VectorDriver::GeoJSON);
+        return Ok(Py::new(py, PyVectorDataset::new(py, dataset)?)?.into_any());
+    }
+    let input = one_layer(py, src, layer)?;
+    let inner = py.detach_result(|| terrio::ops::coverage_clean::clean_coverage(&input, &options)).py()?;
+    Ok(Py::new(py, PyLayer::from(inner))?.into_any())
 }

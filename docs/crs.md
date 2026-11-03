@@ -28,7 +28,15 @@ as PROJ strings with typical parameters and as pyproj's WKT1 and WKT2 of them:
 Krovak off Bessel's ellipsoid, where PROJ's inverse is not the inverse of its forward.
 
 Mollweide and Wagner IV/V use Terrio's own ports of PROJ's formulas, including
-PROJ's finite Mollweide pole approximation. The orthographic inverse intersects
+PROJ's finite Mollweide pole approximation. Their inverses judge antimeridian
+rounding on the normalized projected ellipse, allowing its radius up to
+`1 + 8 * f64::EPSILON`. Longitude estimates at or above `π - 8 * ulp(π)` in
+absolute value snap to the corresponding antimeridian if they pass that radius
+check; points farther outside the ellipse remain errors. The resulting longitude
+allowance grows toward the poles because inversion amplifies projected-coordinate
+rounding there. This deliberately differs from PROJ's strict exclusion of the edge
+in GDAL 3.13.3, avoiding refusals caused by platform libm rounding.
+The orthographic inverse intersects
 the viewing ray with the ellipsoid directly, including local scale and azimuth.
 For Winkel Tripel, an omitted `lat_1` means 0, as in PROJ's CRS model and GDAL;
 PROJ's bare operation instead defaults to `acos(2/pi)` (about 50.46°). Supply
@@ -55,10 +63,10 @@ than Terrio's raster/vector library:
 
 ```toml
 [dependencies]
-terrio-crs = "0.1"
+terrio-crs = "0.2"
 ```
 
-The [published crate](https://crates.io/crates/terrio-crs/0.1.0) works offline by
+The [published crate](https://crates.io/crates/terrio-crs/0.2.1) works offline by
 default. Enable `wbprojection-fallback` when Terrio's wider projection coverage
 is required; the feature matrix below describes the supported configurations.
 
@@ -74,7 +82,7 @@ let (easting, northing) = transform.transform(-105.0, 40.0)?;
 
 | Configuration | Behavior |
 |---|---|
-| Default | EPSG/ESRI tables, WKT and PROJ strings, 40 native methods from the 117-method test corpus, datum operations, epochs, and local or registered grids; offline |
+| Default | EPSG/ESRI tables, WKT and PROJ strings, 43 native methods from the 117-method test corpus, datum operations, epochs, and local or registered grids; offline |
 | `wbprojection-fallback` | 46 additional projection methods and legacy WKT/identification fallback; enabled by Terrio |
 | `grid-transport` (native) | An application supplies `network::GridTransport` with seekable readers; the engine retains lazy TIFF block decoding |
 | Terrio's `remote` feature | Supplies Terrio's existing HTTP range reader, request controls and cache to the shared engine |
@@ -100,10 +108,13 @@ by the settings described below. Direct callers retrieve diagnostics with
 
 The standalone default omits `wbprojection`; Terrio enables the fallback to retain
 its existing coverage. Bundled tables use portable `ruzstd` decompression on all
-targets. TIFF grid codecs retain their previous features, including native Zstd.
+targets. The standalone default has no C dependency: Zstandard TIFF grids are read only with the
+`libzstd` feature, which uses the zstd C library and which Terrio does not enable. The PROJ CDN's
+grids are Deflate-compressed (all 11 sampled, among them those this page and the tests name), so this
+concerns grids recompressed with Zstandard.
 The [dependency and build measurements](crs-footprint.md) record both standalone
 configurations and full Terrio before/after extraction. Extraction and validation are tracked in
-[#268](https://github.com/opengeos/terrio/issues/268). Capability additions are tracked separately in #269–#272.
+[#268](https://github.com/opengeos/terrio/issues/268). Remaining projection coverage is tracked in #272.
 
 ### Publication and release workflow
 
@@ -285,8 +296,8 @@ Where none applies, heights are kept. Vertical CRSs of one datum (NAVD88 height 
 US survey feet) only convert units.
 
 ```sh
-TERRIO_NETWORK=ON terrio crs EPSG:4267+7968 --to EPSG:4267+5703 -105.27 40.01 1700   # VERTCON: 1701.0026
-terrio crs EPSG:4258+5783 --to EPSG:4258+5785 13.4 52.5 100                       # DHHN92 to SNN76: 99.856
+TERRIO_NETWORK=ON terrio crs EPSG:4267+7968 --to EPSG:4267+5703 --dim 3 -105.27 40.01 1700   # VERTCON: 1701.0026
+terrio crs EPSG:4258+5783 --to EPSG:4258+5785 --dim 3 13.4 52.5 100                       # DHHN92 to SNN76: 99.856
 ```
 
 These are listed in `crates/terrio-crs/data/epsg_vertical.tsv.zst` (`scripts/gen_vertical_table.py`)
@@ -359,8 +370,8 @@ apply.
 
 ## Attribution
 
-EPSG definitions come from the [EPSG Geodetic Parameter Dataset](https://epsg.org), through the
-`wbprojection` crate and PROJ. The grid algorithms follow [PROJ](https://proj.org) (MIT licence);
+EPSG definitions come from the [EPSG Geodetic Parameter Dataset](https://epsg.org), generated from
+GDAL and PROJ by `scripts/gen_epsg_table.py`. The grid algorithms follow [PROJ](https://proj.org) (MIT licence);
 the grids themselves come from [PROJ-data](https://cdn.proj.org), under their producers' licences.
 
 ## Geocentric Cartesian CRSs
@@ -640,7 +651,7 @@ configurations and 2,500 forward samples, both sides of the horizon, inverse
 domain boundaries, metres/kilometres/US survey feet, offsets and non-default
 origins/tilt/azimuth. Component allowances are 1 mm projected and 1e-8 degrees
 inverse, with longitude weighted by cos(latitude) at the poles. Other projection
-families in #272 remain tracked there.
+families from #272 are documented below.
 
 ## Interrupted Goode homolosine
 
@@ -688,3 +699,105 @@ lenient, that applies rotated too: its `utm` accepts a sphere, which PROJ refuse
 The `seed-ob_tran-moll` fixture keeps its PROJ 9.9.0 oracle. A PROJ 9.8.1 corpus covers
 15 configurations and 4,680 samples (see Testing). Allowances are 1 mm projected and 1e-8
 degrees inverse.
+
+## Quadrilateralized spherical cube
+
+`+proj=qsc` is computed as PROJ 9.8.1 does (`qsc.cpp`): one face of a cube, chosen by the
+projection centre (`+lat_0` of at least 67.5 degrees north or south for the top or bottom face,
+otherwise `+lon_0` within 45 degrees of 0, 90, 180 or -90 for the front, right, back or left
+face). PROJ's face centres are those values exactly; for other centres, `+lon_0` stays the
+central meridian. On an ellipsoid, geodetic latitudes are converted to
+geocentric latitudes on a sphere of the semi-major axis, as in PROJ. The whole globe projects
+onto the plane of the face, with no refusals; `+units`, `+x_0` and `+y_0` apply. The inverse at
+the point opposite the face centre is sensitive to rounding: a change of 1e-15 in the northing
+moves its latitude by about 1e-6 degrees, in PROJ as in terrio, and so may differ between
+platforms.
+
+GDAL's and ESRI's WKT1 `Quadrilateralized_Spherical_Cube` and WKT2 `Quadrilateralized Spherical
+Cube` are read, and terrio writes the WKT1 form, as GDAL does. PROJJSON export refuses `qsc`, as
+for other projections without an EPSG method.
+
+The `method-qsc` fixture keeps its PROJ 9.9.0 oracle. A PROJ 9.8.1 corpus covers 16
+configurations and 4,288 samples (see Testing). Allowances are 1 mm projected and 1e-8 degrees
+inverse. At the point opposite the face centre the inverse is allowed 1e-5 degrees, and must
+project back within 1 mm.
+
+## HEALPix and rHEALPix
+
+`+proj=healpix` and `+proj=rhealpix` are computed as PROJ 9.8.1 does (`healpix.cpp`): an
+equal-area cylindrical projection between the latitudes of asin(2/3) and Collignon projections
+in the four polar caps on each side, which `healpix` leaves as triangles and `rhealpix` combines
+into one square at each pole. `+rot_xy` rotates the `healpix` image, in degrees; `+north_square`
+and `+south_square` (0 to 3, the default 0) pick the equatorial square below which `rhealpix`
+places each polar square, and other values are refused, as in PROJ. On an ellipsoid the
+latitude is the authalic latitude and the image is scaled by the authalic radius, as in PROJ
+9.8.1 (PROJ 9.4 differs by 0.18 m on WGS 84 at the south pole). `+lon_0`, `+units`,
+`+x_0` and `+y_0` apply. The inverse refuses points outside the image, as PROJ's does. As in
+PROJ, whose point-in-polygon test leaves out the polygon's closing edge, the `rhealpix` inverse
+accepts points left of the image between the polar squares, such as (-4, 0) on the unit sphere.
+
+GDAL's WKT1 (`custom_proj4`, which carries the PROJ string), ESRI's `PROJ_healpix` and
+`PROJ_rhealpix`, and PROJ's WKT2 methods `PROJ healpix` and `PROJ rhealpix` are read; terrio
+writes the WKT1 form, as GDAL does. PROJJSON with these methods is not read, and PROJJSON
+export refuses them, as for other projections without an EPSG method.
+
+On the edge of the image (the poles, the antimeridian of the central meridian and the edges of
+the polar caps) the last bit of a projected coordinate moves a point in or out of the image.
+There a US survey foot in the PROJ string's `+units` can decide it: PROJ 9.8.1 takes that unit
+in these methods' own `+units` as 0.304800609601219 m, and terrio, as PROJ's `unitconvert` for
+other methods, as 1200/3937 m.
+
+The `method-healpix` and `method-rhealpix` fixtures keep their PROJ 9.9.0 oracles. A PROJ
+9.8.1 corpus covers 22 configurations and 6,600 samples (see Testing). Allowances are 1 mm
+projected and 1e-8 degrees inverse.
+
+## Icosahedral Snyder Equal Area
+
+`+proj=isea` is computed as PROJ 9.8.1 does (`isea.cpp`): Snyder's equal-area projection of the
+sphere onto the 20 faces of an icosahedron, unfolded in the plane. `+orient=isea` (the default)
+places the poles on edge midpoints and makes the equator symmetric; `+orient=pole` places a
+vertex at each pole. As in PROJ, `+lon_0` and `+lat_0` set the icosahedron's orientation, and
+`+lon_0` is also the central meridian; `+azi` rotates it. `+units`, `+x_0` and `+y_0` apply.
+`+mode=plane` is the default; `+mode=di`, `dd` and `hex`, which give grid addresses rather than
+coordinates, are refused. Invalid `+orient`, `+mode`, `+resolution` and `+aperture` values are
+refused, as in PROJ.
+
+As in PROJ 9.8.1, the inverse is defined only for the default grid (`+resolution=4`,
+`+aperture=3`, no `+azi`) whose origin, after any `+lon_0` and `+lat_0`, is exactly the default
+orientation's (which `+lon_0=11.25` keeps) or the pole orientation's (which
+`+lat_0=90 +lon_0=0` gives), and refuses points outside the unfolded icosahedron; elsewhere it
+is refused. On an ellipsoid the forward takes the geodetic latitude on a sphere of the
+semi-major axis, while the inverse uses the authalic radius without the authalic latitude, so
+the inverse does not return the projected point: on WGS 84, (147, -42) projects and unprojects
+to (147.166, -41.969), in PROJ as in terrio.
+
+GDAL's WKT1 (`custom_proj4`, which carries the PROJ string), ESRI's `PROJ_isea` (with
+`PROJ_isea_orient=pole` and other options in the method's name) and PROJ's WKT2 method
+`PROJ isea` (`PROJ isea orient=pole`) are read; terrio writes the WKT1 form, as GDAL does.
+PROJJSON export refuses `isea`, as for other projections without an EPSG method.
+
+Other PROJ versions differ: PROJ 9.4 has no inverse and a forward up to 2 mm different,
+and PROJ 9.9 replaced the method with a new implementation (another default origin, the
+authalic latitude on an ellipsoid, other parameters). The `method-isea` fixture, from PROJ
+9.9.0, is therefore not used. A PROJ 9.8.1 corpus covers 14 configurations and 7,784 samples
+(see Testing). Allowances are 1 mm projected and 1e-8 degrees inverse.
+
+## Two-point oblique Mercator
+
+`+proj=omerc` without `+alpha` or `+gamma` takes its centre line through two
+points, `+lat_1`/`+lon_1` and `+lat_2`/`+lon_2`, as PROJ does: the azimuth and
+the central meridian are derived from them, and `+lon_0` is ignored. The
+formulas are PROJ 9.8.1's (`omerc.cpp`), on a sphere or an ellipsoid, with
+`+lat_0`, `+k`, `+units`, `+x_0` and `+y_0`. PROJ's checks apply: neither point
+at a pole, different latitudes, a first point off the equator and `+lat_0` off a
+pole. A point left out is 0, as PROJ reads it; a value that isn't a number is
+refused by Terrio.
+
+GDAL's WKT1 `Hotine_Oblique_Mercator_Two_Point_Natural_Origin`, with GDAL's
+(`latitude_of_point_1`) or ESRI's (`Latitude_Of_1st_Point`) parameter names, and
+WKT2 `Hotine Oblique Mercator Two Point Natural Origin` are read, and terrio
+writes the former, as GDAL does. The `method-omerc-2pt` fixture keeps its PROJ
+9.9.0 oracle; a GDAL 3.12.2 / PROJ 9.8.1 corpus covers 12 lines and 1,524
+samples (see Testing). Allowances are 1 mm projected and 1e-8 degrees inverse.
+The line poles are refused; their finite neighbours and geographic poles are checked
+against live GDAL. PROJJSON export of this non-EPSG method remains unsupported.

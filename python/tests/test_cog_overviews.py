@@ -1,4 +1,15 @@
-"""COG overviews supplied or area-matched, GDAL's PREDICTOR=YES, and strict COG options."""
+"""COG overviews against GDAL's COG driver: the same levels and the same pixels.
+
+An ingestion pipeline converts uploads with `rasterio.shutil.copy(src, dst, driver="COG", ...)`,
+whose overviews GDAL resamples with CUBIC unless told otherwise. Each case writes a source with
+GDAL (rasterio), converts it with GDAL and with terrio, and compares every level of every band,
+pixel for pixel: overview count, sizes and values. Skipped without rasterio.
+
+Tolerance: none. terrio follows GDAL 3.12.1's overview code function by function
+(`gcore/overview.cpp`), so any difference fails.
+"""
+
+from xml.etree import ElementTree
 
 import numpy as np
 import pytest
@@ -23,6 +34,28 @@ def raster(a, nodata=-9999.0):
 def overviews(path):
     r = terrio.open_raster(str(path), lazy=True)
     return [np.asarray(r.read(overview=i))[0] for i in range(len(r.overviews))]
+
+
+def assert_overview_method(path, rasterio, public_tags, expected):
+    """GDAL 3.13 exposes this IMAGE_STRUCTURE item; older readers may filter it.
+
+    Always verify the actual TIFF metadata, including on older GDAL readers. The
+    OVERVIEW_REPORT domain and decoded values have their own unconditional checks.
+    """
+    encoded = path.read_bytes()
+    start = encoded.index(b"<GDALMetadata>")
+    end = encoded.index(b"</GDALMetadata>", start) + len(b"</GDALMetadata>")
+    metadata = ElementTree.fromstring(encoded[start:end])
+    items = [
+        item.text
+        for item in metadata.findall("Item")
+        if item.get("name") == "OVERVIEW_RESAMPLING" and item.get("domain") == "IMAGE_STRUCTURE"
+    ]
+    assert items == [expected]
+    version = tuple(int(part) for part in rasterio.__gdal_version__.split(".")[:2])
+    # Skip only the public-tag exposure check on an older reader that filters it.
+    if "OVERVIEW_RESAMPLING" in public_tags or version >= (3, 13):
+        assert public_tags["OVERVIEW_RESAMPLING"] == expected
 
 
 def test_area_matched_overviews_keep_the_wet_area(tmp_path):
@@ -117,7 +150,7 @@ def test_gdal_reads_terrio_cogs_as_its_own(tmp_path):
         ims = src.tags(ns="IMAGE_STRUCTURE")
         assert ims["LAYOUT"] == "COG"
         assert ims["MAX_Z_ERROR"] == "0.01"
-        assert ims["OVERVIEW_RESAMPLING"] == "AREA_MATCHED"
+        assert_overview_method(out, rasterio, ims, "AREA_MATCHED")
         assert src.tags()["compression_lossy"] == "true"
         assert np.nanmax(np.abs(src.read(1) - a)) <= 0.01 + 1e-6
 
@@ -138,7 +171,7 @@ def test_cog_overview_factors_are_written(tmp_path):
 
 
 def test_cog_overview_factors_match_gdal_reuse(tmp_path):
-    """GDAL: gdaladdo the factors on the source, then the COG driver reuses them (OVERVIEWS=AUTO)."""
+    """GDAL builds source overviews with gdaladdo; COG reuses them (OVERVIEWS=AUTO)."""
     rasterio = pytest.importorskip("rasterio")
     from rasterio.enums import Resampling
     from rasterio.shutil import copy
@@ -190,7 +223,7 @@ def test_area_ratios_in_image_structure_metadata(tmp_path):
     out = tmp_path / "am.tif"
     report = raster(a).write(str(out), driver="COG", overview_resampling="area_matched")
     with rasterio.open(out) as src:
-        assert src.tags(ns="IMAGE_STRUCTURE")["OVERVIEW_RESAMPLING"] == "AREA_MATCHED"
+        assert_overview_method(out, rasterio, src.tags(ns="IMAGE_STRUCTURE"), "AREA_MATCHED")
         tags = src.tags(ns="OVERVIEW_REPORT")
         assert src.tags() == {"AREA_OR_POINT": "Area"}  # the default domain stays the caller's
     assert tags["OVERVIEW_METHOD"] == "area_matched"

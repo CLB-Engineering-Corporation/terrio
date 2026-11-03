@@ -7,7 +7,8 @@ keywords = ["gis", "geospatial", "raster", "vector", "point-cloud"]
 categories = ["science::geo", "parser-implementations", "encoding"]
 version.workspace = true
 edition.workspace = true
-license.workspace = true
+# MPL-2.0 for pointcloud/filters/selfadjoint.rs, a port of Eigen's eigensolver.
+license = "MIT AND MPL-2.0"
 rust-version.workspace = true
 repository.workspace = true
 homepage.workspace = true
@@ -29,6 +30,7 @@ rstar.workspace = true
 spade.workspace = true
 thiserror.workspace = true
 serde.workspace = true
+shlex.workspace = true
 # Keeps JSON object keys (properties, fields) in file order, and parses numbers exactly.
 serde_json = { workspace = true, features = ["preserve_order", "float_roundtrip", "raw_value"] }
 zip.workspace = true
@@ -43,6 +45,7 @@ arrow-ipc = { workspace = true, optional = true }
 arrow-buffer = { workspace = true, optional = true }
 bytes = { workspace = true, optional = true }
 quick-xml.workspace = true
+encoding_rs.workspace = true
 osmpbfreader = { workspace = true, optional = true }
 half.workspace = true
 flate2.workspace = true
@@ -52,6 +55,7 @@ lz4_flex = { workspace = true, optional = true }
 ruzstd.workspace = true
 netcdf-reader = { workspace = true, optional = true }
 hdf5-reader = { workspace = true, optional = true }
+ras-commander-fast-hdf = { workspace = true, optional = true }
 jpeg-decoder.workspace = true
 laz = { workspace = true, optional = true }
 e57 = { workspace = true, optional = true }
@@ -61,8 +65,6 @@ image-webp.workspace = true
 webp-rust.workspace = true
 # JPEG 2000, in WebAssembly builds too (see `drivers::jp2` for the allocator it links against).
 openjp2 = { workspace = true, optional = true }
-gribberish = { workspace = true, optional = true }
-bitvec = { workspace = true, optional = true }
 lerc-reader = { workspace = true, optional = true }
 lerc-core = { workspace = true, optional = true }
 lerc-writer = { workspace = true, optional = true }
@@ -74,6 +76,8 @@ jxl-oxide.workspace = true
 rayon.workspace = true
 rusty_av1d = { workspace = true, optional = true }
 lzma-rust2 = { workspace = true, optional = true }
+# GRIB2's CCSDS packing (template 5.42): a pure-Rust decoder of CCSDS 121.0-B-3 (libaec's format).
+rust-aec = { version = "0.1.1", optional = true }
 
 # The optional GDAL backend: opens what GDAL can when terrio has no driver for it. Needs GDAL
 # (3.4 or later) installed, found with pkg-config or GDAL_HOME.
@@ -90,20 +94,27 @@ ndarray = { workspace = true, optional = true }
 # Disabled drivers stay in the API (`RasterDriver`, `VectorDriver`) and fail with "built without
 # the `...` feature".
 [features]
-default = ["cad", "geotiff", "parquet", "remote", "avif", "netcdf-hdf5", "osm", "lzma", "flatgeobuf", "jp2", "lerc", "pointcloud", "tiles", "zarr", "sqlite", "grib", "libzstd"]
+default = ["cad", "geotiff", "parquet", "remote", "avif", "netcdf-hdf5", "osm", "lzma", "flatgeobuf", "jp2", "lerc", "pointcloud", "tiles", "zarr", "sqlite", "grib", "hecras", "xlsx"]
 ## GeoTIFF and COG reading and writing. Always built (it is the core): the feature exists so that
 ## `features = ["geotiff"]` states what a build needs.
 geotiff = []
 ## DWG and ASCII/binary DXF reading and writing, through acadrust.
 cad = ["dep:acadrust"]
 ## GeoParquet, the `arrow` module and Arrow streams of vector layers.
-parquet = ["dep:parquet", "dep:arrow-array", "dep:arrow-schema", "dep:arrow-ipc", "dep:arrow-buffer", "dep:bytes", "wbvector/geoparquet"]
+parquet = ["dep:parquet", "dep:arrow-array", "dep:arrow-schema", "dep:arrow-ipc", "dep:arrow-buffer", "dep:bytes"]
 ## HTTP(S), S3, GCS and Azure inputs, range reads of remote COGs and STAC (native builds only).
-remote = ["dep:ureq", "dep:hmac", "dep:sha2", "terrio-crs/grid-transport"]
+remote = ["dep:ureq", "dep:rustls-graviola", "dep:hmac", "dep:sha2", "terrio-crs/grid-transport"]
 ## AVIF tiles of PMTiles and MBTiles archives.
 avif = ["tiles", "dep:rusty_av1d"]
 ## NetCDF, HDF5 and HDF-EOS reading, netCDF writing.
 netcdf-hdf5 = ["dep:netcdf-reader", "dep:hdf5-reader"]
+## HEC-RAS geometry (`.g##.hdf`) and plan (`.p##.hdf`) HDF files as vector layers (read only),
+## through the ras-commander-fast-hdf engine.
+## Needs `netcdf-hdf5`: HEC-RAS files stay readable as HDF5 rasters, and in-memory opens find
+## the root `File Type` with terrio's HDF5 reader.
+hecras = ["netcdf-hdf5", "dep:ras-commander-fast-hdf"]
+## XLSX and XLSM workbooks as vector layers (pure Rust).
+xlsx = []
 ## OpenStreetMap PBF and XML.
 osm = ["dep:osmpbfreader", "wbvector/osmpbf"]
 ## LZMA-compressed GeoTIFFs.
@@ -112,8 +123,8 @@ lzma = ["dep:lzma-rust2"]
 flatgeobuf = ["dep:flatgeobuf", "dep:flatbuffers"]
 ## JPEG 2000.
 jp2 = ["dep:openjp2"]
-## GRIB editions 1 and 2 (read only). JPEG 2000 packed GRIB2 messages need `jp2` too.
-grib = ["dep:gribberish", "dep:bitvec"]
+## GRIB1 and GRIB2 reading (pure Rust). GRIB2's JPEG 2000 packing needs `jp2` too.
+grib = ["dep:rust-aec"]
 ## LERC-compressed GeoTIFFs (read and written).
 lerc = ["dep:lerc-reader", "dep:lerc-core", "dep:lerc-writer"]
 ## Point clouds: LAS, LAZ, COPC, EPT, E57, PLY (the `pointcloud` module).
@@ -124,16 +135,18 @@ tiles = ["sqlite"]
 zarr = ["dep:lz4_flex"]
 ## GeoPackage (vector and raster tiles), SQLite/SpatiaLite and the SQLite store of MBTiles.
 sqlite = []
-## Zstandard (GeoTIFF and EPT tiles) with the zstd C library, natively: it decodes faster and
-## compresses better than `ruzstd`, used without it and in WebAssembly, which writes at its fastest
-## level (about zstd's 1) whatever level is asked for. Without it, natively, ZSTD GeoTIFFs whose
-## samples only the `tiff` crate decodes (Float16, 1 to 7 bits, WhiteIsZero) are not read, as in
-## WebAssembly. In WebAssembly it compiles the C library (as `parquet` does) but does not use it.
-libzstd = ["dep:zstd", "tiff/zstd", "terrio-crs/libzstd"]
+## Zstandard (GeoTIFF chunks and EPT tiles) with the zstd C library, natively: it decodes faster
+## and compresses better than `ruzstd`, used without it and in WebAssembly, which writes at its
+## fastest level (about zstd's 1) whatever level is asked for. terrio decodes every ZSTD GeoTIFF
+## chunk itself, Float16, complex and WhiteIsZero samples included: the `tiff` crate is built
+## without its Zstandard (zstd 0.13, whose streaming decoder has known advisories), so ZSTD datum
+## grids, which terrio-crs reads with the crate, are not read (PROJ's are DEFLATE-compressed).
+libzstd = ["dep:zstd"]
 ## Open any format GDAL reads, through the same data model, when terrio has no driver for it.
 gdal = ["dep:gdal", "dep:gdal-sys"]
 ## Raster pixels as `ndarray` arrays without copying them: borrowed and mutable views, owned
-## transfers between rasters and arrays, and lazy reads' masks as arrays. Re-exports the crate as
+## transfers between rasters and arrays, and lazy reads' masks as arrays; floating-point windows
+## (NaN where pixels are invalid) as owned arrays, bands first or last. Re-exports the crate as
 ## `terrio::ndarray`. Off by default.
 ndarray = ["dep:ndarray"]
 
@@ -148,8 +161,21 @@ ureq = { workspace = true, optional = true }
 hmac = { workspace = true, optional = true }
 sha2 = { workspace = true, optional = true }
 
+# HTTPS without a C compiler, on the architectures `rustls-graviola` supports.
+[target.'cfg(all(not(target_family = "wasm"), any(target_arch = "x86_64", target_arch = "aarch64")))'.dependencies]
+rustls-graviola = { workspace = true, optional = true }
+
+# Elsewhere (no release is built for these), HTTPS with `ring`, which needs a C compiler.
+[target.'cfg(all(not(target_family = "wasm"), not(any(target_arch = "x86_64", target_arch = "aarch64"))))'.dependencies]
+ureq = { workspace = true, optional = true, features = ["rustls"] }
+
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_IO"] }
+# Windows file identity (including hard links) for dataset destination guards.
+same-file.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

@@ -1,3 +1,8 @@
+// Written to match the behavior of:
+//   GDAL v3.13.3:
+//     frmts/raw/ehdrdataset.cpp
+// No code is translated from these sources.
+
 //! Esri `.hdr` labelled rasters (EHdr): BIL, BIP and BSQ data files such as `.bil` and `.flt`,
 //! with a `.hdr` header and a `.prj` CRS, read and written as GDAL does.
 
@@ -16,6 +21,14 @@ pub(crate) fn is_ehdr(path: &Path) -> bool {
     std::fs::read_to_string(hdr).ok().is_some_and(|t| {
         !t.starts_with("ENVI") && t.lines().any(|l| l.split_whitespace().next().is_some_and(|k| k.eq_ignore_ascii_case("ncols")))
     })
+}
+
+/// [`open`] for a data file `raw_opener` recognised by the EHdr header beside it, whatever driver
+/// its name points to: refused when the process-wide allow-list leaves EHdr out, as a data file
+/// named for another driver (`h.img`, Imagine's) reaches this point as that driver's file.
+pub(crate) fn open_recognised(path: &Path) -> Result<RawRaster> {
+    crate::formats::check_driver_allowed("EHdr", &path.to_string_lossy(), crate::formats::Kind::Raster)?;
+    open(path)
 }
 
 /// Opens an EHdr data file, reading only its header now: its pixels are read by window.

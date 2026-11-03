@@ -35,6 +35,18 @@ class BenchmarkTests(unittest.TestCase):
                 self.assertEqual(benchmark.terrio_dem("terrio", "slope")[-1], version)
                 self.assertEqual("COG_OVERVIEW_POLICY=GDAL_3_13" in benchmark.terrio_cog("terrio"), version == "3.13")
 
+    def test_cog_commands_request_average_from_both_tools(self):
+        with (
+            patch.object(benchmark, "gdal_kernel_version", return_value="3.13"),
+            patch.object(benchmark.os.path, "exists", return_value=True),
+        ):
+            rows = benchmark.cases("data", "out", 2) + benchmark.large_cases("large", "out", 2)
+        cogs = [row for row in rows if "COG (Deflate)" in row[1]]
+        self.assertEqual(len(cogs), 2)
+        for _group, _task, terrio, reference in cogs:
+            self.assertIn("RESAMPLING=AVERAGE", terrio)
+            self.assertIn("RESAMPLING=AVERAGE", reference)
+
     def test_successful_but_wrong_output_is_not_scored(self):
         with tempfile.TemporaryDirectory() as root:
 
@@ -177,6 +189,11 @@ class BenchmarkTests(unittest.TestCase):
     def test_main_caches_cases_and_marks_failed_duration(self):
         from osgeo import gdal
 
+        original_config = {
+            name: gdal.GetConfigOption(name)
+            for name in ["GDAL_PAM_ENABLED", "GDAL_NUM_THREADS"]
+        }
+
         def large_cases(data, out, budget):
             return [("test", "cached case", ["terrio", str(Path(out) / "out.tif")], ["gdal", str(Path(out) / "out.tif")])]
 
@@ -206,6 +223,8 @@ class BenchmarkTests(unittest.TestCase):
                 benchmark.main()
             finally:
                 os.chdir(original_cwd)
+                for name, value in original_config.items():
+                    gdal.SetConfigOption(name, value)
         # One metadata list, then one list for each tool's output directory.
         self.assertEqual(factory.call_count, 3)
         self.assertIn("| failed |", output.getvalue())

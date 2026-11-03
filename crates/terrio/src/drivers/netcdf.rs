@@ -1,3 +1,14 @@
+// SPDX-FileCopyrightText: Copyright (c) 2004, Frank Warmerdam
+// SPDX-FileCopyrightText: Copyright (c) 2007-2016, Even Rouault <even.rouault at spatialys.com>
+// SPDX-FileCopyrightText: Copyright (c) 2010, Kyle Shannon <kyle at pobox dot com>
+// SPDX-FileCopyrightText: Copyright (c) 2021, CLS
+// SPDX-FileCopyrightText: Copyright (c) 2026 Qiusheng Wu and Terrio contributors
+// SPDX-License-Identifier: MIT
+//
+// Derived from (translated to Rust and modified):
+//   GDAL v3.13.3:
+//     frmts/netcdf/netcdfdataset.cpp
+
 //! NetCDF (classic CDF-1/2/5 and netCDF-4/HDF5), read with the pure-Rust `netcdf-reader` crate
 //! and interpreted as GDAL's netCDF driver does: one variable at a time (a file with several
 //! opens its first; `NETCDF:"file.nc":var` selects one), its last two dimensions as rows and
@@ -30,6 +41,9 @@ pub(crate) fn parse_subdataset(s: &str) -> Option<(String, String)> {
     Some((file.to_string(), var.to_string()))
 }
 
+/// netCDF's extensions: an HDF5 file named with one of them is a netCDF-4 file.
+pub(crate) const EXTENSIONS: &[&str] = &["nc", "cdf", "nc2", "nc3", "nc4", "gmac"];
+
 /// Whether a file is a netCDF file: a classic one, or an HDF5 one with one of netCDF's extensions
 /// (GDAL's HDF5 driver reads the others).
 pub(crate) fn is_netcdf(path: &Path) -> bool {
@@ -37,10 +51,7 @@ pub(crate) fn is_netcdf(path: &Path) -> bool {
     if std::fs::File::open(path).and_then(|mut f| std::io::Read::read_exact(&mut f, &mut b)).is_err() {
         return false;
     }
-    let netcdf_ext = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .is_some_and(|e| ["nc", "cdf", "nc2", "nc3", "nc4", "gmac"].iter().any(|n| e.eq_ignore_ascii_case(n)));
+    let netcdf_ext = path.extension().and_then(|e| e.to_str()).is_some_and(|e| EXTENSIONS.iter().any(|n| e.eq_ignore_ascii_case(n)));
     b.starts_with(b"CDF") || (netcdf_ext && super::hdf5::has_signature(path))
 }
 

@@ -1,8 +1,15 @@
+// Written to match the behavior of:
+//   SQLite version-3.54.1:
+//     src/btree.c
+// No code is translated from these sources.
+
 //! A writer of SQLite database files, enough for GeoPackages: tables (rowid b-trees, any size,
 //! with overflow pages) and small indexes (the automatic indexes of UNIQUE and PRIMARY KEY
 //! constraints), written in one go.
 //!
 //! The format is described at <https://www.sqlite.org/fileformat2.html>.
+
+mod spilled;
 
 use crate::Result;
 
@@ -401,19 +408,29 @@ pub(crate) fn build_index<S: PageStore + ?Sized>(
     root: Option<u32>,
     spare: &mut Vec<u32>,
 ) -> Result<u32> {
+    let records: Vec<_> = keys.iter().map(|key| record(key)).collect();
+    build_index_records(store, &records, root, spare)
+}
+
+/// Builds an index from already sorted, encoded keys, preserving their bytes and collation order.
+/// This also represents WITHOUT ROWID tables, expression indexes and UTF-16 databases.
+pub(crate) fn build_index_records<S: PageStore + ?Sized>(
+    store: &mut S,
+    records: &[Vec<u8>],
+    root: Option<u32>,
+    spare: &mut Vec<u32>,
+) -> Result<u32> {
     let (max_local, min_local) = index_local_limits(store.page_size());
-    // Each key's payload as stored in a cell (without the child pointer of interior cells).
-    let mut payloads: Vec<Vec<u8>> = Vec::with_capacity(keys.len());
-    for k in keys {
-        let rec = record(k);
-        let (local, overflow) = store_payload(store, &rec, max_local, min_local)?;
-        let mut c = Vec::with_capacity(local.len() + 13);
-        varint(&mut c, rec.len() as u64);
-        c.extend_from_slice(&local);
-        if let Some(o) = overflow {
-            c.extend_from_slice(&o.to_be_bytes());
+    let mut payloads: Vec<Vec<u8>> = Vec::with_capacity(records.len());
+    for rec in records {
+        let (local, overflow) = store_payload(store, rec, max_local, min_local)?;
+        let mut cell = Vec::with_capacity(local.len() + 13);
+        varint(&mut cell, rec.len() as u64);
+        cell.extend_from_slice(&local);
+        if let Some(page) = overflow {
+            cell.extend_from_slice(&page.to_be_bytes());
         }
-        payloads.push(c);
+        payloads.push(cell);
     }
     // The leaves, with the keys between them as dividers.
     let (mut children, mut dividers) = split_index_level(payloads, 8, 0, store, |store, cells, _| {
@@ -530,6 +547,7 @@ pub struct StreamTable<W: std::io::Write + std::io::Seek> {
     used: usize,
     last_key: i64,
     level: Vec<(u32, i64)>,
+    disk_level: Option<(std::io::BufWriter<Box<dyn super::Spill>>, usize)>,
 }
 
 impl<W: std::io::Write + std::io::Seek> StreamTable<W> {
@@ -541,7 +559,14 @@ impl<W: std::io::Write + std::io::Seek> StreamTable<W> {
 
     /// Starts a table whose pages go to `out` from page `first` on, after other tables'.
     pub fn starting_at(out: W, first: u32) -> Self {
-        Self { out, next: first, leaf: Vec::new(), used: 8, last_key: 0, level: Vec::new() }
+        Self { out, next: first, leaf: Vec::new(), used: 8, last_key: 0, level: Vec::new(), disk_level: None }
+    }
+
+    /// Also spills the page directory, for memory independent of the number of leaves.
+    pub(crate) fn starting_at_spilled(out: W, first: u32) -> Result<Self> {
+        let mut table = Self::starting_at(out, first);
+        table.disk_level = Some((std::io::BufWriter::new(super::spill()?), 0));
+        Ok(table)
     }
 
     fn alloc(&mut self) -> u32 {
@@ -608,7 +633,14 @@ impl<W: std::io::Write + std::io::Seek> StreamTable<W> {
         let n = self.alloc();
         let page = node_bytes(0x0D, &std::mem::take(&mut self.leaf), None);
         self.write_page(n, &page)?;
-        self.level.push((n, self.last_key));
+        if let Some((rows, count)) = &mut self.disk_level {
+            use std::io::Write;
+            rows.write_all(&n.to_le_bytes())?;
+            rows.write_all(&self.last_key.to_le_bytes())?;
+            *count += 1;
+        } else {
+            self.level.push((n, self.last_key));
+        }
         self.used = 8;
         Ok(())
     }
@@ -620,8 +652,12 @@ impl<W: std::io::Write + std::io::Seek> StreamTable<W> {
 
     /// [`StreamTable::finish`], handing back the output for more pages.
     pub fn finish_with_output(mut self) -> Result<(u32, u32, W)> {
-        if !self.leaf.is_empty() || self.level.is_empty() {
+        let empty = self.disk_level.as_ref().map_or(self.level.is_empty(), |(_, count)| *count == 0);
+        if !self.leaf.is_empty() || empty {
             self.flush_leaf()?;
+        }
+        if let Some((rows, count)) = self.disk_level.take() {
+            return self.finish_spilled(rows, count);
         }
         let mut level = std::mem::take(&mut self.level);
         // A single leaf is the root.
@@ -674,7 +710,26 @@ impl<W: std::io::Write + std::io::Seek> StreamTable<W> {
 /// [`StreamTable`] from page `first` on: the rows of `table` then `more`. Returns the table as
 /// listed in the schema, and the first page after it.
 pub fn stream_table<W: std::io::Write + std::io::Seek>(out: W, first: u32, table: Table, more: &mut Rows) -> Result<(BuiltTable, u32, W)> {
-    let mut st = StreamTable::starting_at(out, first);
+    stream_table_impl(out, first, table, more, false)
+}
+
+pub(crate) fn stream_table_spilled<W: std::io::Write + std::io::Seek>(
+    out: W,
+    first: u32,
+    table: Table,
+    more: &mut Rows,
+) -> Result<(BuiltTable, u32, W)> {
+    stream_table_impl(out, first, table, more, true)
+}
+
+fn stream_table_impl<W: std::io::Write + std::io::Seek>(
+    out: W,
+    first: u32,
+    table: Table,
+    more: &mut Rows,
+    spilled: bool,
+) -> Result<(BuiltTable, u32, W)> {
+    let mut st = if spilled { StreamTable::starting_at_spilled(out, first)? } else { StreamTable::starting_at(out, first) };
     for (rowid, values) in &table.rows {
         st.push(*rowid, &record(values))?;
     }

@@ -1,3 +1,21 @@
+// SPDX-FileCopyrightText: Copyright (c) 2025, ISciences LLC
+// SPDX-FileCopyrightText: Copyright (c) 2001, Frank Warmerdam <warmerdam@pobox.com>
+// SPDX-FileCopyrightText: Copyright (c) 2008-2013, Even Rouault <even dot rouault at spatialys.com>
+// SPDX-FileCopyrightText: Copyright (c) 1999, Frank Warmerdam
+// SPDX-FileCopyrightText: Copyright (c) 2007-2013, Even Rouault <even dot rouault at spatialys.com>
+// SPDX-FileCopyrightText: Copyright (c) 2025, Even Rouault <even dot rouault at spatialys.com>
+// SPDX-FileCopyrightText: Copyright (c) 2026 Qiusheng Wu and Terrio contributors
+// SPDX-License-Identifier: MIT
+//
+// Derived from (translated to Rust and modified):
+//   GDAL v3.13.3:
+//     frmts/vrt/vrtreclassifier.cpp
+//     frmts/vrt/vrtsources.cpp
+//     gcore/gdal_misc.cpp
+//     apps/gdalalg_raster_unscale.cpp
+//     apps/gdalalg_raster_nodata_to_alpha.cpp
+//     apps/gdalalg_raster_reclassify.cpp
+
 //! Pixel-wise band operations: [`unscale`] (`gdal raster unscale`), [`nodata_to_alpha`]
 //! (`gdal raster nodata-to-alpha`) and [`reclassify`] (`gdal raster reclassify`).
 //!
@@ -80,6 +98,7 @@ pub fn unscale(ds: &RasterDataset, o: &UnscaleOptions) -> Result<RasterDataset> 
             let mut m = ds.band_metadata.get(b).cloned().unwrap_or_default();
             m.scale = None;
             m.offset = None;
+            m.items.retain(|(key, _)| !key.starts_with("STATISTICS_"));
             m
         })
         .collect();
@@ -667,6 +686,20 @@ mod tests {
         }
     }
 
+    #[test]
+    fn unscale_discards_stale_band_statistics_and_keeps_descriptive_items() {
+        let mut source = ds(vec![vec![1., 2.]], 2, 1, DataType::U8, None);
+        source.band_metadata = vec![crate::BandMetadata {
+            scale: Some(2.),
+            offset: Some(10.),
+            items: vec![("STATISTICS_MINIMUM".into(), "1".into()), ("SOURCE".into(), "sensor".into())],
+            ..Default::default()
+        }];
+        let output = unscale(&source, &Default::default()).unwrap();
+        assert_eq!(output.raster.data.to_f64_vec(), [12., 14.]);
+        assert_eq!(output.band_metadata[0].items, [("SOURCE".into(), "sensor".into())]);
+        assert_eq!(source.band_metadata[0].items.len(), 2);
+    }
     #[test]
     fn unscales_with_nodata_and_types() {
         let mut src = ds(vec![vec![1.0, 2.0, -9999.0, 4.0], vec![1.0, 2.0, 3.0, -9999.0]], 2, 2, DataType::I16, Some(-9999.0));

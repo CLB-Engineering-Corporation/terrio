@@ -1,12 +1,14 @@
 """File management with terrio.vsi_* (GDAL's ``gdal vsi``)."""
 
+import http.server
 import os
+import threading
 import zipfile
 
 import pytest
 
 import terrio
-from terrio.errors import InvalidArgumentError, NotFoundError, TerrioIOError
+from terrio.errors import InvalidArgumentError, NotFoundError, ResourceLimitError, TerrioIOError
 
 
 @pytest.fixture
@@ -128,3 +130,94 @@ def test_recursive_copy_preserves_io_exception(tree, tmp_path):
         terrio.vsi_copy(str(tree), str(destination), recursive=True)
     assert (destination / "t" / "x.txt").is_dir()
     assert (tree / "x.txt").read_text() == "hello\n"
+
+
+@pytest.fixture
+def declaring_server():
+    """A loopback HTTP server of files it declares to hold 2**50 bytes, of which it sends at most
+    16,384 at a time: a range request is answered 206 with the declared total, a HEAD with the
+    length, anything else 404.
+
+    Returns:
+        tuple: The base URL, and the list of the ``Range`` headers of the GET requests.
+    """
+    size, ranges = 1 << 50, []
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def do_HEAD(self):
+            self.send_response(200)
+            self.send_header("Content-Length", str(size))
+            self.end_headers()
+
+        def do_GET(self):
+            rng = self.headers.get("Range")
+            ranges.append(rng)
+            if not rng:
+                self.send_response(404)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            start = int(rng[6:].partition("-")[0])
+            body = bytes(min(16384, size - start))
+            self.send_response(206)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Content-Range", f"bytes {start}-{start + len(body) - 1}/{size}")
+            self.end_headers()
+            self.wfile.write(body)
+
+    httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    yield f"http://127.0.0.1:{httpd.server_address[1]}", ranges
+    httpd.shutdown()
+
+
+def test_a_remote_file_larger_than_the_memory_is_refused_after_its_first_response(declaring_server):
+    url, ranges = declaring_server
+    refusal = (
+        r"^a file read into memory is too large to allocate: 1125899906842624 bytes, "
+        r"more than the \d+ bytes of memory the process can use$"
+    )
+    with pytest.raises(ResourceLimitError, match=refusal):
+        terrio.vsi_read(url + "/read.bin")
+    with pytest.raises(ResourceLimitError, match=refusal):
+        terrio.vsi_copy(url + "/copy.bin", "/vsimem/declared/copy.bin")
+    assert terrio.vsi_stat("/vsimem/declared/copy.bin") is None
+    # Nothing past the first response's bytes was asked for.
+    assert [r for r in ranges if r] == ["bytes=0-16383", "bytes=0-0", "bytes=0-16383"]
+
+
+def test_sozip(tmp_path):
+    big = tmp_path / "big.csv"
+    big.write_bytes(b"".join(f"{i},{i * 7919 % 10007}\n".encode() for i in range(20000)))
+    (tmp_path / "small.txt").write_text("small")
+    archive = tmp_path / "out.zip"
+    archive.touch()  # Existing empty placeholders are accepted, like GDAL.
+    r = terrio.sozip_create(
+        [str(big), str(tmp_path / "small.txt")],
+        str(archive),
+        enable="yes",
+        chunk_size=4096,
+        junk_paths=True,
+    )
+    assert (r["added"], r["seek_optimized"]) == (2, 1)
+    members = terrio.sozip_list(str(archive))
+    assert [(m["name"], m["sozip_chunk_size"]) for m in members] == [
+        ("big.csv", 4096),
+        ("small.txt", None),
+    ]
+    v = terrio.sozip_validate(str(archive))
+    assert v["valid"] and v["sozip_files"] == ["big.csv"]
+    with zipfile.ZipFile(archive) as z:
+        assert z.namelist() == ["big.csv", "small.txt"]
+        assert z.read("big.csv") == big.read_bytes()
+    plain = tmp_path / "plain.zip"
+    with zipfile.ZipFile(plain, "w", zipfile.ZIP_DEFLATED) as z:
+        z.write(big, "big.csv")
+    terrio.sozip_optimize(str(plain), str(tmp_path / "opt.zip"), enable="yes", chunk_size=8192)
+    assert terrio.sozip_list(str(tmp_path / "opt.zip"))[0]["sozip_chunk_size"] == 8192
+    gdal = pytest.importorskip("osgeo.gdal")
+    # GDAL reads terrio's seek-optimized member and its index.
+    assert gdal.GetFileMetadata(f"/vsizip/{archive}/big.csv", "ZIP").get("SOZIP_VALID") == "YES"

@@ -2,6 +2,14 @@
 
 terrio stands on the work of many projects and their authors. Thank you to all of them.
 
+terrio is released under the MIT License, except its point cloud eigensolver
+(`pointcloud/filters/selfadjoint.rs`), a port of Eigen under MPL-2.0, but much of it is ported or adapted from these
+projects, and the copyright in that code and data remains with their authors: Frank Warmerdam,
+Even Rouault and the GDAL contributors; Gerald Evenden, Frank Warmerdam, Even Rouault and the PROJ
+contributors; Hobu, Inc. and the PDAL contributors; and the authors of the other projects below.
+[`NOTICE`](https://github.com/opengeos/terrio/blob/main/NOTICE) lists each of them with their
+licenses.
+
 !!! note "Disclaimer"
 
     terrio is primarily built with [Claude Opus 5.5](https://www.anthropic.com/claude), an AI
@@ -17,24 +25,99 @@ terrio began on the pure-Rust format libraries of
 [`wbprojection`](https://crates.io/crates/wbprojection). They still read and write many of the
 formats terrio supports, and they made a C-free geospatial library in Rust a realistic goal.
 
-## GDAL, PROJ and PDAL
+## GDAL
 
-[GDAL](https://gdal.org), [PROJ](https://proj.org) and [PDAL](https://pdal.io) are the reference
-terrio measures itself against. Its commands, options and outputs follow GDAL's and PDAL's, and its
-tests compare its results with theirs, pixel for pixel and point for point.
+terrio owes its design to [GDAL](https://gdal.org): to Frank Warmerdam, who started it in 1998, to
+Even Rouault, its long-time lead maintainer, and to the hundreds of developers who have built it
+since, with the organizations that fund their work. terrio's command names and options, the meaning
+of those options, the behavior of its drivers and many of its algorithms come from more than
+twenty-five years of their work. GDAL is also the reference terrio
+is tested against, and an optional backend for the formats terrio cannot read itself.
+
+Several parts of terrio are ports of GDAL code, under GDAL's MIT licence except where the code GDAL
+includes has other terms (the public-domain degrib and g2clib of the GRIB driver), each attributed
+in [`NOTICE`](https://github.com/opengeos/terrio/blob/main/NOTICE) with its source files and
+copyright holders:
+
+- contour generation, from GDAL's marching squares implementation (Oslandia)
+- nodata filling (`alg/rasterfill.cpp`), gridding (`alg/gdalgrid.cpp`) and pixel interpolation
+  (`alg/gdal_interpolateatpoint.cpp` and the resampling kernels)
+- overview generation (`gcore/overview.cpp`) and GeoTIFF update rules
+- weighted Brovey pansharpening, VRT kernel filters and focal statistics, nearblack, enhance,
+  blend, unscale, reclassify, nodata-to-alpha and as-features
+- median-cut palette quantization and integer error diffusion (`alg/gdalmediancut.cpp`,
+  `alg/gdaldither.cpp`), following Frank Warmerdam and Even Rouault
+- the edge-mode height recurrence of the viewshed (Tamas Szekeres)
+- segmentize, geometry type conversion, combine, Hilbert sort and linear referencing (OGR)
+- the vector dataset commands concat, partition, set-field-type, make-point, create,
+  export-schema, rename-layer, edit and update
+- raster compare, pixel-info and gdal2xyz output
+- GDAL Cloud Optimized GeoTIFF validation and compressed-block layout checks (Even Rouault)
+- the SRTMHGT driver rules, and the GRIB driver with its degrib and g2clib rules and the GRIB
+  tables GDAL distributes; small GRIB files of GDAL's test suite are among terrio's test files
+- the EPSG table, with the coordinate operations GDAL uses for each CRS, generated with GDAL and
+  PROJ by `scripts/gen_epsg_table.py`
+
+Where terrio's results differ from GDAL's, [Conformance](conformance.md) lists the cases and
+tolerances. If terrio is useful to you, please consider
+[sponsoring GDAL](https://gdal.org/en/stable/sponsors/index.html), whose work it builds on.
+
+## PROJ and PDAL
+
+[PROJ](https://proj.org) and [PDAL](https://pdal.io) are, with GDAL, the reference terrio measures
+itself against: its point cloud commands and filters follow PDAL's, and its tests compare its
+coordinates and point clouds with theirs.
 
 - The map projections in `crates/terrio-crs/src/` are ported from PROJ (MIT licence). The
   ellipsoidal gnomonic, as PROJ's, uses Charles Karney's geodesic algorithms, from
   [`geographiclib-rs`](https://crates.io/crates/geographiclib-rs) (MIT licence), a port of
   [GeographicLib](https://geographiclib.sourceforge.io).
-- The EPSG table, with the coordinate operations GDAL uses for each CRS, is generated with GDAL and
-  PROJ by `scripts/gen_epsg_table.py`, the ESRI table, from PROJ's ESRI authority, by
-  `scripts/gen_esri_table.py`, and the datum names by `scripts/gen_datum_names.py`.
-- The point cloud filters follow PDAL's (`filters.csf`, `filters.pmf`, `filters.elm`,
-  `filters.hag_nn`, `filters.normal` and others); the cloth simulation filter is a port of the
-  [CSF](https://github.com/jianbingshen/CSF) code PDAL vendors (Apache-2.0, copyright the State
-  Key Laboratory of Remote Sensing Science, Beijing Normal University), after Zhang et al. (2016),
-  *An Easy-to-Use Airborne LiDAR Data Filtering Method Based on Cloth Simulation*.
+- The ESRI table, from PROJ's ESRI authority, is generated by `scripts/gen_esri_table.py`, and the
+  datum names by `scripts/gen_datum_names.py`.
+- Many point cloud filters are ports of PDAL's (BSD-3-Clause): `filters.smrf`, `filters.pmf`,
+  `filters.elm`, `filters.outlier`, `filters.sample`, the voxel filters, `filters.hag_nn`,
+  `filters.normal`, `filters.covariancefeatures`, `filters.lof`, `filters.chipper`,
+  `filters.hexbin` and others, with the k-d tree of the nanoflann copy PDAL vendors
+  (BSD-2-Clause). Each file's header and `NOTICE` name the PDAL source files and their authors,
+  most of them Bradley J. Chambers. The cloth simulation filter is a port of the
+  [CSF](https://github.com/PDAL/PDAL/tree/2.10.2/filters/private/csf) code PDAL vendors
+  (Apache-2.0, copyright the State Key Laboratory of Remote Sensing Science, Beijing Normal
+  University), after Zhang et al. (2016), *An Easy-to-Use Airborne LiDAR Data Filtering Method
+  Based on Cloth Simulation*.
+
+## GEOS, JTS and GeoRust
+
+[JTS Topology Suite](https://github.com/locationtech/jts) 1.20.0 (Martin Davis and
+other contributors) supplies the source algorithms for topology-preserving simplification,
+convex and concave hulls, their triangulations, integer tile validity, spatial packing and
+robust clipping envelopes. These ports use JTS's Eclipse Distribution License 1.0;
+the exact revisions, copyrights and adaptations are recorded in
+[`NOTICE`](https://github.com/opengeos/terrio/blob/main/NOTICE) and
+[the JTS provenance record](jts-provenance.md).
+
+[GEOS](https://libgeos.org), the geometry engine GDAL uses, is an executable
+behavioral reference for these operations. The tile writer's polygon repair
+(`tiles/repair/`) was independently implemented from observed behavior in an
+isolated process; [its record](make-valid-implementation.md) preserves the design,
+information boundary, import hashes and validation limits. It is separate from
+the JTS ports and from the public geometry-repair command.
+
+The tile writer's pre-quantization clipping-failure predictor remains a heuristic:
+its original probes agreed with GEOS 3.14 on about 97% of random self-crossing
+polygons and rectangles (and 97% of overlapping parts). Quantized repair can also
+enumerate equivalent rings differently. These limits are documented in the
+provenance records rather than claimed as universal reference equivalence.
+
+The buffer, overlay, dissolve and validity commands are built on
+[GeoRust](https://georust.org)'s [`geo`](https://crates.io/crates/geo) crate (MIT/Apache-2.0),
+with [`rstar`](https://crates.io/crates/rstar) R-trees. GDAL-style vector gridding
+uses [`spade`](https://crates.io/crates/spade) triangulations.
+
+Polygon coverage checking also ports JTS's `CoverageValidator`,
+`CoveragePolygonValidator`, `CoverageRing`, `InvalidSegmentDetector` and their
+point/segment helpers, pinned to commit `3460207216f3091cd7f72d48d6ddd1b561b2b8fd`,
+under the Eclipse Distribution License 1.0 (BSD-3-Clause). The file headers and
+`NOTICE` name the source files and retain their copyright notices.
 
 ## The EPSG dataset and Esri's projection data
 
@@ -47,6 +130,13 @@ Its ESRI table (`crates/terrio-crs/data/esri.tsv.zst`) and the ESRI datum names 
 PROJ's database, from Esri's
 [projection engine data](https://github.com/Esri/projection-engine-db-doc), copyright Esri,
 under the Apache License 2.0.
+
+## Esri's FeatureCollection protocol buffer
+
+terrio's `ESRIPBF` reader (`crates/terrio/src/drivers/vector/esripbf.rs`) is written from Esri's
+published [`FeatureCollection.proto`](https://github.com/Esri/arcgis-pbf), copyright 2021 Esri, under
+the Apache License 2.0. It follows the message and field numbers that file defines; no code is copied
+from it.
 
 ## Python APIs
 
@@ -89,11 +179,18 @@ runs it in parallel, [ureq](https://crates.io/crates/ureq) fetches remote data,
 JPEG writing (through `jpeg-encoder`) is based in part on the work of the Independent JPEG
 Group.
 
+Polygon coverage simplification ports JTS's shared-edge topology construction,
+TPVW corner removal and ring rebuilding from commit
+`3460207216f3091cd7f72d48d6ddd1b561b2b8fd`, using the Eclipse Distribution License
+1.0 (BSD-3-Clause). Its source header, NOTICE entries and JTS provenance document
+retain exact source paths and copyright notices.
+
 ## Notices and licenses
 
 [`NOTICE`](https://github.com/opengeos/terrio/blob/main/NOTICE) holds the copyright and license
-notices of the code and data terrio adapts (PROJ, CSF, the EPSG dataset, Esri's projection data,
-rasterio, rioxarray, Apache Arrow and the IJG), and
+notices of the code and data terrio adapts (GDAL, PROJ, PDAL, JTS, Eigen, CSF, the EPSG dataset, Esri's
+projection data, rasterio, rioxarray, Apache Arrow, acadrust, ras-commander, the IJG and others), whose copyright remains with their authors,
+and
 [`LICENSE-THIRD-PARTY.md`](https://github.com/opengeos/terrio/blob/main/LICENSE-THIRD-PARTY.md)
 the licenses of every Rust crate terrio's packages and binaries are built with, generated with
 [cargo-about](https://github.com/EmbarkStudios/cargo-about). Both ship with the Python wheels,

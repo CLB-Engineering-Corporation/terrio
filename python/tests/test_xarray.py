@@ -265,6 +265,40 @@ def test_south_up_reproject_and_write(tmp_path):
     assert back.terrio.transform() == Affine(1.0, 0.0, 100.0, 0.0, -1.0, 13.0)
 
 
+def test_south_up_reproject_keeps_the_source_s_pixel_edges():
+    """A south-up array is warped through its own transform, as rioxarray hands it to GDAL.
+
+    A destination pixel centre on the edge between two source rows falls in the row that edge
+    starts in the source's order (the northern row, latitudes ascending), and a centre within
+    1e-10 pixel of the source's far edge (the north pole) is outside it. Flipped north-up
+    first, the source gave the southern row, and values at the north pole but not the south.
+    """
+    # Latitudes 19 to 20, 1/9 degree apart: destination row 3's centre is 19.5, the edge
+    # between the source rows at 19.444 (4) and 19.556 (5).
+    v = np.random.default_rng(42).random((10, 10), dtype=np.float32)
+    da = xr.DataArray(
+        v,
+        dims=("y", "x"),
+        coords={"y": np.linspace(19.0, 20.0, 10), "x": np.linspace(-156.0, -155.0, 10)},
+    ).terrio.write_crs("EPSG:4326")
+    t = rio.transform.from_bounds(-155.9, 19.1, -155.1, 19.9, 7, 7)
+    out = da.terrio.reproject("EPSG:4326", shape=(7, 7), transform=t)
+    rows, cols = [8, 7, 6, 5, 3, 2, 1], [1, 2, 3, 5, 6, 7, 8]
+    np.testing.assert_array_equal(out.values, v[np.ix_(rows, cols)])
+    # A global 1-degree grid onto Web Mercator's default grid (401 x 33): its 54 top rows have
+    # centres within 1e-10 degree of the north pole and stay empty; every other pixel is warped.
+    g = xr.DataArray(
+        np.ones((180, 360), "float32"),
+        dims=("lat", "lon"),
+        coords={"lat": np.arange(-89.5, 90.0), "lon": np.arange(-179.5, 180.0)},
+    )
+    g = g.terrio.set_spatial_dims(x_dim="lon", y_dim="lat").terrio.write_crs("EPSG:4326")
+    m = g.terrio.reproject("EPSG:3857", nodata=np.nan).values
+    assert m.shape == (401, 33)
+    np.testing.assert_array_equal(np.isnan(m).all(axis=1), np.arange(401) < 54)
+    assert int(np.isnan(m).sum()) == 54 * 33 and (m[54:] == 1.0).all()
+
+
 def test_to_raster_round_trips(files, tmp_path):
     da = txr.open_rasterio(files["dem"], mask_and_scale=True, chunks={"x": 100, "y": 100})
     for name, kw in [
@@ -300,6 +334,112 @@ def test_to_raster_round_trips(files, tmp_path):
     ds.terrio.to_raster(str(tmp_path / "ds.tif"))
     with rio.open(str(tmp_path / "ds.tif")) as src:
         assert src.count == 3 and src.descriptions == ("red", "green", "blue")
+
+
+@pytest.mark.parametrize("source_nodata", [None, -32768])
+@pytest.mark.parametrize("mode", ["eager", "windowed", "delayed"])
+def test_masked_integer_warp_export(tmp_path, source_nodata, mode):
+    """Warp borders round-trip with their grid and floating or encoded integer nodata.
+
+    The GDAL 3.13.3 cross-read is a separate manual validation.
+    """
+    source = tmp_path / "source.tif"
+    pixels = np.arange(16, dtype="int16").reshape(4, 4)
+    with rio.open(
+        source,
+        "w",
+        driver="GTiff",
+        width=4,
+        height=4,
+        count=1,
+        dtype="int16",
+        crs="EPSG:32611",
+        transform=TRANSFORM,
+        nodata=source_nodata,
+    ) as dst:
+        dst.write(pixels, 1)
+    with txr.open_rasterio(source, masked=True) as original:
+        da = original.terrio.reproject(
+            original.terrio.crs,
+            shape=(6, 6),
+            transform=TRANSFORM @ Affine.translation(-1, -1),
+        )
+        encoding = da.encoding.copy()
+        assert np.isnan(da.values[0, 0, 0])
+        np.testing.assert_array_equal(da.values[0, 1:5, 1:5], pixels)
+        if mode == "delayed":
+            da = da.chunk({"x": 2, "y": 2})
+        target = tmp_path / "out.tif"
+        result = da.terrio.to_raster(
+            target,
+            windowed=mode == "windowed",
+            compute=mode != "delayed",
+        )
+        if mode == "delayed":
+            assert not target.exists()
+            result.compute()
+        assert da.encoding == encoding
+        with txr.open_rasterio(target, masked=True) as back:
+            np.testing.assert_array_equal(back.values, da.values)
+            assert back.terrio.crs == da.terrio.crs
+            assert back.terrio.transform() == da.terrio.transform()
+        with rio.open(target) as raw:
+            assert raw.dtypes == (("float32",) if source_nodata is None else ("int16",))
+            if source_nodata is None:
+                assert np.isnan(raw.nodata)
+            else:
+                assert raw.nodata == source_nodata
+        if source_nodata is None:
+            with pytest.raises(ValueError, match="write_nodata.*encoded=True"):
+                da.terrio.to_raster(tmp_path / "invalid.tif", dtype="int16")
+            assert not (tmp_path / "invalid.tif").exists()
+            encoded = da.terrio.write_nodata(-32768, encoded=True)
+            encoded.terrio.to_raster(tmp_path / "integer.tif", dtype="int16")
+            with txr.open_rasterio(tmp_path / "integer.tif", masked=True) as back:
+                np.testing.assert_array_equal(back.values, da.values)
+
+
+def test_write_nan_nodata_to_integer_keeps_value_error():
+    da = xr.DataArray(np.ones((2, 2), dtype="int16"), dims=("y", "x"))
+    with pytest.raises(ValueError, match="nodata value.*nan.*dtype.*int16"):
+        da.terrio.write_nodata(np.nan)
+
+
+def test_to_raster_float_override_preserves_fractions(tmp_path):
+    da = (
+        xr.DataArray(
+            np.array([[1.25, 2.75], [3.5, np.nan]], dtype="float32"),
+            dims=("y", "x"),
+        )
+        .terrio.write_crs("EPSG:32611")
+        .terrio.write_transform(TRANSFORM)
+    )
+    da.encoding["dtype"] = "int16"
+    da.terrio.write_nodata(np.nan, inplace=True)
+    target = tmp_path / "float.tif"
+    da.terrio.to_raster(target, dtype="float32")
+    with txr.open_rasterio(target) as back:
+        np.testing.assert_array_equal(back.values[0], da.values)
+    assert da.encoding["dtype"] == "int16"
+
+
+def test_float_override_keeps_packed_values_and_metadata(files, tmp_path):
+    """GDAL 3.13.3 cross-read: dtype overrides retain CF scales and offsets."""
+    gdal = pytest.importorskip("osgeo.gdal")
+    da = txr.open_rasterio(files["dem"], mask_and_scale=True)
+    target = tmp_path / "packed-float.tif"
+    da.terrio.to_raster(target, dtype="float32")
+    with gdal.ExceptionMgr(), gdal.Open(str(target)) as dataset:
+        band = dataset.GetRasterBand(1)
+        assert band.DataType == gdal.GDT_Float32
+        assert band.GetScale() == 0.5
+        assert band.GetOffset() == 100.0
+        assert band.GetNoDataValue() == -32768
+        np.testing.assert_array_equal(
+            dataset.ReadAsArray(), terrio.open_raster(files["dem"]).read(1)
+        )
+    with txr.open_rasterio(target, mask_and_scale=True) as back:
+        np.testing.assert_array_equal(back.values, da.values)
 
 
 def test_to_zarr_georeferencing(files, tmp_path):

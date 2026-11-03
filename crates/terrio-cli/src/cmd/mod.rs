@@ -1,3 +1,8 @@
+// Written to match the behavior of:
+//   GDAL v3.13.3:
+//     doc/source/programs/index.rst
+// No code is translated from these sources.
+
 //! The subcommands.
 
 pub mod calc;
@@ -7,6 +12,7 @@ pub mod compare;
 pub mod convert;
 pub mod create;
 pub mod crs;
+pub mod dataset_files;
 pub mod dem;
 pub mod edit;
 pub mod enhance;
@@ -15,12 +21,15 @@ pub mod filter;
 pub mod formats;
 pub mod grid;
 pub mod info;
+pub mod inspection;
 pub mod lineref;
 pub mod mosaic;
 pub mod multidim;
 pub mod neighbors;
 pub mod overviews;
+pub mod parquet_metadata;
 
+pub mod palette;
 pub mod pansharpen;
 pub mod pixel;
 pub mod pixel_info;
@@ -28,12 +37,16 @@ pub mod points;
 pub mod polygonize;
 pub mod processing;
 pub mod proximity;
+pub mod raster_retile;
+pub mod raster_tile;
 pub mod rasterize;
 pub mod rasterout;
 pub mod sieve;
 pub mod tile_index;
 pub mod translate;
 pub mod update;
+pub mod validate_cog;
+pub mod vector_clip;
 pub mod vector_dataset;
 pub mod vector_geom;
 pub mod vector_grid;
@@ -140,3 +153,9 @@ pub fn with_driver(input: &str, driver: Option<&str>) -> terrio::Result<String> 
         _ => Ok(input.to_string()),
     }
 }
+
+pub mod gpkg;
+
+pub mod pipeline;
+
+pub mod rpftoc;

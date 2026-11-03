@@ -1,3 +1,14 @@
+# SPDX-FileCopyrightText: Copyright (c) 2019-2025, Corteva Agriscience™
+# SPDX-FileCopyrightText: Copyright (c) 2018, Dymaxion Labs
+# SPDX-FileCopyrightText: Copyright (c) 2026 Qiusheng Wu and Terrio contributors
+# SPDX-License-Identifier: MIT AND Apache-2.0 AND BSD-2-Clause
+#
+# Derived from (adapted and modified):
+#   rioxarray 0.23.0:
+#     rioxarray/raster_writer.py
+#   dask-rasterio 8dd7fdece7ad094a41908c0ae6b4fe6ca49cf5e1:
+#     dask_rasterio/write.py
+
 """Writing DataArrays to raster files with terrio, as rioxarray's `to_raster` writes them.
 
 Metadata handling follows rioxarray's `raster_writer` (Apache-2.0, Copyright (c) 2019-2023
@@ -118,8 +129,8 @@ def _write_metadata(
     if lossy and str(raster_handle.driver).upper() != "GTIFF":
         warnings.warn(
             f"terrio's {raster_handle.driver} writer does not store band scales and offsets: "
-            "the file holds the encoded values without them. Write a GeoTIFF, write decoded "
-            "values (dtype='float32'), or use xarray's to_zarr / to_netcdf.",
+            "the file holds the encoded values without them. Write a GeoTIFF "
+            "or use xarray's to_zarr / to_netcdf.",
             UserWarning,
             stacklevel=4,
         )
@@ -156,6 +167,18 @@ def _to_raster_dtypes(
     """
     if dtype is None:
         dtype = xarray_dataarray.encoding.get("dtype", str(xarray_dataarray.dtype))
+        # A masked integer source may have no on-disk nodata. Warping introduces NaN
+        # borders, which its old integer encoding cannot represent. Keep those pixels
+        # and the floating values instead of inventing an integer sentinel.
+        nodata = xarray_dataarray.terrio.nodata
+        if (
+            np.issubdtype(np.dtype(dtype), np.integer)
+            and np.issubdtype(xarray_dataarray.dtype, np.floating)
+            and xarray_dataarray.encoding.get("_FillValue") is None
+            and nodata is not None
+            and np.isnan(nodata)
+        ):
+            dtype = xarray_dataarray.dtype
     numpy_dtype = np.dtype(dtype)
     if "_Unsigned" in xarray_dataarray.encoding:
         unsigned = _get_unsigned_dtype(xarray_dataarray.encoding["_Unsigned"] == "true", dtype)
@@ -163,7 +186,9 @@ def _to_raster_dtypes(
             numpy_dtype = unsigned
             dtype = unsigned
             xarray_dataarray.encoding["rasterio_dtype"] = str(unsigned)
-            xarray_dataarray.encoding["dtype"] = str(unsigned)
+    # CF encoding must use the selected output type too, including explicit overrides.
+    # Otherwise it can cast floating values through the stale source integer type.
+    xarray_dataarray.encoding["dtype"] = str(numpy_dtype)
     return xarray_dataarray, numpy_dtype, str(np.dtype(dtype))
 
 
@@ -317,7 +342,14 @@ def write_raster(
     da.terrio.set_spatial_dims(x_dim=x_dim, y_dim=y_dim, inplace=True)
     da, numpy_dtype, kwargs["dtype"] = _to_raster_dtypes(da, kwargs.get("dtype"))
     if kwargs.get("nodata") is not None:
-        kwargs["nodata"] = _ensure_nodata_dtype(kwargs["nodata"], numpy_dtype)
+        try:
+            kwargs["nodata"] = _ensure_nodata_dtype(kwargs["nodata"], numpy_dtype)
+        except (OverflowError, ValueError) as error:
+            raise type(error)(
+                f"{error} Choose a floating output dtype (for example dtype='float32'), "
+                "or set a representable fill value with "
+                "write_nodata(value, encoded=True) before to_raster()."
+            ) from error
     if kwargs.get("crs") is None:
         kwargs.pop("crs", None)
     # Ground control points and RPCs, written as the file's georeferencing.

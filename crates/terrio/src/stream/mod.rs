@@ -32,7 +32,7 @@
 
 mod json;
 #[cfg(feature = "sqlite")]
-mod sqlite;
+pub(crate) mod sqlite;
 
 pub use crate::drivers::vector::profile::{FieldProfile, GeometryProfile, LayerProfile};
 
@@ -229,7 +229,7 @@ pub fn open_layers(path: &str, options: &VectorOpenOptions, batch: usize) -> Res
     let Some(driver) = driver.filter(|d| local && can_read_stream(*d)) else {
         let ds = crate::open_vector(path, options)?;
         return Ok(ds
-            .layers
+            .into_resolved_layers()
             .into_iter()
             .map(|mut l| {
                 let features = std::mem::take(&mut l.features);
@@ -237,6 +237,9 @@ pub fn open_layers(path: &str, options: &VectorOpenOptions, batch: usize) -> Res
             })
             .collect());
     };
+    // Read by the driver its extension names, as `open_vector` would read it: judged as that open
+    // judges a dataset, by its name and its first bytes.
+    crate::formats::check_allowed(path, Some(crate::formats::Kind::Vector))?;
     #[cfg(feature = "sqlite")]
     if driver == VectorDriver::GPKG {
         return open_gpkg(path, options, batch);
@@ -249,7 +252,7 @@ pub fn open_layers(path: &str, options: &VectorOpenOptions, batch: usize) -> Res
             let s = csv::CsvStream::open(path, &options.csv)?;
             (s.layer.clone(), Box::new(CsvSource { s, batch }))
         }
-        VectorDriver::Shapefile => open_shapefile(path)?,
+        VectorDriver::Shapefile => open_shapefile(path, options)?,
         #[cfg(feature = "flatgeobuf")]
         VectorDriver::FlatGeobuf => open_fgb(path, batch)?,
         #[cfg(feature = "parquet")]
@@ -341,7 +344,7 @@ fn open_geojson(path: &str, stem: &str, batch: usize) -> Result<(Layer, Box<dyn 
     }
     let name = c.members.get("name").and_then(|n| n.as_str()).unwrap_or(stem).to_string();
     let crs = c.members.get("crs").and_then(|c| c["properties"]["name"].as_str()).and_then(|n| crate::crs::SpatialRef::parse(n).ok());
-    let layer = scan.layer(&name, crs);
+    let layer = scan.geojson_layer(&name, crs);
     let decoder = geojson::FeatureDecoder::new(&layer, &scan);
     let collection = json::Collection::new(File::open(path)?)?;
     Ok((layer, Box::new(GeoJsonSource { collection, decoder, n: 0, batch })))
@@ -428,6 +431,7 @@ struct ShpSource {
     fid: u64,
     shp_done: bool,
     batch_bytes: usize,
+    organize: shapefile::OrganizePolygons,
 }
 
 impl ShpSource {
@@ -503,9 +507,9 @@ impl FeatureSource for ShpSource {
             return Ok(None);
         }
         let (fields, first) = (self.fields, self.fid);
-        let layout = self.dbf.as_ref().map(|(_, l, _)| l);
+        let (layout, organize) = (self.dbf.as_ref().map(|(_, l, _)| l), self.organize);
         let out = crate::par::map_range(count, |i| {
-            let geometry = shapes.get(i).and_then(|rec| shapefile::decode_shape(rec));
+            let geometry = shapes.get(i).and_then(|rec| shapefile::decode_shape(rec, organize));
             let attributes = match layout {
                 Some(l) if i < n => l.record(&records[i * l.record_len..(i + 1) * l.record_len]),
                 _ => vec![wbvector::FieldValue::Null; fields],
@@ -517,7 +521,7 @@ impl FeatureSource for ShpSource {
     }
 }
 
-fn open_shapefile(path: &str) -> Result<(Layer, Box<dyn FeatureSource>)> {
+fn open_shapefile(path: &str, options: &crate::VectorOpenOptions) -> Result<(Layer, Box<dyn FeatureSource>)> {
     let base = std::path::Path::new(path).with_extension("");
     let sidecar = |ext: &str| [ext.to_string(), ext.to_ascii_uppercase()].into_iter().map(|e| base.with_extension(e)).find(|p| p.exists());
     let name = base.file_name().and_then(|s| s.to_str()).unwrap_or("layer");
@@ -553,7 +557,18 @@ fn open_shapefile(path: &str) -> Result<(Layer, Box<dyn FeatureSource>)> {
     }
     shapefile::apply_prj(&mut layer, prj.as_deref());
     let fields = layer.schema.len();
-    Ok((layer, Box::new(ShpSource { shp, dbf, fields, fid: 0, shp_done: false, batch_bytes: source_bytes(CHUNK_BYTES) })))
+    Ok((
+        layer,
+        Box::new(ShpSource {
+            shp,
+            dbf,
+            fields,
+            fid: 0,
+            shp_done: false,
+            batch_bytes: source_bytes(CHUNK_BYTES),
+            organize: options.shapefile.method(),
+        }),
+    ))
 }
 
 // FlatGeobuf
@@ -738,7 +753,7 @@ fn open_gpkg(path: &str, options: &VectorOpenOptions, batch: usize) -> Result<Ve
 fn open_layers_whole(path: &str, options: &VectorOpenOptions, batch: usize) -> Result<Vec<FeatureReader>> {
     let ds = crate::open_vector(path, options)?;
     Ok(ds
-        .layers
+        .into_resolved_layers()
         .into_iter()
         .map(|mut l| {
             let features = std::mem::take(&mut l.features);
@@ -806,6 +821,7 @@ impl FeatureWriter {
             None => VectorDriver::for_extension(path)
                 .ok_or_else(|| Error::InvalidArgument(format!("cannot tell the output format of '{path}': give it explicitly")))?,
         };
+        crate::dataset::ensure_vector_options_apply(options, Some(driver))?;
         let schema = schema_of(layer);
         let streamed = can_write_stream(driver) && (profile.is_some() || !needs_profile(driver, &schema));
         let sink: Box<dyn FeatureSink> = match (streamed, driver, profile) {
@@ -815,14 +831,15 @@ impl FeatureWriter {
                 options: VectorWriteOptions { driver: Some(driver), ..options.clone() },
             }),
             (true, VectorDriver::GeoJSON, _) => {
-                let enc = geojson::CollectionEncoder::new(&schema, options.geojson)?;
+                let enc = geojson::CollectionEncoder::new(&schema, &options.geojson)?;
                 let mut out = BufWriter::with_capacity(1 << 20, File::create(path)?);
                 out.write_all(enc.head().as_bytes())?;
                 Box::new(GeoJsonSink { out, enc })
             }
-            (true, VectorDriver::GeoJSONSeq, _) => {
-                Box::new(SeqSink { out: BufWriter::with_capacity(1 << 20, File::create(path)?), enc: geojson::SeqEncoder::new(&schema)? })
-            }
+            (true, VectorDriver::GeoJSONSeq, _) => Box::new(SeqSink {
+                out: BufWriter::with_capacity(1 << 20, File::create(path)?),
+                enc: geojson::SeqEncoder::new(&schema, &options.geojson)?,
+            }),
             (true, VectorDriver::CSV, Some(p)) => {
                 let enc = csv::CsvEncoder::new(&schema, p, &options.csv)?;
                 let mut out = BufWriter::with_capacity(1 << 20, File::create(path)?);
@@ -833,7 +850,7 @@ impl FeatureWriter {
             #[cfg(feature = "flatgeobuf")]
             (true, VectorDriver::FlatGeobuf, _) => Box::new(FgbSink::create(path, &schema)?),
             #[cfg(feature = "sqlite")]
-            (true, VectorDriver::GPKG, Some(p)) => match GpkgSink::create(path, &schema, p)? {
+            (true, VectorDriver::GPKG, Some(p)) => match GpkgSink::create(path, &schema, p, options.preserve_declared_geometry_type)? {
                 Some(sink) => Box::new(sink),
                 // A field named fid would give the rowids, which must then be checked unique over
                 // all the features: written whole.
@@ -878,6 +895,7 @@ impl FeatureWriter {
 /// whose schema decisions (geometry type, Z, MEDIUMINT) are taken from the profile.
 #[cfg(feature = "sqlite")]
 struct GpkgSink {
+    preserve: bool,
     table: crate::drivers::vector::sqlite::StreamTable<BufWriter<File>>,
     builder: crate::drivers::vector::geopackage::Builder,
     cols: crate::drivers::vector::geopackage::LayerColumns,
@@ -889,8 +907,11 @@ struct GpkgSink {
 #[cfg(feature = "sqlite")]
 impl GpkgSink {
     /// `None` when the layer has an integer field named fid (see `FeatureWriter::create`).
-    fn create(path: &str, schema: &Layer, profile: &LayerProfile) -> Result<Option<Self>> {
+    fn create(path: &str, schema: &Layer, profile: &LayerProfile, preserve: bool) -> Result<Option<Self>> {
         use wbvector::FieldType;
+        if preserve {
+            crate::drivers::vector::profile::validate_geometry_profile(schema, profile)?;
+        }
         let fields = schema.schema.fields();
         if fields.iter().any(|f| f.name.eq_ignore_ascii_case("fid") && f.field_type == FieldType::Integer) {
             return Ok(None);
@@ -899,9 +920,14 @@ impl GpkgSink {
         builder.claim(&schema.name)?;
         let g = &profile.geometry;
         let all_none = g.count == 0;
-        let declared = if all_none { schema.geom_type } else { g.first.filter(|(_, same)| *same).map(|(t, _)| t) };
+        let declared = if preserve || all_none { schema.geom_type } else { g.first.filter(|(_, same)| *same).map(|(t, _)| t) };
         let small = |i: usize| profile.fields.get(i).is_none_or(|f| f.no_int_beyond_int32);
-        let cols = builder.layer_columns(schema, all_none, declared, g.has_z, None, small);
+        let mut cols = builder.layer_columns(schema, all_none, declared, g.any_z, None, small);
+        cols.z_hint = crate::drivers::vector::profile::dimension_hint(g.any_z, g.missing_z);
+        cols.m_hint = crate::drivers::vector::profile::dimension_hint(g.has_m, g.missing_m);
+        if preserve && declared.is_none() && g.any_z {
+            cols.z_hint = 2;
+        }
         // The file is created anew: pages left over from a larger file would remain at its end.
         let out = BufWriter::with_capacity(1 << 20, File::create(path)?);
         Ok(Some(Self {
@@ -909,6 +935,7 @@ impl GpkgSink {
             builder,
             cols,
             layer: schema.clone(),
+            preserve,
             extent: Default::default(),
             count: 0,
         }))
@@ -918,6 +945,9 @@ impl GpkgSink {
 #[cfg(feature = "sqlite")]
 impl FeatureSink for GpkgSink {
     fn write(&mut self, chunk: &Layer) -> Result<()> {
+        if self.preserve {
+            crate::drivers::vector::profile::validate_geometry_type(self.layer.geom_type, &chunk.features)?;
+        }
         let fields = self.layer.schema.fields();
         let first = self.count as i64 + 1;
         let (cols, features) = (&self.cols, &chunk.features);
@@ -934,7 +964,7 @@ impl FeatureSink for GpkgSink {
     }
 
     fn finish(self: Box<Self>) -> Result<()> {
-        let Self { table, mut builder, cols, layer, extent, count } = *self;
+        let Self { table, mut builder, cols, layer, extent, count, .. } = *self;
         let (root, mut next, mut out) = table.finish_with_output()?;
         let built = crate::drivers::vector::sqlite::BuiltTable { name: layer.name.clone(), sql: cols.sql.clone(), root };
         // The R-tree's tables follow the layer's.
@@ -955,6 +985,76 @@ impl FeatureSink for GpkgSink {
     }
 }
 
+/// Writes several GeoPackage layers in bounded memory, accepting chunks in any order.
+///
+/// In native builds, rows, spatial-index entries and SQLite page directories are spooled
+/// to temporary files. Memory depends on schemas, the current chunk, fixed sort buffers
+/// and tree-depth bookkeeping, rather than the total feature count. Call [`Self::finish`]
+/// to write tables, R-trees and metadata. Dropping an unfinished writer leaves an
+/// incomplete output file.
+/// Requires the `sqlite` feature. Existing files are truncated by successful creation.
+///
+/// ```no_run
+/// use terrio::stream::{GpkgLayersWriter, schema_of};
+/// # let layers: Vec<terrio::Layer> = vec![];
+/// let schemas: Vec<_> = layers.iter().map(schema_of).collect();
+/// let mut writer = GpkgLayersWriter::create("combined.gpkg", &schemas)?;
+/// for (index, chunk) in layers.iter().enumerate() {
+///     writer.write(index, chunk)?;
+/// }
+/// writer.finish()?;
+/// # Ok::<(), terrio::Error>(())
+/// ```
+#[cfg(feature = "sqlite")]
+pub struct GpkgLayersWriter {
+    sink: GpkgLayersSink,
+}
+
+#[cfg(feature = "sqlite")]
+impl GpkgLayersWriter {
+    /// Creates the output using each layer's name, fields, CRS and geometry type, ignoring
+    /// features. Refuses integer `fid` fields and schemas with neither CRS nor geometry type;
+    /// use [`crate::write_vector`] for those. Duplicate/reserved table names are also refused.
+    /// Geometry declarations are inferred from arriving features, as in the whole-layer writer.
+    pub fn create(path: &str, schemas: &[Layer]) -> Result<Self> {
+        for schema in schemas {
+            let name = schema.name.to_ascii_lowercase();
+            if name.starts_with("gpkg_") || name.starts_with("sqlite_") {
+                return Err(Error::InvalidArgument(format!("'{}' is a reserved GeoPackage table name", schema.name)));
+            }
+        }
+        let sink = GpkgLayersSink::create(path, schemas, false)?.ok_or_else(|| {
+            Error::Unsupported("streaming GeoPackage layers require a geometry type or CRS and no integer fid field".into())
+        })?;
+        Ok(Self { sink })
+    }
+
+    /// Writes a chunk to the zero-based layer index from [`Self::create`]. Chunks must have
+    /// the same fields, in the same order, as that layer's schema; feature IDs are assigned
+    /// sequentially within each output layer. An invalid index or field schema returns an error.
+    /// Chunk CRS declarations are ignored: coordinates must already use the output schema's
+    /// CRS; this method does not reproject them. Geometry types are inferred from features,
+    /// rather than the chunk's geometry-type declaration.
+    pub fn write(&mut self, index: usize, chunk: &Layer) -> Result<()> {
+        let layer = self.sink.layers.get(index).ok_or_else(|| Error::InvalidArgument(format!("no output layer at index {index}")))?;
+        if layer.schema.schema.fields().iter().map(|f| (&f.name, f.field_type)).ne(chunk
+            .schema
+            .fields()
+            .iter()
+            .map(|f| (&f.name, f.field_type)))
+            || chunk.features.iter().any(|f| f.attributes.len() != layer.schema.schema.fields().len())
+        {
+            return Err(Error::InvalidArgument("chunk fields must match the output layer schema".into()));
+        }
+        self.sink.write(index, chunk)
+    }
+
+    /// Consumes the writer and completes the GeoPackage, including empty layers.
+    pub fn finish(self) -> Result<()> {
+        self.sink.finish()
+    }
+}
+
 /// A GeoPackage of several layers whose features arrive in any interleaving (a chunk of one
 /// layer, then of another): each layer's rows are encoded as they come into a temporary file of
 /// its own, with their bounds, then copied into the database one table after another
@@ -966,6 +1066,7 @@ pub(crate) struct GpkgLayersSink {
     out: BufWriter<File>,
     builder: crate::drivers::vector::geopackage::Builder,
     layers: Vec<SpilledLayer>,
+    preserve: bool,
 }
 
 #[cfg(feature = "sqlite")]
@@ -982,7 +1083,7 @@ impl GpkgLayersSink {
     /// `None` when a layer has an integer field named fid (which gives the rowids, to be checked
     /// unique over all the features), or neither a geometry type nor a CRS (whether it is a
     /// spatial table depends on all its geometries): such layers are written whole.
-    pub(crate) fn create(path: &str, schemas: &[Layer]) -> Result<Option<Self>> {
+    pub(crate) fn create(path: &str, schemas: &[Layer], preserve: bool) -> Result<Option<Self>> {
         use wbvector::FieldType;
         let mut builder = crate::drivers::vector::geopackage::Builder::new();
         let mut layers = Vec::with_capacity(schemas.len());
@@ -999,12 +1100,15 @@ impl GpkgLayersSink {
         }
         // The file is created anew: pages left over from a larger file would remain at its end.
         let out = BufWriter::with_capacity(1 << 20, File::create(path)?);
-        Ok(Some(Self { out, builder, layers }))
+        Ok(Some(Self { out, builder, layers, preserve }))
     }
 
     /// Adds a chunk of features of layer `i`.
     pub(crate) fn write(&mut self, i: usize, chunk: &Layer) -> Result<()> {
         let l = &mut self.layers[i];
+        if self.preserve {
+            crate::drivers::vector::profile::validate_geometry_type(l.schema.geom_type, &chunk.features)?;
+        }
         l.profile.add(&chunk.features);
         let fields = l.schema.schema.fields();
         let first = l.count as i64 + 1;
@@ -1036,16 +1140,16 @@ impl GpkgLayersSink {
 
     /// Writes the tables, one after another, then the rest of the database.
     pub(crate) fn finish(self) -> Result<()> {
-        use crate::drivers::vector::geopackage::{LayerExtent, LayerTable};
+        use crate::drivers::vector::geopackage::LayerTable;
         use crate::drivers::vector::sqlite::{BuiltTable, StreamTable};
-        let Self { mut out, mut builder, layers } = self;
+        let Self { mut out, mut builder, layers, preserve } = self;
         let mut next = 2;
         for l in layers {
             let mut rows = l.rows.into_inner().map_err(|e| Error::Io(e.into_error()))?;
             rows.seek(SeekFrom::Start(0))?;
             let mut rows = BufReader::with_capacity(1 << 20, rows);
-            let mut table = StreamTable::starting_at(&mut out, next);
-            let mut extent = LayerExtent::default();
+            let mut table = StreamTable::starting_at_spilled(&mut out, next)?;
+            let mut extent = crate::drivers::vector::geopackage::spilled::Extent::new()?;
             let mut head = [0u8; 9];
             let mut rec = Vec::new();
             for _ in 0..l.count {
@@ -1064,22 +1168,28 @@ impl GpkgLayersSink {
                 rec.resize(u32::from_le_bytes(len) as usize, 0);
                 rows.read_exact(&mut rec)?;
                 table.push(rowid, &rec)?;
-                extent.add(rowid, bbox);
+                extent.add(rowid, bbox)?;
             }
             let (root, after) = table.finish()?;
             next = after;
             // The R-tree's tables follow the layer's.
             let mut write = |t, rows: &mut crate::drivers::vector::sqlite::Rows| {
-                let (built, after, _) = crate::drivers::vector::sqlite::stream_table(&mut out, next, t, rows)?;
+                let (built, after, _) = crate::drivers::vector::sqlite::stream_table_spilled(&mut out, next, t, rows)?;
                 next = after;
                 Ok(built)
             };
             // The schema decisions of the whole-layer writer, from the profile.
+            let extent = extent.finish()?;
             let g = &l.profile.geometry;
             let all_none = g.count == 0;
-            let declared = if all_none { l.schema.geom_type } else { l.profile.uniform_type() };
+            let declared = if preserve || all_none { l.schema.geom_type } else { l.profile.uniform_type() };
             let small = |i: usize| l.profile.fields.get(i).is_none_or(|f| f.no_int_beyond_int32);
-            let cols = builder.layer_columns(&l.schema, all_none, declared, g.has_z, None, small);
+            let mut cols = builder.layer_columns(&l.schema, all_none, declared, g.any_z, None, small);
+            cols.z_hint = crate::drivers::vector::profile::dimension_hint(g.any_z, g.missing_z);
+            cols.m_hint = crate::drivers::vector::profile::dimension_hint(g.has_m, g.missing_m);
+            if preserve && declared.is_none() && g.any_z {
+                cols.z_hint = 2;
+            }
             let built = BuiltTable { name: l.schema.name.clone(), sql: cols.sql.clone(), root };
             builder.finish_layer(&l.schema.name, &cols, l.count, l.count as i64, extent, LayerTable::Built(built), Some(&mut write))?;
         }
@@ -1670,6 +1780,11 @@ fn same_dataset(src: &str, dst: &str) -> bool {
 /// written to a GeoPackage go one after another, and OpenStreetMap PBF files sorted by type then
 /// id (as osmium, Geofabrik and the planet write them) are read a block at a time.
 pub fn convert(src: &str, dst: &str, options: &ConvertOptions) -> Result<()> {
+    crate::dataset::ensure_vector_options_apply(&options.write, options.write.driver.or_else(|| VectorDriver::for_extension(dst)))?;
+
+    // The source is read by the driver its name points to (OpenStreetMap files by a reader of their
+    // own), as `open_vector` reads it: judged as that open judges a dataset.
+    crate::formats::check_allowed(src, Some(crate::formats::Kind::Vector))?;
     if let Some(done) = convert_osm(src, dst, options) {
         return done;
     }
@@ -1692,7 +1807,7 @@ pub fn convert(src: &str, dst: &str, options: &ConvertOptions) -> Result<()> {
             }
             let mut translators = readers.iter().map(|r| Translator::new(r.layer(), &options.translate)).collect::<Result<Vec<_>>>()?;
             let schemas: Vec<Layer> = translators.iter().map(|t| t.schema().clone()).collect();
-            let Some(mut sink) = GpkgLayersSink::create(dst, &schemas)? else {
+            let Some(mut sink) = GpkgLayersSink::create(dst, &schemas, options.write.preserve_declared_geometry_type)? else {
                 drop(readers);
                 return convert_whole(src, dst, options);
             };
@@ -1777,7 +1892,14 @@ fn write_ahead(mut next: impl FnMut() -> Result<Option<Layer>> + Send, mut write
 
 fn convert_whole(src: &str, dst: &str, options: &ConvertOptions) -> Result<()> {
     let ds = crate::open_vector(src, &options.open)?;
-    let layers = crate::ops::vector_filter::translate_owned(ds.layers, &options.translate)?;
+    // A KML or KMZ output holds the shared styles; elsewhere each feature gets its style.
+    let output = options.write.driver.or_else(|| crate::formats::VectorDriver::for_extension(dst));
+    if output.is_some_and(|d| d.holds_style_table()) {
+        let write = crate::VectorWriteOptions { style_table: ds.style_table, ..options.write.clone() };
+        let layers = crate::ops::vector_filter::translate_owned(ds.layers, &options.translate)?;
+        return crate::write_vector(&layers, dst, &write);
+    }
+    let layers = crate::ops::vector_filter::translate_owned(ds.into_resolved_layers(), &options.translate)?;
     crate::write_vector(&layers, dst, &options.write)
 }
 
@@ -1875,7 +1997,9 @@ fn convert_sorted_osm(data: &mut File, src: &str, dst: &str, options: &ConvertOp
     #[cfg(feature = "sqlite")]
     if driver == VectorDriver::GPKG {
         let out: Vec<Layer> = translators.iter().map(|t| t.schema().clone()).collect();
-        let Some(mut sink) = GpkgLayersSink::create(dst, &out)? else { return convert_whole(src, dst, options) };
+        let Some(mut sink) = GpkgLayersSink::create(dst, &out, options.write.preserve_declared_geometry_type)? else {
+            return convert_whole(src, dst, options);
+        };
         let written = (|| {
             osm::read_sorted_pbf(data, wanted, &mut |l, features| {
                 let Some(k) = selected.iter().position(|&s| s == l) else { return Ok(()) };

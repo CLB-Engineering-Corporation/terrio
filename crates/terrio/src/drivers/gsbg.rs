@@ -1,3 +1,8 @@
+// Written to match the behavior of:
+//   GDAL v3.13.3:
+//     frmts/gsg/gsbgdataset.cpp
+// No code is translated from these sources.
+
 //! Golden Software Surfer 6 binary grids (`DSBB`), as GDAL's GSBG driver writes them. Surfer's
 //! ASCII and Surfer 7 grids are read by wbraster.
 
@@ -44,6 +49,14 @@ pub(crate) fn open(path: &Path) -> Result<common::RawRaster> {
     let crs = common::read_prj(path).unwrap_or_default();
     let raster = common::raster_header(nx, ny, 1, DataType::F32, gt, crs, Some(BLANK as f64))?;
     common::RawRaster::open(RasterDataset::with_driver(raster, RasterDriver::GSBG, true), path, layout, &[])
+}
+
+/// [`open`] for a file `raw_opener` recognised by its first bytes, whatever driver its name points
+/// to: refused when the process-wide allow-list leaves GSBG out, as a Surfer 6 grid named for
+/// another driver (`x.tif`, `big.hgt`) reaches this point as that driver's file.
+pub(crate) fn open_recognised(path: &Path) -> Result<common::RawRaster> {
+    crate::formats::check_driver_allowed("GSBG", &path.to_string_lossy(), crate::formats::Kind::Raster)?;
+    open(path)
 }
 
 /// Writes a Surfer 6 binary grid (Float32), with nodata cells blanked.

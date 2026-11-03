@@ -1,3 +1,12 @@
+// SPDX-FileCopyrightText: Copyright (c) 2006, 2009 Matthew Perry
+// SPDX-FileCopyrightText: Copyright (c) 2009-2013, Even Rouault <even dot rouault at spatialys.com>
+// SPDX-FileCopyrightText: Copyright (c) 2026 Qiusheng Wu and Terrio contributors
+// SPDX-License-Identifier: MIT
+//
+// Derived from (translated to Rust and modified):
+//   GDAL v3.12.2 and v3.13.3:
+//     apps/gdaldem_lib.cpp
+
 //! Terrain analysis: an equivalent of `gdaldem`.
 //!
 //! Hillshade (with combined, multidirectional and Igor shading), slope, aspect, color relief,
@@ -139,7 +148,9 @@ pub struct DemOptions {
     /// For the operations written to a path a strip of rows at a time ([`dem_to_path`],
     /// [`color_relief_to_path`]): about how much memory, in MiB, the strips in flight may take
     /// (read ahead, computed, being written), which sets their height (like `gdalwarp -wm`). By
-    /// default, 256 MiB. The values do not depend on it.
+    /// default, strips of about 64 MiB of input values, as `dem_to_path` always used (about
+    /// 300 to 550 MiB in flight for a Float32 DEM). The values do not depend on it. Below one row
+    /// of the input's blocks, each strip decodes the blocks it touches again: slower, same values.
     pub max_memory_mib: Option<f64>,
 }
 
@@ -545,7 +556,7 @@ impl MultiDirectionalParams {
 
 /// GDAL 3.13 changed terrain arithmetic and parameters to Float32.
 #[derive(Clone, Copy)]
-struct Terrain313 {
+struct Float32Terrain {
     alg: GradientAlg,
     inv_ew: f32,
     inv_ns: f32,
@@ -558,7 +569,7 @@ struct Terrain313 {
     same_x: f32,
     same_y: f32,
 }
-impl Terrain313 {
+impl Float32Terrain {
     fn new(gt: &[f64; 6], o: &DemOptions, xs: f64, ys: f64) -> Self {
         let inv_ew = (1.0 / (gt[1] * xs)) as f32;
         let inv_ns = (1.0 / (gt[5] * ys)) as f32;
@@ -602,15 +613,15 @@ impl Terrain313 {
             let (x, y) = (x * self.inv_ew, y * self.inv_ns);
             (self.sin_alt - (y * self.cos_az - x * self.sin_az), 1.0 + self.square_z * (x * x + y * y))
         };
-        let ratio = divide_sqrt313(num, den, multi);
+        let ratio = divide_sqrt_f32(num, den, multi);
         if ratio <= 0.0 { 1.0 } else { 1.0 + ratio }
     }
 }
 
-/// Match the reference's x86 estimate/refinement path, not a cross-CPU bit pattern.
+/// Match GDAL 3.13's x86 estimate/refinement path, not a cross-CPU bit pattern.
 /// Intel and AMD rsqrt estimates can differ; non-x86 uses exact division/sqrt.
 #[inline]
-fn divide_sqrt313(numerator: f32, denominator: f32, multi: bool) -> f32 {
+fn divide_sqrt_f32(numerator: f32, denominator: f32, multi: bool) -> f32 {
     if !multi {
         return numerator / denominator.sqrt();
     }
@@ -627,7 +638,8 @@ fn divide_sqrt313(numerator: f32, denominator: f32, multi: bool) -> f32 {
     }
 }
 
-fn slope313<T: Px>(w: &[T; 9], alg: GradientAlg, ew: f64, ns: f64, percent: bool) -> f32 {
+/// Slope, in degrees or percent, with GDAL 3.13's Float32 arithmetic.
+fn slope_f32<T: Px>(w: &[T; 9], alg: GradientAlg, ew: f64, ns: f64, percent: bool) -> f32 {
     let (x, y, div) = match alg {
         GradientAlg::Horn => {
             let (x, y) = horn(w);
@@ -1055,13 +1067,13 @@ impl Terrain {
             ($t:ty, $src:expr, $nd:expr) => {{
                 let hs = HillshadeParams::new(&gt, o, xscale, yscale);
                 let md = MultiDirectionalParams::new(&gt, o, xscale, yscale);
-                let modern = o.kernel_version == super::warp::KernelVersion::Gdal313;
-                let f313 = Terrain313::new(&gt, o, xscale, yscale);
+                let use_float32 = o.kernel_version == super::warp::KernelVersion::Gdal313;
+                let float32_terrain = Float32Terrain::new(&gt, o, xscale, yscale);
                 let same_res = gt[1] == -gt[5] && xscale == yscale;
                 let (ew, ns) = (gt[1] * xscale, gt[5] * yscale);
                 let azimuth = !o.trigonometric;
                 let f: Box<dyn Fn(&[$t; 9]) -> f32 + Sync> = match product {
-                    DemProduct::Hillshade if modern => Box::new(move |w| f313.shade(w, false)),
+                    DemProduct::Hillshade if use_float32 => Box::new(move |w| float32_terrain.shade(w, false)),
                     DemProduct::Hillshade => match o.shading {
                         Shading::MultiDirectional => Box::new(move |w| md.shade(w)),
                         Shading::Combined => Box::new(move |w| hs.combined(w)),
@@ -1071,7 +1083,7 @@ impl Terrain {
                     },
                     DemProduct::Slope => {
                         let (alg, percent) = (o.gradient, o.slope_percent);
-                        Box::new(move |w| if modern { slope313(w, alg, ew, ns, percent) } else { slope(w, alg, ew, ns, percent) })
+                        Box::new(move |w| if use_float32 { slope_f32(w, alg, ew, ns, percent) } else { slope(w, alg, ew, ns, percent) })
                     }
                     DemProduct::Aspect => {
                         let alg = o.gradient;
@@ -1083,7 +1095,7 @@ impl Terrain {
                     DemProduct::Roughness => Box::new(roughness::<$t>),
                 };
                 #[cfg(target_arch = "x86_64")]
-                let simd = move |w: &[$t; 9]| if modern { f313.shade(w, true) } else { hs.same_res_simd(w) };
+                let simd = move |w: &[$t; 9]| if use_float32 { float32_terrain.shade(w, true) } else { hs.same_res_simd(w) };
                 #[cfg(target_arch = "x86_64")]
                 let multi: Option<&(dyn Fn(&[$t; 9]) -> f32 + Sync)> =
                     (product == DemProduct::Hillshade && o.shading == Shading::Standard && o.gradient == GradientAlg::Horn && same_res)
@@ -1124,8 +1136,8 @@ pub fn dem(ds: &RasterDataset, product: DemProduct, o: &DemOptions) -> Result<Ra
 /// the DEM and writing a GeoTIFF output a strip of rows at a time: neither is held whole (other
 /// formats are written whole). The values are those of [`dem`].
 ///
-/// `path` must not be the file `src` reads, which writing it would truncate: read such a DEM
-/// whole with [`crate::open_raster`] and use [`dem`].
+/// A DEM that is also the output (`path` is the file `src` reads) is read whole first, so that
+/// writing does not truncate it; [`DemOptions::max_memory_mib`] is then refused.
 ///
 /// ```no_run
 /// use terrio::ops::dem::{DemOptions, DemProduct, dem_to_path};
@@ -1142,8 +1154,7 @@ pub fn dem_to_path(
     options: &crate::RasterWriteOptions,
 ) -> Result<()> {
     o.validate()?;
-    // A DEM that is also the output is read whole first.
-    if super::strips::overwrites(path, &src.input_paths()?) {
+    if overwrites_input(src, o, path)? {
         return crate::write_raster_dataset(&dem(&src.read()?, product, o)?, path, options);
     }
     let out_bytes = if product == DemProduct::Hillshade { 1 } else { 4 };
@@ -1151,24 +1162,41 @@ pub fn dem_to_path(
     dem_in_strips(src, product, o, path, options, rows)
 }
 
-/// The memory budget of the operations written a strip at a time, when none is given.
-const DEFAULT_MEMORY_MIB: f64 = 256.0;
+/// Whether `path` is the file `src` reads, which is then read whole first instead of in strips:
+/// a memory budget, which could not be honored, is refused.
+fn overwrites_input(src: &crate::LazyRaster, o: &DemOptions, path: &str) -> Result<bool> {
+    let overwrites = super::strips::overwrites(path, &src.input_paths()?);
+    if overwrites && o.max_memory_mib.is_some() {
+        return Err(Error::InvalidArgument(
+            "max_memory_mib does not apply to an output that is also the input, which is read whole".into(),
+        ));
+    }
+    Ok(overwrites)
+}
 
-/// The rows of the strips a DEM operation written a strip at a time processes, for an output of
-/// `out_bytes` bytes per pixel (all bands): as many rows as `max_memory_mib` (by default
-/// [`DEFAULT_MEMORY_MIB`]) holds. About three strips of input (read ahead, read, worked on) and three of
-/// output (computed, queued, being written) are in flight, with the `f64` values of one.
-fn strip_rows(src: &crate::LazyRaster, o: &DemOptions, out_bytes: usize) -> usize {
-    let (w, block) = (src.width().max(1), src.block_size().map(|b| b.1));
-    let value = src.data_type().size_bytes().max(4);
-    let mib = o.max_memory_mib.unwrap_or(DEFAULT_MEMORY_MIB);
-    let row = w * (3 * value + 8 + 4 + 3 * out_bytes);
-    let rows = ((mib * 1048576.0) as usize / row).max(1);
-    // Whole rows of the input's blocks, when they fit.
+/// The rows of the strips of a DEM read a strip at a time, `row` bytes in flight per row: as many
+/// as `max_memory_mib` holds, at least one, whole rows of the input's blocks when they fit; without
+/// a budget, about 64 MiB of input values ([`super::strips::strip_rows`]).
+fn budget_rows(src: &crate::LazyRaster, max_memory_mib: Option<f64>, row: usize) -> usize {
+    let block = src.block_size().map(|b| b.1);
+    let Some(mib) = max_memory_mib else {
+        return super::strips::strip_rows(src.width(), 1, src.data_type().size_bytes().max(4), block);
+    };
+    let rows = ((mib * 1048576.0) as usize / row.max(1)).max(1);
     match block.filter(|b| *b > 1 && rows >= *b) {
         Some(b) => rows / b * b,
         None => rows,
     }
+}
+
+/// The rows of the strips a DEM operation written a strip at a time processes, for an output of
+/// `out_bytes` bytes per pixel (all bands): as many rows as `max_memory_mib` holds (see
+/// [`budget_rows`]). About three strips of input values (read ahead, read, worked on) and three of
+/// output (computed, queued, being written) are in flight, with the `f64` values of one strip (8
+/// bytes a pixel) and its 4-byte copy in [`read_band`].
+fn strip_rows(src: &crate::LazyRaster, o: &DemOptions, out_bytes: usize) -> usize {
+    let value = src.data_type().size_bytes().max(4);
+    budget_rows(src, o.max_memory_mib, src.width().max(1) * (3 * value + 8 + 4 + 3 * out_bytes))
 }
 
 /// [`dem_to_path`] in strips of `rows` rows.
@@ -1259,10 +1287,21 @@ impl ColorMap {
     }
 
     /// [`ColorMap::parse`] for a DEM read by window: percentages, when there are some and no
-    /// `range` is given, are of the band's range read a strip of rows at a time.
-    pub fn parse_lazy(text: &str, src: &mut crate::LazyRaster, band: usize, range: Option<(f64, f64)>) -> Result<Self> {
+    /// `range` is given, are of the band's range read a strip of rows at a time (a pass over the
+    /// band before it is colored), the strips taking about `max_memory_mib` MiB (as
+    /// [`DemOptions::max_memory_mib`]).
+    pub fn parse_lazy(
+        text: &str,
+        src: &mut crate::LazyRaster,
+        band: usize,
+        range: Option<(f64, f64)>,
+        max_memory_mib: Option<f64>,
+    ) -> Result<Self> {
+        if max_memory_mib.is_some_and(|m| m.is_nan() || m <= 0.0) {
+            return Err(Error::InvalidArgument("invalid max_memory_mib".into()));
+        }
         let nodata = src.header().nodata();
-        Self::parse_with(text, nodata, range, || lazy_band_range(src, band))
+        Self::parse_with(text, nodata, range, || lazy_band_range(src, band, max_memory_mib))
     }
 
     fn parse_with(
@@ -1367,15 +1406,16 @@ fn band_range(ds: &RasterDataset, band: usize) -> Result<(f64, f64)> {
     Ok((lo, hi))
 }
 
-/// The minimum and maximum of the valid values of a band read by window, a strip of rows at a time.
-fn lazy_band_range(src: &mut crate::LazyRaster, band: usize) -> Result<(f64, f64)> {
+/// The minimum and maximum of the valid values of a band read by window, a strip of rows at a
+/// time: as many rows as `max_memory_mib` holds of the values read and their `f64` copy.
+fn lazy_band_range(src: &mut crate::LazyRaster, band: usize, max_memory_mib: Option<f64>) -> Result<(f64, f64)> {
     if band == 0 || band > src.band_count() {
         return Err(Error::InvalidArgument(format!("unable to fetch band #{band}")));
     }
     let header = src.header();
     let nodata = header.nodata();
     let (w, h) = (src.width(), src.height());
-    let rows = super::strips::strip_rows(w, 1, 8, src.block_size().map(|b| b.1));
+    let rows = budget_rows(src, max_memory_mib, w.max(1) * (src.data_type().size_bytes() + 8));
     let read = crate::WindowOptions { bands: vec![band], ..Default::default() };
     let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
     for y in (0..h).step_by(rows.max(1)) {
@@ -1603,6 +1643,10 @@ pub fn color_relief_vrt(
     vrt_path: Option<&str>,
 ) -> Result<super::vrt::VrtDataset> {
     use super::vrt::{VrtBand, VrtDataset, VrtSource};
+    // The VRT is written over the DEM it reads from: that would destroy the DEM, so it is refused.
+    if vrt_path.is_some_and(|p| super::strips::overwrites(p, &[src_path.to_string()])) {
+        return Err(Error::InvalidArgument("a VRT output cannot replace the DEM it is built from".into()));
+    }
     let r = &ds.raster;
     if o.band == 0 || o.band > r.bands {
         return Err(Error::InvalidArgument(format!("unable to fetch band #{}", o.band)));
@@ -1756,13 +1800,13 @@ pub fn color_relief(ds: &RasterDataset, colors: &ColorMap, o: &DemOptions) -> Re
 /// Colors a DEM band with a color map as [`color_relief`] does and writes the result to `path`,
 /// reading the DEM and writing a GeoTIFF output a strip of rows at a time: neither is held whole
 /// (other formats are written whole). The values are those of [`color_relief`]. A DEM that is
-/// also the output is read whole first.
+/// also the output is read whole first, and [`DemOptions::max_memory_mib`] is then refused.
 ///
 /// ```no_run
 /// use terrio::ops::dem::{ColorMap, DemOptions, color_relief_to_path};
 ///
 /// let mut src = terrio::open_raster_lazy("dem.tif")?;
-/// let colors = ColorMap::parse_lazy("0 0 0 255\n1000 255 255 255\nnv 0 0 0 0", &mut src, 1, None)?;
+/// let colors = ColorMap::parse_lazy("0 0 0 255\n1000 255 255 255\nnv 0 0 0 0", &mut src, 1, None, None)?;
 /// let o = DemOptions { alpha: true, ..Default::default() };
 /// color_relief_to_path(&mut src, &colors, &o, "relief.tif", &Default::default())?;
 /// # Ok::<(), terrio::Error>(())
@@ -1775,7 +1819,7 @@ pub fn color_relief_to_path(
     options: &crate::RasterWriteOptions,
 ) -> Result<()> {
     o.validate()?;
-    if super::strips::overwrites(path, &src.input_paths()?) {
+    if overwrites_input(src, o, path)? {
         return crate::write_raster_dataset(&color_relief(&src.read()?, colors, o)?, path, options);
     }
     let rows = strip_rows(src, o, if o.alpha { 4 } else { 3 });
@@ -1892,7 +1936,7 @@ pub fn shaded_relief_to_path(
 ) -> Result<()> {
     o.validate()?;
     blend.validate()?;
-    if super::strips::overwrites(path, &src.input_paths()?) {
+    if overwrites_input(src, o, path)? {
         return crate::write_raster_dataset(&shaded_relief(&src.read()?, colors, o, blend)?, path, options);
     }
     let rows = strip_rows(src, o, if o.alpha { 5 } else { 4 });
@@ -2015,7 +2059,10 @@ nv 10 20 30 0
             crate::write_raster_dataset(&ds, input.to_str().unwrap(), &Default::default()).unwrap();
             let map = ColorMap::parse(text, &ds, 1, None).unwrap();
             let mut lazy = crate::open_raster_lazy(input.to_str().unwrap()).unwrap();
-            assert_eq!(ColorMap::parse_lazy(text, &mut lazy, 1, None).unwrap(), map, "{dt:?}");
+            assert_eq!(ColorMap::parse_lazy(text, &mut lazy, 1, None, None).unwrap(), map, "{dt:?}");
+            // A row at a time.
+            assert_eq!(ColorMap::parse_lazy(text, &mut lazy, 1, None, Some(1e-9)).unwrap(), map, "{dt:?}");
+            assert!(ColorMap::parse_lazy(text, &mut lazy, 1, None, Some(0.0)).is_err());
             for (alpha, mode) in [(true, ColorSelection::Interpolate), (false, ColorSelection::Nearest), (true, ColorSelection::Exact)] {
                 let o = DemOptions { alpha, color_selection: mode, ..Default::default() };
                 let whole = color_relief(&ds, &map, &o).unwrap();
@@ -2050,6 +2097,8 @@ nv 10 20 30 0
         let mut src = crate::open_raster_lazy(input).unwrap();
         assert_eq!(strip_rows(&src, &DemOptions { max_memory_mib: Some(1e-9), ..Default::default() }, 4), 1);
         assert!(strip_rows(&src, &DemOptions { max_memory_mib: Some(1.0), ..Default::default() }, 4) > 30);
+        // Without a budget, the strips dem_to_path has always used.
+        assert_eq!(strip_rows(&src, &DemOptions::default(), 1), crate::ops::strips::strip_rows(40, 1, 4, src.block_size().map(|b| b.1)));
         assert!(
             dem_to_path(
                 &mut src,
@@ -2096,6 +2145,20 @@ nv 10 20 30 0
         let copy = copy.to_str().unwrap();
         std::fs::copy(input, copy).unwrap();
         let mut src = crate::open_raster_lazy(copy).unwrap();
+        // A budget cannot apply to a DEM read whole: refused, before the output is written.
+        let budget = DemOptions { max_memory_mib: Some(64.0), ..Default::default() };
+        assert!(dem_to_path(&mut src, DemProduct::Slope, &budget, copy, &Default::default()).is_err());
+        let map = ColorMap::parse_lazy(
+            "0 0 0 0
+300 255 255 255",
+            &mut src,
+            1,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(color_relief_to_path(&mut src, &map, &budget, copy, &Default::default()).is_err());
+        assert!(shaded_relief_to_path(&mut src, &map, &budget, &HillshadeBlend::default(), copy, &Default::default()).is_err());
         dem_to_path(&mut src, DemProduct::Slope, &DemOptions::default(), copy, &Default::default()).unwrap();
         drop(src);
         assert_eq!(
@@ -2153,6 +2216,32 @@ nv 10 20 30 0
     }
 
     #[test]
+    fn a_vrt_cannot_replace_its_dem() {
+        let dir = tempfile::tempdir().unwrap();
+        let v: Vec<f64> = (0..40 * 30).map(|i| ((i * 53 % 211) as f64) * 1.5).collect();
+        let ds = dem_ds(v, 40, 30, DataType::F32, None, 5.0);
+        let input = dir.path().join("dem.tif");
+        let input = input.to_str().unwrap();
+        crate::write_raster_dataset(&ds, input, &Default::default()).unwrap();
+        let map = ColorMap::parse("0 0 0 0\n300 255 255 255", &ds, 1, None).unwrap();
+        let o = DemOptions::default();
+        assert!(color_relief_vrt(&ds, input, &map, &o, Some(input)).is_err());
+        #[cfg(unix)]
+        {
+            let link = dir.path().join("link.tif");
+            std::fs::hard_link(input, &link).unwrap();
+            assert!(color_relief_vrt(&ds, input, &map, &o, link.to_str()).is_err());
+        }
+        // The DEM is unchanged by the refusals.
+        assert_eq!(crate::open_raster(input).unwrap().raster.data.to_f64_vec(), ds.raster.data.to_f64_vec());
+        // A VRT beside the DEM is written.
+        let vrt = dir.path().join("relief.vrt");
+        let vrt = vrt.to_str().unwrap();
+        color_relief_vrt(&ds, input, &map, &o, Some(vrt)).unwrap().write(vrt).unwrap();
+        assert!(std::fs::read_to_string(vrt).unwrap().starts_with("<VRTDataset"));
+    }
+
+    #[test]
     fn gradients_of_rotated_grids_are_refused() {
         let mut ds = dem_ds(plane(6, 5), 6, 5, DataType::F32, None, 10.0);
         ds.set_geo_transform([0.0, 0.0, 10.0, 0.0, 10.0, 0.0]);
@@ -2166,7 +2255,7 @@ nv 10 20 30 0
 
     /// Captured from GDAL 3.13.3 on this Float32 3x3 source, without SIMD columns.
     #[test]
-    fn modern_terrain_matches_gdal_float32_golden_values() {
+    fn float32_terrain_matches_gdal_golden_values() {
         let ds = dem_ds(vec![942.315, 946.702, 951.43, 945.132, 943.95, 959.37, 948.15, 954.318, 960.01], 3, 3, DataType::F32, None, 3.5);
         let options = DemOptions { kernel_version: super::super::warp::KernelVersion::Gdal313, ..Default::default() };
         let slope = slope_map(&ds, &options).unwrap();

@@ -10,7 +10,7 @@
 //! meanwhile. A cancelled call (`notifications/cancelled`) kills its command, and so does the
 //! client going away.
 
-use clap::CommandFactory;
+use crate::usage::commands;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::ffi::OsString;
@@ -37,7 +37,8 @@ const INSTRUCTIONS: &str = "terrio reads, writes and converts geospatial rasters
 - Start with info (--json) to see what a dataset holds; formats lists the formats terrio reads and writes.";
 
 /// Commands that only read: they write no file.
-const READ_ONLY: &[&str] = &["info", "formats", "crs", "mdinfo", "mdread", "compare"];
+const READ_ONLY: &[&str] =
+    &["info", "formats", "crs", "mdinfo", "mdread", "compare", "validate-cog", "gpkg-validate", "identify", "dataset-files", "check"];
 
 type RpcError = (i64, String);
 
@@ -172,7 +173,7 @@ impl Server {
 }
 
 /// A tool call's name and command-line arguments.
-fn tool_call(params: &Value) -> Result<(String, Vec<OsString>), RpcError> {
+pub(crate) fn tool_call(params: &Value) -> Result<(String, Vec<OsString>), RpcError> {
     let name = params.get("name").and_then(Value::as_str).ok_or((INVALID_PARAMS, "name is required".to_string()))?;
     if !commands().any(|c| c.get_name() == name) {
         return Err((INVALID_PARAMS, format!("unknown tool '{name}'")));
@@ -191,7 +192,7 @@ fn tool_call(params: &Value) -> Result<(String, Vec<OsString>), RpcError> {
 
 /// Runs `terrio <name> <args>`: the tool's result, or `None` when `cancel` was set and the command
 /// killed. A failing command is a result the model reads (`isError`), not a protocol error.
-fn call_tool(terrio: &[OsString], name: &str, args: Vec<OsString>, cancel: &AtomicBool) -> Option<Value> {
+pub(crate) fn call_tool(terrio: &[OsString], name: &str, args: Vec<OsString>, cancel: &AtomicBool) -> Option<Value> {
     let (text, failed) = match run(terrio, name, args, cancel) {
         Ok(None) => return None,
         Ok(Some((status, stdout, stderr))) => {
@@ -329,16 +330,19 @@ fn initialize(params: &Value) -> Value {
     })
 }
 
-/// The commands served as tools: all but `mcp` itself and `help`.
-fn commands() -> impl Iterator<Item = clap::Command> {
-    let mut cli = crate::Cli::command();
-    cli.build();
-    cli.get_subcommands().filter(|c| !matches!(c.get_name(), "mcp" | "help")).cloned().collect::<Vec<_>>().into_iter()
-}
-
 /// Whether the help of `c` or of one of its subcommands (`filter merge`) offers `@FILE` lists.
 fn offers_file_lists(c: &mut clap::Command) -> bool {
     c.render_long_help().to_string().contains("`@FILE`") || c.get_subcommands_mut().any(offers_file_lists)
+}
+
+/// Append the help of every subcommand of `c`, at any depth, under its command path.
+fn push_subcommand_help(description: &mut String, path: &str, c: &mut clap::Command) {
+    for sub in c.get_subcommands_mut().filter(|s| s.get_name() != "help") {
+        let path = format!("{path} {}", sub.get_name());
+        let help = sub.render_long_help().to_string();
+        description.push_str(&format!("\n\n`{path}`:\n{}", help.trim_end()));
+        push_subcommand_help(description, &path, sub);
+    }
 }
 
 fn tool_list() -> Vec<Value> {
@@ -347,12 +351,8 @@ fn tool_list() -> Vec<Value> {
             let name = c.get_name().to_string();
             let ro = READ_ONLY.contains(&name.as_str());
             let mut description = c.render_long_help().to_string().trim_end().to_string();
-            // A group of subcommands (`vsi list`, `vsi copy`...): each one's help too.
-            let subcommands: Vec<clap::Command> = c.get_subcommands().filter(|s| s.get_name() != "help").cloned().collect();
-            for mut sub in subcommands {
-                let help = sub.render_long_help().to_string();
-                description.push_str(&format!("\n\n`{name} {}`:\n{}", sub.get_name(), help.trim_end()));
-            }
+            // A group of subcommands (`vsi list`, `vsi sozip create`...): each one's help too.
+            push_subcommand_help(&mut description, &name, &mut c);
             // The help offers `@FILE` input lists, which tool calls refuse (`expand_file_lists`).
             if offers_file_lists(&mut c) {
                 description.push_str("\n\nOver MCP, `@FILE` lists are refused: pass each input as an item of `args`.");
@@ -405,9 +405,18 @@ mod tests {
         Server::new(vec!["terrio".into()], std::sync::mpsc::channel().0)
     }
 
+    /// `Server::handle` on a thread with the stack of `run_as`. Building the command catalog (any
+    /// tool call, `tools/list`) needs more than the 2 MiB default of a test thread, so this runs it
+    /// on the production worker's stack.
+    fn handle_on_big_stack(s: &mut Server, message: &str) -> Option<String> {
+        std::thread::scope(|scope| {
+            std::thread::Builder::new().stack_size(crate::STACK_SIZE).spawn_scoped(scope, || s.handle(message)).unwrap().join().unwrap()
+        })
+    }
+
     fn request(s: &mut Server, method: &str, params: Value) -> Value {
         let msg = json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}).to_string();
-        serde_json::from_str(&s.handle(&msg).expect("a reply")).unwrap()
+        serde_json::from_str(&handle_on_big_stack(s, &msg).expect("a reply")).unwrap()
     }
 
     #[test]
@@ -420,7 +429,16 @@ mod tests {
     }
 
     #[test]
-    fn lists_every_command_but_mcp() {
+    fn tool_descriptions_include_the_help_of_nested_subcommands() {
+        let r = request(&mut server(), "tools/list", json!({}));
+        let tools = r["result"]["tools"].as_array().unwrap();
+        let vsi = tools.iter().find(|t| t["name"] == "vsi").unwrap()["description"].as_str().unwrap();
+        assert!(vsi.contains("`vsi sozip`:") && vsi.contains("`vsi sozip validate`:"));
+        assert!(vsi.contains("Exits with status 1 when invalid"));
+    }
+
+    #[test]
+    fn lists_every_command_but_the_servers() {
         let r = request(&mut server(), "tools/list", json!({}));
         let tools = r["result"]["tools"].as_array().unwrap();
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
@@ -428,7 +446,7 @@ mod tests {
         for name in ["centroid", "singlepart", "vertices", "footprint", "sample", "contour", "zonal-stats", "sql"] {
             assert!(names.contains(&name), "missing processing command {name}");
         }
-        assert!(!names.contains(&"mcp") && !names.contains(&"help"));
+        assert!(!names.contains(&"mcp") && !names.contains(&"ui") && !names.contains(&"help"));
         for name in ["sample", "zonal-stats"] {
             let tool = tools.iter().find(|t| t["name"] == name).unwrap();
             let help = tool["description"].as_str().unwrap();
@@ -448,9 +466,9 @@ mod tests {
         assert_eq!(request(s, "tools/call", json!({"name": "help", "arguments": {"args": []}}))["error"]["code"], INVALID_PARAMS);
         assert_eq!(request(s, "tools/call", json!({"name": "info", "arguments": {"args": [1]}}))["error"]["code"], INVALID_PARAMS);
         assert_eq!(request(s, "nope", json!({}))["error"]["code"], METHOD_NOT_FOUND);
-        assert_eq!(serde_json::from_str::<Value>(&s.handle("{").unwrap()).unwrap()["error"]["code"], PARSE_ERROR);
+        assert_eq!(serde_json::from_str::<Value>(&handle_on_big_stack(s, "{").unwrap()).unwrap()["error"]["code"], PARSE_ERROR);
         // Notifications get no reply.
-        assert!(s.handle(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#).is_none());
+        assert!(handle_on_big_stack(s, r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#).is_none());
     }
 
     /// A tool call runs while the server answers other requests, and a cancelled one is killed
@@ -462,10 +480,13 @@ mod tests {
         // `sh -c 'sleep 30' info`: a command that takes a while.
         let mut s = Server::new(vec!["sh".into(), "-c".into(), "sleep 30".into()], send);
         let call = json!({"jsonrpc": "2.0", "id": "slow", "method": "tools/call", "params": {"name": "info", "arguments": {"args": []}}});
-        assert!(s.handle(&call.to_string()).is_none());
+        assert!(handle_on_big_stack(&mut s, &call.to_string()).is_none());
         assert!(request(&mut s, "ping", json!({}))["result"].is_object());
         let started = std::time::Instant::now();
-        s.handle(&json!({"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": "slow"}}).to_string());
+        handle_on_big_stack(
+            &mut s,
+            &json!({"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": "slow"}}).to_string(),
+        );
         s.shutdown();
         assert!(started.elapsed() < Duration::from_secs(10));
         assert!(replies.try_recv().is_err());

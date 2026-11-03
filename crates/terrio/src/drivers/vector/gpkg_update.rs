@@ -1,15 +1,21 @@
+// Written to match the behavior of:
+//   GDAL v3.13.3:
+//     apps/ogr2ogr_lib.cpp
+// No code is translated from these sources.
+
 //! Updating GeoPackage files, as `ogr2ogr -append`, `-overwrite` and `-update` do: features added
 //! to an existing layer (feature ids continuing its sequence, its R-tree index, extent in
 //! `gpkg_contents` and feature count in `gpkg_ogr_contents` updated), a layer replaced, layers
 //! added, and everything else in the file kept: other layers, rasters, metadata, extensions,
 //! triggers and views.
 //!
-//! Files are changed in place (see [`super::gpkg_inplace`]). Those that cannot be (a write-ahead
-//! log, auto-vacuum, triggers this module does not emulate) and GeoPackages held in memory are
+//! Files are changed in place (see [`super::gpkg_inplace`]). Those that cannot be (auto-vacuum
+//! or triggers this module does not emulate) and GeoPackages held in memory are
 //! read whole (every table's rows as stored, every index, trigger and view) and written anew;
-//! a file is then renamed over the original. Files with tables or indexes that cannot be
-//! rewritten (`WITHOUT ROWID` tables, indexes on expressions, UTF-16 text) or that a hot
-//! rollback journal goes with are left untouched, with an error.
+//! a file is then renamed over the original. A pending WAL must be checkpointed with SQLite
+//! first; rewriting only the main file would lose committed changes. Files with tables or
+//! indexes that cannot be rewritten (`WITHOUT ROWID` tables, indexes on expressions, UTF-16
+//! text), or accompanied by a hot rollback journal, are left untouched with an error.
 
 use super::geopackage::{self as gw, Builder};
 use super::sqlite::{self as w, Index, SchemaObject, Table};
@@ -68,34 +74,71 @@ fn real(v: &w::Value) -> Option<f64> {
 /// are written, in a transaction protected by a rollback journal); files that cannot be changed
 /// that way are rewritten, the new file replacing the original once complete.
 pub fn update(path: &str, layers: &[Layer], mode: UpdateMode) -> Result<()> {
-    if super::gpkg_inplace::update_in_place(std::path::Path::new(path), layers, mode)? {
+    update_with_geometry_types(path, layers, mode, false)
+}
+
+/// Retains declarations for new/replaced layers through both transaction paths.
+pub fn update_with_geometry_types(path: &str, layers: &[Layer], mode: UpdateMode, preserve_declared_geometry_type: bool) -> Result<()> {
+    let resolved = std::fs::canonicalize(path)?;
+    // Reject pending WAL state before selecting the in-place or rewrite path.
+    crate::drivers::sqlite_edit::ensure_no_wal(&resolved)?;
+    if preserve_declared_geometry_type {
+        if super::gpkg_inplace::update_in_place_with_geometry_types(&resolved, layers, mode, true)? {
+            return Ok(());
+        }
+        return rewrite_with_geometry_types(&resolved, layers, mode, true);
+    }
+    if super::gpkg_inplace::update_in_place(&resolved, layers, mode)? {
         return Ok(());
     }
-    rewrite(path, layers, mode)
+    rewrite(&resolved, layers, mode)
 }
 
 /// Updates a GeoPackage file by writing it anew, the new file renamed over the original. A file
 /// with a hot rollback journal is left untouched, with an error: without SQLite's locks (where
 /// files are not changed in place) a transaction interrupted cannot be told from one under way,
 /// and the journal, left next to the new file, would be rolled back over it.
-fn rewrite(path: &str, layers: &[Layer], mode: UpdateMode) -> Result<()> {
-    if crate::drivers::sqlite_edit::has_hot_journal(std::path::Path::new(path))? {
+fn rewrite(path: impl AsRef<std::path::Path>, layers: &[Layer], mode: UpdateMode) -> Result<()> {
+    rewrite_with_geometry_types(path, layers, mode, false)
+}
+fn rewrite_with_geometry_types(
+    path: impl AsRef<std::path::Path>,
+    layers: &[Layer],
+    mode: UpdateMode,
+    preserve_declared_geometry_type: bool,
+) -> Result<()> {
+    let path = path.as_ref();
+    // Recheck at the rewrite boundary before reading only the main image.
+    crate::drivers::sqlite_edit::ensure_no_wal(path)?;
+    if crate::drivers::sqlite_edit::has_hot_journal(path)? {
         return Err(Error::Unsupported(format!(
-            "{path}: the database has a hot rollback journal (a transaction interrupted or under way); \
-             open it with SQLite to recover it first"
+            "{}: the database has a hot rollback journal (a transaction interrupted or under way); \
+             open it with SQLite to recover it first",
+            path.display()
         )));
     }
-    let bytes = update_bytes(std::fs::read(path)?, layers, mode)?;
-    let tmp = format!("{path}.terrio-update");
-    std::fs::write(&tmp, bytes)?;
-    std::fs::rename(&tmp, path).inspect_err(|_| {
-        let _ = std::fs::remove_file(&tmp);
-    })?;
-    Ok(())
+    let bytes = if preserve_declared_geometry_type {
+        update_bytes_with_geometry_types(std::fs::read(path)?, layers, mode, true)?
+    } else {
+        update_bytes(std::fs::read(path)?, layers, mode)?
+    };
+    use std::io::Write;
+    crate::vsi::write_local_atomic(path, |file| {
+        file.write_all(&bytes)?;
+        Ok(())
+    })
 }
 
 /// Updates a GeoPackage held in memory: see [`update`].
 pub fn update_bytes(bytes: Vec<u8>, layers: &[Layer], mode: UpdateMode) -> Result<Vec<u8>> {
+    update_bytes_with_geometry_types(bytes, layers, mode, false)
+}
+fn update_bytes_with_geometry_types(
+    bytes: Vec<u8>,
+    layers: &[Layer],
+    mode: UpdateMode,
+    preserve_declared_geometry_type: bool,
+) -> Result<Vec<u8>> {
     let db = Db::new(bytes)?;
     let (existing, _) = super::gpkg_read::contents(&db)?;
     let mut d = Database::load(&db)?;
@@ -105,7 +148,11 @@ pub fn update_bytes(bytes: Vec<u8>, layers: &[Layer], mode: UpdateMode) -> Resul
             (Some(c), UpdateMode::Append) => d.append(&c.name, layer)?,
             (Some(c), UpdateMode::Overwrite) => {
                 d.remove_layer(&c.name);
-                d.add_layer(layer)?;
+                if preserve_declared_geometry_type {
+                    d.add_layer_with_geometry_type(layer, true)?;
+                } else {
+                    d.add_layer(layer)?;
+                }
             }
             (None, _) => {
                 if d.has(&layer.name) {
@@ -114,7 +161,11 @@ pub fn update_bytes(bytes: Vec<u8>, layers: &[Layer], mode: UpdateMode) -> Resul
                         layer.name
                     )));
                 }
-                d.add_layer(layer)?;
+                if preserve_declared_geometry_type {
+                    d.add_layer_with_geometry_type(layer, true)?;
+                } else {
+                    d.add_layer(layer)?;
+                }
             }
         }
     }
@@ -288,8 +339,11 @@ impl Database {
     /// Adds a layer, as a new file would hold it, its CRS reusing an entry of
     /// `gpkg_spatial_ref_sys` that matches.
     pub(super) fn add_layer(&mut self, layer: &Layer) -> Result<()> {
+        self.add_layer_with_geometry_type(layer, false)
+    }
+    pub(super) fn add_layer_with_geometry_type(&mut self, layer: &Layer, preserve_declared_geometry_type: bool) -> Result<()> {
         let mut b = Builder::new();
-        b.add_layer(layer)?;
+        b.add_layer_with_geometry_type(layer, preserve_declared_geometry_type)?;
         let mut parts = b.into_layer_parts();
 
         let remap = self.merge_srs(&parts.srs)?;
@@ -473,8 +527,8 @@ impl Database {
             .unwrap_or(0)
     }
 
-    /// Updates what describes a layer after features were appended to it: its sequence, `z`
-    /// flag, extent, last change and feature count (`total`).
+    /// Updates what describes a layer after features were appended to it: its sequence,
+    /// dimension flags, extent, last change and feature count (`total`).
     pub(super) fn appended(&mut self, name: &str, sql: &str, enc: &Encoded, total: i64) {
         if keywords_contain(sql, "AUTOINCREMENT")
             && let Some((last, _)) = enc.rows.last()
@@ -483,10 +537,14 @@ impl Database {
             self.set_sequence(name, seq);
         }
         if let Some((_, _, z)) = self.geometry_column(name)
-            && enc.has_z
-            && z == 0
+            && ((z == 0 && enc.has_z) || (z == 1 && enc.missing_z))
         {
             self.set("gpkg_geometry_columns", "table_name", name, "z", w::Value::Int(2));
+        }
+
+        let m = self.lookup("gpkg_geometry_columns", "table_name", name, "m").as_ref().and_then(int).unwrap_or(0);
+        if (m == 0 && enc.has_m) || (m == 1 && enc.missing_m) {
+            self.set("gpkg_geometry_columns", "table_name", name, "m", w::Value::Int(2));
         }
 
         // The extent and the feature count.
@@ -529,6 +587,12 @@ pub(super) struct Encoded {
     pub bounds: Option<[f64; 4]>,
     /// Whether a geometry has z values.
     pub has_z: bool,
+    /// Some non-null encoded geometry has no Z values.
+    pub missing_z: bool,
+    /// Some encoded geometry has M values.
+    pub has_m: bool,
+    /// Some non-null encoded geometry has no M values.
+    pub missing_m: bool,
 }
 
 /// Encodes the features of `layer` as rows of the feature table created by `sql`, with ids
@@ -561,11 +625,16 @@ pub(super) fn encode_append(sql: &str, geometry: Option<&(String, i64, i64)>, la
         }
         let mut bbox = None;
         let mut z = false;
+        let mut missing_z = false;
+        let mut m = false;
+        let mut missing_m = false;
         if let Some(gi) = geom_col {
             values[gi] = match &f.geometry {
                 Some(g) => {
                     bbox = g.bbox().filter(|b| b.min_x.is_finite() && b.min_y.is_finite());
-                    z = crate::vector::geometry_has_z(g);
+                    (z, m) = crate::vector::geometry_dims(g);
+                    missing_z = !z;
+                    missing_m = !m;
                     w::Value::Blob(gw::gpkg_geometry(g, srs_id as i32))
                 }
                 None => w::Value::Null,
@@ -579,12 +648,15 @@ pub(super) fn encode_append(sql: &str, geometry: Option<&(String, i64, i64)>, la
                 values[i] = convert(v, &decls[i].1);
             }
         }
-        (values, bbox, z)
+        (values, bbox, z, missing_z, m, missing_m)
     });
     let mut bounds: Option<[f64; 4]> = None;
     let mut has_z = false;
+    let mut missing_z = false;
+    let mut has_m = false;
+    let mut missing_m = false;
     let mut rows = Vec::with_capacity(encoded.len());
-    for ((values, bbox, z), id) in encoded.into_iter().zip(first..) {
+    for ((values, bbox, z, no_z, m, no_m), id) in encoded.into_iter().zip(first..) {
         if let Some(b) = bbox {
             bounds = Some(match bounds {
                 None => [b.min_x, b.min_y, b.max_x, b.max_y],
@@ -592,9 +664,12 @@ pub(super) fn encode_append(sql: &str, geometry: Option<&(String, i64, i64)>, la
             });
         }
         has_z |= z;
+        missing_z |= no_z;
+        has_m |= m;
+        missing_m |= no_m;
         rows.push((id, values));
     }
-    Encoded { rows, geom_col, bounds, has_z }
+    Encoded { rows, geom_col, bounds, has_z, missing_z, has_m, missing_m }
 }
 
 /// An envelope `[min_x, max_x, min_y, max_y]` as SQLite's R-tree stores it, rounded outwards to
@@ -695,6 +770,91 @@ mod tests {
     }
 
     #[test]
+    fn append_promotes_measure_flags_without_changing_existing_geometry_types() {
+        let point = |m| Some(wbvector::Geometry::Point(wbvector::Coord { m, ..wbvector::Coord::xy(1., 2.) }));
+        for (first, second, expected) in
+            [(point(Some(3.)), point(None), 2), (point(None), point(Some(3.)), 2), (point(Some(3.)), None, 1), (point(None), None, 0)]
+        {
+            let make = |geometry| {
+                let mut l = Layer::new("points").with_epsg(4326);
+                l.features.push(Feature { fid: 1, geometry, attributes: vec![] });
+                l
+            };
+            let a = make(first);
+            let b = make(second);
+            let initial = gw::to_bytes(std::slice::from_ref(&a)).unwrap();
+            let check = |bytes: Vec<u8>| {
+                let db = crate::drivers::sqlite::Db::new(bytes.clone()).unwrap();
+                let table = db.table("gpkg_geometry_columns").unwrap();
+                assert_eq!(table.get(&table.rows[0], "m").unwrap().as_i64(), Some(expected));
+                assert_eq!(table.get(&table.rows[0], "geometry_type_name").unwrap().as_str(), Some("POINT"));
+                let back = crate::memory::open_vector_bytes(bytes, "points.gpkg", &Default::default()).unwrap();
+                assert_eq!(back.layers[0].features[0].geometry, a.features[0].geometry);
+                assert_eq!(back.layers[0].features[1].geometry, b.features[0].geometry);
+            };
+            check(update_bytes(initial.clone(), std::slice::from_ref(&b), UpdateMode::Append).unwrap());
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("points.gpkg");
+            std::fs::write(&path, &initial).unwrap();
+            update(path.to_str().unwrap(), std::slice::from_ref(&b), UpdateMode::Append).unwrap();
+            check(std::fs::read(path).unwrap());
+        }
+    }
+
+    #[test]
+    fn append_promotes_height_flags_without_changing_existing_geometry_types() {
+        let point = |z| Some(wbvector::Geometry::Point(wbvector::Coord { z, ..wbvector::Coord::xy(1., 2.) }));
+        for (first, second, expected) in
+            [(point(Some(3.)), point(None), 2), (point(None), point(Some(3.)), 2), (point(Some(3.)), None, 1), (point(None), None, 0)]
+        {
+            let make = |geometry| {
+                let mut l = Layer::new("points").with_epsg(4326);
+                l.features.push(Feature { fid: 1, geometry, attributes: vec![] });
+                l
+            };
+            let a = make(first);
+            let b = make(second);
+            let initial = gw::to_bytes(std::slice::from_ref(&a)).unwrap();
+            let check = |bytes: Vec<u8>| {
+                let db = crate::drivers::sqlite::Db::new(bytes.clone()).unwrap();
+                let table = db.table("gpkg_geometry_columns").unwrap();
+                assert_eq!(table.get(&table.rows[0], "z").unwrap().as_i64(), Some(expected));
+                assert_eq!(table.get(&table.rows[0], "geometry_type_name").unwrap().as_str(), Some("POINT"));
+                let back = crate::memory::open_vector_bytes(bytes, "points.gpkg", &Default::default()).unwrap();
+                assert_eq!(back.layers[0].features[0].geometry, a.features[0].geometry);
+                assert_eq!(back.layers[0].features[1].geometry, b.features[0].geometry);
+            };
+            check(update_bytes(initial.clone(), std::slice::from_ref(&b), UpdateMode::Append).unwrap());
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("points.gpkg");
+            std::fs::write(&path, &initial).unwrap();
+            update(path.to_str().unwrap(), std::slice::from_ref(&b), UpdateMode::Append).unwrap();
+            check(std::fs::read(path).unwrap());
+        }
+    }
+
+    #[test]
+    fn append_keeps_typed_empty_geometries_without_indexing_them() {
+        let mut empty = layer("a", 0, 0.);
+        for (i, geometry) in [Some(Geometry::polygon(vec![], vec![])), Some(Geometry::MultiPolygon(vec![])), None].into_iter().enumerate() {
+            empty.push(Feature { fid: i as u64 + 1, geometry, attributes: vec![] });
+        }
+        let mut base = layer("a", 1, 0.);
+        base.push(Feature { fid: 2, geometry: Some(Geometry::point(20., 20.)), attributes: vec![] });
+        let bytes = super::super::geopackage::to_bytes(&[base]).unwrap();
+        let updated = update_bytes(bytes, &[empty], UpdateMode::Append).unwrap();
+        let db = Db::new(updated).unwrap();
+        let all = super::super::gpkg_read::read_db(&db, &["a".into()], None).unwrap();
+        assert_eq!(all[0].features.len(), 5);
+        assert!(matches!(&all[0].features[2].geometry, Some(Geometry::Polygon { exterior, .. }) if exterior.0.is_empty()));
+        assert!(matches!(&all[0].features[3].geometry, Some(Geometry::MultiPolygon(parts)) if parts.is_empty()));
+        assert!(all[0].features[4].geometry.is_none());
+        let selected = super::super::gpkg_read::read_db(&db, &["a".into()], Some((-1., -1., 2., 2.))).unwrap();
+        assert_eq!(selected[0].features.len(), 1);
+        assert!(selected[0].features[0].geometry.as_ref().unwrap().bbox().is_some());
+    }
+
+    #[test]
     fn appends_overwrites_and_adds() {
         let base = super::super::geopackage::to_bytes(&[layer("a", 300, 0.0), layer("b", 5, 0.0)]).unwrap();
         // Append: fields matched ignoring case, extra fields dropped.
@@ -730,6 +890,75 @@ mod tests {
         assert_eq!(layers.iter().map(|l| (l.name.as_str(), l.len())).collect::<Vec<_>>(), [("a", 500), ("b", 2), ("c", 3)]);
         assert_eq!(layers[1].features[0].fid, 1);
         assert_eq!(layers[2].crs_epsg(), Some(4326));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn symlinked_append_rewrite_preserves_the_link_and_updates_its_target() {
+        #[allow(unused_mut)] // The invalid-byte case is added only outside macOS.
+        let mut target_names = vec![std::ffi::OsString::from("target.gpkg"), std::ffi::OsString::from("café.gpkg")];
+        // APFS rejects invalid UTF-8 filenames before Terrio can open them.
+        #[cfg(not(target_os = "macos"))]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            target_names.push(std::ffi::OsString::from_vec(b"caf\xe9.gpkg".to_vec()));
+        }
+        for target_name in target_names {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join(&target_name);
+            let link = dir.path().join("alias.gpkg");
+            let source = Db::new(gw::to_bytes(&[layer("a", 1, 0.)]).unwrap()).unwrap();
+            let mut database = Database::load(&source).unwrap();
+            database.objects.push(SchemaObject {
+                kind: "trigger",
+                name: "custom_after_insert".into(),
+                table: "a".into(),
+                sql: "CREATE TRIGGER custom_after_insert AFTER INSERT ON a BEGIN SELECT 1; END".into(),
+            });
+            let original = database.finish().unwrap();
+            std::fs::write(&path, &original).unwrap();
+            std::os::unix::fs::symlink(&target_name, &link).unwrap();
+            let victim = dir.path().join("unrelated.bin");
+            std::fs::write(&victim, b"keep unrelated bytes").unwrap();
+            let mut staged_name = path.as_os_str().to_os_string();
+            staged_name.push(".terrio-update");
+            let staged = std::path::PathBuf::from(staged_name);
+            std::os::unix::fs::symlink(&victim, &staged).unwrap();
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+            let appended = [layer("a", 1, 10.)];
+            assert!(!super::super::gpkg_inplace::update_in_place(&path, &appended, UpdateMode::Append).unwrap());
+            let mut wal = path.as_os_str().to_os_string();
+            wal.push("-wal");
+            let wal = std::path::PathBuf::from(wal);
+            std::fs::write(&wal, b"pending frames").unwrap();
+            assert!(update(link.to_str().unwrap(), &appended, UpdateMode::Append).is_err());
+            assert_eq!(std::fs::read(&path).unwrap(), original);
+            std::fs::remove_file(&wal).unwrap();
+            update(link.to_str().unwrap(), &appended, UpdateMode::Append).unwrap();
+            assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+            assert_eq!(std::fs::read(&victim).unwrap(), b"keep unrelated bytes");
+            assert_eq!(std::fs::read_link(&staged).unwrap(), victim);
+            assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o640);
+            assert_eq!(std::fs::read_link(&link).unwrap(), std::path::Path::new(&target_name));
+            let database = Db::new(std::fs::read(&path).unwrap()).unwrap();
+            assert_eq!(super::super::gpkg_read::read_db(&database, &[], None).unwrap()[0].len(), 2);
+        }
+    }
+
+    #[test]
+    fn rewrite_refuses_pending_wal_without_touching_either_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wal.gpkg");
+        let base = super::super::geopackage::to_bytes(&[layer("a", 3, 0.0)]).unwrap();
+        std::fs::write(&path, &base).unwrap();
+        let wal = dir.path().join("wal.gpkg-wal");
+        std::fs::write(&wal, b"pending committed frames").unwrap();
+        assert!(rewrite(path.to_str().unwrap(), &[layer("a", 2, 10.0)], UpdateMode::Append).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), base);
+        assert_eq!(std::fs::read(&wal).unwrap(), b"pending committed frames");
+        std::fs::write(&wal, []).unwrap();
+        rewrite(path.to_str().unwrap(), &[layer("a", 2, 10.0)], UpdateMode::Append).unwrap();
     }
 
     #[test]

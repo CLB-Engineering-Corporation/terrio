@@ -9,11 +9,15 @@ crates/terrio        the library
   tiles/             PMTiles, MBTiles and MVT: archives, tile pyramids, vector tile clipping
   vfs.rs             locations: paths, URLs, s3://, gs://, az://, zip archives, /vsi prefixes
   http.rs, s3.rs     range requests with a block cache; AWS Signature Version 4
-  crs.rs             parsing, identification and transformation of coordinate systems
+  crs.rs             terrio::crs, over crates/terrio-crs
+  multidim/          native groups, dimensions and arrays
+  pointcloud/        LAS, LAZ, COPC, EPT, PLY, E57 and filters
+  vsi/               terrio vsi file management
   ops/               translate, warp, mosaic, vrt, vector filters and SQL, rasterize, polygonize
   memory.rs          datasets from and to bytes
   info.rs            summaries
-crates/terrio-cli    the terrio command
+crates/terrio-crs    standalone coordinate systems: parsing, identification, transformation
+crates/terrio-cli    the terrio command and MCP server
 python/              Python bindings (PyO3, NumPy)
 js/                  WebAssembly bindings (wasm-bindgen)
 scripts/             test data, comparisons with GDAL, benchmarks
@@ -23,7 +27,8 @@ scripts/             test data, comparisons with GDAL, benchmarks
 
 Rasters are held as `wbraster::Raster`: typed pixel buffers, band after band and row after row,
 with the georeferencing and CRS. `RasterDataset` adds the driver and whether nodata is declared.
-GeoTIFFs and tile archives (PMTiles, MBTiles) can also be opened lazily, to read windows and
+GeoTIFFs, tile archives (PMTiles, MBTiles), JPEG 2000, Zarr, GRIB and raw-layout rasters can also
+be opened lazily, to read windows and
 overviews without loading the image.
 
 Vector datasets are `wbvector::Layer`s: features with OGC simple-feature geometries (with Z and
@@ -31,8 +36,8 @@ M), typed attributes and a schema.
 
 ## Building on whitebox_next_gen
 
-The `wbraster`, `wbvector` and `wbprojection` crates supply the data model, many codecs and the
-projection engine. Testing them against GDAL found codecs that decoded wrong pixels or lost
+The `wbraster`, `wbvector` and `wbprojection` crates supply the data model, many codecs and a
+fallback for projections terrio does not compute itself. Testing them against GDAL found codecs that decoded wrong pixels or lost
 georeferencing, so terrio has its own drivers for GeoTIFF, JPEG 2000, Zarr, netCDF, HFA,
 GeoPackage (on its own SQLite file reader and writer), the Esri formats, FlatGeobuf, CSV,
 GeoJSON, GeoParquet, GML, GPX, KML, TopoJSON, MapInfo, OSM and shapefile writing. Upstream bugs
@@ -46,11 +51,32 @@ bands of rows), writing Zarr chunks, and decoding and encoding vector features. 
 work is computed on its own and the results are combined in input order, so outputs are the same
 bytes as a single-threaded run gives. WebAssembly builds run the same code sequentially.
 
+All of it runs on one thread pool, terrio's own (`crates/terrio/src/par.rs`), never on rayon's
+global pool. A `fork()`ed child, as Python's `multiprocessing` starts on Linux, has only the
+thread that forked: a pool started before the fork has no threads there, and work given to it
+would wait forever. terrio's pool is per process, so the first parallel call in a child starts a
+new one. A fork also waits for terrio's background work in progress to finish. New parallel code
+uses `par`'s functions: `par::map_range`, `par::for_each_owned` and the like for data parallelism,
+`par::spawn` for work in the background, and `par::install` around rayon code they cannot express
+or a dependency that uses rayon by itself. `clippy.toml` disallows rayon's global-pool functions
+and parallel iterators everywhere else.
+
 ## Pure Rust
 
-There are no C dependencies apart from the Zstandard codec, which compiles for WebAssembly too
-(the default `libzstd` feature, natively; without it, Zstandard is decoded and written with
-`ruzstd`).
+The default builds have no C dependencies, and CI builds them without a C compiler. Three choices
+keep it so:
+
+- Zstandard is decoded and written with `ruzstd`, GeoParquet's pages included. The optional
+  `libzstd` feature uses the zstd C library natively instead, which decodes faster and compresses
+  better: `ruzstd` writes at its fastest level, about zstd's level 1, whatever level is asked for.
+- HTTPS uses `rustls` with `rustls-graviola`, whose cryptography is Rust and assembly and needs no
+  C compiler. It requires `aes`, `pclmulqdq`, `ssse3`, `avx`, `avx2`, `adx`, `bmi1` and `bmi2` on
+  x86-64 (most CPUs since about 2014), and `aes`, `sha2`, `pmull` and `neon` on AArch64: without the
+  ones it checks, an HTTPS request panics, naming the missing feature. Other
+  architectures, for which no release is built, use `ring`, which needs a C compiler.
+- GeoParquet is written with Snappy, which needs no C. Reading also takes Zstandard, gzip, LZ4 and
+  Brotli.
+
 JPEG 2000 uses a Rust port of OpenJPEG, in WebAssembly too: terrio supplies the C allocator calls
 the port makes. JPEG is decoded by terrio's own decoder, which reproduces libjpeg's arithmetic;
 LERC, JPEG XL and LZMA by pure-Rust crates.

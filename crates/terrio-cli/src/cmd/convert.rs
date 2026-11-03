@@ -1,3 +1,9 @@
+// Written to match the behavior of:
+//   GDAL v3.13.3:
+//     doc/source/programs/ogr2ogr.rst
+//     doc/source/programs/gdal_translate.rst
+// No code is translated from these sources.
+
 //! `terrio convert`.
 
 use terrio::crs::SpatialRef;
@@ -27,7 +33,7 @@ pub struct Args {
     /// Reproject into this CRS.
     #[arg(long = "t-srs", value_name = "CRS")]
     t_srs: Option<String>,
-    /// Compression: GeoTIFF/COG NONE, LZW, DEFLATE, ZSTD, PACKBITS, JPEG, WEBP; Zarr NONE, ZLIB (v2),
+    /// Compression: GeoTIFF/COG NONE, LZW, DEFLATE, ZSTD, PACKBITS, LERC, LERC_DEFLATE, LERC_ZSTD, JXL, JPEG, WEBP; Zarr NONE, ZLIB (v2),
     /// GZIP, ZSTD; GeoPackage tiles PNG, JPEG.
     #[arg(long)]
     compress: Option<String>,
@@ -45,12 +51,23 @@ pub struct Args {
     #[arg(long, value_name = "N")]
     overview: Option<usize>,
     /// An open option, as GDAL names it: `KEY=VALUE` (CSV: X_POSSIBLE_NAMES, Y_POSSIBLE_NAMES,
-    /// GEOM_POSSIBLE_NAMES, AUTODETECT_TYPE, KEEP_GEOM_COLUMNS, SEPARATOR; PMTiles, MBTiles and MVT:
-    /// ZOOM_LEVEL, CLIP).
+    /// GEOM_POSSIBLE_NAMES, AUTODETECT_TYPE, KEEP_GEOM_COLUMNS, SEPARATOR; XLSX: HEADERS,
+    /// FIELD_TYPES, the geometry column options of CSV; Shapefile:
+    /// ORGANIZE_POLYGONS, the methods of GDAL's OGR_ORGANIZE_POLYGONS; PMTiles, MBTiles and MVT:
+    /// ZOOM_LEVEL, CLIP; WFS: WFS_PAGE_SIZE, WFS_PAGING, WFS_MAX_VECTOR_BYTES;
+    /// HECRAS: MESHES, GEOMETRY_POLICY, CELL_SUMMARIES, FACE_SUMMARIES,
+    /// CELL_ATTRIBUTES, FACE_ATTRIBUTES, CELL_SERIES, FACE_SERIES, CELL_MAXIMUM, CELL_MINIMUM,
+    /// FACE_MAXIMUM, FACE_MINIMUM, TIME_STEP, XS_SUMMARIES, XS_RESULTS, XS_PROFILE, XS_GEOMETRY,
+    /// STRUCTURE_SERIES, BC_SERIES, REFERENCE_LINE_SERIES, REFERENCE_POINT_SERIES,
+    /// METADATA_MAX_BYTES, MAX_BYTES).
     #[arg(long = "oo", value_name = "KEY=VALUE")]
     open_options: Vec<String>,
     /// A vector layer creation option, as GDAL names it: `KEY=VALUE` (CSV: GEOMETRY=AS_WKT|AS_XY;
-    /// GeoJSON: RFC7946=YES; vector tiles: MINZOOM, MAXZOOM, EXTENT, BUFFER, SIMPLIFICATION,
+    /// XLSX: GEOMETRY=AS_XY|AS_WKT|NONE, HEADER_STYLE=BOLD, FREEZE_HEADER=YES, AUTOFILTER=YES,
+    /// COLUMN_WIDTH=AUTO|<n>, DATE_FORMAT, DATETIME_FORMAT, CREATION_TIME; GeoJSON: RFC7946=YES,
+    /// ID_FIELD, ID_TYPE; GeoJSONSeq:
+    /// ID_FIELD, ID_TYPE; vector tiles:
+    /// MINZOOM, MAXZOOM, EXTENT, BUFFER, SIMPLIFICATION,
     /// SIMPLIFICATION_MAX_ZOOM, NAME, DESCRIPTION, TYPE).
     #[arg(long = "lco", value_name = "KEY=VALUE")]
     creation_options: Vec<String>,
@@ -59,7 +76,7 @@ pub struct Args {
     #[arg(long = "dsco", value_name = "KEY=VALUE")]
     dataset_options: Vec<String>,
     /// A raster creation option, as GDAL names it: `KEY=VALUE` (Zarr: FORMAT=ZARR_V2|ZARR_V3;
-    /// netCDF: FORMAT=NC|NC2|NC5; PMTiles and MBTiles: TILE_FORMAT, RESAMPLING,
+    /// netCDF: FORMAT=NC|NC2|NC5; PMTiles and MBTiles: TILE_FORMAT, RESAMPLING, OVERVIEW_RESAMPLING,
     /// ZOOM_LEVEL_STRATEGY, MINZOOM, MAXZOOM, QUALITY, NAME, DESCRIPTION, TYPE).
     #[arg(long = "co", value_name = "KEY=VALUE")]
     raster_options: Vec<String>,
@@ -69,6 +86,20 @@ pub struct Args {
     /// Tile archives (PMTiles, MBTiles, MVT): the highest zoom level written.
     #[arg(long)]
     maxzoom: Option<u8>,
+    /// KMZ output: a file packed into the archive, such as an icon image, by the relative path
+    /// the styles refer to it with: `PATH` (read from that path) or `PATH=FILE`. A `PATH` that is
+    /// an existing file is taken whole, even with an `=`. Repeat it for several files.
+    #[arg(long = "kmz-resource", value_name = "PATH[=FILE]")]
+    kmz_resources: Vec<String>,
+    /// CityJSON output version (default: 2.0).
+    #[arg(long, value_parser = ["1.1", "2.0"])]
+    cityjson_version: Option<String>,
+    /// CityGML output version (default: 3.0).
+    #[arg(long, value_parser = ["2.0", "3.0"])]
+    citygml_version: Option<String>,
+    /// CityGML 2.0 building LoD 0 property when the source has no footprint/roof hint.
+    #[arg(long, value_parser = ["footprint", "roof-edge"])]
+    citygml_lod0_surface: Option<String>,
     #[command(flatten)]
     vector: super::vector_opts::VectorArgs,
     #[command(flatten)]
@@ -82,6 +113,19 @@ pub(super) fn key_values(options: &[String]) -> terrio::Result<Vec<(&str, &str)>
     options
         .iter()
         .map(|o| o.split_once('=').ok_or_else(|| terrio::Error::InvalidArgument(format!("option '{o}' is not KEY=VALUE"))))
+        .collect()
+}
+
+/// The files of `--kmz-resource`: `PATH`, read from that path, or `PATH=FILE`. A value that is an
+/// existing file is a `PATH`, so archive paths may hold `=`.
+fn kmz_resources(values: &[String]) -> terrio::Result<Vec<(String, Vec<u8>)>> {
+    values
+        .iter()
+        .map(|v| {
+            let whole = (v.as_str(), v.as_str());
+            let (path, file) = if std::path::Path::new(v).is_file() { whole } else { v.split_once('=').unwrap_or(whole) };
+            Ok((path.to_string(), std::fs::read(file)?))
+        })
         .collect()
 }
 
@@ -103,11 +147,22 @@ fn stream_options(a: &Args) -> terrio::Result<Option<terrio::stream::ConvertOpti
     let translate = a.vector.to_options(t_srs)?;
     let mut open = VectorOpenOptions { layers: a.layers.clone(), spatial_filter: a.vector.spatial_hint(&a.input), ..Default::default() };
     for (k, v) in key_values(&a.open_options)? {
-        if !open.csv.set(k, v)? && !open.tiles.set(k, v)? {
+        if !open.set(k, v)? {
             return Err(terrio::Error::InvalidArgument(format!("unknown open option '{k}'")));
         }
     }
-    let mut write = VectorWriteOptions { driver, ..Default::default() };
+    // KMZ resources are packed by the whole-archive writer, and XLSX, with its own creation
+    // options, is written whole.
+    if !a.kmz_resources.is_empty() || matches!(driver.or_else(|| VectorDriver::for_extension(&a.output)), Some(VectorDriver::XLSX)) {
+        return Ok(None);
+    }
+    let mut write = VectorWriteOptions {
+        driver,
+        cityjson_version: a.cityjson_version.as_deref().map(str::parse).transpose()?,
+        citygml_version: a.citygml_version.as_deref().map(str::parse).transpose()?,
+        citygml_lod0_surface: a.citygml_lod0_surface.as_deref().map(str::parse).transpose()?,
+        ..Default::default()
+    };
     for (k, v) in key_values(&a.creation_options)? {
         if !(write.csv.set(k, v)? || write.geojson.set(k, v)?) {
             return Ok(None);
@@ -175,6 +230,18 @@ fn streamed_raster(a: &Args) -> terrio::Result<Option<(terrio::LazyRaster, Raste
 }
 
 pub fn run(mut a: Args) -> terrio::Result<()> {
+    if (a.citygml_version.is_some() || a.citygml_lod0_surface.is_some())
+        && a.format.as_deref().map_or_else(|| VectorDriver::for_extension(&a.output), VectorDriver::from_name)
+            != Some(VectorDriver::CityGML)
+    {
+        return Err(terrio::Error::InvalidArgument("--citygml-version/--citygml-lod0-surface applies to CityGML output".into()));
+    }
+    if a.cityjson_version.is_some()
+        && a.format.as_deref().map_or_else(|| VectorDriver::for_extension(&a.output), VectorDriver::from_name)
+            != Some(VectorDriver::CityJSON)
+    {
+        return Err(terrio::Error::InvalidArgument("--cityjson-version applies to CityJSON output".into()));
+    }
     let coordinate_options = a.vector.coordinate_options()?;
     a.input = super::with_driver(&a.input, a.driver.as_deref())?;
     if terrio::pointcloud::is_point_cloud_path(&a.input) {
@@ -191,6 +258,7 @@ pub fn run(mut a: Args) -> terrio::Result<()> {
     if let Some((mut r, options)) = streamed_raster(&a)? {
         return r.write(&a.output, &options);
     }
+    let mut output_mask = None;
     let ds = if a.srcwin.is_some() || a.overview.is_some() {
         let mut r = super::quiet(|| terrio::open_raster_lazy(&a.input))?;
         let opts = WindowOptions { bands: Vec::new(), overview: a.overview };
@@ -206,14 +274,23 @@ pub fn run(mut a: Args) -> terrio::Result<()> {
                 Window::full(w, h)
             }
         };
+        output_mask = r.read_mask(window, a.overview)?;
         Dataset::Raster(r.read_window(window, &opts)?)
     } else if a.layers.is_empty() && a.open_options.is_empty() && a.vector.spatial_hint(&a.input).is_none() {
-        super::quiet(|| terrio::open(&a.input))?
+        let ds = super::quiet(|| terrio::open(&a.input))?;
+        if let Dataset::Raster(r) = &ds {
+            // `open` returns pixels only: the validity comes from the lazy reader, when it has one.
+            let mut source = super::quiet(|| terrio::open_raster_lazy(&a.input))?;
+            if source.has_mask() {
+                output_mask = source.read_mask(Window::full(r.raster.cols, r.raster.rows), None)?;
+            }
+        }
+        ds
     } else {
         let spatial_filter = a.vector.spatial_hint(&a.input);
         let mut options = VectorOpenOptions { layers: a.layers.clone(), spatial_filter, ..Default::default() };
         for (k, v) in key_values(&a.open_options)? {
-            if !options.csv.set(k, v)? && !options.tiles.set(k, v)? {
+            if !options.set(k, v)? {
                 return Err(terrio::Error::InvalidArgument(format!("unknown open option '{k}'")));
             }
         }
@@ -227,10 +304,19 @@ pub fn run(mut a: Args) -> terrio::Result<()> {
     match ds {
         Dataset::Raster(mut r) => {
             let append = a.vector.append_only();
-            if a.vector.is_set() && !append {
+            if (a.vector.is_set() && !append)
+                || a.cityjson_version.is_some()
+                || a.citygml_version.is_some()
+                || a.citygml_lod0_surface.is_some()
+            {
                 return Err(terrio::Error::InvalidArgument("the vector options apply to vector inputs only".into()));
             }
             if let Some(dst) = t_srs {
+                if output_mask.is_some() {
+                    return Err(terrio::Error::InvalidArgument(
+                        "reprojection does not preserve dataset masks; use `terrio warp`, which applies them".into(),
+                    ));
+                }
                 let o = terrio::ops::warp::WarpOptions { dst_srs: Some(dst), transform_options: coordinate_options, ..Default::default() };
                 r = terrio::ops::warp::warp(&[&r], &o)?;
             }
@@ -239,6 +325,11 @@ pub fn run(mut a: Args) -> terrio::Result<()> {
             creation_options.extend(a.minzoom.map(|z| ("MINZOOM".to_string(), z.to_string())));
             creation_options.extend(a.maxzoom.map(|z| ("MAXZOOM".to_string(), z.to_string())));
             if append {
+                if output_mask.is_some() {
+                    return Err(terrio::Error::InvalidArgument(
+                        "tile archive writes do not preserve dataset masks; write GeoTIFF or COG".into(),
+                    ));
+                }
                 // Added to an existing archive of image tiles.
                 if !terrio::tiles::is_archive(&a.output) || !std::path::Path::new(&a.output).exists() {
                     return Err(terrio::Error::InvalidArgument(
@@ -266,6 +357,11 @@ pub fn run(mut a: Args) -> terrio::Result<()> {
                     _ => None,
                 };
                 if let Some(d) = gdal_driver {
+                    if output_mask.is_some() {
+                        return Err(terrio::Error::InvalidArgument(format!(
+                            "GDAL's {d} driver does not preserve dataset masks; write GeoTIFF or COG"
+                        )));
+                    }
                     return terrio::gdal_backend::write_raster(&r, &a.output, &d, &creation_options);
                 }
             }
@@ -274,18 +370,30 @@ pub fn run(mut a: Args) -> terrio::Result<()> {
                 .as_deref()
                 .map(|f| RasterDriver::from_name(f).ok_or_else(|| terrio::Error::InvalidArgument(format!("unknown raster format '{f}'"))))
                 .transpose()?;
+            let output_driver = driver.or_else(|| RasterDriver::for_extension(&a.output));
+            if output_mask.is_some() && !matches!(output_driver, Some(RasterDriver::GTiff | RasterDriver::Cog)) {
+                return Err(terrio::Error::InvalidArgument(
+                    "this output format does not preserve dataset masks; write GeoTIFF or COG".into(),
+                ));
+            }
             let opts = RasterWriteOptions {
                 driver,
                 compression: a.compress,
                 tile_size: a.tile_size,
                 bigtiff: a.bigtiff,
                 creation_options,
+                mask: output_mask,
                 ..Default::default()
             };
             terrio::write_raster_dataset(&r, &a.output, &opts)
         }
         Dataset::Vector(v) => {
-            let layers = terrio::ops::vector_filter::translate_owned(v.layers, &a.vector.to_options(t_srs)?)?;
+            // A KML or KMZ output holds the shared styles; elsewhere each feature gets its style.
+            let kml_output = a.format.as_deref().map_or_else(|| VectorDriver::for_extension(&a.output), VectorDriver::from_name);
+            let kml_output = kml_output.is_some_and(|d| d.holds_style_table());
+            let style_table = if kml_output { v.style_table.clone() } else { Vec::new() };
+            let source = if kml_output { v.layers } else { v.into_resolved_layers() };
+            let layers = terrio::ops::vector_filter::translate_owned(source, &a.vector.to_options(t_srs)?)?;
             #[cfg(feature = "gdal")]
             {
                 let gdal_driver = match a.format.as_deref() {
@@ -300,6 +408,11 @@ pub fn run(mut a: Args) -> terrio::Result<()> {
                     if a.minzoom.is_some() || a.maxzoom.is_some() {
                         return Err(terrio::Error::InvalidArgument(format!(
                             "--minzoom and --maxzoom apply to tile archives, not to GDAL's {d} driver"
+                        )));
+                    }
+                    if !a.kmz_resources.is_empty() {
+                        return Err(terrio::Error::InvalidArgument(format!(
+                            "--kmz-resource applies to KMZ output, not to GDAL's {d} driver"
                         )));
                     }
                     let pairs = |o: &[String]| -> terrio::Result<Vec<(String, String)>> {
@@ -317,20 +430,58 @@ pub fn run(mut a: Args) -> terrio::Result<()> {
                 .as_deref()
                 .map(|f| VectorDriver::from_name(f).ok_or_else(|| terrio::Error::InvalidArgument(format!("unknown vector format '{f}'"))))
                 .transpose()?;
-            let mut options = VectorWriteOptions { driver, ..Default::default() };
+            let mut options = VectorWriteOptions {
+                driver,
+                cityjson_version: a.cityjson_version.as_deref().map(str::parse).transpose()?,
+                citygml_version: a.citygml_version.as_deref().map(str::parse).transpose()?,
+                citygml_lod0_surface: a.citygml_lod0_surface.as_deref().map(str::parse).transpose()?,
+                style_table,
+                ..Default::default()
+            };
             options.tiles.min_zoom = a.minzoom;
             options.tiles.max_zoom = a.maxzoom;
+            if !a.kmz_resources.is_empty() {
+                if !matches!(driver.or_else(|| VectorDriver::for_extension(&a.output)), Some(VectorDriver::KMZ)) {
+                    return Err(terrio::Error::InvalidArgument("--kmz-resource applies to KMZ output".into()));
+                }
+                options.kmz.resources = kmz_resources(&a.kmz_resources)?;
+            }
+            let xlsx_out = matches!(driver.or_else(|| VectorDriver::for_extension(&a.output)), Some(VectorDriver::XLSX));
             let tiles_out = matches!(
                 driver.or_else(|| VectorDriver::for_extension(&a.output)),
                 Some(VectorDriver::MBTiles | VectorDriver::PMTiles | VectorDriver::MVT)
             );
             for (k, v) in key_values(&a.creation_options)? {
-                let known = if tiles_out { options.tiles.set(k, v)? } else { options.csv.set(k, v)? || options.geojson.set(k, v)? };
+                let known = if tiles_out {
+                    options.tiles.set(k, v)?
+                } else if xlsx_out {
+                    options.xlsx.set_creation(k, v)?
+                } else {
+                    options.csv.set(k, v)? || options.geojson.set(k, v)?
+                };
                 if !known {
                     return Err(terrio::Error::InvalidArgument(format!("unknown layer creation option '{k}'")));
                 }
             }
             terrio::ops::vector_filter::write_vector_with_mode(&layers, &a.output, &options, a.vector.write_mode())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::kmz_resources;
+
+    #[test]
+    fn kmz_resources_take_an_existing_file_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        let named = dir.path().join("pin=blue.png");
+        std::fs::write(&named, b"blue").unwrap();
+        let source = dir.path().join("red.png");
+        std::fs::write(&source, b"red").unwrap();
+        let named = named.to_str().unwrap().to_string();
+        let mapped = format!("icons/pin.png={}", source.to_str().unwrap());
+        let got = kmz_resources(&[named.clone(), mapped]).unwrap();
+        assert_eq!(got, vec![(named, b"blue".to_vec()), ("icons/pin.png".to_string(), b"red".to_vec())]);
     }
 }

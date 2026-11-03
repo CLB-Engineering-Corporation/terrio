@@ -19,6 +19,14 @@ terrio's commands map onto GDAL's utilities, with GDAL's option names in kebab c
 | `gdal_sieve.py` | `terrio sieve` |
 | `gdalsrsinfo`, `gdaltransform` | `terrio crs` |
 | `gdalinfo --formats`, `ogrinfo --formats` | `terrio formats` |
+| `gdaladdo` | `terrio overviews` |
+| `gdal_contour` | `terrio contour` |
+| `gdal_fillnodata.py` | `terrio fill-nodata` |
+| `gdal_grid` | `terrio vector-grid` |
+| `gdal_viewshed` | `terrio viewshed` |
+| `gdallocationinfo` | `terrio pixel-info` |
+| `gdal2xyz.py` | `terrio xyz` |
+| `nearblack` | `terrio nearblack` |
 
 ## Options
 
@@ -50,10 +58,12 @@ are not supported.
 
 ## Differences to know
 
-- terrio reads datasets into memory, except GeoTIFFs, which can be read window by window. Very
-  large non-GeoTIFF inputs need enough memory.
-- Downsampling with `warp` or `translate` reads full resolution; GDAL may use overviews.
-- Rotated geotransforms are not supported.
+- terrio reads most raster formats whole into memory. GeoTIFF/COG and JPEG 2000 are read by
+  window, Zarr by chunk, and large vector layers and point clouds as streams. See
+  [Formats](formats.md).
+- Downsampling with `translate` reads full resolution, where GDAL may use overviews. `warp` chooses
+  an overview as GDAL does (`--overview AUTO`, the default).
+- `warp` and `terrio.rio` handle rotated geotransforms. `translate` refuses them.
 - GeoTIFFs are written with terrio's own writer; COGs pass GDAL's COG validator.
 - Only the drivers listed in [Formats](formats.md) exist, unless terrio is built with the
   optional GDAL backend (below).
@@ -64,9 +74,9 @@ See [CAD drawings](formats.md#cad-drawings-dwg-and-dxf) for the native subset.
 
 ## The optional GDAL backend
 
-For the long tail of formats (HDF4, NITF, KEA, PCIDSK, SQLite, spreadsheets...),
-terrio can hand files to GDAL. The backend is a cargo feature, `gdal`, off by default: it is
-terrio's only C dependency, and builds need GDAL 3.4 or later installed where `pkg-config` (or
+For the long tail of formats (HDF4, NITF, KEA, PCIDSK, SQLite, ODS and XLS spreadsheets...),
+terrio can hand files to GDAL. The backend is a cargo feature, `gdal`, off by default: it adds
+a C dependency, and builds need GDAL 3.4 or later installed where `pkg-config` (or
 `GDAL_HOME`) finds it.
 
 ```sh
@@ -86,6 +96,10 @@ With the feature enabled:
 - `terrio::open`, `open_raster`, `open_vector` and `list_layers` (and every command) fall back to
   GDAL when terrio's own drivers cannot open a path. terrio's drivers keep priority for the
   formats they know; when GDAL cannot open a file either, terrio's error is reported.
+  Errors classified as resource refusals (`ResourceLimit`, `DecodedLimitExceeded`, or I/O
+  `OutOfMemory`) are terminal and never retried through GDAL. This includes Terrio's native
+  parser, expansion, chunk and allocation budgets. Generic parser/data errors remain eligible
+  for fallback. GDAL's own resource refusals are reported as such.
 - A `GDAL:` prefix forces GDAL, even for formats terrio reads itself: `terrio info GDAL:dem.tif`,
   or `--driver gdal` on `terrio info` and `terrio convert`.
 - GDAL's dataset names work as they are: `HDF4_SDS:UNKNOWN:"file.hdf":0`, and with a `GDAL:`
@@ -98,7 +112,7 @@ With the feature enabled:
   itself, is written through GDAL.
 - Vector layers can be written with any GDAL vector driver, as `ogr2ogr -f` writes them: ESRI
   File Geodatabases (`terrio convert roads.gpkg roads.gdb`, GDAL's `OpenFileGDB`), DXF, MapInfo,
-  SQLite and SpatiaLite, GML, spreadsheets... (`-f "MapInfo File"`, `--dsco KEY=VALUE` and
+  SQLite and SpatiaLite, GML, ODS and XLS spreadsheets... (`-f "MapInfo File"`, `--dsco KEY=VALUE` and
   `--lco KEY=VALUE` for GDAL's dataset and layer creation options). Fields, geometry types (Z
   included; a layer of unknown type gets the type its features share, single geometries promoted
   to multi ones as `-nlt PROMOTE_TO_MULTI` does) and CRSs are kept; an existing output is
@@ -138,6 +152,30 @@ let ntf = terrio::memory::open_raster_bytes(std::fs::read("image.ntf")?, "image.
 
 Not covered: rotated geotransforms and GCP-only georeferencing (as for terrio's own drivers),
 appending to existing datasets through GDAL (`--append`), and updating GDAL datasets in place.
+
+## Vector read budget
+
+All GDAL vector reads, including explicit `GDAL:` paths and reads from bytes, share an
+estimated retained-data budget across selected layers. The default is 1 GiB; set
+`TERRIO_GDAL_MAX_VECTOR_BYTES` to a positive integer byte count to change it. Invalid
+settings on explicit GDAL reads are argument errors. Exceeding the budget raises Rust `Error::ResourceLimit`
+(Python `ResourceLimitError`, a `MemoryError`).
+
+This introduces a default limit on GDAL vector reads that were previously unbounded.
+A large read that previously succeeded can now be refused; raise the positive byte
+budget for a trusted dataset that needs more retained data. Native driver reads
+are unaffected by this GDAL-only setting.
+
+The budget counts feature structs, every attribute cell (including missing/null values),
+schema structs, layer/field names and retained CRS WKT, text/blob payloads and eight times the larger of
+the original and linearized geometry WKB sizes as an estimate of nested Rust storage. The factor is deliberately conservative: a Rust coordinate retains optional Z/M storage even
+for XY data, with additional vector capacity and nested containers. GDAL counts are queried only
+when the layer advertises fast feature counting, allowing oversized sparse layers to be refused
+before the first feature is read; other layers are checked
+incrementally before each dense attribute allocation. Layer selection and spatial filters
+apply before counting. This is an estimate of retained data, not a process-memory limit:
+allocator capacity/overhead, GDAL's parser and caches, individual field conversions and
+curve linearization workspace are outside it. Raster reads have no equivalent budget.
 
 ## Python wheels with GDAL
 

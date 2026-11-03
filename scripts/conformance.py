@@ -17,6 +17,8 @@ Suites:
     windows           windowed and overview reads of GeoTIFFs, JPEG 2000 and raw-layout rasters
                       (compare_windows_with_gdal.py)
     ops               translate, warp, mosaic vs GDAL's tools (compare_ops_with_gdal.py)
+    raster-masks      per-dataset masks in convert/warp, including COG overviews
+    parquet-zstd      Zstandard GeoParquet pages read without the zstd C library vs GDAL
     catalogs          indexed real DEM mosaics and HTTP window I/O vs GDAL GTI
                       (compare_catalogs_with_gdal.py)
     vrt               serialized warped/derived/kernel VRTs, masks and lazy windows
@@ -29,7 +31,14 @@ Suites:
     footprint         raster footprints, source/custom fields and singleparts vs GDAL
     vsi               terrio vsi list/copy/sync/move/delete vs gdal vsi, locally, in archives and on S3
                       (compare_vsi_with_gdal.py)
+    vector-clip       points/lines/polygons against bbox, geometry and template clips vs GDAL
     topology          buffer, polygon overlay/dissolve, validity, repair and cleanup vs GEOS
+    pipeline          composed raster/vector operations and saved GDALG definitions
+    layer-algebra     seven polygon/line/point operations with schema and GDAL comparisons
+
+    coverage-clean    polygon coverage cleaning: snapping, overlaps and enclosed narrow gaps
+    coverage          polygon coverage validity: shared nodes, overlaps and narrow gaps
+    coverage-simplify shared-edge topology-preserving coverage simplification
     vector-dataset    concat, partition, set-field-type, make-point, create, export-schema, rename-layer, edit, update
     vector-geom       simplify, segmentize, hulls, swap-xy, set-geom-type, combine and sort vs
                       gdal vector and GEOS (compare_vector_geom_with_gdal.py)
@@ -40,6 +49,8 @@ Suites:
     tiles             PMTiles, MBTiles and MVT read and written vs GDAL (compare_tiles_with_gdal.py)
     grib              GRIB1 and GRIB2 files band by band vs GDAL's GRIB driver (compare_grib_with_gdal.py)
     pointclouds       LAS, LAZ and COPC vs laspy and PDAL (compare_pointclouds.py)
+    hecras            HEC-RAS 7.0.1 geometry and plan HDF files vs an h5py reading
+                      (compare_hecras_with_h5py.py, on --hecras-data)
     crs               every EPSG CRS's transformations vs GDAL's (tests/epsg_accuracy.rs)
     crs-grids         the same with datum shift grids, then grids, geoid models and coordinate
                       epochs (tests/epsg_accuracy_grids.rs, compare_crs_grids_with_gdal.py)
@@ -47,7 +58,7 @@ Suites:
 Usage:
     python scripts/conformance.py ../terrio-data [--output docs/conformance.md] [--json FILE]
         [--only SUITE,...] [--skip SUITE,...] [--terrio target/release/terrio] [--jobs N]
-        [--remote] [--strict]
+        [--remote] [--strict] [--hecras-data DIR]
 
 Needs a release build of the command-line tool (``cargo build --release``), GDAL's command-line
 tools and Python bindings (``osgeo``) with NumPy; the point cloud suite needs the terrio Python
@@ -77,6 +88,7 @@ ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / "scripts"
 
 IDENTICAL = "identical"
+EXPECTED_REJECTION = "expected rejection"
 TOLERANCE = "within tolerance"
 DIFFERS = "differs"
 # A case whose reference values could not be computed (no coordinates to compare), reported apart.
@@ -395,6 +407,17 @@ def suite_windows(ctx):
                 s.cases.append(Case(f"{fmt} {mode}, headers", m[1], IDENTICAL if ok else DIFFERS))
         if not s.cases:
             s.error = tail(err or out)
+    if sys.platform == "win32":
+        s.cases.append(Case("GTiff identity", "replacement NONE/DEFLATE", NOT_COMPARED,
+                            "GDAL 3.13.3 Windows handles do not share delete access"))
+    elif missing_modules("terrio", "pytest", "osgeo", "numpy"):
+        s.cases.append(Case("GTiff identity", "replacement NONE/DEFLATE", NOT_COMPARED,
+                            "needs current Python bindings, pytest, GDAL and NumPy"))
+    else:
+        code, out, err = run([sys.executable, "-m", "pytest", "-q",
+                              str(ROOT / "python/tests/test_raster_file_identity.py")])
+        s.cases.append(Case("GTiff identity", "replacement NONE/DEFLATE", IDENTICAL if code == 0 else DIFFERS,
+                            "exact original/new pixels with GDAL block cache disabled" if code == 0 else tail(err or out)))
     return s
 
 
@@ -517,8 +540,11 @@ def suite_indexes(ctx):
 def suite_raster_manage(ctx):
     """Real DEM raster management, cross-read and compared by GDAL."""
     suite = Suite("raster-manage", "Raster management", "GDAL 3.13.3",
-                  "Creation types/bands, metadata escaping, nodata, internal/external overview add/delete "
-                  "and real DEM subset updates: masks, type, nodata, CRS and geotransform exact; "
+                  "Creation types/bands, metadata escaping, nodata, internal/external overview add/delete, "
+                  "exact Landsat Byte/UInt16/Float32 mode on uneven levels, "
+                  "internal mask overviews added, refreshed (whole and over an extent) and added again over "
+                  "gdaladdo's, and real DEM subset updates: masks, mask blocks, type, nodata, CRS and "
+                  "geotransform exact; "
                   "pixel values exact or within 2e-7 relative and 1e-6 absolute tolerance.")
     missing = missing_modules("osgeo", "numpy")
     if missing:
@@ -576,7 +602,9 @@ def suite_shapefile_rings(ctx):
                   "18 synthetic records written by OGR, read by OGR and converted by terrio to GeoPackage. "
                   "Identical: the same ISO WKB bytes. Within tolerance: equal under GEOS and both valid, with rings "
                   "in another direction or from another start. GDAL 3.12 keeps these rings as stored; with it, "
-                  "terrio is compared with GDAL 3.13.1's reading, frozen in the script.")
+                  "terrio is compared with GDAL 3.13.1's reading, frozen in the script. With GDAL 3.13 or later, "
+                  "each record is also read with the DEFAULT, CCW_INNER_JUST_AFTER_CW_OUTER and SKIP methods of "
+                  "OGR_ORGANIZE_POLYGONS; known differences are reported as not compared.")
     if missing_modules("osgeo"):
         suite.skipped = "needs GDAL Python bindings"
         return suite
@@ -590,6 +618,153 @@ def suite_shapefile_rings(ctx):
         suite.cases.append(Case("Shapefile rings", result["name"], result["status"], result["detail"]))
     if code and not any(case.status == DIFFERS for case in suite.cases):
         suite.error = tail(err or out) or f"exit {code}"
+    return suite
+
+
+def suite_citygml(ctx):
+    """CityGML is checked against schemas and source coordinates, not GDAL's subset."""
+    suite = Suite("citygml", "CityGML reader", "OGC CityGML 2.0/3.0 encoding schemas and source XML",
+                  "Real citygml4j 2.0/3.0 building examples, validated with published XSDs cached "
+                  "offline; exact XYZ, holes, owner/type, LoD, thematic class and source scalar "
+                  "attributes across CLI, Python path/bytes and optional Node/WASM. Compound "
+                  "CRS is checked. Synthetic tests cover implicit geometry and invalid links. "
+                  "GDAL 3.13.3 is informational only.")
+    missing = missing_modules("terrio", "lxml")
+    if missing:
+        suite.skipped = "needs the Python modules " + ", ".join(missing)
+        return suite
+    root = Path(ctx.data) / "citymodels"
+    if not all((root / name).is_file() for name in ("lod3_building_v2.gml", "lod2_buildings_v3.gml")) or not (root / "gml-schemas").is_dir():
+        suite.skipped = "prepare fixtures and schemas with scripts/compare_citygml.py DATA --fetch"
+        return suite
+    command = [sys.executable, str(SCRIPTS / "compare_citygml.py"), ctx.data, "--terrio", ctx.terrio, "--json"]
+    node = ROOT / "js/pkg-node/terrio.js"
+    if node_exports_available(node, ["open"]):
+        command += ["--node-package", str(node)]
+    code, out, err = run(command)
+    try:
+        results = json.loads(out)
+    except json.JSONDecodeError:
+        suite.error = tail(err or out)
+        return suite
+    for result in results:
+        suite.cases.append(Case("city models", result["name"], result["status"], result["detail"]))
+    if code or not results:
+        suite.error = tail(err or out) or "no comparison results"
+    return suite
+
+
+def suite_cityjson(ctx):
+    """CityJSON's specification is authoritative; GDAL has no CityJSON driver."""
+    suite = Suite(
+        "cityjson", "CityJSON reader", "CityJSON 1.1/2.0 specifications and published JSON Schemas",
+        "Real Den Haag, Delft and Rotterdam models validated with published schemas; CLI and "
+        "Python path/bytes reads compared against an independent boundary/coordinate traversal. "
+        "Exact XYZ (including vertical faces), holes, primitive counts, object identity/type, "
+        "LoD, parents, attributes, semantics text and CRS. This is a flat vector view, not a "
+        "lossless city-model round trip. GDAL 3.13.3 has no CityJSON driver.",
+    )
+    missing = missing_modules("terrio", "jsonschema", "referencing")
+    if missing:
+        suite.skipped = "needs the Python modules " + ", ".join(missing)
+        return suite
+    root = Path(ctx.data) / "citymodels"
+    required = [root / name for name in ("DH_01_subs.city.json", "delft.json", "rotterdam_subset.json")]
+    required += [root / "schemas" / version / "cityjson.schema.json" for version in ("1.1.3", "2.0.2")]
+    required.append(root / "schemas/2.0.2/cityobjects.schema.json")
+    if any(not p.is_file() for p in required):
+        suite.skipped = "prepare fixtures/schemas with scripts/compare_cityjson.py DATA --fetch"
+        return suite
+    command = [sys.executable, str(SCRIPTS / "compare_cityjson.py"), ctx.data, "--terrio", ctx.terrio, "--json"]
+    node = ROOT / "js/pkg-node/terrio.js"
+    if node_exports_available(node, ["open"]):
+        command += ["--node-package", str(node)]
+    code, out, err = run(command)
+    try:
+        results = json.loads(out)
+    except json.JSONDecodeError:
+        suite.error = tail(err or out)
+        return suite
+    for result in results:
+        suite.cases.append(Case("city models", result["name"], result["status"], result["detail"]))
+    if code or not results:
+        suite.error = tail(err or out) or "no comparison results"
+    return suite
+
+
+def suite_cityjson_write(ctx):
+    """Both writer versions are checked against schemas and the shared reader-reference XYZ traversal."""
+    suite = Suite("cityjson-write", "CityJSON writer", "CityJSON 1.1/2.0 specifications and published JSON Schemas",
+                  "Real Den Haag, Delft and Rotterdam sources (plus cached 3DBAG pages) and a schema-derived core-type sample written "
+                  "as 1.1 and 2.0 through CLI, Python paths/bytes and optional Node/WASM. "
+                  "GenericCityObject sources must reject 1.1; a labelled compatible subset is also checked. "
+                  "Schemas, primitive structure, identity/type, parents, attributes, LoD, face "
+                  "classification and CRS are checked. XYZ tolerance: half an output quantization "
+                  "step plus four floating-point ULPs; constant axes use ULPs only. "
+                  "Solid topology, semantic hierarchy and appearance are outside the flat model.")
+    missing = missing_modules("terrio", "jsonschema", "referencing")
+    if missing:
+        suite.skipped = "needs the Python modules " + ", ".join(missing)
+        return suite
+    root = Path(ctx.data) / "citymodels"
+    required = [root / name for name in ("DH_01_subs.city.json", "delft.json", "rotterdam_subset.json")]
+    required += [root / "schemas" / version / "cityjson.schema.json" for version in ("1.1.3", "2.0.2")]
+    required.append(root / "schemas/2.0.2/cityobjects.schema.json")
+    if any(not path.is_file() for path in required):
+        suite.skipped = "prepare fixtures/schemas with scripts/compare_cityjson.py DATA --fetch"
+        return suite
+    command = [sys.executable, str(SCRIPTS / "compare_cityjson_writer.py"), ctx.data, "--terrio", ctx.terrio, "--json"]
+    node = ROOT / "js/pkg-node/terrio.js"
+    if node_cityjson_writer_available(node):
+        command += ["--node-package", str(node)]
+    code, out, err = run(command)
+    try:
+        results = json.loads(out)
+    except json.JSONDecodeError:
+        suite.error = tail(err or out)
+        return suite
+    for result in results:
+        suite.cases.append(Case("city models", result["name"], result["status"], result["detail"]))
+    if code or not results:
+        suite.error = tail(err or out) or "no comparison results"
+    return suite
+
+
+def suite_citygml_write(ctx):
+    """Published native XML schemas and an independent primitive/metadata traversal."""
+    suite = Suite("citygml-write", "CityGML writer", "OGC CityGML 2.0/3.0 schemas and published CityJSON source models",
+                  "Both native versions through CLI, Python paths/bytes and optional Node/WASM. "
+                  "Native XML coordinates, holes, object types, owning hierarchy, integer LoD and CRS "
+                  "are checked independently of Terrio's reader; standard generic annotations retain "
+                  "typed flat attributes, original IDs/types, fractional LoD and per-face properties. "
+                  "Includes published CityGML models, Den Haag/Delft/Rotterdam, cached 3DBAG pages "
+                  "all 33 schema-derived CityJSON core classes for CityGML 3.0, per-patch TIN fields "
+                  "and both explicit 2.0 building LoD 0 property choices. Exact XYZ; no quantization. "
+                  "This does not reconstruct source solids, appearance or semantic tables.")
+    missing = missing_modules("terrio", "lxml", "pyproj")
+    if missing:
+        suite.skipped = "needs the Python modules " + ", ".join(missing)
+        return suite
+    root = Path(ctx.data) / "citymodels"
+    required = [root/name for name in ("lod3_building_v2.gml", "lod2_buildings_v3.gml", "DH_01_subs.city.json", "delft.json", "rotterdam_subset.json")]
+    required += [root/"gml-schemas", root/"schemas/2.0.2/cityobjects.schema.json"]
+    if any(not path.exists() for path in required):
+        suite.skipped = "prepare CityGML and CityJSON fixtures/schemas with their comparison scripts' --fetch options"
+        return suite
+    command = [sys.executable, str(SCRIPTS/"compare_citygml_writer.py"), ctx.data, "--terrio", ctx.terrio, "--json"]
+    node = ROOT/"js/pkg-node/terrio.js"
+    if node_citygml_writer_available(node):
+        command += ["--node-package",str(node)]
+    code,out,err = run(command)
+    try:
+        results = json.loads(out)
+    except json.JSONDecodeError:
+        suite.error = tail(err or out)
+        return suite
+    for result in results:
+        suite.cases.append(Case("city models",result["name"],result["status"],result["detail"]))
+    if code or not results:
+        suite.error = tail(err or out) or "no comparison results"
     return suite
 
 
@@ -649,6 +824,29 @@ def suite_ops(ctx):
     )
 
 
+def suite_raster_masks(ctx):
+    """Mask preservation and validity across the conversion and warp paths."""
+    suite = Suite("raster-masks", "Raster dataset masks", "GDAL gdal_translate/gdalwarp (3.13.2 reference)",
+                  "Synthetic Byte and real Landsat rasters with internal and sidecar masks: "
+                  "every pixel, mask, type, nodata, CRS and geotransform, including regenerated COG "
+                  "overviews, extracted windows/levels and single/multiple-source/cutline warps. "
+                  "Landsat forced-overview bilinear and average warps allow one value of rounding "
+                  "difference and must also match GDAL -wt Float32 exactly. Cutlines use the same binary mask as alpha "
+                  "because GDAL 3.13.2 drops a per-dataset mask when adding a cutline. "
+                  "A local masked COG counts HTTP payload bytes and requires small windows to fetch less than whole conversion.")
+    code, out, err = run([sys.executable, str(SCRIPTS / "compare_raster_masks_with_gdal.py"), ctx.data, "--terrio", ctx.terrio, "--json"])
+    try:
+        results = json.loads(out)
+    except json.JSONDecodeError:
+        suite.error = tail(err or out) or f"comparison exited {code} without JSON"
+        return suite
+    for result in results:
+        suite.cases.append(Case(result["name"].split()[0], result["name"], result["status"], result["detail"]))
+    if code and not any(case.status == DIFFERS for case in suite.cases):
+        suite.error = tail(err or out) or f"comparison exited {code}"
+    return suite
+
+
 def suite_benchmark_metadata(ctx):
     """Full real-data regressions for the metadata/schema defects from #253."""
     return suite_json_ops(
@@ -669,7 +867,8 @@ def suite_benchmark_compat(ctx):
     return suite_json_ops(
         ctx, "benchmark-compat", "compare_benchmark_compat_with_gdal.py",
         "Benchmark compatibility and codec roundtrips", "Installed GDAL independent decoder",
-        "GDAL 3.13 recursive COG pyramids and versioned slope/hillshade match exactly. "
+        "GDAL 3.13 recursive COG pyramids, versioned slope/hillshade, the bilinear NAD83 to UTM warp "
+        "and counties to Conus Albers match exactly on glibc Linux. "
         "WebP lossless pixels/masks and JPEG XL Byte/UInt16 layouts roundtrip exactly; "
         "lossy WebP quality must change valid decoded output, with no cross-encoder pixel equality claim.", 1,
     )
@@ -752,6 +951,42 @@ def suite_dem_calc(ctx):
     )
 
 
+def suite_mdmosaic(ctx):
+    """Coordinate-aligned scientific mosaics against GDAL."""
+    suite = Suite("mdmosaic", "Multidimensional mosaics", "`gdal mdim mosaic`",
+                  "NOAA wind spatial/temporal tiles, gaps, overlap/nodata, nested selection, "
+                  "netCDF/Zarr snapshots, Float32-coordinate gaps, unindexed CF bounds and all ten numeric types: exact coordinate-aligned data values, "
+                  "types, nodata, units and axis names. Descending inputs are normalized for a GDAL "
+                  "3.13.3 invalid-VRT bug. Within tolerance: source group paths retained rather than flattened, "
+                  "and source coordinate values/types retained exactly; GDAL regenerated-grid rounding differences are accepted only where input samples prove the expected value, and gap coordinates must match the rounded reference.")
+    if missing_modules("osgeo", "numpy"):
+        suite.skipped = "needs osgeo and numpy"
+        return suite
+    if shutil.which("gdal") is None or run(["gdal", "mdim", "mosaic", "--help"])[0] != 0:
+        suite.skipped = "needs a GDAL release with the gdal mdim mosaic command"
+        return suite
+    _code, out, err = run([sys.executable, str(SCRIPTS / "compare_mdmosaic_with_gdal.py"), ctx.data, "--terrio", ctx.terrio, "--json"])
+    try:
+        results = json.loads(out)
+    except json.JSONDecodeError:
+        suite.error = tail(err or out)
+        return suite
+    for result in results:
+        if result.get("expected_rejection"):
+            suite.cases.append(Case("Multidimensional mosaics", result["name"], IDENTICAL if result.get("same_rejection") else DIFFERS,
+                                    "both reject; Terrio preserves the absent destination" if result.get("same_rejection") else "rejection differs"))
+            continue
+        classified = dict(result)
+        if result.get("permitted_coordinate_type_difference"):
+            classified["same_type"] = True
+        status, detail = classify_raster(classified)
+        differences = [result.get("path_difference"),result.get("coordinate_difference")]
+        if status in (IDENTICAL,TOLERANCE) and any(differences):
+            status, detail = TOLERANCE, "; ".join(filter(None,[detail,*differences]))
+        suite.cases.append(Case("Multidimensional mosaics", result["name"], status, detail))
+    return suite
+
+
 def suite_multidim(ctx):
     """Native groups, dimensions, slices and snapshots against GDAL MD and xarray."""
     suite = Suite(
@@ -773,6 +1008,51 @@ def suite_multidim(ctx):
     return suite
 
 
+def suite_gpkg_validate(ctx):
+    suite = Suite("gpkg-validate", "GeoPackage specification validation", "GDAL 3.13.3",
+                  "Natural Earth vector and USGS raster derivatives: valid/invalid verdicts, core requirement diagnostics, default and full checks. Incomplete SQL/codec checks must never report validity; diagnostic wording is not compared.")
+    if missing_modules("osgeo"):
+        suite.skipped = "needs osgeo"
+        return suite
+    if shutil.which("gdal") is None or run(["gdal", "driver", "gpkg", "validate", "--help"])[0] != 0:
+        suite.skipped = "needs gdal driver gpkg validate"
+        return suite
+    code, out, err = run([sys.executable, str(SCRIPTS / "compare_gpkg_validation_with_gdal.py"), ctx.data, "--terrio", ctx.terrio, "--json"])
+    try:
+        results = json.loads(out)
+    except json.JSONDecodeError:
+        suite.error = tail(err or out)
+        return suite
+    for result in results:
+        status = {"identical": IDENTICAL, "not compared": NOT_COMPARED}.get(result["status"], DIFFERS)
+        suite.cases.append(Case("GeoPackage validation", result["name"], status, result["reference"]))
+    if code and not any(case.status == DIFFERS for case in suite.cases):
+        suite.error = tail(err or out)
+    return suite
+
+
+def suite_gpkg_repack(ctx):
+    suite = Suite("gpkg-repack", "GeoPackage storage repacking", "GDAL 3.13.3 / SQLite VACUUM",
+                "Natural Earth and USGS derivatives: all SQL records/objects/rowids, GDAL features and raster pixels/masks, types, CRS and metadata. Covers arbitrary indexes, WITHOUT ROWID, encodings, auto-vacuum, page sizes and mutation guards. Physical page layouts may differ.")
+    if missing_modules("osgeo"):
+        suite.skipped = "needs osgeo"
+        return suite
+    if shutil.which("gdal") is None or run(["gdal", "driver", "gpkg", "repack", "--help"])[0] != 0:
+        suite.skipped = "needs gdal driver gpkg repack"
+        return suite
+    code, out, err = run([sys.executable,str(SCRIPTS/"compare_gpkg_repack_with_gdal.py"),ctx.data,"--terrio",ctx.terrio,"--json"])
+    try:
+        results = json.loads(out)
+    except json.JSONDecodeError:
+        suite.error = tail(err or out)
+        return suite
+    for result in results:
+        suite.cases.append(Case("GeoPackage repack",result["name"],IDENTICAL if result["status"] == "identical" else DIFFERS,result["detail"]))
+    if code and not any(case.status == DIFFERS for case in suite.cases):
+        suite.error = tail(err or out)
+    return suite
+
+
 def suite_pansharpen(ctx):
     """Real Landsat panchromatic/spectral pairs against GDAL's weighted Brovey."""
     return suite_json_ops(
@@ -782,6 +1062,171 @@ def suite_pansharpen(ctx):
         "extents. Compare every pixel, dimensions, type, nodata and geotransform; integer cases "
         "are exact, and Float32 allows 0.002 (one ULP at the scene's radiometric scale).", 1,
     )
+
+
+def suite_dataset_check(ctx):
+    suite = Suite("dataset-check", "Dataset content read checks", "`gdal dataset check` and GDAL all-level/mask reads (3.13.3)",
+                  "Real imagery, scientific arrays and vector files, plus derived grouped wind arrays and damaged compressed tiles/GeoJSON. Compare read success/failure status and all-level/mask sample counts, not checksums or pixel equality. A malformed GeoPackage geometry blob is accepted by both readers and is reported explicitly; successful reads cannot detect every mutation.")
+    if missing_modules("osgeo", "numpy") or shutil.which("gdal") is None:
+        suite.skipped = "needs GDAL 3.13 commands/bindings and NumPy"
+        return suite
+    from osgeo import gdal
+
+    if int(gdal.VersionInfo("VERSION_NUM")) < 3130000:
+        suite.skipped = "needs GDAL >= 3.13 for dataset check"
+        return suite
+    code, out, err = run([sys.executable, str(SCRIPTS / "compare_check_with_gdal.py"), ctx.data, "--terrio", ctx.terrio, "--json"])
+    try:
+        results = json.loads(out)
+    except json.JSONDecodeError:
+        suite.error = tail(err or out)
+        return suite
+    statuses = {"identical": IDENTICAL, "not compared": NOT_COMPARED}
+    for result in results:
+        suite.cases.append(Case("Dataset content check", result["name"], statuses.get(result["status"], DIFFERS), result["detail"]))
+    if code and not any(case.status == DIFFERS for case in suite.cases):
+        suite.error = tail(err or out)
+    return suite
+
+
+def suite_parquet_zstd(ctx):
+    suite = Suite("parquet-zstd", "Zstandard GeoParquet pages", "GDAL 3.13.3 / Arrow",
+                  "Fixtures with v1, v2 and per-column compression: feature ids, attributes and points, read whole")
+    if missing_modules("osgeo"):
+        suite.skipped = "needs osgeo"
+        return suite
+    from osgeo import ogr
+
+    ogr.UseExceptions()
+    fixtures = SCRIPTS.parent / "crates/terrio/tests/data/parquet_zstd"
+    for path in sorted(fixtures.glob("*.parquet")):
+        ds = ogr.Open(str(path))
+        reference = [
+            (f.GetField("id"), f.GetField("name"), f.GetField("value"), f.GetGeometryRef().GetX(), f.GetGeometryRef().GetY())
+            for f in ds.GetLayer(0)
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            out_path = Path(tmp) / "out.geojson"
+            code, out, err = run([ctx.terrio, "convert", str(path), str(out_path)])
+            if code:
+                suite.cases.append(Case("GeoParquet", path.name, DIFFERS, tail(err or out)))
+                continue
+            features = json.loads(out_path.read_text())["features"]
+        got = [
+            (f["properties"]["id"], f["properties"]["name"], f["properties"]["value"], *f["geometry"]["coordinates"][:2])
+            for f in features
+        ]
+        status = IDENTICAL if got == reference else DIFFERS
+        detail = "" if got == reference else f"{len(got)} features, GDAL {len(reference)}"
+        suite.cases.append(Case("GeoParquet", path.name, status, detail))
+    return suite
+
+
+def suite_parquet_metadata(ctx):
+    suite = Suite("parquet-metadata", "Parquet metadata aggregation", "GDAL 3.13.3 / Arrow dataset reader",
+                  "Natural Earth partitions: row groups, column offsets/statistics, all values, CRS, geometry types and merged GeoParquet metadata; reference CRS loss explicitly reported.")
+    if missing_modules("osgeo", "pyarrow"):
+        suite.skipped = "needs osgeo and pyarrow"
+        return suite
+    code_help, _, _ = run(["gdal", "driver", "parquet", "create-metadata-file", "--help"])
+    if code_help:
+        suite.skipped = "needs GDAL 3.13+ with the Parquet metadata command"
+        return suite
+    code, out, err = run([sys.executable, str(SCRIPTS / "compare_parquet_metadata_with_gdal.py"), ctx.data, "--terrio", ctx.terrio, "--json"])
+    try:
+        results = json.loads(out)
+    except json.JSONDecodeError:
+        suite.error = tail(err or out)
+        return suite
+    statuses = {"identical": IDENTICAL, "tolerance": TOLERANCE}
+    for result in results:
+        suite.cases.append(Case("Parquet metadata", result["name"], statuses.get(result["status"], DIFFERS), result["detail"]))
+    if code and not any(case.status == DIFFERS for case in suite.cases):
+        suite.error = tail(err or out)
+    return suite
+
+
+def suite_dataset_files(ctx):
+    suite = Suite(
+        "dataset-files", "Dataset file management", "GDAL 3.13.3 dataset commands and recursive VSI copy",
+        "Real Landsat and Natural Earth derivatives: encoded bytes, owned companion files, "
+        "pixels/features, masks, overviews, types, CRS, transforms and metadata. VRT references "
+        "are rebased and CSV CRS .prj files retained rather than repeating GDAL's copy losses. "
+        "HTTP requests and transferred bytes are measured, with metadata-only overhead bounded.",
+    )
+    if missing_modules("osgeo") or shutil.which("gdal") is None:
+        suite.skipped = "needs osgeo and the gdal command"
+        return suite
+    code, out, err = run([
+        sys.executable, str(SCRIPTS / "compare_dataset_files_with_gdal.py"),
+        ctx.data, "--terrio", ctx.terrio, "--json",
+    ])
+    try:
+        results = json.loads(out)
+    except json.JSONDecodeError:
+        suite.error = tail(err or out)
+        return suite
+    statuses = {"identical": IDENTICAL, "tolerance": TOLERANCE}
+    for result in results:
+        suite.cases.append(Case("Dataset file management", result["name"],
+                                statuses.get(result["status"], DIFFERS), result["detail"]))
+    if code and not any(case.status == DIFFERS for case in suite.cases):
+        suite.error = tail(err or out)
+    return suite
+
+
+def suite_identify(ctx):
+    suite = Suite("identify", "Dataset identification", "`gdal dataset identify` / GDALIdentifyDriverEx (GDAL 3.13.3)",
+                  "Real Landsat, USGS, OPERA, SRTM, NOAA scientific data and vector files, plus derived raster encodings. Exact driver labels; generic JP2, KML and HDF5 label families are reported within tolerance. Companion-file formats use the explicit deep fallback. Unknown inputs must remain unknown; no pixel/feature values are decoded by the bounded header path.")
+    if missing_modules("osgeo"):
+        suite.skipped = "needs osgeo"
+        return suite
+    code, out, err = run([sys.executable, str(SCRIPTS / "compare_identify_with_gdal.py"), ctx.data, "--terrio", ctx.terrio, "--json"])
+    try:
+        results = json.loads(out)
+    except json.JSONDecodeError:
+        suite.error = tail(err or out)
+        return suite
+    statuses = {"identical":IDENTICAL,"tolerance":TOLERANCE,"not compared":NOT_COMPARED}
+    for result in results:
+        suite.cases.append(Case("Dataset identification",result["name"],statuses.get(result["status"],DIFFERS),result["detail"]))
+    if code and not any(case.status == DIFFERS for case in suite.cases):
+        suite.error = tail(err or out)
+    return suite
+
+
+def suite_cog_validate(ctx):
+    suite = Suite("cog-validate", "Cloud Optimized GeoTIFF validation", "`gdal driver cog validate` (GDAL 3.13.3)",
+                  "Real Landsat/DEM COGs, pixel/band/tile interleave, classic/BigTIFF, corrupt leaders/trailers, striped TIFFs and external overviews. Full checks on/off: exact validity, exit status, error/warning counts, IFD and first-block offsets. Diagnostic wording is not compared; no pixel decoding is performed.")
+    try:
+        missing = missing_modules("osgeo", "numpy", "osgeo_utils.samples.validate_cloud_optimized_geotiff")
+    except (ImportError, ModuleNotFoundError):
+        missing = ["osgeo_utils.samples.validate_cloud_optimized_geotiff"]
+    if missing:
+        suite.skipped = "needs " + ", ".join(missing)
+        return suite
+    if shutil.which("gdal") is None or run(["gdal", "driver", "cog", "validate", "--help"])[0] != 0:
+        suite.skipped = "needs a GDAL release with the gdal driver cog validate command"
+        return suite
+    from osgeo import gdal
+
+    if int(gdal.VersionInfo("VERSION_NUM")) < 3130000:
+        suite.skipped = "needs GDAL >= 3.13 for the cog validate reference"
+        return suite
+    suite.reference = f"`gdal driver cog validate` (GDAL {gdal.VersionInfo('RELEASE_NAME')})"
+    code, out, err = run([sys.executable, str(SCRIPTS / "compare_cog_validate_with_gdal.py"), ctx.data, "--terrio", ctx.terrio, "--json"])
+    try:
+        results = json.loads(out)
+    except json.JSONDecodeError:
+        suite.error = tail(err or out)
+        return suite
+    for result in results:
+        suite.cases.append(Case("COG validation", result["name"], IDENTICAL if result["status"] == "identical" else DIFFERS, result["detail"]))
+    if len(results) != 44:
+        suite.cases.append(Case("COG validation", "case count", DIFFERS, f"expected 44 results, got {len(results)}"))
+    if code and not any(case.status == DIFFERS for case in suite.cases):
+        suite.error = tail(err or out)
+    return suite
 
 
 def suite_vector_grid(ctx):
@@ -850,6 +1295,103 @@ def suite_raster_query(ctx):
         status = statuses.get(result["status"], DIFFERS)
         suite.cases.append(Case(result["operation"], result["name"], status, result.get("detail", "") if status != IDENTICAL else ""))
     return suite
+
+
+def suite_retile(ctx):
+    """Traditional retile layouts on real Landsat and USGS derivatives."""
+    suite = Suite("retile", "Retile layouts", "GDAL 3.13.3 gdal_retile",
+                  "Real Landsat and USGS raster samples, types, nodata, masks and georeferencing; cropped edge tiles, overlap, row directories, recursive pyramid levels, per-level CSV extents and Shapefile footprint indexes.")
+    if missing_modules("osgeo", "numpy"):
+        suite.skipped = "needs GDAL bindings and NumPy"
+        return suite
+    from osgeo import gdal
+    if int(gdal.VersionInfo("VERSION_NUM")) < 3130000:
+        suite.skipped = "needs GDAL >= 3.13"
+        return suite
+    code, out, err = run([sys.executable, str(SCRIPTS / "compare_retile_with_gdal.py"), ctx.data, "--terrio", ctx.terrio, "--json"])
+    try:
+        results = json.loads(out)
+    except json.JSONDecodeError:
+        suite.error = tail(err or out)
+        return suite
+    if len(results) != 29:
+        suite.cases.append(Case("Retile", "case count", DIFFERS, f"expected 29 results, got {len(results)}"))
+    for result in results:
+        suite.cases.append(Case("Retile", result["name"], {"identical": IDENTICAL, "tolerance": TOLERANCE}.get(result["status"], DIFFERS), result["detail"]))
+    if code and not any(case.status == DIFFERS for case in suite.cases):
+        suite.error = tail(err or out)
+    return suite
+
+
+def suite_tile_publication(ctx):
+    """Publication semantics and cross-read mosaics on real Landsat imagery."""
+    suite = Suite("tile-publication", "Tile publication helpers", "GDAL 3.13.3 raster tile / STACTA",
+                  "Real imagery payloads, XYZ/TMS KML overlays and local links, custom MapML substitutions, and GDAL cross-read STACTA grids/samples. Nondefault tile-size reference scale defects are independently verified before normalization. HTML viewers are checked separately in a real browser.")
+    if missing_modules("osgeo", "numpy") or shutil.which("gdal") is None:
+        suite.skipped = "needs GDAL 3.13 commands/bindings and NumPy"
+        return suite
+    from osgeo import gdal
+    if int(gdal.VersionInfo("VERSION_NUM")) < 3130000:
+        suite.skipped = "needs GDAL >= 3.13"
+        return suite
+    code, out, err = run([sys.executable, str(SCRIPTS / "compare_tile_publication_with_gdal.py"), ctx.data, "--terrio", ctx.terrio, "--json"])
+    try:
+        results = json.loads(out)
+    except json.JSONDecodeError:
+        suite.error = tail(err or out)
+        return suite
+    if len(results) != 3:
+        suite.cases.append(Case("Tile publication", "case count", DIFFERS, f"expected 3 results, got {len(results)}"))
+    for result in results:
+        suite.cases.append(Case("Tile publication", result["name"], {"identical": IDENTICAL, "tolerance": TOLERANCE}.get(result["status"], DIFFERS), result["detail"]))
+    if code and not any(case.status == DIFFERS for case in suite.cases):
+        suite.error = tail(err or out)
+    return suite
+
+
+def suite_raster_tiles(ctx):
+    """Folder tile pixels, filenames, masks and grids on real imagery/elevation."""
+    suite = Suite("raster-tiles", "Separate-file raster tiles", "GDAL 3.13.3 raster tile / alpha warp",
+                  "Real Landsat and USGS derivatives; XYZ/TMS, raster/global grids, Byte PNG alpha/nodata/masks and typed GeoTIFF tiles. Exact nearest-neighbor samples, names, masks, types and TIFF georeferencing; independent GDAL alpha warps check masked UInt16/Float32 outputs, and two remote COG probes measure payload reads. Lower zooms resample directly from source. Generated-pyramid and no-alpha blank-tile differences are independently checked and reported; interpolating-kernel agreement is not asserted.")
+    if missing_modules("osgeo", "numpy") or shutil.which("gdal") is None:
+        suite.skipped = "needs GDAL 3.13 commands/bindings and NumPy"
+        return suite
+    from osgeo import gdal
+    if int(gdal.VersionInfo("VERSION_NUM")) < 3130000:
+        suite.skipped = "needs GDAL >= 3.13"
+        return suite
+    code, out, err = run([sys.executable, str(SCRIPTS / "compare_raster_tiles_with_gdal.py"), ctx.data, "--terrio", ctx.terrio, "--json"])
+    try:
+        results = json.loads(out)
+    except json.JSONDecodeError:
+        suite.error = tail(err or out)
+        return suite
+    for result in results:
+        suite.cases.append(Case("Raster tiles", result["name"], {"identical": IDENTICAL, "tolerance": TOLERANCE}.get(result["status"], DIFFERS), result["detail"]))
+    if code and not any(case.status == DIFFERS for case in suite.cases):
+        suite.error = tail(err or out)
+    return suite
+
+
+def suite_palette(ctx):
+    """Indexed colors on real Landsat and OPERA imagery."""
+    if missing_modules("osgeo", "numpy") or shutil.which("gdal") is None:
+        suite = Suite("palette", "Palette conversion", "GDAL 3.13", "Exact palettes and pixels.")
+        suite.skipped = "needs GDAL 3.13 commands/bindings and NumPy"
+        return suite
+    from osgeo import gdal
+
+    if int(gdal.VersionInfo("VERSION_NUM")) < 3130000 or run(["gdal", "raster", "rgb-to-palette", "--help"])[0] != 0:
+        suite = Suite("palette", "Palette conversion", "GDAL 3.13", "Exact palettes and pixels.")
+        suite.skipped = "needs GDAL >= 3.13 for rgb-to-palette"
+        return suite
+    return suite_json_ops(
+        ctx, "palette", "compare_palette_with_gdal.py", "Palette conversion",
+        "`gdal raster rgb-to-palette`, `gdal_translate -expand`, GDAL SetRasterColorTable",
+        "Landsat median cut and diffusion at 5/8 bits, supplied raster/text tables, "
+        "nodata, masks, alpha, OPERA expansion and attachment: exact pixels, palettes, "
+        "types, nodata, masks, CRS and georeferencing.", 1,
+    )
 
 
 def suite_blend(ctx):
@@ -1126,9 +1668,9 @@ def suite_igh(ctx):
 def suite_ob_tran(ctx):
     """PROJ's general oblique transformation of projections other than longlat, and its refusals."""
     suite = Suite("ob_tran", "General oblique transformation", "GDAL/PROJ",
-                  "15 spherical/WGS84 configurations of 8 rotated projections (moll, merc, eqc, sinu, ortho, "
+                  "19 spherical/WGS84 configurations of 10 rotated projections (moll, wag4, wag5, merc, eqc, sinu, ortho, "
                   "robin, lcc, utm), with the pole given in each of PROJ's three forms and a transverse "
-                  "rotation, and 4,680 geographic samples, as PROJ strings, WKT2 and WKT1; forward and "
+                  "rotation, and geographic samples, as PROJ strings, WKT2 and WKT1; forward and "
                   "inverse refusals. Projected allowance 1 mm; inverse 1e-8 degrees, longitude weighted "
                   "by cos(latitude).")
     if missing_modules("osgeo"):
@@ -1142,6 +1684,102 @@ def suite_ob_tran(ctx):
         return suite
     for case in cases:
         suite.cases.append(Case("General oblique transformation", case["name"], case["status"], case["detail"]))
+    if code and not any(c.status == DIFFERS for c in suite.cases):
+        suite.error = tail(err or out)
+    return suite
+
+
+def suite_qsc(ctx):
+    """The quadrilateralized spherical cube on each face, as PROJ strings and as GDAL's WKT."""
+    suite = Suite("qsc", "Quadrilateralized spherical cube", "GDAL/PROJ",
+                  "16 spherical/WGS84 configurations (the six cube faces, centres between faces, units "
+                  "and false offsets) and 4,288 geographic samples over the whole globe and each side "
+                  "of the face and area edges, as PROJ strings, WKT2, WKT1 and ESRI WKT1, and inverse "
+                  "points on and beyond the face. Projected allowance 1 mm; inverse 1e-8 degrees, "
+                  "longitude weighted by cos(latitude); at the antipode of the face centre, 1e-5 degrees "
+                  "and 1 mm of projected residual.")
+    if missing_modules("osgeo"):
+        suite.skipped = "needs GDAL Python bindings"
+        return suite
+    code, out, err = run([sys.executable, str(SCRIPTS / "compare_qsc_with_gdal.py"), ctx.data, "--terrio", ctx.terrio, "--json"])
+    try:
+        cases = json.loads(out)
+    except json.JSONDecodeError:
+        suite.error = tail(err or out)
+        return suite
+    for case in cases:
+        suite.cases.append(Case("Quadrilateralized spherical cube", case["name"], case["status"], case["detail"]))
+    if code and not any(c.status == DIFFERS for c in suite.cases):
+        suite.error = tail(err or out)
+    return suite
+
+
+def suite_healpix(ctx):
+    """HEALPix and rHEALPix, as PROJ strings and as GDAL's and ESRI's WKT, and their inverse refusals."""
+    suite = Suite("healpix", "HEALPix and rHEALPix", "GDAL/PROJ",
+                  "22 spherical/WGS84/flattened configurations (central meridians, rot_xy, polar squares, "
+                  "units and false offsets) and 6,600 geographic samples over the equatorial region, each "
+                  "side of the polar caps' edges and the poles, as PROJ strings, WKT2, WKT1 and ESRI WKT1; "
+                  "inverse refusals outside the image. Projected allowance 1 mm; inverse 1e-8 degrees, "
+                  "longitude weighted by cos(latitude).")
+    if missing_modules("osgeo"):
+        suite.skipped = "needs GDAL Python bindings"
+        return suite
+    code, out, err = run([sys.executable, str(SCRIPTS / "compare_healpix_with_gdal.py"), ctx.data, "--terrio", ctx.terrio, "--json"])
+    try:
+        cases = json.loads(out)
+    except json.JSONDecodeError:
+        suite.error = tail(err or out)
+        return suite
+    for case in cases:
+        suite.cases.append(Case("HEALPix and rHEALPix", case["name"], case["status"], case["detail"]))
+    if code and not any(c.status == DIFFERS for c in suite.cases):
+        suite.error = tail(err or out)
+    return suite
+
+
+def suite_isea(ctx):
+    """ISEA, as PROJ strings and as GDAL's and ESRI's WKT, and its inverse refusals."""
+    suite = Suite("isea", "Icosahedral Snyder Equal Area", "GDAL/PROJ",
+                  "14 configurations on the authalic sphere of WGS 84 and on WGS 84 (both orientations, "
+                  "central meridians, lat_0, azi, resolution and aperture, units and false offsets) and "
+                  "7,784 geographic samples, as PROJ strings, WKT2, WKT1 and ESRI WKT1; PROJ's inverse and "
+                  "its refusals. Projected allowance 1 mm; inverse 1e-8 degrees, longitude weighted by "
+                  "cos(latitude). Not compared with a PROJ whose isea differs from PROJ 9.8.1's.")
+    if missing_modules("osgeo"):
+        suite.skipped = "needs GDAL Python bindings"
+        return suite
+    code, out, err = run([sys.executable, str(SCRIPTS / "compare_isea_with_gdal.py"), ctx.data, "--terrio", ctx.terrio, "--json"])
+    try:
+        cases = json.loads(out)
+    except json.JSONDecodeError:
+        suite.error = tail(err or out)
+        return suite
+    for case in cases:
+        suite.cases.append(Case("ISEA", case["name"], case["status"], case["detail"]))
+    if code and not any(c.status == DIFFERS for c in suite.cases):
+        suite.error = tail(err or out)
+    return suite
+
+
+def suite_omerc_two_point(ctx):
+    """The two-point oblique Mercator, as PROJ strings and as GDAL's WKT, and its refusals."""
+    suite = Suite("omerc-two-point", "Two-point oblique Mercator", "GDAL/PROJ",
+                  "12 spherical/WGS84 lines (both hemispheres, swapped points, across the antimeridian, "
+                  "near a meridian; units and false offsets) and 1,524 geographic samples, as PROJ "
+                  "strings, WKT2, WKT1 and ESRI WKT1; PROJ's invalid-parameter refusals. Projected "
+                  "allowance 1 mm; inverse 1e-8 degrees, longitude weighted by cos(latitude).")
+    if missing_modules("osgeo"):
+        suite.skipped = "needs GDAL Python bindings"
+        return suite
+    code, out, err = run([sys.executable, str(SCRIPTS / "compare_omerc_two_point_with_gdal.py"), ctx.data, "--terrio", ctx.terrio, "--json"])
+    try:
+        cases = json.loads(out)
+    except json.JSONDecodeError:
+        suite.error = tail(err or out)
+        return suite
+    for case in cases:
+        suite.cases.append(Case("Two-point oblique Mercator", case["name"], case["status"], case["detail"]))
     if code and not any(c.status == DIFFERS for c in suite.cases):
         suite.error = tail(err or out)
     return suite
@@ -1588,39 +2226,80 @@ def suite_tiles(ctx):
     return s
 
 
+def suite_tile_rgba(ctx):
+    """Strict full-channel synthetic tile comparisons against GDAL 3.13."""
+    s = Suite("tile-rgba", "RGBA tile arithmetic", "GDAL 3.13 Python API",
+              "EPSG:4326 opaque, masked, variable alpha and off-grid RGBA; base and overview pixels exact.")
+    code, version, err = run([sys.executable, "-c", "from osgeo import gdal; print(gdal.VersionInfo())"])
+    if code or not version.strip().startswith("313"):
+        s.skipped = "requires GDAL 3.13 Python bindings"
+        return s
+    code, out, err = run([sys.executable, str(SCRIPTS / "compare_tile_rgba_with_gdal.py"), "--terrio", ctx.terrio])
+    try:
+        report = json.loads(out)
+        for result in report["results"]:
+            for level in ("base", "pyramid"):
+                v = result[level]
+                exact = v["coverage_equal"] and v["channels"] == 0
+                s.cases.append(Case("RGBA", result["case"] + ": " + level,
+                                    IDENTICAL if exact else DIFFERS, json.dumps(v)))
+    except (ValueError, KeyError):
+        s.error = tail(err or out)
+    if code:
+        s.error = tail(err or out)
+    return s
+
+
 def suite_grib(ctx):
     """GRIB files, band by band, against GDAL's GRIB driver."""
     s = Suite(
         "grib",
         "GRIB",
         "GDAL's GRIB driver (degrib and g2clib)",
-        "GDAL's GRIB test files, ecCodes' and real forecasts (NOAA's GFS and HRRR, ECMWF's open data): "
-        "sizes, geotransforms (1e-9 relative) and CRSs, every band's description, `GRIB_*` metadata "
-        "and nodata value exactly, and its pixels (identical, or within one Float32 unit in the last "
-        "place), with units normalized (GDAL's default) and as stored.",
+        "GRIB1 and GRIB2 files band by band: sizes, geotransforms, CRSs, every band's description, "
+        "`GRIB_*` metadata, nodata value, mask and pixels.",
     )
-    dirs = [os.path.abspath(os.path.join(ctx.data, "grib", d)) for d in ("real", "gdal", "eccodes")]
-    dirs = [d for d in dirs if os.path.isdir(d)]
-    if not dirs:
-        s.skipped = "no GRIB data (scripts/fetch_test_data.sh)"
-        return s
-    missing = missing_modules("numpy", "osgeo", "terrio")
+    missing = missing_modules("terrio", "rasterio")
     if missing:
-        s.skipped = f"needs {', '.join(missing)}"
+        s.skipped = "needs the Python modules " + ", ".join(missing)
         return s
-    code, out, err = run([sys.executable, str(SCRIPTS / "compare_grib_with_gdal.py"), *dirs, "--raw"])
-    # Exit code 1 means a file differs; anything else, or a traceback, that the script failed.
-    if code not in (0, 1) or "Traceback" in err:
-        s.error = tail(err or out)
-    for line in out.splitlines():
-        # Files neither tool opens (SKIP) are not cases.
-        m = re.match(r"^(OK|TOL|DIFF)\s+(\S+?)/(\S+?)( \(units as stored\))?: (.*)$", line)
-        if m:
-            status = {"OK": IDENTICAL, "TOL": TOLERANCE}.get(m[1], DIFFERS)
-            group = {"real": "real forecasts", "gdal": "GDAL's test files", "eccodes": "ecCodes' test files"}.get(m[2], m[2])
-            s.cases.append(Case(group, m[3] + (m[4] or ""), status, "" if status == IDENTICAL else m[5]))
+    # The repository's GRIB fixtures and the GRIB files of the test data, one case each:
+    # compare_grib_with_gdal.py reads a file locally and as a URL (by range), and counts the
+    # problems it finds; a file GDAL refuses must be refused by terrio too.
+    exts = (".grib2", ".grb2", ".grib", ".grb")
+
+    def head(path):
+        with open(path, "rb") as f:
+            return f.read(4096)
+
+    def is_grib(path):
+        # By extension, or a .bin file that starts a GRIB message (after a bulletin header).
+        b = head(path) if path.suffix.lower() == ".bin" else b""
+        return path.suffix.lower() in exts or any(b[i : i + 4] == b"GRIB" and b[i + 7] in (1, 2) for i in range(len(b) - 7))
+
+    fixtures = ROOT / "crates" / "terrio" / "tests" / "data" / "grib"
+    files = sorted(p for p in fixtures.iterdir() if p.is_file() and (is_grib(p) or p.suffix == ".begin"))
+    data = Path(ctx.data)
+    if data.is_dir():
+        files += sorted(p for p in data.rglob("*") if p.is_file() and is_grib(p))
+    with tempfile.TemporaryDirectory() as out:
+        for path in files:
+            first = head(path)
+            at = first.find(b"GRIB")
+            group = {1: "GRIB1", 2: "GRIB2"}.get(first[at + 7] if 0 <= at < len(first) - 7 else 0, "GRIB")
+            code, text, err = run(
+                [sys.executable, str(SCRIPTS / "compare_grib_with_gdal.py"), out, path.resolve().as_uri()],
+                timeout=1800,
+            )
+            m = re.search(r"^(\d+) problem\(s\)$", text, re.MULTILINE)
+            if code == 0 and m and m[1] == "0":
+                refused = "both refuse" in text
+                s.cases.append(Case(group, path.name, IDENTICAL, "both refuse" if refused else ""))
+                continue
+            bad = [line.strip() for line in text.splitlines() if re.search(r"differ|!=|SIZE|False|GDAL refuses", line)]
+            s.cases.append(Case(group, path.name, DIFFERS, "; ".join(bad[:3]) or tail(err or text, 3)))
     if not s.cases:
-        s.error = tail(err or out)
+        s.error = "no GRIB file found"
     return s
 
 
@@ -1648,6 +2327,167 @@ def suite_analysis_output(ctx):
     return suite
 
 
+def node_exports_available(module, names):
+    """An optional Node backend needs a complete package and the requested exports."""
+    if shutil.which("node") is None or not module.is_file() or not module.with_name("terrio_bg.wasm").is_file():
+        return False
+    try:
+        result = subprocess.run([
+            "node", "-e",
+            "const t=require(process.argv[1]);process.exit(process.argv.slice(2).every(n=>typeof t[n]==='function')?0:1)",
+            str(module.resolve()), *names,
+        ], capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0
+
+
+def node_cityjson_writer_available(module):
+    """Probe the instance method and version option required by the writer suite."""
+    if not node_exports_available(module, ["open"]):
+        return False
+    code = """const t=require(process.argv[1]);
+const doc={type:'CityJSON',version:'2.0',transform:{scale:[1,1,1],translate:[0,0,0]},CityObjects:{probe:{type:'Building'}},vertices:[]};
+const d=t.open(new TextEncoder().encode(JSON.stringify(doc)),'probe.city.json');
+try {const out=JSON.parse(new TextDecoder().decode(d.toBytes('probe.city.json',{cityjsonVersion:'1.1'})));process.exitCode=out.version==='1.1'?0:1;}finally{d.free();}"""
+    try:
+        result = subprocess.run(["node", "-e", code, str(module.resolve())], capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0
+
+
+def node_citygml_writer_available(module):
+    """Check the instance method and actual 2.0 namespace, not just the export list."""
+    if not node_exports_available(module,["open"]):
+        return False
+    code = """const t=require(process.argv[1]);
+const doc={type:'CityJSON',version:'2.0',transform:{scale:[1,1,1],translate:[0,0,0]},CityObjects:{probe:{type:'Building'}},vertices:[]};
+const d=t.open(new TextEncoder().encode(JSON.stringify(doc)),'probe.city.json');
+try{const xml=new TextDecoder().decode(d.toBytes('probe.citygml',{citygmlVersion:'2.0'}));process.exitCode=xml.includes('xmlns:core="http://www.opengis.net/citygml/2.0"')?0:1;}finally{d.free();}"""
+    try:
+        result = subprocess.run(["node","-e",code,str(module.resolve())],capture_output=True,text=True,timeout=30)
+    except (OSError,subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0
+
+
+def suite_rpftoc(ctx):
+    """All RPF TOC surfaces cross-read by GDAL 3.13.3 on prepared CADRG frames."""
+    suite = Suite("rpftoc", "CADRG RPF table of contents", "GDAL 3.13.3 RPFTOC/NITF",
+                  "Flat two-scale Landsat mosaics, a historical polar frame, nominal WI 3.5M and independent synthetic frames centered on both poles: exact samples, masks, palettes, types, nodata and CRS; affine tolerance 1e-7 CRS units. Native metadata reads stay below 1 KiB/frame. Fractional scale uses GDAL's explicit 3.5M override to correct its verified default 3M truncation.")
+    if missing_modules("osgeo", "numpy", "terrio"):
+        suite.skipped = "needs GDAL >= 3.13, NumPy and current RPF Python bindings"
+        return suite
+    from osgeo import gdal
+    import terrio
+    if int(gdal.VersionInfo("VERSION_NUM")) < 3130000 or not hasattr(terrio, "rpftoc_bytes"):
+        suite.skipped = "needs GDAL >= 3.13 and current RPF Python bindings"
+        return suite
+    driver_algorithm = gdal.GetGlobalAlgorithmRegistry().InstantiateAlg("driver")
+    if (gdal.GetDriverByName("NITF") is None or gdal.GetDriverByName("RPFTOC") is None
+            or "rpftoc" not in driver_algorithm.GetSubAlgorithmNames()):
+        suite.skipped = "needs GDAL NITF/RPFTOC drivers and the rpftoc algorithm"
+        return suite
+    if any(not (Path(ctx.data) / directory).is_dir() for directory in ["rpftoc_landsat", "rpftoc_polar", "rpftoc_fractional3500000", "rpftoc_pole_centers/north-rgb", "rpftoc_pole_centers/south-rgb"]):
+        suite.skipped = "run scripts/make_rpftoc_fixtures.py DATA to prepare CADRG references"
+        return suite
+    command = [sys.executable, str(SCRIPTS / "compare_rpftoc_with_gdal.py"), ctx.data, "--terrio", ctx.terrio, "--json"]
+    module = ROOT / "js" / "pkg-node" / "terrio.js"
+    node = node_exports_available(module, ["rpftocCreate"])
+    if node:
+        command += ["--js", module]
+    else:
+        suite.cases.append(Case("RPFTOC", "Node backend", NOT_COMPARED, "needs Node and both js/pkg-node/terrio.js and terrio_bg.wasm"))
+    code, out, err = run(command)
+    try:
+        results = json.loads(out)
+    except json.JSONDecodeError:
+        suite.error = tail(err or out)
+        return suite
+    expected = 25 if node else 20
+    if len(results) != expected:
+        suite.cases.append(Case("RPFTOC", "case count", DIFFERS, f"expected {expected} results, got {len(results)}"))
+    for result in results:
+        suite.cases.append(Case("RPFTOC", result["name"], {"identical": IDENTICAL, "tolerance": TOLERANCE}.get(result["status"], DIFFERS), result["detail"]))
+    if code and not any(case.status == DIFFERS for case in suite.cases):
+        suite.error = tail(err or out)
+    return suite
+
+
+def suite_zonal_bindings(ctx):
+    """Zonal language surfaces, using GDAL pixel membership and NumPy statistics."""
+    suite = Suite("zonal-bindings", "Remaining analysis bindings", "GDAL 3.13.3 / NumPy",
+                  "Real Tennessee counties on DEM/NLCD grids and Landsat polygon zones: centers/all-touched, multiple rasters/bands, seven statistics, nodata/nulls, source attributes, output CRS and rounding. Counts/nulls exact; floating statistics relative 1e-10 or absolute 1e-9; geometry 1e-12 source degrees or 1e-5 projected metres.")
+    if missing_modules("osgeo", "numpy", "shapely", "terrio"):
+        suite.skipped = "needs current zonal bindings, GDAL 3.13, NumPy and Shapely"
+        return suite
+    import terrio
+    from osgeo import gdal
+    if int(gdal.VersionInfo("VERSION_NUM")) < 3130000 or any(not hasattr(terrio, name) for name in ["zonal_stats", "singlepart"]):
+        suite.skipped = "needs GDAL >= 3.13 and current zonal bindings"
+        return suite
+    required = ["TN_Counties.geojson", "dem.tif", "nlcd_knoxville.tif", "landsat.tif", "countries.geojson", "countries.fgb"]
+    missing = [name for name in required if not (Path(ctx.data) / name).is_file()]
+    if missing:
+        suite.skipped = "missing zonal comparison data: " + ", ".join(missing)
+        return suite
+    command = [sys.executable, str(SCRIPTS / "compare_zonal_bindings_with_gdal.py"), ctx.data, "--json"]
+    module = ROOT / "js" / "pkg-node" / "terrio.js"
+    node = node_exports_available(module, ["zonalStats", "singlepart"])
+    if node:
+        command += ["--js", module]
+    else:
+        suite.cases.append(Case("Zonal bindings", "Node backend", NOT_COMPARED, "needs a complete Node package exporting zonalStats and singlepart"))
+    code, out, err = run(command)
+    try:
+        results = json.loads(out)
+    except json.JSONDecodeError:
+        suite.error = tail(err or out)
+        return suite
+    expected = 12 if node else 6
+    if len(results) != expected:
+        suite.cases.append(Case("Zonal bindings", "case count", DIFFERS, f"expected {expected} results, got {len(results)}"))
+    for result in results:
+        suite.cases.append(Case("Zonal bindings", result["name"], {"identical": IDENTICAL, "tolerance": TOLERANCE}.get(result["status"], DIFFERS), result["detail"]))
+    if code and not any(case.status == DIFFERS for case in suite.cases):
+        suite.error = tail(err or out)
+    return suite
+
+
+def suite_analysis_bindings(ctx):
+    """Real-data analysis results through the installed Python and optional Node APIs."""
+    suite = Suite("analysis-bindings", "Analysis language bindings", "GDAL 3.13.3 / OGR / GEOS",
+                  "Real DEM contours (levels, counts, Z, relative length and pixel-scaled Hausdorff distance); imagery footprints; county/road buffers; grouped dissolve; invalid-county diagnostics and repair. Attributes/CRS and valid polygon output are checked. Geometry tolerances and diagnostic wording limits are explicit per case.")
+    if missing_modules("osgeo", "numpy", "shapely", "terrio"):
+        suite.skipped = "needs current terrio Python bindings, GDAL 3.13, NumPy and Shapely"
+        return suite
+    import terrio
+    from osgeo import gdal
+    if int(gdal.VersionInfo("VERSION_NUM")) < 3130000 or any(not hasattr(terrio, name) for name in ["contour", "footprint", "buffer", "dissolve", "check_geometry", "make_valid"]):
+        suite.skipped = "needs GDAL >= 3.13 and current analysis bindings"
+        return suite
+    command = [sys.executable, str(SCRIPTS / "compare_analysis_bindings_with_gdal.py"), ctx.data, "--json"]
+    module = ROOT / "js" / "pkg-node" / "terrio.js"
+    node = shutil.which("node") is not None and module.is_file()
+    if node:
+        command += ["--js", module]
+    code, out, err = run(command)
+    try:
+        results = json.loads(out)
+    except json.JSONDecodeError:
+        suite.error = tail(err or out)
+        return suite
+    expected = 16 if node else 8
+    if len(results) != expected:
+        suite.cases.append(Case("Analysis bindings", "case count", DIFFERS, f"expected {expected} results, got {len(results)}"))
+    for result in results:
+        suite.cases.append(Case("Analysis bindings", result["name"], {"identical": IDENTICAL, "tolerance": TOLERANCE}.get(result["status"], DIFFERS), result["detail"]))
+    if code and not any(case.status == DIFFERS for case in suite.cases):
+        suite.error = tail(err or out)
+    return suite
+
+
 def suite_footprint(ctx):
     """Source attributes and multipart/singlepart footprints on real rasters."""
     suite = Suite(
@@ -1669,6 +2509,42 @@ def suite_footprint(ctx):
     if code != 0 or len(suite.cases) != 8:
         suite.error = tail(err or out)
     return suite
+
+
+def suite_hecras(ctx):
+    """HEC-RAS 7.0.1 geometry and plan HDF files against an independent h5py reading."""
+    s = Suite(
+        "hecras",
+        "HEC-RAS",
+        "h5py and NumPy, reading the datasets as ras-commander does (`scripts/hecras_oracle.py`)",
+        "The HEC-RAS 7.0.1 files of a corpus directory (`--hecras-data`, or `hecras/` in the test "
+        "data), a case per file: CRS text, units, mesh names, every cell polygon, face polyline and "
+        "perimeter ring, ghost counts, family features and their stored identities, and every "
+        "joined stored value (summaries with their time rows, static mesh arrays, time-step values "
+        "and series maxima, cross-section, structure, boundary-condition and reference results) "
+        "bit for bit. A refusal is accepted only where the test lists it. GDAL has no HEC-RAS "
+        "driver, so the reference is h5py, which ras-commander reads these files with.",
+    )
+    corpus = ctx.hecras_data or os.path.join(ctx.data, "hecras")
+    if not os.path.isdir(corpus):
+        s.skipped = f"no HEC-RAS corpus ({corpus}; set --hecras-data)"
+        return s
+    missing = missing_modules("h5py", "numpy")
+    if missing or not shutil.which("cargo"):
+        s.skipped = f"needs {', '.join(missing + ([] if shutil.which('cargo') else ['cargo']))}"
+        return s
+    code, out, err = run([sys.executable, str(SCRIPTS / "compare_hecras_with_h5py.py"), corpus])
+    # Exit 1 is a comparison with differences, which are DIFF lines; without one it is a failure.
+    if code not in (0, 1) or code == 1 and not re.search(r"^DIFF ", out, re.M):
+        s.error = tail(err or out)
+    for line in out.splitlines():
+        m = re.match(r"^(OK|DIFF) (.+?)(?:: (.*))?$", line)
+        if m:
+            model = m[2].split("/")[0]
+            s.cases.append(Case(model, m[2], IDENTICAL if m[1] == "OK" else DIFFERS, m[3] or ""))
+    if not s.cases and not s.error:
+        s.error = tail(err or out)
+    return s
 
 
 def suite_topology(ctx):
@@ -1795,6 +2671,61 @@ def suite_vector_dataset(ctx):
 
 
 
+def suite_xlsx(ctx):
+    """XLSX workbooks read and written by terrio against GDAL's driver."""
+    s = Suite(
+        "xlsx",
+        "XLSX workbooks",
+        "GDAL's XLSX driver",
+        "A workbook of hand-laid sheets (types, widening, gaps, formulas, blank and repeated headings) "
+        "read by both drivers under each HEADERS and FIELD_TYPES option, an ogr2ogr workbook read by "
+        "terrio, and terrio's workbooks read by GDAL. Field names, feature counts and values must "
+        "match; numbers compared as numbers, fractions of a second within 2 ms. Known differences, "
+        "reported as not compared: a boolean column with other numbers stays boolean in GDAL, which "
+        "loses the values, and GDAL ignored HEADERS=DISABLE on a sheet of cells without references.",
+    )
+    if missing_modules("osgeo"):
+        s.skipped = "needs osgeo"
+        return s
+    if shutil.which("ogr2ogr") is None:
+        s.skipped = "needs the GDAL command-line tools (ogr2ogr)"
+        return s
+    with tempfile.TemporaryDirectory(prefix="terrio-xlsx-suite-") as tmp:
+        report = os.path.join(tmp, "report.json")
+        code, out, err = run([sys.executable, str(SCRIPTS / "compare_xlsx_with_gdal.py"), "--terrio", ctx.terrio, "--json", report])
+        if not os.path.isfile(report):
+            s.error = tail(err or out)
+            return s
+        for r in json.loads(Path(report).read_text())["cases"]:
+            status = NOT_COMPARED if r.get("known") else r["status"]
+            s.cases.append(Case(r["name"].split(":")[0], r["name"], status, r.get("detail", "")))
+    return s
+
+
+def suite_xlsx_layout(ctx):
+    """XLSX layout options against openpyxl, which GDAL has no behavior to compare with."""
+    s = Suite(
+        "xlsx-layout",
+        "XLSX layout options",
+        "openpyxl",
+        "Workbooks written with terrio's layout options loaded by openpyxl: values, bold headers, frozen "
+        "panes, filters, column widths, number formats and the creation time. Workbooks written by "
+        "openpyxl, with merged headings over several rows and a table away from A1, read by terrio.",
+    )
+    if missing_modules("openpyxl"):
+        s.skipped = "needs openpyxl"
+        return s
+    with tempfile.TemporaryDirectory(prefix="terrio-xlsx-layout-") as tmp:
+        report = os.path.join(tmp, "report.json")
+        code, out, err = run([sys.executable, str(SCRIPTS / "compare_xlsx_with_openpyxl.py"), "--terrio", ctx.terrio, "--json", report])
+        if not os.path.isfile(report):
+            s.error = tail(err or out)
+            return s
+        for r in json.loads(Path(report).read_text())["cases"]:
+            s.cases.append(Case("xlsx layout", r["name"], r["status"], r.get("detail", "")))
+    return s
+
+
 def suite_vector_geom(ctx):
     """Vector geometry commands on real data against gdal vector and GEOS."""
     s = Suite(
@@ -1804,11 +2735,11 @@ def suite_vector_geom(ctx):
         "Tennessee and US counties, Las Vegas roads and Natural Earth countries and places: "
         "simplify, segmentize, swap-xy and set-geom-type against gdal vector, coordinate by "
         "coordinate; convex hulls by canonical WKB, concave hulls against OGR/GEOS by their edges (relative "
-        "symmetric-difference area <= 0.2 where erosion order differs); combine and sort "
+        "symmetric-difference area <= 1e-10, scaled Hausdorff distance <= 1e-10, both valid); combine and sort "
         "against GDAL 3.13's algorithms (GEOS's STR tree, GDAL's Hilbert code), ties aside.",
     )
-    if missing_modules("osgeo"):
-        s.skipped = "needs osgeo with GEOS"
+    if missing_modules("osgeo", "shapely"):
+        s.skipped = "needs osgeo with GEOS and shapely"
         return s
     if not shutil.which("gdal"):
         s.skipped = "needs the gdal command (GDAL >= 3.12)"
@@ -1855,6 +2786,195 @@ def suite_vector_geom(ctx):
     return s
 
 
+def suite_vector_clip(ctx):
+    """Vector clipping on real county, road and place features."""
+    suite = Suite("vector-clip", "Vector clipping", "GDAL 3.13.3 gdal vector clip",
+                  "Tennessee counties, Las Vegas roads and Natural Earth places: bbox, polygon, "
+                  "filtered vector templates, raster bounds and clipping-CRS transforms. "
+                  "Exact schema/attributes/CRS/types and source IDs, per-dimension coverage. "
+                  "Area symmetric difference <= 1e-9, relative line length <= 1e-9; "
+                  "coordinate-scaled Hausdorff distance <= 1e-9. Transformed-boundary point inclusion is exact.")
+    if missing_modules("osgeo", "shapely") or not shutil.which("gdal") or run(["gdal", "vector", "clip", "--help"])[0] != 0:
+        suite.skipped = "needs GDAL 3.13 with the vector clip command, GEOS and shapely"
+        return suite
+    needed = ("TN_Counties.geojson", "las_vegas_roads.geojson", "ne_places/ne_10m_populated_places_simple.shp", "usgs_dem.tif")
+    if any(not os.path.isfile(os.path.join(ctx.data, name)) for name in needed):
+        suite.skipped = "needs " + ", ".join(needed)
+        return suite
+    code, out, err = run([sys.executable, str(SCRIPTS / "compare_vector_clip_with_gdal.py"), ctx.data,
+                          "--terrio", ctx.terrio, "--json"])
+    try:
+        rows = json.loads(out)
+    except (ValueError, TypeError) as error:
+        suite.error = str(error) + ": " + tail(err or out)
+        return suite
+    if len(rows) != 27:
+        suite.error = f"expected 27 vector clip comparisons, got {len(rows)}"
+    for row in rows:
+        suite.cases.append(Case("vector-clip", row["name"], row["status"], row.get("detail", "")))
+    if code:
+        suite.error = tail(err or out)
+    return suite
+
+
+def suite_coverage(ctx):
+    """Polygon coverage errors against GDAL on real county boundaries."""
+    suite = Suite("coverage", "Polygon coverage validation", "GDAL 3.13.3 gdal vector check-coverage",
+                  "Projected Tennessee counties and derived splits, overlaps, duplicates and gaps. "
+                  "Exact invalid edge sets, empty schema, output IDs, CRS, types and layer names; "
+                  "valid feature correspondence with include-valid.")
+    if missing_modules("osgeo") or not shutil.which("gdal") or run(["gdal", "vector", "check-coverage", "--help"])[0] != 0:
+        suite.skipped = "needs GDAL with GEOS and the vector check-coverage command"
+        return suite
+    if not os.path.isfile(os.path.join(ctx.data, "TN_Counties.geojson")):
+        suite.skipped = "needs TN_Counties.geojson (scripts/fetch_test_data.sh)"
+        return suite
+    code, out, err = run([sys.executable, str(SCRIPTS / "compare_coverage_with_gdal.py"), ctx.data, "--terrio", ctx.terrio, "--json"])
+    try:
+        rows = json.loads(out)
+        for row in rows:
+            suite.cases.append(Case("check-coverage", row["name"], row["status"], row["detail"]))
+    except (ValueError, KeyError, TypeError) as error:
+        suite.error = f"{error}: {tail(err or out)}"
+        return suite
+    if code:
+        suite.error = tail(err or "coverage comparison process failed")
+    return suite
+
+
+def suite_coverage_simplify(ctx):
+    """Shared coverage simplification, including metadata and global topology."""
+    suite = Suite("coverage-simplify", "Coverage simplification", "GDAL 3.13.3 gdal vector simplify-coverage",
+                  "Projected Tennessee counties, shared zigzags, holes, islands, empty polygons and active-layer copying. "
+                  "Exact retained edge coordinates/multiplicity, attributes, output IDs, types, CRS and names. "
+                  "GDAL independently checks output coverage validity.")
+    if missing_modules("osgeo") or not shutil.which("gdal") or run(["gdal", "vector", "simplify-coverage", "--help"])[0] != 0:
+        suite.skipped = "needs GDAL with GEOS and the vector simplify-coverage command"
+        return suite
+    if not os.path.isfile(os.path.join(ctx.data, "TN_Counties.geojson")):
+        suite.skipped = "needs TN_Counties.geojson (scripts/fetch_test_data.sh)"
+        return suite
+    code, out, err = run([sys.executable, str(SCRIPTS / "compare_coverage_simplify_with_gdal.py"), ctx.data, "--terrio", ctx.terrio, "--json"])
+    try:
+        for row in json.loads(out):
+            suite.cases.append(Case("simplify-coverage", row["name"], row["status"], row["detail"]))
+    except (ValueError, KeyError, TypeError) as error:
+        suite.error = f"{error}: {tail(err or out)}"
+        return suite
+    if code:
+        suite.error = tail(err or "coverage simplification comparison process failed")
+    return suite
+
+
+def suite_layer_algebra(ctx):
+    """All seven layer-algebra operations on polygons, lines, points and collections."""
+    suite = Suite("layer-algebra", "Vector layer algebra", "GDAL 3.13.3 / OGR layer algebra",
+                  "Seven operations, both lower-dimension settings, null/empty and collection inputs, "
+                  "projected Tennessee counties and Las Vegas roads. Schema, attributes, sequential IDs, CRS, feature types and validity; "
+                  "exact normalized WKB where equal, otherwise polygon relative area tolerance 1e-7, "
+                  "line relative length 1e-8 and bidirectional vertex distance 1e-7 CRS units.")
+    if missing_modules("osgeo"):
+        suite.skipped = "needs GDAL with GEOS"
+        return suite
+    from osgeo import gdal, ogr
+    suite.reference = f"GDAL {gdal.VersionInfo('RELEASE_NAME')} / OGR layer algebra"
+    try:
+        if ogr.CreateGeometryFromWkt("POINT (0 0)").Buffer(1) is None:
+            raise RuntimeError("GEOS unavailable")
+    except Exception:
+        suite.skipped = "needs GDAL with GEOS"
+        return suite
+    if not all(os.path.isfile(os.path.join(ctx.data, name)) for name in ["TN_Counties.geojson", "las_vegas_roads.geojson"]):
+        suite.skipped = "needs real counties and roads (scripts/fetch_test_data.sh)"
+        return suite
+    code, out, err = run([sys.executable, str(SCRIPTS / "compare_layer_algebra_with_gdal.py"), ctx.data, "--terrio", ctx.terrio, "--json"])
+    try:
+        for row in json.loads(out):
+            suite.cases.append(Case("layer-algebra", row["name"], row["status"], row["detail"]))
+    except (ValueError, KeyError, TypeError) as error:
+        suite.error = f"{error}: {tail(err or out)}"
+        return suite
+    if code and not any(case.status == DIFFERS for case in suite.cases):
+        suite.error = tail(err or "layer algebra comparison process failed")
+    return suite
+
+
+def suite_pipeline(ctx):
+    """Composed raster/vector operations and bidirectional saved definitions."""
+    suite = Suite("pipeline", "Raster/vector pipelines", "GDAL 3.13.3 pipelines",
+                  "Pixels, masks, types, nodata, color, CRS and affine transforms; vector schemas, "
+                  "attributes, validity and geometry. Polygon relative area tolerance 1e-7 (buffer 5e-4), "
+                  "line relative length 1e-8 and displacement 1e-7, point displacement 1e-8. "
+                  "Derived statistics and GDALG definitions produced by each implementation. "
+                  "A discrete GeoPackage writer-ID policy difference is explicitly recorded; native sequential IDs are independently checked.")
+    if missing_modules("osgeo", "numpy") or shutil.which("gdal") is None or run(["gdal", "pipeline", "--help"])[0] != 0:
+        suite.skipped = "needs GDAL pipeline command, bindings and NumPy"
+        return suite
+    if not all(os.path.isfile(os.path.join(ctx.data, name)) for name in ["usgs_dem.tif", "TN_Counties.geojson"]):
+        suite.skipped = "needs real DEM and counties (scripts/fetch_test_data.sh)"
+        return suite
+    code, out, err = run([sys.executable, str(SCRIPTS / "compare_pipeline_with_gdal.py"), ctx.data, "--terrio", ctx.terrio, "--json"])
+    try:
+        for row in json.loads(out):
+            suite.cases.append(Case("pipeline", row["name"], row["status"], row["detail"]))
+    except (ValueError, KeyError, TypeError) as error:
+        suite.error = f"{error}: {tail(err or out)}"
+        return suite
+    if code and not any(case.status == DIFFERS for case in suite.cases):
+        suite.error = tail(err or "pipeline comparison process failed")
+    return suite
+
+
+def suite_coverage_clean(ctx):
+    """Coverage cleaning against GDAL on county boundaries and overlaps."""
+    suite = Suite("coverage-clean", "Polygon coverage cleaning", "GDAL 3.13.3 gdal vector clean-coverage",
+                  "Projected Tennessee counties, overlaps, duplicates, enclosed gaps and inlets; "
+                  "all four merge strategies and deterministic three-rectangle probes. Exact schema/attributes/IDs/types/CRS; "
+                  "relative symmetric-difference area tolerance 1e-8 and independent coverage validity. "
+                  "Ordering differences require an exact cyclic-input GDAL match or independent legal greedy-merge witnesses for both outputs; "
+                  "the latter do not claim per-feature geometry/type equality.")
+    if missing_modules("osgeo") or not shutil.which("gdal") or run(["gdal", "vector", "clean-coverage", "--help"])[0] != 0:
+        suite.skipped = "needs GDAL with GEOS and the vector clean-coverage command"
+        return suite
+    if not os.path.isfile(os.path.join(ctx.data, "TN_Counties.geojson")):
+        suite.skipped = "needs TN_Counties.geojson (scripts/fetch_test_data.sh)"
+        return suite
+    code, out, err = run([sys.executable, str(SCRIPTS / "compare_coverage_clean_with_gdal.py"), ctx.data, "--terrio", ctx.terrio, "--json"])
+    try:
+        rows = json.loads(out)
+        for row in rows:
+            suite.cases.append(Case("clean-coverage", row["name"], row["status"], row["detail"]))
+    except (ValueError, KeyError, TypeError) as error:
+        suite.error = f"{error}: {tail(err or out)}"
+        return suite
+    if code:
+        suite.error = tail(err or "coverage cleaning comparison process failed")
+    return suite
+
+
+def suite_wfs(ctx):
+    """Native WFS catalogs and complete public feature reads versus GDAL."""
+    suite = Suite("wfs", "WFS services and extensionless responses", "GDAL WFS/GML/GeoJSON",
+                  "Public WFS 1.0/1.1/2.0 catalogs; selected complete layers and opaque GetFeature URLs. "
+                  "Exact field names, attributes, source IDs and CRS; field types checked, with direct GML integer inference differences reported. "
+                  "Every linear geometry vertex within 1e-8 CRS units. Unavailable reference services are not compared. Generated numeric FIDs are ignored.")
+    if missing_modules("osgeo"):
+        suite.skipped = "needs GDAL Python bindings"
+        return suite
+    command = [sys.executable, str(SCRIPTS / "compare_wfs_with_gdal.py"), "--terrio", ctx.terrio, "--json"]
+    if ctx.remote:
+        command.append("--remote")
+    code, out, err = run(command)
+    try:
+        for row in json.loads(out):
+            suite.cases.append(Case("wfs", row["name"], row["status"], row["detail"]))
+    except (ValueError, KeyError, TypeError) as error:
+        suite.error = f"{error}: {tail(err or out)}"
+    if code and not suite.error and not any(case.status == DIFFERS for case in suite.cases):
+        suite.error = tail(err or "WFS comparison failed")
+    return suite
+
+
 SUITES = OrderedDict(
     [
         ("summaries", suite_summaries),
@@ -1862,12 +2982,17 @@ SUITES = OrderedDict(
         ("histograms", suite_histograms),
         ("vector-roundtrip", suite_vector_roundtrip),
         ("cad", suite_cad),
+        ("cityjson", suite_cityjson),
+        ("cityjson-write", suite_cityjson_write),
+        ("citygml-write", suite_citygml_write),
+        ("citygml", suite_citygml),
         ("shapefile-archives", suite_shapefile_archives),
         ("vsi", suite_vsi),
         ("shapefile-rings", suite_shapefile_rings),
         ("raster-roundtrip", suite_raster_roundtrip),
         ("windows", suite_windows),
         ("ops", suite_ops),
+        ("raster-masks", suite_raster_masks),
         ("warp-policy", suite_warp_policy),
         ("benchmark-metadata", suite_benchmark_metadata),
         ("benchmark-compat", suite_benchmark_compat),
@@ -1878,6 +3003,8 @@ SUITES = OrderedDict(
         ("indexes", suite_indexes),
         ("geolocation", suite_geolocation),
         ("dem-calc", suite_dem_calc),
+        ("gpkg-repack", suite_gpkg_repack),
+        ("gpkg-validate", suite_gpkg_validate),
         ("pansharpen", suite_pansharpen),
         ("vector-grid", suite_vector_grid),
         ("lineref", suite_lineref),
@@ -1886,26 +3013,55 @@ SUITES = OrderedDict(
         ("raster-query", suite_raster_query),
         ("raster-pixel", suite_raster_pixel),
         ("blend", suite_blend),
+        ("palette", suite_palette),
+        ("raster-tiles", suite_raster_tiles),
+        ("retile", suite_retile),
+        ("tile-publication", suite_tile_publication),
+        ("cog-validate", suite_cog_validate),
+        ("identify", suite_identify),
+        ("dataset-files", suite_dataset_files),
+        ("parquet-metadata", suite_parquet_metadata),
+        ("parquet-zstd", suite_parquet_zstd),
+        ("dataset-check", suite_dataset_check),
         ("focal", suite_focal),
         ("vector-ops", suite_vector_ops),
         ("multidim", suite_multidim),
+        ("mdmosaic", suite_mdmosaic),
         ("topology", suite_topology),
+        ("layer-algebra", suite_layer_algebra),
+        ("pipeline", suite_pipeline),
+        ("coverage", suite_coverage),
+        ("coverage-simplify", suite_coverage_simplify),
+        ("coverage-clean", suite_coverage_clean),
         ("vector-geom", suite_vector_geom),
+        ("vector-clip", suite_vector_clip),
         ("vector-dataset", suite_vector_dataset),
+        ("xlsx", suite_xlsx),
+        ("xlsx-layout", suite_xlsx_layout),
+        ("rpftoc", suite_rpftoc),
         ("footprint", suite_footprint),
+        ("analysis-bindings", suite_analysis_bindings),
+        ("zonal-bindings", suite_zonal_bindings),
         ("analysis-output", suite_analysis_output),
         ("arrow", suite_arrow),
         ("gpkg", suite_gpkg),
         ("streams", suite_streams),
+        ("wfs", suite_wfs),
         ("tiles", suite_tiles),
+        ("tile-rgba", suite_tile_rgba),
         ("grib", suite_grib),
         ("pointclouds", suite_pointclouds),
         ("lazy-geotiff", suite_lazy_geotiff),
+        ("hecras", suite_hecras),
         ("crs", suite_crs),
         ("geocentric", suite_geocentric),
         ("perspective", suite_perspective),
+        ("omerc-two-point", suite_omerc_two_point),
         ("igh", suite_igh),
         ("ob_tran", suite_ob_tran),
+        ("qsc", suite_qsc),
+        ("healpix", suite_healpix),
+        ("isea", suite_isea),
         ("projjson", suite_projjson),
         ("projjson-export", suite_projjson_export),
         ("iau", suite_iau),
@@ -1921,13 +3077,14 @@ def tally(cases):
         cases: The cases.
 
     Returns:
-        A ``(total, identical, within tolerance, not compared, differing)`` tuple.
+        A ``(total, identical, within tolerance, expected rejections, not compared, differing)`` tuple.
     """
     n = len(cases)
     same = sum(1 for c in cases if c.status == IDENTICAL)
     tol = sum(1 for c in cases if c.status == TOLERANCE)
+    rejected = sum(1 for c in cases if c.status == EXPECTED_REJECTION)
     unchecked = sum(1 for c in cases if c.status == NOT_COMPARED)
-    return n, same, tol, unchecked, n - same - tol - unchecked
+    return n, same, tol, rejected, unchecked, n - same - tol - rejected - unchecked
 
 
 def versions(ctx):
@@ -2007,7 +3164,8 @@ def markdown(suites, ctx, vers):
             "files: the files of `scripts/fetch_test_data.sh` (Natural Earth, USGS 3DEP, Sentinel-2, NASA "
             "ECOSTRESS and OPERA, OpenStreetMap and more, with copies GDAL derives in other formats), and "
             "synthetic rasters for the driver round trips. Each case is **identical** to the reference, "
-            "**within tolerance** (the suite says which), or **differs**. Regenerate this page with:"
+            "**within tolerance** (the suite says which), an **expected rejection**, **not compared**, "
+            "or **differs**. Regenerate this page with:"
         ),
         "",
         "```sh",
@@ -2019,19 +3177,19 @@ def markdown(suites, ctx, vers):
         "",
         "## Summary",
         "",
-        "| Suite | Reference | Cases | Identical | Within tolerance | Not compared | Differs |",
-        "|---|---|---:|---:|---:|---:|---:|",
+        "| Suite | Reference | Cases | Identical | Within tolerance | Expected rejection | Not compared | Differs |",
+        "|---|---|---:|---:|---:|---:|---:|---:|",
     ]
-    totals = [0, 0, 0, 0, 0]
+    totals = [0, 0, 0, 0, 0, 0]
     for s in suites:
         link = f"[{s.title}](#{re.sub(r'[^a-z0-9 -]', '', s.title.lower()).replace(' ', '-')})"
         if s.skipped or s.error:
             note = f"skipped: {s.skipped}" if s.skipped else "could not run"
-            lines.append(f"| {link} | {s.reference} | {note} | | | | |")
+            lines.append(f"| {link} | {s.reference} | {note} | | | | | |")
             continue
-        n, same, tol, unchecked, diff = tally(s.cases)
-        totals = [a + b for a, b in zip(totals, (n, same, tol, unchecked, diff), strict=True)]
-        lines.append(f"| {link} | {s.reference} | {n:,} | {same:,} | {tol:,} | {unchecked:,} | {diff:,} |")
+        n, same, tol, rejected, unchecked, diff = tally(s.cases)
+        totals = [a + b for a, b in zip(totals, (n, same, tol, rejected, unchecked, diff), strict=True)]
+        lines.append(f"| {link} | {s.reference} | {n:,} | {same:,} | {tol:,} | {rejected:,} | {unchecked:,} | {diff:,} |")
     lines.append("| **All** | | " + " | ".join(f"**{t:,}**" for t in totals) + " |")
     for s in suites:
         lines += ["", f"## {s.title}", "", s.criteria, ""]
@@ -2041,13 +3199,13 @@ def markdown(suites, ctx, vers):
         if s.error:
             lines += ["The suite could not run:", "", "```text", s.error, "```"]
             continue
-        lines += ["| Format or operation | Cases | Identical | Within tolerance | Not compared | Differs |", "|---|---:|---:|---:|---:|---:|"]
+        lines += ["| Format or operation | Cases | Identical | Within tolerance | Expected rejection | Not compared | Differs |", "|---|---:|---:|---:|---:|---:|---:|"]
         groups = OrderedDict()
         for c in s.cases:
             groups.setdefault(c.group, []).append(c)
         for group, cases in groups.items():
-            n, same, tol, unchecked, diff = tally(cases)
-            lines.append(f"| {md_escape(group)} | {n:,} | {same:,} | {tol:,} | {unchecked:,} | {diff:,} |")
+            n, same, tol, rejected, unchecked, diff = tally(cases)
+            lines.append(f"| {md_escape(group)} | {n:,} | {same:,} | {tol:,} | {rejected:,} | {unchecked:,} | {diff:,} |")
         others = [c for c in s.cases if c.status != IDENTICAL]
         if others:
             limit = ctx.max_details
@@ -2079,6 +3237,7 @@ def main():
     ap.add_argument("--remote", action="store_true", help="also compare windowed reads of public COGs over HTTP")
     ap.add_argument("--max-details", type=int, default=60, help="non-identical cases listed per suite (default 60)")
     ap.add_argument("--strict", action="store_true", help="exit non-zero when any case differs")
+    ap.add_argument("--hecras-data", help="the HEC-RAS corpus directory (default: hecras/ in the test data)")
     a = ap.parse_args()
 
     names = list(SUITES)
@@ -2091,16 +3250,20 @@ def main():
         ap.error(f"unknown suite(s) {', '.join(unknown)} (suites: {', '.join(SUITES)})")
     if not os.path.isdir(a.data):
         ap.error(f"{a.data} is not a directory")
-    if not os.path.exists(a.terrio):
+    # The HEC-RAS suite runs the library's tests through Cargo, not the CLI.
+    hecras_only = names == ["hecras"]
+    if not hecras_only and not os.path.exists(a.terrio):
         ap.error(f"{a.terrio} does not exist: run `cargo build --release` first, or pass --terrio")
 
-    ctx = argparse.Namespace(data=a.data, terrio=os.path.abspath(a.terrio), remote=a.remote, max_details=a.max_details)
-    ctx.names = format_names(ctx.terrio)
+    ctx = argparse.Namespace(
+        data=a.data, terrio=os.path.abspath(a.terrio), remote=a.remote, max_details=a.max_details, hecras_data=a.hecras_data
+    )
+    ctx.names = {} if hecras_only else format_names(ctx.terrio)
     gdal_missing = missing_modules("osgeo", "numpy")
 
     def go(name):
         start = datetime.datetime.now()
-        if gdal_missing and name not in ("pointclouds", "crs", "vsi"):
+        if gdal_missing and name not in ("pointclouds", "crs", "grib", "vsi", "hecras", "citygml", "cityjson", "cityjson-write", "citygml-write"):
             fn = SUITES[name]
             s = Suite(name, name, "", fn.__doc__ or "")
             s.skipped = "needs the Python modules " + ", ".join(gdal_missing)
@@ -2111,11 +3274,11 @@ def main():
                 s = Suite(name, name, "", "")
                 s.error = f"{type(e).__name__}: {e}"
         s.seconds = (datetime.datetime.now() - start).total_seconds()
-        n, same, tol, unchecked, diff = tally(s.cases)
+        n, same, tol, rejected, unchecked, diff = tally(s.cases)
         state = (
             f"skipped ({s.skipped})"
             if s.skipped
-            else ("ERROR" if s.error else f"{n} cases: {same} identical, {tol} within tolerance, {unchecked} not compared, {diff} differ")
+            else ("ERROR" if s.error else f"{n} cases: {same} identical, {tol} within tolerance, {rejected} expected rejection, {unchecked} not compared, {diff} differ")
         )
         print(f"{name:<17} {state} [{s.seconds:.0f} s]", file=sys.stderr, flush=True)
         return s

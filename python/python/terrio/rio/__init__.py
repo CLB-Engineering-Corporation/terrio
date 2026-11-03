@@ -1,3 +1,11 @@
+# SPDX-FileCopyrightText: Copyright (c) 2013-2021, Mapbox
+# SPDX-FileCopyrightText: Copyright (c) 2026 Qiusheng Wu and Terrio contributors
+# SPDX-License-Identifier: MIT AND BSD-3-Clause
+#
+# Derived from (adapted and modified):
+#   rasterio 1.5.2:
+#     rasterio/__init__.py
+
 """A rasterio-compatible API on top of terrio: `import terrio.rio as rasterio`.
 
 Typical rasterio scripts switch with an import change::
@@ -29,6 +37,7 @@ from typing import Any, NamedTuple
 from affine import Affine
 
 from terrio import __version__ as _terrio_version
+from terrio import _terrio
 from terrio.rio import (
     coords,
     crs,
@@ -229,6 +238,13 @@ def open(
         ds._env.callback(memfile.close)
         ds._env.callback(flush)
         return ds
+    if (
+        io.is_mem_pointer_name(fp)
+        and mode in ("r", "r+")
+        and (not driver or driver.upper() == "MEM")
+        and "MEM" in (_terrio.allowed_drivers("raster") or ["MEM"])
+    ):
+        return io.MemPointerDataset(fp, mode)
     path = os.fspath(fp) if not isinstance(fp, str) else fp
     if mode == "r":
         return DatasetReader(path, driver=driver, **kwargs)

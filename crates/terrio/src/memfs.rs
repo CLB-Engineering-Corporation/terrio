@@ -26,7 +26,16 @@ fn key(p: &Path) -> Option<String> {
 }
 
 fn files() -> std::sync::MutexGuard<'static, BTreeMap<String, Arc<Vec<u8>>>> {
+    crate::par::fork_safe();
     FILES.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Holds the lock of the files in memory across a fork, for [`crate::par`]: the forking thread
+/// takes it before the process is copied and lets it go after, so that the child never starts with
+/// it held by a thread it does not have.
+#[cfg(all(unix, not(target_family = "wasm")))]
+pub(crate) fn hold_for_fork(held: &mut Vec<Box<dyn std::any::Any>>) {
+    held.push(Box::new(files()));
 }
 
 /// Files mounted under a virtual directory, removed when dropped.
@@ -125,6 +134,29 @@ impl AsRef<[u8]> for SharedBytes {
     fn as_ref(&self) -> &[u8] {
         &self.0
     }
+}
+
+/// Atomically replace exactly the immutable image read earlier. A deletion or a newer
+/// write must not be undone by a transformation computed outside the store lock.
+pub(crate) fn replace_if_unchanged(p: &Path, expected: &SharedBytes, bytes: Vec<u8>) -> std::io::Result<()> {
+    let key = key(p).ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "expected an in-memory path"))?;
+    let mut store = files();
+    if !store.get(&key).is_some_and(|current| Arc::ptr_eq(current, &expected.0)) {
+        return Err(std::io::Error::new(std::io::ErrorKind::WouldBlock, format!("{key}: file changed while being transformed")));
+    }
+    store.insert(key, Arc::new(bytes));
+    Ok(())
+}
+
+/// Publish a new memory file without replacing an intervening write.
+pub(crate) fn write_if_absent(p: &Path, bytes: Vec<u8>) -> std::io::Result<()> {
+    let key = key(p).ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "expected an in-memory path"))?;
+    let mut store = files();
+    if store.contains_key(&key) {
+        return Err(std::io::Error::new(std::io::ErrorKind::AlreadyExists, format!("{key}: file appeared while being written")));
+    }
+    store.insert(key, Arc::new(bytes));
+    Ok(())
 }
 
 /// Moves a file in memory to another path, replacing any file there, without copying its bytes;

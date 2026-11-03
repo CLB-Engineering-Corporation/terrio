@@ -1,3 +1,13 @@
+// SPDX-FileCopyrightText: Copyright (c) 1998, 2002, Frank Warmerdam
+// SPDX-FileCopyrightText: Copyright (c) 2007-2015, Even Rouault <even dot rouault at spatialys.com>
+// SPDX-FileCopyrightText: Copyright (c) 2015, Faza Mahamood
+// SPDX-FileCopyrightText: Copyright (c) 2026 Qiusheng Wu and Terrio contributors
+// SPDX-License-Identifier: MIT
+//
+// Derived from (translated to Rust and modified):
+//   GDAL v3.13.3:
+//     apps/gdal_translate_lib.cpp
+
 //! Subsetting, resizing, rescaling and type conversion: an equivalent of `gdal_translate`.
 //!
 //! As in GDAL, the output is a window of the source (`srcwin`, or `projwin` in georeferenced
@@ -244,6 +254,19 @@ pub fn translate(ds: &RasterDataset, o: &TranslateOptions) -> Result<RasterDatas
     let mut res = super::build_raster_data(grid, out, bands.len(), out_nodata.first().copied().flatten(), &srs)?;
     res.raster.metadata = ds.raster.metadata.iter().filter(|(k, _)| k == "AREA_OR_POINT").cloned().collect();
     res.band_metadata = bands.iter().map(|&b| ds.band_metadata.get(b - 1).cloned().unwrap_or_default()).collect();
+    if win != (0., 0., w, h)
+        || ow != r.cols
+        || oh != r.rows
+        || out_type != r.data_type
+        || o.scale.is_some()
+        || o.exponent.is_some()
+        || o.assign_nodata.is_some()
+    {
+        for band in &mut res.band_metadata {
+            band.items.retain(|(key, _)| !key.starts_with("STATISTICS_"));
+        }
+    }
+
     if o.assign_ullr.is_none() {
         res.gcps = ds
             .gcps

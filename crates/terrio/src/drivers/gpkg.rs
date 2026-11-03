@@ -1,3 +1,9 @@
+// Written to match the behavior of:
+//   GDAL v3.13.3:
+//     ogr/ogrsf_frmts/gpkg/gdalgeopackagerasterband.cpp
+//     ogr/ogrsf_frmts/gpkg/ogrgeopackagedatasource.cpp
+// No code is translated from these sources.
+
 //! GeoPackage rasters: tile pyramids (PNG or JPEG tiles) and 2D gridded coverages (16-bit PNG
 //! or 32-bit float TIFF tiles), read at full resolution (the highest zoom level), over the extent
 //! in `gpkg_contents`, as GDAL reads them; and written as GDAL writes them.
@@ -59,7 +65,8 @@ fn decode_tile(b: &[u8]) -> Result<Tile> {
         return Ok((w, h, bands, values));
     }
     if b.starts_with(&[0xff, 0xd8]) {
-        let img = crate::jpeg::decode_file(b).map_err(|e| err(&e))?;
+        let img = crate::jpeg::decode_file(b)
+            .map_err(|e| if crate::jpeg::is_resource_refusal(&e) { Error::ResourceLimit(e.to_string()) } else { err(&e) })?;
         return Ok((img.width, img.height, img.components, img.data.into_iter().map(f64::from).collect()));
     }
     if b.starts_with(b"II*\0") || b.starts_with(b"MM\0*") {
@@ -160,7 +167,7 @@ pub(crate) fn parse_subdataset(name: &str) -> Option<(String, String)> {
 }
 
 /// Reads a raster table (the first when `table` is `None`).
-fn read_db(db: &Db, table: Option<&str>, path: &Path) -> Result<RasterDataset> {
+pub(crate) fn read_db(db: &Db, table: Option<&str>, path: &Path) -> Result<RasterDataset> {
     let contents = db.table("gpkg_contents")?;
     let row = contents
         .rows

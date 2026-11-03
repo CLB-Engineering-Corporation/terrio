@@ -1,3 +1,11 @@
+// SPDX-FileCopyrightText: Copyright (c) 2020, Even Rouault <even dot rouault at spatialys.com>
+// SPDX-FileCopyrightText: Copyright (c) 2026 Qiusheng Wu and Terrio contributors
+// SPDX-License-Identifier: MIT
+//
+// Derived from (translated to Rust and modified):
+//   GDAL v3.13.3:
+//     frmts/stacta/stactadataset.cpp
+
 //! STAC items with tiled assets (STACTA), read as GDAL's STACTA driver reads them.
 //!
 //! An item of the [tiled-assets extension](https://github.com/stac-extensions/tiled-assets)
@@ -22,8 +30,8 @@
 //!   them. terrio opens the first of them and lists them all, as it does for other files of
 //!   several rasters.
 //!
-//! terrio keeps one data type and nodata value per raster: bands of different `raster:bands`
-//! data types are read as `Float64`, and the first band's nodata value is the raster's. Tiles
+//! Mixed-type multiband buffers use `Float64`; windows selecting one sample type retain its declared
+//! sample type, and per-band nodata metadata is retained. Tiles
 //! are assembled through 64-bit floats, so `Int64` and `UInt64` values beyond 2^53 lose
 //! precision. A remote item does not name local files.
 //!
@@ -89,12 +97,22 @@ fn sniff_local(path: &str) -> bool {
         return false;
     }
     let crate::vfs::Location::Local(p) = crate::vfs::Location::parse(path) else { return false };
-    let mut head = Vec::with_capacity(32768);
+    let mut head = Vec::with_capacity(SNIFF_BYTES as usize);
     let Ok(f) = std::fs::File::open(p) else { return false };
-    if std::io::Read::read_to_end(&mut std::io::Read::take(f, 32768), &mut head).is_err() {
+    if std::io::Read::read_to_end(&mut std::io::Read::take(f, SNIFF_BYTES), &mut head).is_err() {
         return false;
     }
-    let head = String::from_utf8_lossy(&head);
+    names_tiled_assets(&head)
+}
+
+/// The bytes GDAL looks at to identify an item: its first 32,768 (`STACTADataset::Identify`
+/// tries the first 1,024, then `TryToIngest(32768)`).
+pub(crate) const SNIFF_BYTES: u64 = 32768;
+
+/// Whether the first bytes of a document name the tiled-assets extension among its
+/// `stac_extensions`, as GDAL identifies a STACTA item (`frmts/stacta/stactadataset.cpp`).
+pub(crate) fn names_tiled_assets(head: &[u8]) -> bool {
+    let head = String::from_utf8_lossy(head);
     head.contains("\"stac_extensions\"")
         && (head.contains("\"tiled-assets\"")
             || head.contains("https:\\/\\/stac-extensions.github.io\\/tiled-assets\\/")
@@ -162,10 +180,11 @@ pub(crate) fn open_named_or_local(path: &str) -> Option<Result<LazyRaster>> {
 /// Opens a STACTA dataset lazily: a `STACTA:` name, a local item, or a remote `.json` one.
 /// `None` when `path` is none of these.
 ///
-/// A remote `.json` document is fetched to see whether it is an item of tiled assets (only on
+/// A remote `.json` document is identified as GDAL identifies one, by its first bytes (at most
+/// [`SNIFF_BYTES`], read by range): only an item of tiled assets is then fetched whole (only on
 /// this lazy path: `open` and `info` route remote items through the STAC module's single
-/// fetch); one that cannot be fetched is that error, and one that is not JSON or not tiled
-/// assets is left to the other drivers.
+/// fetch). One whose first bytes cannot be read is that error, and one that is not JSON or not
+/// tiled assets is left to the other drivers.
 pub(crate) fn open_lazy(path: &str) -> Option<Result<LazyRaster>> {
     if let Some(r) = open_named_or_local(path) {
         return Some(r);
@@ -174,6 +193,22 @@ pub(crate) fn open_lazy(path: &str) -> Option<Result<LazyRaster>> {
     let loc = crate::vfs::Location::parse(path);
     if !base.ends_with(".json") || loc.is_local() || matches!(loc, crate::vfs::Location::Zip { .. }) {
         return None;
+    }
+    #[cfg(remote)]
+    {
+        let remote = loc.remote()?;
+        // GDAL's two looks: the first bytes the open reads anyway, then up to 32,768.
+        let head = match crate::http::head(&remote, crate::http::FIRST_READ) {
+            Ok(h) => h,
+            Err(e) => return Some(Err(e)),
+        };
+        if !names_tiled_assets(&head) {
+            match crate::http::head(&remote, SNIFF_BYTES) {
+                Ok(h) if names_tiled_assets(&h) => {}
+                Ok(_) => return None,
+                Err(e) => return Some(Err(e)),
+            }
+        }
     }
     let bytes = match crate::stac::fetch(path) {
         Ok(b) => b,
@@ -366,8 +401,9 @@ struct Level {
 struct Tiled {
     levels: Vec<Level>,
     data_type: DataType,
-    /// The value of pixels outside the tiles and of missing ones: the nodata value, else 0.
-    fill: f64,
+    band_types: Vec<DataType>,
+    /// The fill values band by band: each band's nodata value, else 0.
+    band_fills: Vec<f64>,
     skip_missing: bool,
     block: (usize, usize),
     /// Tiles opened (`None` for missing ones), by href, reused by later windows.
@@ -430,9 +466,23 @@ fn config_true(key: &str) -> bool {
     std::env::var(key).is_ok_and(|v| !matches!(v.trim().to_ascii_uppercase().as_str(), "NO" | "FALSE" | "OFF" | "0"))
 }
 
+/// Refuses a STACTA item when a raster allow-list is set without the STACTA driver: an item is a
+/// pointer format (its tiles are other files, remote ones too), which opens only when named, as
+/// GDAL opens it only with its STACTA driver registered. Its JSON reads as STAC by content, so a
+/// list that allows STAC does not allow STACTA.
+fn check_allowed() -> Result<()> {
+    match crate::formats::allowed_drivers(Some(crate::formats::Kind::Raster)) {
+        Some(list) if !list.iter().any(|d| crate::formats::canonical_driver_name(d) == "STACTA") => {
+            Err(Error::Unsupported(format!("STACTA: the STACTA driver is not allowed (allowed: {})", list.join(", "))))
+        }
+        _ => Ok(()),
+    }
+}
+
 /// Opens an asset of an item at a tile matrix set (by default, the first of each), or lists the
 /// subdatasets of an item of several when neither is asked for. `extra` is metadata to add.
 fn open_item(item: &Item, asset: Option<&str>, tms: Option<&str>, extra: Vec<(String, String)>) -> Result<Opened> {
+    check_allowed()?;
     let doc = &item.doc;
     let props = doc["properties"].as_object().ok_or_else(|| bad("Missing properties"))?;
     let templates = doc["asset_templates"].as_object().ok_or_else(|| bad("Missing asset_templates"))?;
@@ -546,6 +596,8 @@ fn open_item(item: &Item, asset: Option<&str>, tms: Option<&str>, extra: Vec<(St
         }
         let (url, r) = proto.ok_or_else(|| bad("Cannot find prototype dataset"))?;
         let found = (r.band_count(), r.data_type(), r.nodata());
+        types = (1..=r.band_count()).map(|b| r.band_data_type(b)).collect();
+        nodatas = (1..=r.band_count()).map(|b| r.band_nodata(b)).collect();
         proto_block = r.block_size();
         cache.insert(url, Some(r));
         found
@@ -553,7 +605,7 @@ fn open_item(item: &Item, asset: Option<&str>, tms: Option<&str>, extra: Vec<(St
         let dt = if types.iter().all(|t| *t == types[0]) { types[0] } else { DataType::F64 };
         (types.len(), dt, nodatas[0])
     };
-    let fill = nodata.unwrap_or(0.0);
+    let band_fills = nodatas.iter().map(|v| v.unwrap_or(0.0)).collect();
 
     // The levels, from the most detailed (the last tile matrix): the first valid one is the
     // raster, the others its overviews, cut to its extent when theirs differs.
@@ -633,8 +685,9 @@ fn open_item(item: &Item, asset: Option<&str>, tms: Option<&str>, extra: Vec<(St
         metadata,
         data: RasterData::new_filled(data_type, 0, 0.0),
     };
-    let header = RasterDataset::with_driver(raster, RasterDriver::STACTA, nodata.is_some());
-    let source = Tiled { levels, data_type, fill, skip_missing, block, tiles: Mutex::new(cache) };
+    let mut header = RasterDataset::with_driver(raster, RasterDriver::STACTA, nodata.is_some());
+    header.band_nodata = nodatas;
+    let source = Tiled { levels, data_type, band_types: types, band_fills, skip_missing, block, tiles: Mutex::new(cache) };
     Ok(Opened::Raster(Box::new(LazyRaster::from_source(header, Box::new(source)))))
 }
 
@@ -680,6 +733,10 @@ impl Tiled {
 }
 
 impl WindowSource for Tiled {
+    fn band_data_type(&self, band: usize) -> Option<DataType> {
+        self.band_types.get(band.checked_sub(1)?).copied()
+    }
+
     fn overviews(&self) -> Vec<(usize, usize)> {
         self.levels[1..].iter().map(|l| (l.width, l.height)).collect()
     }
@@ -693,14 +750,22 @@ impl WindowSource for Tiled {
         if !w.fits(l.width, l.height) {
             return Err(bad(format!("window outside the {}x{} level", l.width, l.height)));
         }
+        let data_type = bands
+            .first()
+            .and_then(|&b| self.band_data_type(b))
+            .filter(|data_type| bands.iter().all(|&b| self.band_data_type(b) == Some(*data_type)))
+            .unwrap_or(self.data_type);
         let n = w.width * w.height;
-        let mut out = vec![self.fill; n * bands.len()];
+        let mut out = vec![0.0; n * bands.len()];
+        for (i, band) in bands.iter().enumerate() {
+            out[i * n..(i + 1) * n].fill(self.band_fills[band - 1]);
+        }
         // The window in the tiles' pixels, and its part over them.
         let (ax0, ay0) = (l.off_x + w.x as i64, l.off_y + w.y as i64);
         let (ax1, ay1) = (ax0 + w.width as i64, ay0 + w.height as i64);
         let (cx0, cy0, cx1, cy1) = (ax0.max(0), ay0.max(0), ax1.min(l.raw_w as i64), ay1.min(l.raw_h as i64));
         if cx0 >= cx1 || cy0 >= cy1 {
-            return Ok(RasterData::from_f64_vec(self.data_type, out));
+            return Ok(RasterData::from_f64_vec(data_type, out));
         }
         let (tw, th) = (l.tile_w as i64, l.tile_h as i64);
         let mut tiles = Vec::new();
@@ -729,7 +794,7 @@ impl WindowSource for Tiled {
                 }
             }
         }
-        Ok(RasterData::from_f64_vec(self.data_type, out))
+        Ok(RasterData::from_f64_vec(data_type, out))
     }
 }
 
@@ -882,6 +947,77 @@ fn escape_jsonc(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mixed_band_windows_keep_integer_nodata_comparisons_exact() {
+        let raster = crate::Raster::from_data_native(
+            crate::RasterConfig { cols: 2, rows: 1, bands: 2, data_type: DataType::F64, ..Default::default() },
+            RasterData::F64(vec![4_294_967_295.0, 4_294_967_294.0, 1.5, 2.0]),
+        )
+        .unwrap();
+        let tile = RasterDataset::new(raster, false);
+        let mut header = tile.clone();
+        header.band_nodata = vec![Some(4_294_967_295.0), Some(1.5)];
+        let source = Tiled {
+            levels: vec![Level {
+                template: "tile".into(),
+                tile_w: 2,
+                tile_h: 1,
+                min_col: 0,
+                min_row: 0,
+                raw_w: 2,
+                raw_h: 1,
+                off_x: 0,
+                off_y: 0,
+                width: 2,
+                height: 1,
+            }],
+            data_type: DataType::F64,
+            band_types: vec![DataType::U32, DataType::F32],
+            band_fills: vec![4_294_967_295.0, 1.5],
+            skip_missing: false,
+            block: (2, 1),
+            tiles: Mutex::new(HashMap::from([("tile".into(), Some(LazyRaster::from(tile)))])),
+        };
+        let mut source = LazyRaster::from_source(header, Box::new(source));
+        let selected = source.read_window(Window::full(2, 1), &WindowOptions { bands: vec![1], overview: None }).unwrap();
+        assert!(matches!(selected.raster.data, RasterData::U32(ref values) if values == &[u32::MAX, u32::MAX - 1]));
+        let values = source.read_window_f64(Window::full(2, 1), &Default::default()).unwrap();
+        assert!(values[0].is_nan());
+        assert_eq!(values[1], 4_294_967_294.0);
+        assert!(values[2].is_nan());
+        assert_eq!(values[3], 2.0);
+        let repeated =
+            source.read_window_f64(Window::full(2, 1), &crate::FloatReadOptions { bands: vec![1, 1], ..Default::default() }).unwrap();
+        assert!(repeated[0].is_nan() && repeated[2].is_nan());
+        assert_eq!(repeated[1], 4_294_967_294.0);
+        assert_eq!(repeated[3], 4_294_967_294.0);
+    }
+
+    /// A remote `.json` that is not a STACTA item is identified from a bounded prefix, never
+    /// fetched whole.
+    #[cfg(remote)]
+    #[test]
+    fn a_remote_json_is_identified_from_its_first_bytes() {
+        // Its request count relies on the process-wide cache between two reads of the file.
+        let _serial = crate::http::cache_test_guard();
+        let mut doc = br#"{"type":"FeatureCollection","features":[]"#.to_vec();
+        doc.resize(1_000_000, b' ');
+        doc.push(b'}');
+        let (base, seen) = crate::http::test_server(doc);
+        assert!(open_lazy(&format!("{base}/collection.json")).is_none(), "not an item of tiled assets");
+        let ranges: Vec<Option<String>> = seen.lock().unwrap().clone();
+        assert!(ranges.iter().all(Option::is_some), "only range requests: {ranges:?}");
+        let asked: u64 = ranges
+            .iter()
+            .flatten()
+            .map(|r| {
+                let (a, b) = r.trim_start_matches("bytes=").split_once('-').unwrap();
+                b.parse::<u64>().unwrap() - a.parse::<u64>().unwrap() + 1
+            })
+            .sum();
+        assert!(asked <= 65_536, "{asked} bytes asked: {ranges:?}");
+    }
 
     #[test]
     fn parses_names() {

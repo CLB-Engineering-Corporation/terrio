@@ -1,3 +1,11 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 Qiusheng Wu
+// SPDX-FileCopyrightText: Copyright (c) 2026 Qiusheng Wu and Terrio contributors
+// SPDX-License-Identifier: MIT
+//
+// Derived from (translated to Rust and modified):
+//   geolibre-rust (geolibre-pmtiles) v1.7.1:
+//     crates/geolibre-pmtiles/src/format.rs, tilemath.rs, writer.rs
+
 //! PMTiles v3 archives: the header, directories and tile ids, read from any byte source (a file,
 //! bytes in memory, or a remote file through HTTP range requests) and written in one go.
 //!
@@ -566,8 +574,7 @@ pub(crate) fn write_archive(mut tiles: Vec<OutTile>, metadata: &[u8], params: &A
         };
         push_entry(&mut entries, id, offset, length);
     }
-    let prelude = archive_prelude(&entries, addressed, seen.len() as u64, tile_data.len() as u64, metadata, params)?;
-    let mut out = prelude;
+    let mut out = archive_prelude(&entries, addressed, seen.len() as u64, tile_data.len() as u64, metadata, params)?;
     out.extend_from_slice(&tile_data);
     Ok(out)
 }
@@ -638,6 +645,7 @@ fn archive_prelude(
 
 /// A tile whose bytes were spilled to a file: its id and place, at `offset` in the file, and a
 /// hash of its bytes.
+#[cfg(not(target_family = "wasm"))]
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct SpilledTile {
     pub id: u64,

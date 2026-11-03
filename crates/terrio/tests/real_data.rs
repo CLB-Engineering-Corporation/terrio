@@ -769,6 +769,178 @@ fn topojson_objects_as_layers() {
     assert_eq!(back.layers.iter().map(|l| l.len()).collect::<Vec<_>>(), [177, 1]);
 }
 
+/// A page of a real feature service, read as `f=json` by the ESRIJSON driver, against the same page
+/// as `f=geojson`, which the service itself converted, read by the GeoJSON driver: the same
+/// features, attributes and vertices. Dates are left out: GeoJSON gives them as plain numbers.
+/// The pages change with the services, so no values are fixed, and a missing page skips the test.
+#[test]
+fn esrijson_pages_match_the_services_own_geojson() {
+    use terrio::FieldValue;
+    use wbvector::Geometry;
+    let Some(dir) = std::env::var_os("TERRIO_TEST_DATA").map(PathBuf::from) else { return };
+    // A geometry's parts, each with its holes, as sets of rounded positions: the order of parts and
+    // of a ring's vertices may differ, but a hole must stay in its polygon.
+    type Ring = std::collections::BTreeSet<(i64, i64)>;
+    fn vertices(g: &Option<Geometry>) -> Vec<(Ring, Vec<Ring>)> {
+        let ring =
+            |cs: &[wbvector::Coord]| -> Ring { cs.iter().map(|c| ((c.x * 1e7).round() as i64, (c.y * 1e7).round() as i64)).collect() };
+        let polygon = |e: &wbvector::Ring, hs: &[wbvector::Ring]| {
+            let mut holes: Vec<Ring> = hs.iter().map(|h| ring(h.coords())).collect();
+            holes.sort();
+            (ring(e.coords()), holes)
+        };
+        let mut out: Vec<(Ring, Vec<Ring>)> = match g {
+            Some(Geometry::Point(c)) => vec![(ring(std::slice::from_ref(c)), Vec::new())],
+            Some(Geometry::MultiPoint(cs)) => cs.iter().map(|c| (ring(std::slice::from_ref(c)), Vec::new())).collect(),
+            Some(Geometry::LineString(cs)) => vec![(ring(cs), Vec::new())],
+            Some(Geometry::MultiLineString(ls)) => ls.iter().map(|l| (ring(l), Vec::new())).collect(),
+            Some(Geometry::Polygon { exterior, interiors }) => vec![polygon(exterior, interiors)],
+            Some(Geometry::MultiPolygon(ps)) => ps.iter().map(|(e, hs)| polygon(e, hs)).collect(),
+            _ => Vec::new(),
+        };
+        out.sort();
+        out
+    }
+    let same = |a: &FieldValue, b: &FieldValue| match (a, b) {
+        (FieldValue::Integer(x), FieldValue::Float(y)) | (FieldValue::Float(y), FieldValue::Integer(x)) => (*x as f64 - y).abs() < 1e-9,
+        (FieldValue::Float(x), FieldValue::Float(y)) => (x - y).abs() <= 1e-9 * x.abs().max(1.0),
+        (FieldValue::DateTime(_), _) | (_, FieldValue::DateTime(_)) => true,
+        _ => a == b,
+    };
+    for page in ["counties", "quakes"] {
+        let (json, geojson) = (dir.join(format!("featureservice_{page}.json")), dir.join(format!("featureservice_{page}.geojson")));
+        if !json.exists() || !geojson.exists() {
+            continue;
+        }
+        let esri = terrio::open_vector(json.to_str().unwrap(), &Default::default()).unwrap();
+        let plain = terrio::open_vector(geojson.to_str().unwrap(), &Default::default()).unwrap();
+        assert_eq!(esri.driver, terrio::formats::VectorDriver::ESRIJSON, "{page}");
+        assert_eq!(plain.driver, terrio::formats::VectorDriver::GeoJSON, "{page}");
+        let (e, g) = (&esri.layers[0], &plain.layers[0]);
+        assert!(!e.is_empty() && e.len() == g.len(), "{page}: {} and {} features", e.len(), g.len());
+        assert_eq!(e.crs_epsg(), Some(4326), "{page}");
+        for (i, (a, b)) in e.features.iter().zip(&g.features).enumerate() {
+            assert_eq!(vertices(&a.geometry), vertices(&b.geometry), "{page}, feature {i}");
+            for (n, field) in e.schema.fields().iter().enumerate() {
+                // Worked out per request, so two downloads can fall on either side of an hour.
+                if field.name == "hoursOld" {
+                    continue;
+                }
+                let other = g.schema.field_index(&field.name).unwrap_or_else(|| panic!("{page}: no field {}", field.name));
+                assert!(
+                    same(&a.attributes[n], &b.attributes[other]),
+                    "{page}, feature {i}, {}: {:?} and {:?}",
+                    field.name,
+                    a.attributes[n],
+                    b.attributes[other]
+                );
+            }
+        }
+    }
+}
+
+/// The same page of a public service as a protocol buffer and as JSON: the same features in the
+/// same order, with the same ids, attributes and vertices, to the protocol buffer's quantization.
+#[test]
+fn esripbf_pages_match_the_services_own_json() {
+    use terrio::FieldValue;
+    use wbvector::{Coord, Geometry};
+    let Some(dir) = std::env::var_os("TERRIO_TEST_DATA").map(PathBuf::from) else { return };
+    fn vertices(g: &Option<Geometry>) -> Vec<Coord> {
+        match g {
+            Some(Geometry::Point(c)) => vec![c.clone()],
+            Some(Geometry::MultiPoint(cs) | Geometry::LineString(cs)) => cs.clone(),
+            Some(Geometry::MultiLineString(ls)) => ls.iter().flatten().cloned().collect(),
+            Some(Geometry::Polygon { exterior, interiors }) => {
+                exterior.coords().iter().chain(interiors.iter().flat_map(|r| r.coords())).cloned().collect()
+            }
+            Some(Geometry::MultiPolygon(ps)) => {
+                ps.iter().flat_map(|(e, hs)| e.coords().iter().chain(hs.iter().flat_map(|r| r.coords()))).cloned().collect()
+            }
+            _ => Vec::new(),
+        }
+    }
+    // Keep variants, paths, rings and hole grouping separate before comparing coordinates.
+    fn structure(g: &Option<Geometry>) -> (&'static str, Vec<Vec<usize>>) {
+        match g {
+            None => ("null", vec![]),
+            Some(Geometry::Point(_)) => ("Point", vec![vec![1]]),
+            Some(Geometry::MultiPoint(cs)) => ("MultiPoint", vec![vec![cs.len()]]),
+            Some(Geometry::LineString(cs)) => ("LineString", vec![vec![cs.len()]]),
+            Some(Geometry::MultiLineString(ls)) => ("MultiLineString", ls.iter().map(|l| vec![l.len()]).collect()),
+            Some(Geometry::Polygon { exterior, interiors }) => {
+                ("Polygon", vec![std::iter::once(exterior.coords().len()).chain(interiors.iter().map(|r| r.coords().len())).collect()])
+            }
+            Some(Geometry::MultiPolygon(ps)) => (
+                "MultiPolygon",
+                ps.iter().map(|(e, hs)| std::iter::once(e.coords().len()).chain(hs.iter().map(|r| r.coords().len())).collect()).collect(),
+            ),
+            Some(other) => panic!("unexpected service geometry: {other:?}"),
+        }
+    }
+    // JSON prints a single-precision number with seven significant digits: -122.1502 for what the
+    // protocol buffer holds as -122.15017.
+    let same = |a: &FieldValue, b: &FieldValue| match (a, b) {
+        (FieldValue::Float(x), FieldValue::Float(y)) => (x - y).abs() <= 1e-6 * x.abs().max(1.0),
+        _ => a == b,
+    };
+    let near = |a: Option<f64>, b: Option<f64>| match (a, b) {
+        // Z and M are quantized to 1e-4 of their units.
+        (Some(x), Some(y)) => (x - y).abs() < 1e-3,
+        (None, None) => true,
+        _ => false,
+    };
+    for page in ["counties", "quakes", "zlines", "mlines", "zmlines"] {
+        let (pbf, json) = (dir.join(format!("featureservice_{page}.pbf")), dir.join(format!("featureservice_{page}.json")));
+        if !pbf.exists() || !json.exists() {
+            continue;
+        }
+        let quantized = terrio::open_vector(pbf.to_str().unwrap(), &Default::default()).unwrap();
+        let plain = terrio::open_vector(json.to_str().unwrap(), &Default::default()).unwrap();
+        assert_eq!(quantized.driver, terrio::formats::VectorDriver::ESRIPBF, "{page}");
+        let (p, j) = (&quantized.layers[0], &plain.layers[0]);
+        assert!(!p.is_empty() && p.len() == j.len(), "{page}: {} and {} features", p.len(), j.len());
+        assert_eq!((p.crs_epsg(), p.geom_type), (j.crs_epsg(), j.geom_type), "{page}");
+        let names = |l: &wbvector::Layer| l.schema.fields().iter().map(|f| f.name.clone()).collect::<Vec<_>>();
+        assert_eq!(names(p), names(j), "{page}");
+        // The Z and M pages compare something: Z along their lines, and M given and left out.
+        let every = || p.features.iter().flat_map(|f| vertices(&f.geometry));
+        if page.starts_with('z') {
+            assert!(every().any(|c| c.z.is_some()), "{page}: no Z");
+        }
+        if page == "mlines" {
+            assert!(every().any(|c| c.m.is_some()) && every().any(|c| c.m.is_none()), "{page}: no M, or no vertex without one");
+        }
+        if page == "zmlines" {
+            assert!(every().any(|c| c.m.is_none()), "{page}: no vertex without M");
+        }
+        for (i, (a, b)) in p.features.iter().zip(&j.features).enumerate() {
+            assert_eq!(a.fid, b.fid, "{page}, feature {i}");
+            assert_eq!(structure(&a.geometry), structure(&b.geometry), "{page}, feature {i}: part grouping");
+            let (va, vb) = (vertices(&a.geometry), vertices(&b.geometry));
+            assert_eq!(va.len(), vb.len(), "{page}, feature {i}");
+            for (x, y) in va.iter().zip(&vb) {
+                // Quantized finer than JSON prints: within 1e-7 of it, in degrees or the layer's units.
+                assert!((x.x - y.x).abs() < 1e-7 && (x.y - y.y).abs() < 1e-7, "{page}, feature {i}: {x:?} and {y:?}");
+                assert!(near(x.z, y.z) && near(x.m, y.m), "{page}, feature {i}: {x:?} and {y:?}");
+            }
+            for (n, field) in p.schema.fields().iter().enumerate() {
+                // Worked out per request, so two downloads can fall on either side of an hour.
+                if field.name == "hoursOld" {
+                    continue;
+                }
+                assert!(
+                    same(&a.attributes[n], &b.attributes[n]),
+                    "{page}, feature {i}, {}: {:?} and {:?}",
+                    field.name,
+                    a.attributes[n],
+                    b.attributes[n]
+                );
+            }
+        }
+    }
+}
+
 #[test]
 fn mapinfo_mif() {
     let Some(v) = vector("countries.mif") else { return };
@@ -856,11 +1028,14 @@ fn osm_xml_like_pbf() {
 fn kml_styles() {
     let Some(v) = vector("countries.kml") else { return };
     let l = &v.layers[0];
-    // GDAL's style string for <LineStyle><color>ff0000ff</color>...<fill>0</fill>.
-    assert_eq!(value(l, 0, "OGR_STYLE"), &terrio::FieldValue::Text("PEN(c:#FF0000FF)".into()));
+    // <LineStyle><color>ff0000ff</color>...<fill>0</fill>: GDAL's PEN(c:#FF0000FF) drops the flag.
+    assert_eq!(value(l, 0, "OGR_STYLE"), &terrio::FieldValue::Text(r#"PEN(c:#FF0000FF);BRUSH(id:"ogr-brush-1")"#.into()));
     let back = round_trip(&v.layers, "countries.kml");
     assert_eq!(value(&back.layers[0], 0, "OGR_STYLE"), value(l, 0, "OGR_STYLE"));
     let samples = vector("kml_samples.kml").unwrap();
     let paths = samples.layers.iter().find(|l| l.name == "Paths").unwrap();
-    assert_eq!(value(paths, 5, "OGR_STYLE"), &terrio::FieldValue::Text("PEN(c:#FF0000FF);BRUSH(fc:#0000FFFF)".into()));
+    // As GDAL 3.13.3 gives it: the reference, with the definition in the style table.
+    assert_eq!(value(paths, 5, "OGR_STYLE"), &terrio::FieldValue::Text("@redLineBluePoly".into()));
+    let definition = samples.style_table.iter().find(|(id, _)| id == "redLineBluePoly").map(|(_, style)| style.as_str());
+    assert_eq!(definition, Some("PEN(c:#FF0000FF);BRUSH(fc:#0000FFFF)"));
 }

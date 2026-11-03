@@ -60,6 +60,14 @@ jobs:
             echo "Real-data job skipped: no file it depends on changed."
           fi
 
+  # REUSE (https://reuse.software): every file states its copyright and licence, in an SPDX
+  # header (files derived from other projects) or in REUSE.toml.
+  reuse:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: fsfe/reuse-action@v6
+
   # Linux only: macOS and Windows run in ci-platforms.yml, on every push to main and, for pull
   # requests, by hand or with the label ci:macos, ci:windows or ci:all.
   # The npm package and the conformance report run in ci-extended.yml, on the same terms (labels
@@ -73,6 +81,13 @@ jobs:
         os: [ubuntu-latest]
     steps:
       - uses: actions/checkout@v7
+      # Two jobs died of a full disk while compiling, and their logs were lost: a notice records the
+      # space they started with. The toolchains removed are ones these jobs do not use.
+      - name: Reclaim runner disk
+        run: |
+          echo "::notice title=Free disk at start::$(df -h --output=size,used,avail . | tail -1)"
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup
+          echo "::notice title=Free disk after reclaiming::$(df -h --output=size,used,avail . | tail -1)"
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -80,15 +95,30 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
-      # The `ndarray` feature, off by default: its module and its tests.
-      - run: cargo clippy -p terrio --features ndarray --lib --test ndarray -- -D warnings
-      - run: cargo test -p terrio --features ndarray --test ndarray
+        env:
+          TERRIO_SQLITE_REFERENCE_PYTHON: python3
+      # The `ndarray` feature, off by default: its module and its tests (floating-point reads as
+      # arrays, against GDAL's, in `float_reads`).
+      - run: cargo clippy -p terrio --features ndarray --lib --test ndarray --test float_reads -- -D warnings
+      - run: cargo test -p terrio --features ndarray --test ndarray --test float_reads
+      - name: Disk use of the build
+        if: always()
+        run: |
+          df -h .
+          du -sh target 2>/dev/null || echo "no target directory"
 
   gdal:
     name: GDAL backend (feature build)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+      # Two jobs died of a full disk while compiling, and their logs were lost: a notice records the
+      # space they started with. The toolchains removed are ones these jobs do not use.
+      - name: Reclaim runner disk
+        run: |
+          echo "::notice title=Free disk at start::$(df -h --output=size,used,avail . | tail -1)"
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup
+          echo "::notice title=Free disk after reclaiming::$(df -h --output=size,used,avail . | tail -1)"
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -200,6 +230,7 @@ jobs:
           node-version: 22
       - name: Build and test the npm package (Node.js)
         run: |
+          node --test js/tests/build.test.mjs
           wasm-pack build js --release --target nodejs --out-dir pkg-node --out-name terrio
           node --test js/tests/node.test.mjs
       # The lighter module, `terrio-js/core`: the tests of the formats it leaves out are skipped.
@@ -236,10 +267,28 @@ jobs:
           cargo test -p terrio-crs --all-features
           cargo check -p terrio-crs --target wasm32-unknown-unknown
           cargo check -p terrio-crs --all-features --target wasm32-unknown-unknown
+      - name: The standalone CRS crate has no C dependency
+        run: |
+          set -o pipefail
+          for target in x86_64-unknown-linux-gnu wasm32-unknown-unknown; do
+            crates=$(cargo tree -p terrio-crs -e normal,build --target "$target" --prefix none | cut -d' ' -f1 | sort -u)
+            # Pure-Rust crates whose names end in -sys are not C dependencies.
+            found=$(echo "$crates" | grep -E '^(cc|cmake|bindgen|pkg-config|cxx-build)$|-sys$' | grep -vE '^(js|web|linux-raw)-sys$' || true)
+            if [ -n "$found" ]; then echo "C build dependencies for $target: $found"; exit 1; fi
+          done
+      # The memory64 build has no C compiler that targets it, so it must not need one. `cc` is left
+      # out: rusty_av1d depends on it, but builds no C or assembly with its assembly feature off.
+      - name: The JavaScript package has no C dependency
+        run: |
+          set -o pipefail
+          for target in wasm32-unknown-unknown wasm64-unknown-unknown; do
+            crates=$(cargo tree -p terrio-js -e normal,build --target "$target" --prefix none | cut -d' ' -f1 | sort -u)
+            found=$(echo "$crates" | grep -E '^(ring|cmake|bindgen|pkg-config|cxx-build)$|-sys$' | grep -vE '^(js|web|linux-raw)-sys$' || true)
+            if [ -n "$found" ]; then echo "C dependencies for $target: $found"; exit 1; fi
+          done
       - name: The core for WebAssembly
         run: cargo build -p terrio --no-default-features --features geotiff --target wasm32-unknown-unknown
-      # Every default feature but GeoParquet (whose Zstandard is the zstd C library) builds for
-      # WebAssembly without a C compiler (#180).
+      # Every default feature builds for WebAssembly without a C compiler (#180).
       - name: WebAssembly without a C toolchain
         env:
           CC: "false"
@@ -248,11 +297,23 @@ jobs:
           CC_wasm32_unknown_unknown: "false"
         run: >-
           cargo build -p terrio --target wasm32-unknown-unknown --no-default-features
-          --features geotiff,remote,avif,netcdf-hdf5,osm,lzma,flatgeobuf,jp2,lerc,pointcloud,tiles,zarr,sqlite,grib
+          --features geotiff,cad,parquet,remote,avif,netcdf-hdf5,osm,lzma,flatgeobuf,jp2,lerc,pointcloud,tiles,zarr,sqlite,grib,hecras
+      - name: The default command-line build without a C toolchain
+        env:
+          CC: "false"
+          CXX: "false"
+          AR: "false"
+        # The build is the check; the names only fail faster, and with a clearer message.
+        run: |
+          set -o pipefail
+          crates=$(cargo tree -p terrio-cli -e normal,build --prefix none | cut -d' ' -f1 | sort -u)
+          found=$(echo "$crates" | grep -E '^(ring|cmake|bindgen|pkg-config|cxx-build)$|-sys$' | grep -vE '^(js|web|linux-raw)-sys$' || true)
+          if [ -n "$found" ]; then echo "C dependencies: $found"; exit 1; fi
+          cargo build -p terrio-cli
       - name: A GeoTIFF build pulls none of the optional codecs
         run: |
           crates=$(cargo tree -p terrio -e normal --no-default-features --features geotiff --prefix none | cut -d' ' -f1 | sort -u)
-          found=$(echo "$crates" | grep -E '^(arrow(-[a-z]+)?|parquet|hdf5(-[a-z]+)?|netcdf(-[a-z]+)?|openjp2|rusty_av1d|lzma-rust2|lerc(-[a-z]+)?|laz|e57|flatgeobuf|osmpbfreader|ureq|hmac|sha2|delaunator|gribberish|bitvec|zstd|zstd-safe|zstd-sys)$' || true)
+          found=$(echo "$crates" | grep -E '^(arrow(-[a-z]+)?|parquet|hdf5(-[a-z]+)?|netcdf(-[a-z]+)?|openjp2|rusty_av1d|lzma-rust2|lerc(-[a-z]+)?|laz|e57|flatgeobuf|osmpbfreader|ureq|hmac|sha2|delaunator|rust-aec|zstd|zstd-safe|zstd-sys)$' || true)
           if [ -n "$found" ]; then echo "unexpected dependencies: $found"; exit 1; fi
           echo "$(echo "$crates" | wc -l) crates"
 
@@ -279,7 +340,7 @@ jobs:
         shell: bash
         # rasterio (with its bundled GDAL) and shapely: terrio.rio is compared with rasterio.
         # xarray, dask, rioxarray, zarr and scipy: terrio.xarray is compared with rioxarray.
-        run: python -m pip install pytest rasterio shapely xarray "dask[array]" rioxarray zarr scipy python/dist/*.whl
+        run: python -m pip install pytest "jsonschema>=4.18" rasterio shapely xarray "dask[array]" rioxarray zarr scipy python/dist/*.whl
       - name: Test
         working-directory: python
         run: python -m pytest -v
@@ -316,7 +377,7 @@ jobs:
           cache-environment: true
       - name: Benchmark harness regression tests
         shell: micromamba-shell {0}
-        run: python -m unittest discover -s scripts/tests -v
+        run: python -m pytest -v scripts/tests
       - uses: actions/cache@v6
         with:
           path: terrio-data
@@ -329,7 +390,7 @@ jobs:
         # With pip, on top of the cached environment: terrio.rio is compared with rasterio, and
         # terrio.xarray with rioxarray.
         shell: micromamba-shell {0}
-        run: python -m pip install rasterio xarray "dask[array]" rioxarray zarr scipy
+        run: python -m pip install "jsonschema>=4.18" rasterio xarray "dask[array]" rioxarray zarr scipy
       - name: Real-data tests
         env:
           TERRIO_TEST_DATA: ${{ github.workspace }}/terrio-data

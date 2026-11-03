@@ -1,3 +1,16 @@
+// SPDX-FileCopyrightText: Copyright (c) 2011, Andrey Kiselev <dron@ak4719.spb.edu>
+// SPDX-FileCopyrightText: Copyright (c) 2008, Frank Warmerdam
+// SPDX-FileCopyrightText: Copyright (c) 2011-2014, Even Rouault <even dot rouault at spatialys.com>
+// SPDX-FileCopyrightText: Copyright (c) 1999, Frank Warmerdam
+// SPDX-FileCopyrightText: Copyright (c) 2008-2012, Even Rouault <even dot rouault at spatialys.com>
+// SPDX-FileCopyrightText: Copyright (c) 2026 Qiusheng Wu and Terrio contributors
+// SPDX-License-Identifier: MIT AND ISC
+//
+// Derived from (translated to Rust and modified):
+//   GDAL v3.13.3:
+//     port/cpl_recode.cpp
+//     port/cpl_path.cpp
+
 //! Editing vector datasets, in place or on output, as GDAL 3.13's `gdal vector rename-layer`,
 //! `gdal vector edit` and `gdal vector update` do: renaming layers (to a given name, or with
 //! ASCII, lower-case, file-name and length rules), changing a layer's CRS (without
@@ -378,6 +391,8 @@ pub fn rename_layers_in_place(path: &str, o: &RenameOptions) -> Result<Vec<(Stri
     if !local_gpkg(path) {
         return Err(Error::Unsupported(format!("'{path}': layers are renamed in place in local GeoPackages only; give an output")));
     }
+    // Opened by the GeoPackage driver to be rewritten: only if the vector allow-list has it.
+    crate::formats::check_driver_allowed("GPKG", path, crate::formats::Kind::Vector)?;
     #[cfg(feature = "sqlite")]
     {
         use crate::drivers::vector::gpkg_edit as ge;
@@ -521,6 +536,8 @@ pub fn edit_in_place(path: &str, o: &EditOptions) -> Result<()> {
     if !local_gpkg(path) {
         return Err(Error::Unsupported(format!("'{path}': datasets are edited in place in local GeoPackages only; give an output")));
     }
+    // Opened by the GeoPackage driver to be rewritten: only if the vector allow-list has it.
+    crate::formats::check_driver_allowed("GPKG", path, crate::formats::Kind::Vector)?;
     if o.unset_fid {
         return Err(Error::InvalidArgument("unsetting feature ids needs an output dataset".into()));
     }
@@ -555,7 +572,7 @@ pub fn edit_to(input: &str, output: &str, o: &EditOptions, write: &crate::Vector
     if input == output || std::fs::canonicalize(input).ok().zip(std::fs::canonicalize(output).ok()).is_some_and(|(a, b)| a == b) {
         return Err(Error::InvalidArgument("input and output datasets must be different; use edit_in_place".into()));
     }
-    let mut layers = crate::open_vector(input, &Default::default())?.layers;
+    let mut layers = crate::open_vector(input, &Default::default())?.into_resolved_layers();
     edit_layers(&mut layers, o)?;
     let out_gpkg = write.driver.or_else(|| VectorDriver::for_extension(output)) == Some(VectorDriver::GPKG);
     if (o.has_metadata() || o.geometry_type.is_some_and(|(_, z, m)| z || m)) && !out_gpkg {
@@ -613,6 +630,8 @@ pub type GpkgMetadata = (Vec<(String, String)>, Vec<(String, Vec<(String, String
 pub fn read_gpkg_metadata(path: &str) -> Result<GpkgMetadata> {
     #[cfg(feature = "sqlite")]
     {
+        // Read by the GeoPackage driver whatever its name: only if the vector allow-list has it.
+        crate::formats::check_driver_allowed("GPKG", path, crate::formats::Kind::Vector)?;
         use crate::drivers::vector::gpkg_edit as ge;
         let default = |md: ge::Metadata| md.into_iter().find(|(dom, _)| dom.is_empty()).map(|(_, i)| i).unwrap_or_default();
         return ge::modify_bytes(std::fs::read(path)?, |d| {
@@ -849,9 +868,10 @@ pub fn update(src: &[Layer], output: &str, o: &UpdateOptions) -> Result<UpdateCo
         });
     }
     let ds = crate::open_vector(output, &Default::default())?;
-    let mut layers = ds.layers;
+    let driver = ds.driver;
+    let mut layers = ds.into_resolved_layers();
     let counts = update_layers(&mut layers, src, o)?;
-    replace_dataset(&layers, output, &crate::VectorWriteOptions { driver: Some(ds.driver), ..Default::default() })?;
+    replace_dataset(&layers, output, &crate::VectorWriteOptions { driver: Some(driver), ..Default::default() })?;
     Ok(counts)
 }
 
@@ -901,8 +921,9 @@ fn replace_dataset(_layers: &[Layer], _path: &str, _write: &crate::VectorWriteOp
 
 #[cfg(test)]
 mod tests {
+    /// Reference: GDAL 3.13.
     #[test]
-    fn latin_y_diaeresis_matches_gdal_313() {
+    fn latin_y_diaeresis_matches_gdal() {
         assert_eq!(super::ascii_of('ÿ'), Some("u"));
     }
 

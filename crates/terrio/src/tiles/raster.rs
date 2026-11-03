@@ -1,3 +1,14 @@
+// SPDX-FileCopyrightText: Copyright (c) 2012-2016, Even Rouault <even.rouault at spatialys.com>
+// SPDX-FileCopyrightText: Copyright (c) 2000, Frank Warmerdam
+// SPDX-FileCopyrightText: Copyright (c) 2007-2010, Even Rouault <even dot rouault at spatialys.com>
+// SPDX-FileCopyrightText: Copyright (c) 2026 Qiusheng Wu and Terrio contributors
+// SPDX-License-Identifier: MIT
+//
+// Derived from (translated to Rust and modified):
+//   GDAL v3.13.3:
+//     frmts/mbtiles/mbtilesdataset.cpp
+//     gcore/overview.cpp
+
 //! Raster tiles as rasters: reading a zoom level (and the lower ones as overviews) by window, and
 //! writing rasters as tile pyramids, as GDAL's MBTiles and PMTiles drivers do.
 
@@ -41,7 +52,8 @@ pub(crate) fn decode_image(b: &[u8]) -> Result<Image> {
         return Ok(Image { w, h, channels, data: buf, palette });
     }
     if b.starts_with(&[0xff, 0xd8]) {
-        let img = crate::jpeg::decode_file(b).map_err(|e| err(&e))?;
+        let img = crate::jpeg::decode_file(b)
+            .map_err(|e| if crate::jpeg::is_resource_refusal(&e) { Error::ResourceLimit(e.to_string()) } else { err(&e) })?;
         return Ok(Image { w: img.width, h: img.height, channels: img.components, data: img.data, palette: false });
     }
     if b.len() > 12 && &b[0..4] == b"RIFF" && &b[8..12] == b"WEBP" {
@@ -387,7 +399,7 @@ pub(crate) fn open_lazy(path: &str) -> Result<Option<TileRaster>> {
     if matches!(loc, crate::vfs::Location::Zip { .. }) || super::archive_kind(&loc.file_name()).is_none() {
         return Ok(None);
     }
-    let archive = TileArchive::open(path)?;
+    let archive = TileArchive::open_named(path)?;
     if archive.is_vector() {
         return Err(Error::Unsupported(format!("'{path}' holds vector tiles, not a raster")));
     }
@@ -396,7 +408,7 @@ pub(crate) fn open_lazy(path: &str) -> Result<Option<TileRaster>> {
 
 /// Opens an archive of image tiles held in memory for reading by window.
 pub(crate) fn open_lazy_bytes(bytes: Vec<u8>) -> Result<TileRaster> {
-    TileRaster::new(TileArchive::from_bytes(bytes)?, None)
+    TileRaster::new(TileArchive::from_bytes_judged(bytes, &[])?, None)
 }
 
 // ─── Writing ────────────────────────────────────────────────────────────────────────────────────
@@ -518,13 +530,35 @@ fn downsample(src: &Pixels, w: usize, h: usize, method: &str) -> Pixels {
                 let mut sa = 0.0;
                 let mut sv = [0.0f64; 4];
                 for sy in y0..y1 {
+                    let mut line_weight = 0.0;
+                    let mut line_values = [0.0; 4];
                     for sx in x0..x1 {
                         let i = sy * sw + sx;
-                        let m = src.alpha[i] as f64;
-                        sa += m;
-                        for (b, v) in sv.iter_mut().enumerate().take(nb) {
-                            *v += m * band(b, i);
+                        if src.alpha[i] == 0 {
+                            continue;
                         }
+                        let wx = if sx == x0 {
+                            if x1 == x0 + 1 { 1.0 } else { 1.0 - (x as f64 * rx - x0 as f64) }
+                        } else if sx + 1 == x1 {
+                            1.0 - (x1 as f64 - (x + 1) as f64 * rx)
+                        } else {
+                            1.0
+                        };
+                        line_weight += wx;
+                        for (b, v) in line_values.iter_mut().enumerate().take(nb) {
+                            *v += wx * band(b, i);
+                        }
+                    }
+                    let wy = if sy == y0 {
+                        if y1 == y0 + 1 { 1.0 } else { 1.0 - (y as f64 * ry - y0 as f64) }
+                    } else if sy + 1 == y1 {
+                        1.0 - (y1 as f64 - (y + 1) as f64 * ry)
+                    } else {
+                        1.0
+                    };
+                    sa += line_weight * wy;
+                    for (v, line) in sv.iter_mut().zip(line_values) {
+                        *v += line * wy;
                     }
                 }
                 if sa > 0.0 {
@@ -696,6 +730,11 @@ fn warp_plan<'a>(ds: &'a RasterDataset, o: &TileWriteOptions, grid: Option<Grid>
     if width == 0 || height == 0 {
         return Err(Error::InvalidArgument("the raster is empty at that zoom level".into()));
     }
+    if (width as u64).checked_mul(height as u64).is_none_or(|pixels| pixels > 1 << 31) {
+        return Err(Error::Unsupported(format!(
+            "the raster would be {width} x {height} pixels at zoom level {zoom}: choose a lower MAXZOOM"
+        )));
+    }
     Ok(WarpPlan { src, zoom, sgt, width, height, res })
 }
 
@@ -714,7 +753,7 @@ struct WarpPlan<'a> {
 /// is known to be small enough.
 fn level_resampling(o: &TileWriteOptions, width: usize, height: usize, zoom: u8) -> Result<crate::ops::Resampling> {
     let resampling = crate::ops::Resampling::parse(o.resampling.as_deref().unwrap_or("bilinear"))?;
-    if (width as u64) * (height as u64) > 1 << 31 {
+    if (width as u64).checked_mul(height as u64).is_none_or(|pixels| pixels > 1 << 31) {
         return Err(Error::Unsupported(format!(
             "the raster would be {width} x {height} pixels at zoom level {zoom}: choose a lower MAXZOOM"
         )));
@@ -782,6 +821,8 @@ fn warp_level(ds: &RasterDataset, o: &TileWriteOptions, grid: Option<Grid>) -> R
         d => d.to_f64_vec().into_iter().map(|v| v.clamp(0.0, 255.0) as u8).collect(),
     };
     // Fully transparent source pixels do not count, as with GDAL's source alpha.
+    // NaN is only a validity sentinel here. Keep double precision so the generic
+    // warper does not quantize interpolation to Float32 before Byte conversion.
     let color = if src_alpha {
         let a = &values[data_bands * sn..];
         let mut v = values[..data_bands * sn].to_vec();
@@ -791,7 +832,7 @@ fn warp_level(ds: &RasterDataset, o: &TileWriteOptions, grid: Option<Grid>) -> R
             }
         }
         wo.src_nodata = crate::ops::warp::Nodata::Values(vec![f64::NAN]);
-        with_bands(v, data_bands, DataType::F32)
+        with_bands(v, data_bands, DataType::F64)
     } else {
         with_bands(values[..data_bands * sn].to_vec(), data_bands, DataType::U8)
     };
@@ -867,7 +908,7 @@ fn pyramid_plan(
             zoom.saturating_sub(count)
         }
     };
-    let method = super::pyramid::Method::parse(o.resampling.as_deref());
+    let method = super::pyramid::Method::parse(o.overview_resampling.as_deref().or(o.resampling.as_deref()));
     let (maxx, miny) = (minx + width as f64 * res, maxy - height as f64 * res);
 
     // The bounds, as GDAL records them.
@@ -938,6 +979,7 @@ fn pyramid(
 /// the source pixel of the level's first pixel; pixels outside the source are those the warper
 /// leaves at its initial value (zero), transparent unless the source has no alpha band (as
 /// [`warp_level`] adds none to a raster already in EPSG:3857).
+#[cfg(not(target_family = "wasm"))]
 struct AlignedRows<'a> {
     src: &'a mut crate::LazyRaster,
     w: usize,
@@ -948,18 +990,21 @@ struct AlignedRows<'a> {
     next: usize,
 }
 
+#[cfg(not(target_family = "wasm"))]
 impl super::pyramid::BaseRows for AlignedRows<'_> {
     fn next_rows(&mut self, n: usize) -> Result<Vec<Vec<u8>>> {
         let (w, bands) = (self.w, self.data_bands);
         let (sw, sh) = (self.src.width() as i64, self.src.height() as i64);
         let outside_alpha = if self.src_alpha { 0 } else { 255 };
-        let mut rows: Vec<Vec<u8>> = (0..n)
-            .map(|_| {
-                let mut row = vec![0u8; (bands + 1) * w];
-                row[bands * w..].fill(outside_alpha);
-                row
-            })
-            .collect();
+        // Sized from the source's header: allocated fallibly (`super::pyramid::build` checked
+        // the strip against the memory the process can use).
+        let row_len = crate::dataset::fallible::len(&[bands + 1, w], super::pyramid::ROWS)?;
+        let mut rows: Vec<Vec<u8>> = Vec::with_capacity(n);
+        for _ in 0..n {
+            let mut row = crate::dataset::fallible::filled(row_len, 0u8, super::pyramid::ROWS)?;
+            row[bands * w..].fill(outside_alpha);
+            rows.push(row);
+        }
         // The part of the rows inside the source.
         let (y0, y1) = ((self.next as i64 + self.dy).max(0), (self.next as i64 + n as i64 + self.dy).min(sh));
         let (x0, x1) = (self.dx.max(0), (self.dx + w as i64).min(sw));
@@ -991,11 +1036,27 @@ impl super::pyramid::BaseRows for AlignedRows<'_> {
         self.next += n;
         Ok(rows)
     }
+
+    /// While `n` rows are read: the source's window (one byte per sample, as `warp_plan` takes
+    /// Byte rasters only), its chunks decoded and read on each thread (`decode_chunks` decodes
+    /// four per thread at a time), and the compressed window a source that is not a local file
+    /// fetches first.
+    fn held(&self, n: usize) -> (u64, u64) {
+        let (bands, cols) = (self.src.band_count() as u64, self.w.min(self.src.width()) as u64);
+        let window = n as u64 * cols * bands;
+        let (bw, bh) = self.src.block_size().unwrap_or((self.src.width(), n));
+        let (bw, bh) = (bw.max(1), bh.max(1));
+        let chunks = (n.div_ceil(bh) as u64 + 1) * (self.w.div_ceil(bw) as u64 + 1);
+        let decoding = chunks.min(4 * crate::par::threads() as u64) * (bw * bh) as u64 * bands * 2;
+        let remote = if self.src.input_paths().is_ok_and(|p| !p.is_empty()) { 0 } else { window };
+        (0, window + decoding + remote)
+    }
 }
 
 /// When a raster is already on the pixel grid [`warp_level`] would warp it to (EPSG:3857 at the
 /// zoom level's resolution, shifted by whole pixels), the level's size, zoom and corner, and the
 /// source pixel of its first pixel: the warp copies pixels, so the level can be read by window.
+#[cfg(not(target_family = "wasm"))]
 fn aligned_level(header: &RasterDataset, o: &TileWriteOptions) -> Result<Option<(WarpPlanned, i64, i64)>> {
     let gt = header.geo_transform();
     if header.crs().epsg != Some(3857) || !header.gcps.is_empty() || gt[2] != 0.0 || gt[4] != 0.0 || gt[1] <= 0.0 || gt[5] >= 0.0 {
@@ -1003,7 +1064,9 @@ fn aligned_level(header: &RasterDataset, o: &TileWriteOptions) -> Result<Option<
     }
     let p = warp_plan(header, o, None)?;
     let dst = [p.sgt[0], p.res, 0.0, p.sgt[3], 0.0, -p.res];
-    let near_int = |v: f64| (v - v.round()).abs() < 1e-8;
+    // Coordinates near 2e7 m are only good to about 4e-9 m, more than 1e-8 of a pixel at zoom 19
+    // and above, so the tolerance is a millionth of a pixel.
+    let near_int = |v: f64| (v - v.round()).abs() < 1e-6;
     let translation = (gt[1] - dst[1]).abs() < 1e-12 * gt[1].abs()
         && (gt[5] - dst[5]).abs() < 1e-12 * gt[5].abs()
         && near_int((dst[0] - gt[0]) / gt[1])
@@ -1015,8 +1078,9 @@ fn aligned_level(header: &RasterDataset, o: &TileWriteOptions) -> Result<Option<
     Ok(Some((WarpPlanned { zoom: p.zoom, minx: p.sgt[0], maxy: p.sgt[3], width: p.width, height: p.height }, dx, dy)))
 }
 
-/// What [`LevelSource`] gives the warp: the data bands, as Byte, or as Float32 that is NaN where
+/// What [`LevelSource`] gives the warp: the data bands, as Byte, or as Float64 that is NaN where
 /// the alpha band is 0 (`masked`); the alpha band; or an alpha of 255 everywhere.
+#[cfg(not(target_family = "wasm"))]
 enum LevelBands {
     Data { bands: usize, masked: bool },
     Alpha(usize),
@@ -1025,17 +1089,19 @@ enum LevelBands {
 
 /// A raster read by window as [`warp_level`] hands it to its warps (the same bands, types and
 /// masking), for a warp a chunk at a time. The raster is shared with the other warp of the level.
+#[cfg(not(target_family = "wasm"))]
 struct LevelSource<'a, 'r> {
     src: &'a std::sync::Mutex<&'r mut crate::LazyRaster>,
     header: RasterDataset,
     what: LevelBands,
 }
 
+#[cfg(not(target_family = "wasm"))]
 impl<'a, 'r> LevelSource<'a, 'r> {
     fn new(src: &'a std::sync::Mutex<&'r mut crate::LazyRaster>, header: &RasterDataset, what: LevelBands) -> Self {
         // As `warp_level` builds the rasters it warps from the source.
         let (bands, t) = match what {
-            LevelBands::Data { bands, masked: true } => (bands, DataType::F32),
+            LevelBands::Data { bands, masked: true } => (bands, DataType::F64),
             LevelBands::Data { bands, masked: false } => (bands, DataType::U8),
             LevelBands::Alpha(_) | LevelBands::Opaque => (1, DataType::U8),
         };
@@ -1048,6 +1114,7 @@ impl<'a, 'r> LevelSource<'a, 'r> {
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 impl crate::ops::warp::WarpSource for LevelSource<'_, '_> {
     fn info(&mut self) -> Result<crate::ops::warp::WarpSourceInfo> {
         // Read at full resolution, as the raster in memory `warp_level` warps.
@@ -1068,7 +1135,7 @@ impl crate::ops::warp::WarpSource for LevelSource<'_, '_> {
                 };
                 let a = &v[bands * n..(bands + 1) * n];
                 // Fully transparent source pixels do not count, as with GDAL's source alpha.
-                (RasterData::F32((0..bands * n).map(|i| if a[i % n] == 0 { f32::NAN } else { v[i] as f32 }).collect()), bands)
+                (RasterData::F64((0..bands * n).map(|i| if a[i % n] == 0 { f64::NAN } else { v[i] as f64 }).collect()), bands)
             }
             LevelBands::Alpha(band) => (read(vec![band])?.raster.data, 1),
             LevelBands::Opaque => (RasterData::U8(vec![255; n]), 1),
@@ -1086,6 +1153,7 @@ impl crate::ops::warp::WarpSource for LevelSource<'_, '_> {
 /// The full-resolution level of a raster not on its zoom level's grid, as [`warp_level`] warps it
 /// (without an existing archive's grid), a chunk at a time: the data bands and the alpha band are
 /// two warps, each in its own chunks, advanced in lockstep to the rows asked for.
+#[cfg(not(target_family = "wasm"))]
 struct WarpedRows<'x, 'a, 's, 'b, 't> {
     data: &'x mut crate::ops::warp::RowWarp<'a, 's>,
     alpha: Option<&'x mut crate::ops::warp::RowWarp<'b, 't>>,
@@ -1097,6 +1165,7 @@ struct WarpedRows<'x, 'a, 's, 'b, 't> {
     alpha_rows: Vec<u8>,
 }
 
+#[cfg(not(target_family = "wasm"))]
 impl<'x, 'a, 's, 'b, 't> WarpedRows<'x, 'a, 's, 'b, 't> {
     fn new(
         data: &'x mut crate::ops::warp::RowWarp<'a, 's>,
@@ -1111,6 +1180,7 @@ impl<'x, 'a, 's, 'b, 't> WarpedRows<'x, 'a, 's, 'b, 't> {
 
 /// Takes the rows `warp` emits, `bands` bands of `w` pixels each, into `rows` (one vector per
 /// band), as Byte.
+#[cfg(not(target_family = "wasm"))]
 fn take_rows(rows: &mut [Vec<u8>], w: usize) -> impl FnMut(RasterData, usize) -> Result<()> + '_ {
     move |data, n| {
         let bytes = match data {
@@ -1124,7 +1194,13 @@ fn take_rows(rows: &mut [Vec<u8>], w: usize) -> impl FnMut(RasterData, usize) ->
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 impl super::pyramid::BaseRows for WarpedRows<'_, '_, '_, '_, '_> {
+    fn held(&self, n: usize) -> (u64, u64) {
+        let retained = self.data.held_bytes().saturating_add(self.alpha.as_deref().map_or(0, |a| a.held_bytes()));
+        (retained, (n as u64) * self.w as u64 * (self.bands as u64 + 1) * 2)
+    }
+
     fn next_rows(&mut self, n: usize) -> Result<Vec<Vec<u8>>> {
         let w = self.w;
         let have = self.data_rows.first().map_or(0, |b| b.len() / w.max(1));
@@ -1160,6 +1236,7 @@ impl super::pyramid::BaseRows for WarpedRows<'_, '_, '_, '_, '_> {
 /// warping its full-resolution level a chunk at a time ([`WarpedRows`]) with the pixels
 /// [`warp_level`] gives it whole. `None` when the raster's latitudes are cut to Web Mercator's
 /// (the cut raster is made in memory), which is then warped whole.
+#[cfg(not(target_family = "wasm"))]
 fn make_tiles_warped(
     src: &mut crate::LazyRaster,
     header: &RasterDataset,
@@ -1201,6 +1278,7 @@ fn make_tiles_warped(
 }
 
 /// Whether [`warp_plan`] cuts the raster's latitudes to Web Mercator's first.
+#[cfg(not(target_family = "wasm"))]
 fn cuts_latitudes(ds: &RasterDataset) -> bool {
     let gt = ds.geo_transform();
     ds.crs().is_geographic()
@@ -1211,6 +1289,7 @@ fn cuts_latitudes(ds: &RasterDataset) -> bool {
 }
 
 /// The level [`warp_plan`] plans, without its source.
+#[cfg(not(target_family = "wasm"))]
 struct WarpPlanned {
     zoom: u8,
     minx: f64,
@@ -1221,6 +1300,7 @@ struct WarpPlanned {
 
 /// A tile pyramid being written: built a tile row at a time from rows of its full-resolution
 /// level, its tiles given to `sink`. Returns the bounds and the zoom levels.
+#[cfg(not(target_family = "wasm"))]
 pub(crate) struct Streamed {
     pub bounds: [f64; 4],
     pub min_zoom: u8,
@@ -1234,12 +1314,14 @@ pub(crate) struct Streamed {
 /// and the zoom level's `-tr`) is read a strip at a time, so that it is never held whole. Others
 /// are warped to the level a chunk at a time, read by window, with the pixels [`make_tiles`]
 /// gives them; only a geographic raster whose latitudes are cut to Web Mercator's is read whole.
+#[cfg(not(target_family = "wasm"))]
 pub(crate) fn make_tiles_streamed(
     src: &mut crate::LazyRaster,
     o: &TileWriteOptions,
     sink: &mut dyn super::pyramid::TileSink,
 ) -> Result<Streamed> {
     let format = tile_format(o)?;
+    crate::ops::Resampling::parse(o.resampling.as_deref().unwrap_or("bilinear"))?;
     let header = src.header();
     if let Some((p, dx, dy)) = aligned_level(&header, o)? {
         let src_alpha = matches!(header.raster.bands, 2 | 4);
@@ -1258,6 +1340,7 @@ pub(crate) fn make_tiles_streamed(
 
 /// [`make_tiles_streamed`] for a raster in memory: warped whole, then its pyramid built a tile
 /// row at a time.
+#[cfg(not(target_family = "wasm"))]
 pub(crate) fn make_tiles_from_dataset(
     ds: &RasterDataset,
     o: &TileWriteOptions,
@@ -1371,7 +1454,7 @@ pub(crate) fn update_tiles(archive: TileArchive, ds: &RasterDataset, o: &TileWri
 pub(crate) fn encode_tile(px: &[u8], bands: usize, format: TileFormat, quality: u8) -> Result<Vec<u8>> {
     let ch = bands + 1;
     let (channels, samples): (usize, std::borrow::Cow<[u8]>) = if format == TileFormat::Jpeg {
-        (bands, px.chunks(ch).flat_map(|p| p[..ch - 1].to_vec()).collect::<Vec<u8>>().into())
+        (bands, px.chunks(ch).flat_map(|p| p[..ch - 1].iter().copied()).collect::<Vec<u8>>().into())
     } else {
         (ch, px.into())
     };
@@ -1430,6 +1513,50 @@ fn cut_tiles(l: &Pixels, z: u8, sx: i64, sy: i64, format: TileFormat, quality: u
 mod tests {
     use super::*;
 
+    /// Independent GDAL 3.13.3 MBTiles Byte/bilinear samples from the opaque
+    /// EPSG:4326 fixture in compare_tile_rgba_with_gdal.py. These values lie
+    /// just below byte half-integers; staging masked colors as Float32 changes them.
+    #[test]
+    fn alpha_mask_staging_preserves_byte_bilinear_rounding() {
+        let (w, h) = (513, 377);
+        let mut values = Vec::new();
+        for b in 0..4 {
+            for y in 0..h {
+                for x in 0..w {
+                    values.push(match b {
+                        0 => ((x * 17 + y * 3) % 256) as u8,
+                        1 => ((x * 5 + y * 23) % 256) as u8,
+                        2 => ((x * 7 + y * 11) % 256) as u8,
+                        _ => 255,
+                    });
+                }
+            }
+        }
+        let ds = crate::drivers::common::make_raster(
+            w,
+            h,
+            4,
+            RasterData::U8(values),
+            [-88.1234567, 0.0001, 0.0, 33.1234567, 0.0, -0.0001],
+            SpatialRef::from_epsg(4326).unwrap().to_crs_info(),
+            None,
+        )
+        .unwrap();
+        let ds = RasterDataset::with_driver(ds, crate::formats::RasterDriver::GTiff, false);
+        let tiles = make_tiles(&ds, &TileWriteOptions { min_zoom: Some(14), ..Default::default() }).unwrap();
+        for (tx, tms_y, y, x, band, expected) in [
+            (4182, 9790, 238, 7, 2, 237),
+            (4183, 9789, 80, 146, 0, 172),
+            (4183, 9789, 181, 31, 0, 66),
+            (4183, 9790, 63, 39, 0, 144),
+            (4183, 9790, 135, 140, 0, 237),
+        ] {
+            let tile = tiles.tiles.iter().find(|(z, x, y, _)| *z == 14 && *x == tx && *y == (1 << 14) - 1 - tms_y).unwrap();
+            let image = decode_image(&tile.3).unwrap();
+            assert_eq!(image.data[(y * 256 + x) * image.channels + band], expected);
+        }
+    }
+
     /// The pyramid as terrio computed it before it streamed: every level held whole.
     fn pyramid_reference(
         mut level: Pixels,
@@ -1442,7 +1569,7 @@ mod tests {
     ) -> Result<RasterTiles> {
         let res0 = 2.0 * MAX_GM / 256.0;
         let (plan, bounds) = pyramid_plan(level.w, level.h, zoom, minx, maxy, level.bands, o, format, bounds);
-        let method = o.resampling.as_deref().unwrap_or("bilinear").to_ascii_lowercase();
+        let method = o.overview_resampling.as_deref().or(o.resampling.as_deref()).unwrap_or("bilinear").to_ascii_lowercase();
         let method = match method.as_str() {
             "near" | "nearest" => "nearest",
             "average" => "average",
@@ -1653,6 +1780,129 @@ mod tests {
         assert!(left.is_empty());
     }
 
+    /// Independent GDAL 3.13 MEM BuildOverviews reference, generated with the lwi-gdal
+    /// Python: Byte 4x4, rows [0,0,0,240] three times then [240,240,240,240], factor 2.
+    /// Opaque data only: this does not assert GDAL partial-alpha parity.
+    #[test]
+    fn overview_override_matches_gdal_313_opaque_reference() {
+        let values = vec![0, 0, 0, 240, 0, 0, 0, 240, 0, 0, 0, 240, 240, 240, 240, 240];
+        for (method, expected) in [("average", [0, 120, 120, 180]), ("bilinear", [0, 103, 103, 162])] {
+            let level = Pixels { w: 4, h: 4, bands: 1, data: values.clone(), alpha: vec![255; 16] };
+            let o = TileWriteOptions {
+                resampling: Some("bilinear".into()),
+                overview_resampling: Some(method.into()),
+                min_zoom: Some(1),
+                ..Default::default()
+            };
+            let rt = pyramid(level, 2, -MAX_GM, MAX_GM, &o, TileFormat::Png, None).unwrap();
+            let tile = rt.tiles.iter().find(|t| t.0 == 1).unwrap();
+            let image = decode_image(&tile.3).unwrap();
+            for (i, expected) in expected.into_iter().enumerate() {
+                let offset = ((i / 2) * image.w + i % 2) * image.channels;
+                assert_eq!(image.data[offset], expected, "{method} pixel {i}");
+                assert_eq!(image.data[offset + image.channels - 1], 255);
+            }
+        }
+    }
+
+    #[test]
+    fn tile_png_is_lossless() {
+        // All channel values, including RGB under zero and partial alpha, survive PNG.
+        let data: Vec<u8> = (0..256).flat_map(|i| [i as u8, (255 - i) as u8, (i / 2) as u8, i as u8]).collect();
+        let encoded = encode_png(16, 16, 4, &data).unwrap();
+        let decoded = decode_image(&encoded).unwrap();
+        assert_eq!(decoded.data, data);
+    }
+
+    #[test]
+    fn overview_override_handles_small_and_offgrid_pyramids() {
+        for (w, h, gx, gy) in [(1, 1, 5, 9), (41, 27, 250, 255), (513, 259, 37, 211)] {
+            let zoom = 8;
+            let r = resolution(zoom, 256);
+            let (minx, maxy) = (-MAX_GM + gx as f64 * r, MAX_GM - gy as f64 * r);
+            for method in ["near", "average", "bilinear", "cubic"] {
+                let mut o = TileWriteOptions { resampling: Some("bilinear".into()), min_zoom: Some(6), ..Default::default() };
+                assert!(o.set("overview_resampling", method).unwrap());
+                assert_eq!(o.overview_resampling.as_deref(), Some(method));
+                let a = pyramid_reference(test_level(w, h, 3, 7), zoom, minx, maxy, &o, TileFormat::Png, None).unwrap();
+                let b = pyramid(test_level(w, h, 3, 7), zoom, minx, maxy, &o, TileFormat::Png, None).unwrap();
+                assert!(!a.tiles.is_empty());
+                assert!(sorted(a.tiles) == sorted(b.tiles), "{w}x{h} {method}");
+            }
+        }
+    }
+
+    /// Separate overview selection preserves base pixels and works through both archive writers,
+    /// including RGBA with holes and partial alpha, aligned and resampled source grids.
+    #[test]
+    fn overview_resampling_is_independent_and_lazy_matches_eager() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, ds) = aligned_raster(dir.path(), "rgba.tif", 4, 13);
+        let alpha = &ds.raster.data.to_f64_vec()[3 * 900 * 520..];
+        assert!(alpha.iter().any(|&v| v > 0.0 && v < 255.0));
+        for zoom in [13, 12] {
+            let defaults = TileWriteOptions {
+                resampling: Some("bilinear".into()),
+                max_zoom: Some(zoom),
+                min_zoom: Some(zoom - 2),
+                ..Default::default()
+            };
+            let baseline = make_tiles(&ds, &defaults).unwrap();
+            let explicit = TileWriteOptions { overview_resampling: Some("bilinear".into()), ..defaults.clone() };
+            assert!(sorted(make_tiles(&ds, &explicit).unwrap().tiles) == sorted(baseline.tiles.clone()));
+            let o = TileWriteOptions { overview_resampling: Some("average".into()), ..defaults };
+            let actual = make_tiles(&ds, &o).unwrap();
+            if zoom == 12 {
+                let nearest = TileWriteOptions { resampling: Some("near".into()), ..o.clone() };
+                let n = make_tiles(&ds, &nearest).unwrap();
+                let base = |t: &RasterTiles| sorted(t.tiles.iter().filter(|t| t.0 == zoom).cloned().collect());
+                assert!(base(&actual) != base(&n), "base resampling remains effective");
+            }
+            let at = |tiles: &RasterTiles, base: bool| sorted(tiles.tiles.iter().filter(|t| (t.0 == zoom) == base).cloned().collect());
+            assert!(at(&actual, true) == at(&baseline, true), "base z{zoom}");
+            assert!(at(&actual, false) != at(&baseline, false), "overview z{zoom}");
+            let w = warp_level(&ds, &o, None).unwrap();
+            let reference = pyramid_reference(w.level, w.zoom, w.minx, w.maxy, &o, TileFormat::Png, None).unwrap();
+            assert!(sorted(actual.tiles.clone()) == sorted(reference.tiles));
+            for (ext, kind) in [("pmtiles", super::super::ArchiveKind::PMTiles), ("mbtiles", super::super::ArchiveKind::MBTiles)] {
+                let out = dir.path().join(format!("mixed{zoom}.{ext}")).to_str().unwrap().to_string();
+                let options = crate::RasterWriteOptions {
+                    creation_options: vec![
+                        ("RESAMPLING".into(), "BILINEAR".into()),
+                        ("overview_resampling".into(), "AVERAGE".into()),
+                        ("MAXZOOM".into(), zoom.to_string()),
+                        ("MINZOOM".into(), (zoom - 2).to_string()),
+                    ],
+                    ..Default::default()
+                };
+                let expected = super::super::write_raster_archive(&actual, &o, &format!("mixed{zoom}"), kind).unwrap();
+                crate::open_raster_lazy(&path).unwrap().write(&out, &options).unwrap();
+                assert!(std::fs::read(&out).unwrap() == expected, "lazy {ext} z{zoom}");
+                crate::write_raster_dataset(&ds, &out, &options).unwrap();
+                assert!(std::fs::read(&out).unwrap() == expected, "eager {ext} z{zoom}");
+            }
+        }
+    }
+
+    /// Rasters on the grids of zoom 19 and 20 are still read a strip at a time, and give the
+    /// in-memory tiles: at these zooms the rounding of coordinates near 2e7 m is about the size
+    /// of the alignment tolerance.
+    #[test]
+    fn aligned_rasters_at_high_zooms_stream_as_the_in_memory_writer_writes_them() {
+        let dir = tempfile::tempdir().unwrap();
+        for zoom in [19, 20] {
+            let (path, ds) = aligned_raster(dir.path(), &format!("z{zoom}.tif"), 3, zoom);
+            let o = TileWriteOptions { resampling: Some("near".into()), max_zoom: Some(zoom), ..Default::default() };
+            let mut lazy = crate::open_raster_lazy(&path).unwrap();
+            assert!(aligned_level(&lazy.header(), &o).unwrap().is_some(), "zoom {zoom} aligned");
+            let w = warp_level(&ds, &o, None).unwrap();
+            let reference = pyramid_reference(w.level, w.zoom, w.minx, w.maxy, &o, TileFormat::Png, None).unwrap();
+            let mut tiles = Vec::new();
+            make_tiles_streamed(&mut lazy, &o, &mut tiles).unwrap();
+            assert!(sorted(tiles) == sorted(reference.tiles), "zoom {zoom}");
+        }
+    }
+
     /// A raster that is not on a zoom level's grid (another resolution, another CRS) is warped as
     /// before, then tiled a tile row at a time: the same archive.
     #[test]
@@ -1750,3 +2000,6 @@ mod tests {
         assert!(sorted(tiles) == sorted(pyramid_reference(w.level, w.zoom, w.minx, w.maxy, &o, TileFormat::Png, None).unwrap().tiles));
     }
 }
+
+#[cfg(all(test, not(target_family = "wasm")))]
+mod memory_tests;

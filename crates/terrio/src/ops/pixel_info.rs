@@ -1,3 +1,18 @@
+// SPDX-FileCopyrightText: Copyright (c) 2001, Frank Warmerdam
+// SPDX-FileCopyrightText: Copyright (c) 2008-2012, Even Rouault <even dot rouault at spatialys.com>
+// SPDX-FileCopyrightText: Copyright (c) 2024, Javier Jimenez Shaw
+// SPDX-FileCopyrightText: Copyright (c) 2002, i3 - information integration and imaging Fort Collin, CO
+// SPDX-FileCopyrightText: Copyright (c) 2008-2013, Even Rouault <even dot rouault at spatialys.com>
+// SPDX-FileCopyrightText: Copyright (c) 2021, CLS
+// SPDX-FileCopyrightText: Copyright (c) 2026 Qiusheng Wu and Terrio contributors
+// SPDX-License-Identifier: MIT
+//
+// Derived from (translated to Rust and modified):
+//   GDAL v3.13.3:
+//     alg/gdal_interpolateatpoint.cpp
+//     alg/gdalresamplingkernels.h
+//     alg/gdaltransformer.cpp
+
 //! Pixel values at positions, as GDAL's `gdal raster pixel-info` and `gdallocationinfo`: given as
 //! column/line, as coordinates in the raster's CRS or in another CRS, or as the points (or
 //! centroids) of a vector layer; read by nearest neighbour, or interpolated bilinearly, by cubic
@@ -1156,8 +1171,9 @@ mod tests {
         assert_eq!(info.to_values("\n"), "7\n\n");
     }
 
+    /// Reference: GDAL 3.13.
     #[test]
-    fn nan_nodata_queries_keep_nan_like_gdal_313() {
+    fn nan_nodata_queries_keep_nan_like_gdal() {
         let config = crate::RasterConfig { cols: 2, rows: 2, bands: 1, data_type: DataType::F32, nodata: f64::NAN, ..Default::default() };
         let mut source = LazyRaster::from(crate::RasterDataset::new(crate::Raster::from_data(config, vec![f64::NAN; 4]).unwrap(), true));
         for resampling in [Resampling::Nearest, Resampling::Bilinear, Resampling::Cubic, Resampling::CubicSpline] {

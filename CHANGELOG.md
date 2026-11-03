@@ -2,7 +2,237 @@
 
 ## Unreleased
 
+- XLSX layout options beyond GDAL: `HEADER_ROWS`, `RANGE` and `FIRST_ROW` when reading, and
+  `HEADER_STYLE`, `FREEZE_HEADER`, `AUTOFILTER`, `COLUMN_WIDTH`, `DATE_FORMAT`, `DATETIME_FORMAT`
+  and `CREATION_TIME` when writing. A workbook's sheets may expand to 8 GiB together (#405).
+- The `XLSX` driver reads and writes `.xlsx` and `.xlsm` workbooks in pure Rust, natively and in
+  WebAssembly, as GDAL's driver does: a layer per worksheet, with the `HEADERS` and `FIELD_TYPES`
+  open options. Naming coordinate or WKT columns reads geometries from them, and the `GEOMETRY`
+  layer creation option writes them (#405).
+
+- Remote GeoJSON and GML responses open by detected content when their URLs have no
+  file extension, including WFS GetFeature requests (#494).
+- XML element-count and nesting budget refusals report `ResourceLimitError` in Python,
+  including palette XML reads, consistently with other parser resource limits.
+- Native HTTP builds read WFS 1.0/1.1/2.0 services by `WFS:` endpoint or
+  GetCapabilities URL, list layers without downloading features, and read selected
+  simple-feature layers with schemas, CRS and configurable paging (#495).
+- GML source IDs resolve namespace aliases. Unrelated prefixed `id`/`fid`
+  attributes are no longer treated as source IDs.
+- The `ESRIPBF` driver reads the protocol buffer of ArcGIS feature-service queries (`f=pbf`), which
+  GDAL has no driver for: files recognized by content, and query URLs read page by page as
+  `ESRIJSON` reads them, with the `ESRIPBF:` prefix (#475).
+
+- Resource and allocation refusals are terminal across native and optional GDAL reads. Python
+  reports them as `ResourceLimitError` (a `MemoryError`), replacing `InvalidArgumentError`
+  for GRIB/ESRIJSON limits, `TerrioError` for decoded-byte limits, and `TerrioIOError` for
+  I/O allocation failures. The audited native parser, expansion, chunk,
+  archive, listing and metadata budgets also replace prior `InvalidDataError`/`UnsupportedError`
+  refusals with the resource class. Update exception handlers accordingly.
+  GDAL vector reads, including fallback
+  reads, now have a default 1 GiB retained-data estimate; previously successful large reads can
+  require raising `TERRIO_GDAL_MAX_VECTOR_BYTES` to a positive byte count (#485).
+
+### Projections
+
+- `+proj=omerc` with two points (`+lat_1`/`+lon_1`, `+lat_2`/`+lon_2`) and no
+  azimuth is now computed as PROJ does; it was refused. GDAL's WKT1
+  `Hotine_Oblique_Mercator_Two_Point_Natural_Origin` (with GDAL's or ESRI's
+  parameter names) and WKT2 `Hotine Oblique Mercator Two Point Natural Origin`
+  are read, and the former is written.
+
+## 0.6.1 (2026-11-01)
+
+- CityJSON 1.1 and 2.0 and CityGML 2.0 and 3.0 are read and written as flat XYZ features through
+  Rust, the CLI and MCP, Python and JavaScript. They do not keep lossless city-model topology,
+  textures or materials (#464, #470, #473, #480).
+- `terrio [command ...] --json-usage` prints a versioned, still unstable JSON catalog of the
+  commands (#461).
+- CADRG `A.TOC` indexes can be created from existing frame files through every API (#446).
+- Python and JavaScript expose contour, footprint, buffer, grouped dissolve, geometry validity and
+  repair, zonal statistics and multipart splitting directly (#445, #447).
+- `stream::GpkgLayersWriter` writes interleaved multi-layer GeoPackages from Rust (#458).
+- Python `to_bytes` and JavaScript `toBytes` reject several layers for a single-layer format
+  rather than writing only the first (#445).
+- xarray `to_raster()` exports reprojected masked integer rasters as floating point with NaN
+  nodata when their integer encoding cannot hold the new borders (#463).
+- `terrio-crs` 0.2.1 adds `Transformer::with_reverse_degree_division`, which `terrio` needs, and
+  accepts antimeridian rounding in the Mollweide and Wagner IV and V inverses (#458, #472).
+- Rust: `VectorOpenOptions` has a new `feature_server_paging` field and `VectorWriteOptions` new
+  `cityjson_version`, `citygml_version` and `citygml_lod0_surface` fields, so a struct literal of
+  either type without `..Default::default()` no longer compiles.
+- The `ESRIJSON` driver reads the JSON of ArcGIS feature-service queries as GDAL's does: files
+  recognized by content, and query URLs read page by page, with the `FEATURE_SERVER_PAGING` open
+  option and the `ESRIJSON:` prefix.
+- `terrio ui` serves a local page with a form for every command, a file browser, the equivalent
+  command line and cancellation. It listens on 127.0.0.1 only and needs a per-session token. The
+  `--json-usage` catalog records whether each option is `hidden`.
+- Warps map output pixels to the source with GDAL's degree rounding on every platform, except
+  between Web Mercator and WGS 84, so warped pixels can change in the last bits.
+- On glibc Linux, projections call the installed C library's `asinh` and `atanh`, so coordinates can
+  change in the last bits and are no longer reproducible across glibc releases. With the warp
+  change, the #253 bilinear warp and county cases match GDAL 3.13.3 exactly.
+- `terrio info` of a rotated raster reports the extent of its four corners, and prints the
+  geotransform in place of a pixel size. South-up rasters lazily read report ordered bounds (#468).
+- `terrio formats` lists EPT as written, and the compression help and errors list LERC and JPEG XL
+  (#467).
+- The command line page opens with every command in alphabetical order, with its `--help`
+  summary, and a test keeps the list current. The rest of the site was corrected against the code.
+- The documentation site runs the notebooks in the browser with JupyterLite, with
+  terrio's wheel served by the site and installed by each notebook, at
+  <https://terrio.dev/notebooks/>.
+- `terrio.rio.MemoryFile` given PNG, JPEG or WebP bytes without a filename or
+  `ext` names its file for their format, so they open (#451). Other bytes are
+  named `.tif`, as before.
+- `open_raster` (eager or lazy) and `validate_cog` name a missing local file, or
+  a directory, in their errors, as in `'dem.tif': No such file or directory (os
+  error 2)` (#451). The error's kind and its Python class are unchanged.
+- A first range request answered 206 with an unknown total length
+  (`Content-Range: bytes 0-16383/*`) fails with its own message, distinct from
+  that of a 206 without `Content-Range` (#451).
+- `terrio --help` and the nested command lists are sorted alphabetically, with a
+  one-line summary of at most 60 characters per command. Details such as the
+  matching GDAL or PDAL tool moved to each command's own `--help`.
+- Homebrew installs the `terrio` command on macOS and Linux, with `brew install
+  --cask opengeos/terrio/terrio`. Each release tests the cask and updates the tap.
+
+## 0.6.0 (2026-10-31)
+
+### Standalone CRS crate
+
+- `terrio-crs` 0.2.0 carries the CRS work since 0.1.0: geocentric and IAU CRSs,
+  PROJJSON, and more projections. `TransformOptions` has a new public field,
+  `promote_to_3d`: struct literals need it or `..Default::default()`.
+- The crate's default build has no C dependency, on native targets as well as
+  WebAssembly. Its default features changed: Zstandard TIFF grids are no longer
+  read unless the optional `libzstd` feature (the zstd C library) is enabled, and
+  such a grid is treated as unavailable, so a transformation that needs it falls
+  back to the next operation, possibly a ballpark one, without an error. Set
+  `only_best` (`ONLY_BEST=YES`) to get an error instead. PROJ's grids are
+  DEFLATE-compressed.
+
+### No C dependencies
+
+- The default builds of the CLI, the Python package, the Rust crates and the JavaScript
+  package have no C dependencies, and CI builds them without a C compiler.
+- `libzstd` is no longer a default feature of `terrio`. Zstandard GeoTIFF and EPT tiles are decoded
+  and written with `ruzstd`, which decodes more slowly and writes at its fastest level (about zstd's
+  level 1) whatever level is asked for. Enable `libzstd` to use the zstd C library.
+- Zstandard GeoParquet is read with the same codec, rather than through the `parquet` crate's zstd.
+- HTTPS uses `rustls-graviola` rather than `ring` on x86-64 and AArch64. An HTTPS request panics on
+  a CPU without the features it needs; see [Architecture](docs/architecture.md#pure-rust).
+
+### Raster dataset masks
+
+- Preserve internal GeoTIFF and `.msk` validity masks in `convert`, including
+  extracted windows and overviews. Stream masks alongside GeoTIFF/COG pixels
+  and use them when generating COG overviews. Lazy warps, CLI output and Python
+  inputs now apply source masks, including multiple sources and cutlines (#431).
+- Masked inputs are refused, rather than written without their mask, by
+  `convert` to any output other than GeoTIFF and COG (PMTiles, MBTiles and GDAL
+  drivers included), by `convert --append` and by `convert --t-srs`. Write
+  GeoTIFF or COG to keep the validity, or use `warp` to apply it. The library,
+  Python and JavaScript writers refuse tile archives but keep the pixel, alpha
+  and nodata serialization of other non-GeoTIFF formats, which do not store the
+  mask.
+
+### Docker image
+
+- Publish the `terrio` command-line tool as a Docker image for linux/amd64 and
+  linux/arm64 to the GitHub Container Registry (`ghcr.io/opengeos/terrio`) with
+  each release.
+
+### Licensing
+
+- Geometry routines are ports of JTS or independent implementations (#402).
+- Point cloud radius searches sort with Rust's standard library (#414).
+- The repository follows the [REUSE specification](https://reuse.software): files
+  adapted from other projects carry SPDX headers naming their sources, and
+  `NOTICE` lists every upstream project and its copyright holders (#415, #435).
+- `LICENSE` names its copyright holders again (#416).
+- Package metadata declares MIT AND MPL-2.0: the point cloud eigensolver
+  (`pointcloud/filters/selfadjoint.rs`) is MPL-2.0 (#435).
+- Earlier releases ship older notices; upgrading is recommended.
+
+### Geometry implementation provenance
+
+- Replace the GEOS-derived simplification, hull, tile-validity, spatial-packing
+  and clipping-envelope kernels with attributed JTS 1.20.0 implementations under
+  EDL-1.0. Replace the tile writer's linework repair independently, preserving its
+  isolated implementation and behavioral evidence. The complete old repair
+  module and helpers are removed. Public signatures are unchanged; simplification,
+  hull and tile-validity outputs can differ from earlier releases, including
+  ring starts, orientation and some geometries. The
+  [compatibility record](docs/jts-provenance.md) describes the observed behavior
+  and numeric limits. Polygon hulls can return an error when no non-degenerate
+  finite frame can be constructed. Repeated mesh edges and unclosed boundary
+  walks also return errors instead of overwriting adjacency or losing components.
+  Polygon hulls require valid, non-overlapping input; mixed degenerate components
+  can error, and invalid-input output is not guaranteed to match GEOS.
+  The previous upfront ring-crossing rejection is not preserved: invalid inputs
+  are not guaranteed to return the former "run make-valid first" error.
+- Polygon hulls keep holes on their containing outer shell when an island
+  touches a hole vertex, rather than assigning the hole to that smaller island.
+- Tile conversion now fails explicitly on repair invariant violations instead
+  of silently dropping a feature or emitting unrepaired geometry. One such
+  failure stops the conversion, including a multi-zoom run.
+  Tile encoding errors identify the layer, feature ID and index, and tile Z/X/Y.
+- Polygon tile encoding reports an error when a signed cursor delta cannot fit
+  in 32 bits. The [provenance inventory](docs/geos-retirement-audit.md) records
+  reference comparisons, collinear-ring ordering differences and the existing
+  approximate clipping-failure predictor.
+
+### Terrain
+
+- `terrio dem color-relief` and Python's `terrio.dem(path, ..., dst=path)` read the DEM and write
+  the output a strip of rows at a time, as `terrio dem` already did for the other products
+  (Rust: `color_relief_to_path`, and `ColorMap::parse_lazy` for color files with percentages).
+  A path-to-path `terrio.dem` now returns the result opened lazily from `dst` instead of in
+  memory; the pixels are unchanged. On a 15,000 x 12,000 Float32 DEM, a color relief with alpha
+  peaks at about 560 MiB (160 MiB with `max_memory_mib=256`) instead of 7,569 MiB.
+- `--max-memory` (CLI), `max_memory_mib` (Python) and `DemOptions::max_memory_mib` set the strip
+  height from a memory budget, like `gdalwarp -wm` (by default, strips of about 64 MiB of input
+  values, as before). The values do not depend on it.
+- The in-memory `color_relief` colors the band directly into the Byte output, in parallel,
+  instead of holding a Float64 copy of the band and four Float64 output planes.
+- `dem_to_path` and `color_relief_to_path` read a DEM that is also the output whole first,
+  instead of truncating it while it is read.
+- On Unix, an output that is a hard link to an input now counts as that input wherever an output
+  may replace its input: the DEM paths, `warp`, `mosaic`, `LazyRaster::write` and pansharpening
+  read the input whole first (or refuse, for a VRT output), as for the same path. On Windows, a
+  hard link is not detected.
+- `terrio dem` names `--max-memory`, not `max_memory_mib`, when it refuses a budget for an output
+  that is a hard link to the input.
+
 ### Formats
+
+- GeoJSON and GeoJSONSeq outputs write a field as each feature's `id` member with GDAL's
+  `ID_FIELD` and `ID_TYPE` creation options (`--lco`, `GeoJsonOptions::id_field` and
+  `id_type`), so the string identifiers read from a GeoJSON `id` go back out as RFC 7946 `id`
+  members. `GeoJsonOptions` is no longer `Copy`.
+- KMZ archives can carry files such as the icon images of `SYMBOL` styles (#394):
+  `VectorWriteOptions::kmz` (`KmzOptions::resources`), `terrio convert --kmz-resource`, Python's
+  `kmz_resources=` and JavaScript's `kmzResources` pack them beside the layer documents, where
+  relative icon links resolve.
+- HEC-RAS geometry (`.g##.hdf`) and plan (`.p##.hdf`) HDF files are read as
+  vector layers (the `HECRAS` driver, the `hecras` feature, on by default), through the
+  [`ras-commander-fast-hdf`](https://crates.io/crates/ras-commander-fast-hdf)
+  engine: 2D mesh cells, cell centres, faces, face points and perimeters (with
+  the stored 2D flow area table); cross sections (with station-elevation,
+  Manning's n and ineffective areas as JSON fields), river lines, storage
+  areas, structures, boundary-condition lines, breaklines, refinement regions,
+  reference lines and points, junctions, pump stations, and pipe conduits and
+  nodes, each with its stored attribute columns. Stored results join through
+  open options (summary maxima and minima with their times, time-step values,
+  series extremes, cross-section, structure, boundary and reference results).
+  The CRS is the stored `Projection` WKT. A file is claimed only when its root
+  `File Type` is `HEC-RAS Geometry` or `HEC-RAS Results`; other HDF5 and
+  NetCDF files are not affected. Compared with h5py on the HEC-RAS 7.0.1 files
+  of a public corpus: every value identical. See `docs/hecras.md`.
+- `hdf5-reader` and `netcdf-reader` are the crates.io 0.10.1 releases; the
+  `[patch]` to a netcdf-rust branch is gone (its fix, roteiro-gis/netcdf-rust#95,
+  is in 0.10). The HEC-RAS engine uses the same `hdf5-reader`, so a build
+  compiles one HDF5 reader.
 
 - SRTM HGT tiles are read and written (the `SRTMHGT` driver), as GDAL's SRTMHGT
   driver does: 3", 1" and 0.5" tiles georeferenced from their name
@@ -25,6 +255,23 @@
   source, instead of reading it whole: the colour and alpha warps of GDAL's MBTiles driver run in
   their own chunks, in step. The archive is byte-identical. A geographic raster reaching beyond
   Web Mercator's latitudes is still read whole.
+- Lazy GeoTIFF reads keep the tile or strip offsets and byte counts of each
+  image (full resolution or overview) after its first window read (#348): later
+  windows of the image no longer read and decode both tables again, nor does
+  terrio's own codec (LZW and the other compressions it decodes) read them a
+  second time, and mask reads no longer copy the mask's tables. Windows decoded
+  on the calling thread (one chunk, or remote and sparse files) no longer cost
+  more as the image has more tiles; the threads decoding the chunks of larger
+  windows of local files still each read the tables, as does moving to another
+  overview. The tables kept take 16 bytes per chunk of each image read.
+
+### GeoPackage
+
+- `terrio gpkg-repack` (CLI, and the `gpkg-repack` MCP tool) compacts a native GeoPackage in
+  place, rebuilding every B-tree from its encoded records and preserving rowids, SQL objects,
+  text encodings, rasters and auto-vacuum pointer maps. Python `gpkg_repack(path)` and
+  `gpkg_repack_bytes(data)`, and JavaScript `gpkgRepack` and `gpkgRepackBytes`, expose the same
+  operation. Scope and storage safety are in [docs/cli.md](docs/cli.md#geopackage-repacking).
 
 ### Remote I/O
 
@@ -38,6 +285,19 @@
 
 ### Breaking changes
 
+- Dataset/VSI paths retain leading and trailing whitespace across CLI, Python, JavaScript
+  and MCP (#372). Native filenames and virtual keys with edge whitespace are distinct from their
+  trimmed neighbors; callers must normalize pasted paths/URLs themselves. `@FILE` lines
+  still apply their file-list whitespace rules.
+- Native Unix SQLite in-place append/update and recovery propagate parent-directory open/fsync
+  failures. Filesystems without directory fsync support can fail before page writes. An error
+  after journal deletion reports committed changes or completed recovery with unconfirmed
+  durability; do not blindly retry an append. Native append also refuses linked/special
+  journal, WAL and shared-memory sidecars before recovery, and refuses a database file with
+  hard-link aliases (Unix `nlink > 1`).
+- VRT `SourceFilename` values retain trailing whitespace and newlines, matching GDAL.
+  Remove formatting whitespace from inside the element when it is not part of the filename;
+  encoded leading whitespace and CDATA remain significant.
 - Signed S3 uploads of local files over 8 MiB over HTTPS use `UNSIGNED-PAYLOAD`
   (#335). An S3-compatible service, or a bucket policy, that refuses it now
   rejects those uploads; they can be sent over plain HTTP to keep a signed
@@ -46,6 +306,11 @@
   HTTP does not encrypt the request body or headers, including
   `x-amz-security-token` for temporary credentials; use this workaround only
   over a trusted connection.
+- A path-to-path Python `terrio.dem(src_path, ..., dst=path)` (other than to a VRT) returns the
+  result opened lazily from `dst` instead of in memory: the returned `Raster` reads `dst`, which
+  must stay in place and unchanged while the `Raster` is in use.
+- `DemOptions` has a new public field, `max_memory_mib`: struct literals need it or
+  `..Default::default()`.
 - `mosaic`, `warp`, `concat` and `filter merge` now treat an input beginning
   with `@` as a file list, so a file named `@name.tif` must be written
   `./@name.tif`.
@@ -64,6 +329,16 @@
   `--projwin`) are aligned with the rounding of the whole read. Python's `terrio.calc(expr, dst,
   A=path, ...)` does the same when every input is a path (`str` or `os.PathLike`), takes
   `max_memory_mib`, and returns the result opened lazily from `dst`.
+- `validate_cog` (Rust, Python) and `terrio validate-cog` (and MCP) check that a GeoTIFF is a
+  Cloud Optimized GeoTIFF with the checks and messages of rio-cogeo's `cog_validate` (GDAL's
+  `validate_cloud_optimized_geotiff.py`), reading only headers and chunk offsets: local files,
+  `/vsizip/` paths, and HTTP(S) or S3 URLs by range requests. The command exits with status 1
+  when the file is not a valid COG.
+- Dataset file operations (`dataset-copy`, `dataset-rename`, `dataset-delete` and
+  `dataset-files`) use paths and URLs exactly
+  as given, across CLI, Python, JavaScript and MCP. Native filenames and virtual keys with
+  edge whitespace are distinct from their trimmed neighbors, so callers must trim pasted
+  paths/URLs themselves.
 
 ### Point clouds
 
@@ -130,6 +405,26 @@
   pole may be given by `+o_lat_p`/`+o_lon_p`, by `+o_lon_c`/`+o_lat_c`/`+o_alpha`
   or by `+o_lon_1`/`+o_lat_1`/`+o_lon_2`/`+o_lat_2`, for rotated-pole grids too.
   PROJ's WKT2 `PROJ ob_tran o_proj=...` method is read.
+- `+proj=qsc` (quadrilateralized spherical cube) is computed as PROJ does, on
+  each of the six cube faces and on a sphere or an ellipsoid; it was refused.
+  GDAL's and ESRI's WKT1 `Quadrilateralized_Spherical_Cube` and WKT2
+  `Quadrilateralized Spherical Cube` are read, and the WKT1 form is written.
+- `+proj=healpix` and `+proj=rhealpix` are computed as PROJ does, with
+  `+rot_xy` and `+north_square`/`+south_square`; they were refused. On an
+  ellipsoid they use the authalic latitude, as PROJ 9.8.1. GDAL's WKT1 (which
+  carries the PROJ string), ESRI's `PROJ_healpix` and `PROJ_rhealpix` and WKT2
+  `PROJ healpix` and `PROJ rhealpix` are read, and the first is written.
+- `+proj=isea` is computed as PROJ 9.8.1 does, with `+orient`, `+azi`, `+lon_0`,
+  `+lat_0`, `+resolution` and `+aperture`; it was refused. As in PROJ 9.8.1, the
+  inverse is defined for the default grid in its two orientations only, and on an
+  ellipsoid the forward takes the geodetic latitude on the semi-major axis while
+  the inverse uses the authalic radius. `+mode=di`, `dd` and `hex` (grid
+  addresses) are refused. GDAL's WKT1 (which carries the PROJ string), ESRI's
+  `PROJ_isea` and WKT2 `PROJ isea` are read, and the first is written.
+- WKT2 `PROJ name` methods take only the projection's string-valued parameters
+  in the name (`o_proj` for `ob_tran`, `orient` and `mode` for `isea`), and refuse
+  `R_C`, `geoc`, `vunits` and `vto_meter` among their PARAMETERs, as they refused
+  the figure, datum and units before.
 
 ### Warp
 
@@ -151,6 +446,12 @@
 
 ### Shapefile
 
+- The rings of polygon records can be organized by any of the methods of GDAL's
+  `OGR_ORGANIZE_POLYGONS`, chosen with the `ORGANIZE_POLYGONS` open option (`--oo`,
+  `VectorOpenOptions::shapefile`) or the `OGR_ORGANIZE_POLYGONS` (or `TERRIO_ORGANIZE_POLYGONS`)
+  environment variable. `DEFAULT` groups rings by containment, whatever their winding, so files
+  that wind every ring one way keep their holes. `ONLY_CCW` stays the default, as in GDAL. With
+  every method, the self-touching rings below are split first, as GDAL 3.13 does.
 - In polygon records of several parts, rings that touch themselves at a vertex
   to enclose a hole, which Esri allows, are now split into an exterior and
   holes when read, wherever the stored ring starts, as GDAL 3.13 does (GDAL
@@ -161,3 +462,66 @@
   suite compares 18 such cases with GDAL.
 - A hole whose first vertex lies on the exterior now belongs to that exterior.
   It was read as a polygon of its own.
+
+### Hardening and GDAL parity
+
+- `driver=` and the process-wide allow-lists (`TERRIO_ALLOWED_DRIVERS`) are
+  enforced; under them, VRT, STAC, STACIT and Zarr open only when named.
+- Every entry point that opens data judges the driver it opens it with against
+  the allow-lists before the data is read or downloaded: formats recognised by
+  their content or by a file beside them (a Surfer 6 grid under any name, ENVI
+  and EHdr data by their `.hdr`), GTI catalogs, the multidimensional, tile
+  archive, VRT, TIFF, sparse and point cloud readers, and the GDAL backend.
+- Format identification (`identify`) names only drivers the allow-lists allow,
+  as GDAL identifies only with its registered drivers, and reads a remote
+  file's first 16 KiB through the range reader: cached, and refused from a
+  server that ignores ranges for a file over ten times that, as GDAL refuses
+  it. The content check (`check_dataset`) reads a dataset only through openers
+  that judge its driver, a GeoPackage only with GPKG allowed.
+- `terrio.identify_drivers(path)` gives what the allow-lists judge, the drivers
+  a file's name and its first bytes point to, beside `terrio.identify`'s format
+  identification.
+- A format no terrio driver recognises is refused; the `wbraster` and `wbvector`
+  fallbacks need `TERRIO_WBRASTER_FALLBACK` or `TERRIO_WBVECTOR_FALLBACK`.
+- Zip archives, on raster opens and in the `vsi` functions, JSON documents
+  fetched whole and STAC links are limited (`TERRIO_ZIP_MAX_*`,
+  `TERRIO_JSON_MAX_SIZE`, same-origin STAC links).
+- Outside STAC API paths, a remote file whose name says no format, or one of
+  most formats read whole (VRT, netCDF, HDF5, GeoPackage...), is refused after
+  its first bytes unless they show a format the read takes under that name.
+- Zarr chunks past 1 GiB (Fortran order counting twice) are refused, as in GDAL,
+  others decoded no further than they need; Zstandard GeoTIFF chunks, decoded
+  by terrio, stop at their size.
+- Zarr decimated reads read only picked chunks; windows past memory are errors.
+- A Zarr chunk is held once; big ones decode in parallel within half the memory.
+- Zarr stores of more than 65,536 bands are refused at open, as in GDAL.
+- `zarr_format`, GeoTIFF tile sizes and codecs are checked at open, as in GDAL.
+- A compressed GeoTIFF chunk running past the end of the file is an error.
+- `validate_cog` refuses a file whose images' tag arrays together take more
+  bytes than the file (images pointing to one array), before reading them.
+- Raster PMTiles and MBTiles pyramids built a tile row at a time are refused,
+  before anything is read, when the process cannot hold what they hold at once
+  (each level's rows, the filtered rows, the tiles an MBTiles archive gathers),
+  and allocate their rows fallibly: an error, not an abort.
+- WhiteIsZero GeoTIFF samples of 8 bits and more are read as stored, as in GDAL.
+- Panics in bindings that release the GIL raise `terrio.errors.InternalError`.
+- `MEM:::DATAPOINTER=` names open only when `GDAL_MEM_ENABLE_OPEN` allows it.
+- WEBP files are read, and written lossless; JPEG files are written with GDAL's
+  `QUALITY` and 4:2:0 chroma subsampling.
+- GRIB is read by a new pure-Rust reader, in place of the driver of #232, and
+  GRIB2 written, as GDAL does.
+- Web Mercator to WGS 84 longitudes are GDAL's, bit for bit, in bounded time.
+- A remote SRTM tile is known by its name and size from its first request, before
+  anything more of it is read (by range); where a tile is recognised by its name
+  and size, locally or remotely, the allow-list applies to SRTMHGT.
+- GeoTIFF and COG writes carry a color table as GDAL 3.12.1's `CreateCopy` does: a
+  single Byte or UInt16 band's.
+- Parallel work runs on a thread pool of terrio's own, which survives `fork()`.
+- `scripts/build_wheel_manylinux_2_28.sh` builds the Linux wheel for glibc 2.28
+  and later without Docker.
+- `terrio.rio.MemoryFile` removes its files when it is dropped unclosed, as
+  rasterio's leaves nothing.
+- The internal mask overviews that `overviews` adds and refreshes keep the tile
+  height of the overview they mask in whole tiles, as GDAL writes them. Mask
+  overviews smaller than a tile had a `TileLength` that was not a multiple of 16,
+  and refreshed or re-added ones short tiles that GDAL failed to read.

@@ -1,3 +1,8 @@
+// Written to match the behavior of:
+//   GDAL v3.13.3:
+//     apps/ogr2ogr_lib.cpp
+// No code is translated from these sources.
+
 //! Vector conversion options, the equivalent of `ogr2ogr`'s: attribute and spatial filters, field
 //! selection, a feature limit, geometry type conversion, exploding collections, CRS assignment and
 //! reprojection, simple SQL, and appending to or overwriting existing outputs.
@@ -22,7 +27,8 @@ pub fn select_layers(layers: Vec<Layer>, names: &[String]) -> Result<Vec<Layer>>
 /// Opens selected operation inputs and rejects every missing requested layer name.
 /// Keeps the file-stem alias supported by single-layer file drivers.
 pub fn open_layers(path: &str, options: &crate::VectorOpenOptions) -> Result<Vec<Layer>> {
-    let ds = crate::open_vector(path, options)?;
+    let mut ds = crate::open_vector(path, options)?;
+    ds.resolve_styles();
     let alias = if ds.layers.len() == 1 && ds.driver != crate::formats::VectorDriver::GPKG {
         std::path::Path::new(path).file_stem().and_then(|stem| stem.to_str())
     } else {
@@ -646,23 +652,51 @@ pub fn write_vector_with_mode(layers: &[Layer], path: &str, options: &VectorWrit
     if mode == WriteMode::Create || !std::path::Path::new(path).exists() {
         return crate::write_vector(layers, path, options);
     }
-    // GeoPackages are updated in place, keeping their other tables.
+
     let driver = options.driver.or_else(|| crate::formats::VectorDriver::for_extension(path));
+    let check_layer_updates = |driver| {
+        if let Some(driver @ (crate::formats::VectorDriver::CityJSON | crate::formats::VectorDriver::CityGML)) = driver {
+            return Err(crate::Error::Unsupported(format!(
+                "{} has no persistent layer names; append/overwrite layer modes cannot update an existing model. Use create mode to replace the complete model",
+                driver.name()
+            )));
+        }
+        // Rewriting would lose the workbook's other sheets' layout, and sheets whose header is not detected.
+        if driver == Some(crate::formats::VectorDriver::XLSX) {
+            return Err(crate::Error::Unsupported(
+                "XLSX: append/overwrite layer modes cannot update an existing workbook without losing its styles and merged cells. Use create mode to replace the workbook".into(),
+            ));
+        }
+        Ok(())
+    };
+    check_layer_updates(driver)?;
+    // GeoPackages are updated in place, keeping their other tables.
     if let Some(d) = driver {
         d.ensure_built()?;
     }
+    crate::dataset::ensure_vector_options_apply(options, driver)?;
     #[cfg(feature = "sqlite")]
     if driver == Some(crate::formats::VectorDriver::GPKG) {
         use crate::drivers::vector::gpkg_update::{UpdateMode, update};
         let mode = if mode == WriteMode::Append { UpdateMode::Append } else { UpdateMode::Overwrite };
-        return update(path, layers, mode);
+        return if options.preserve_declared_geometry_type {
+            crate::drivers::vector::gpkg_update::update_with_geometry_types(path, layers, mode, true)
+        } else {
+            update(path, layers, mode)
+        };
     }
     // Tile archives get the layers' features added to their tiles.
     #[cfg(all(feature = "tiles", not(target_family = "wasm")))]
     if matches!(driver, Some(crate::formats::VectorDriver::MBTiles | crate::formats::VectorDriver::PMTiles)) {
         return crate::tiles::update_vector(path, layers, &options.tiles, mode == WriteMode::Overwrite);
     }
-    let mut existing = crate::open_vector(path, &Default::default())?.layers;
+    let mut existing = crate::open_vector(path, &Default::default())?;
+    existing.resolve_styles();
+    // Use the detected content driver too: `.json` can contain a CityJSON model,
+    // even when its root type occurs after the bounded identification prefix.
+    // Reuse this normal update read, without opening or reading the file again.
+    check_layer_updates(Some(existing.driver))?;
+    let mut existing = existing.layers;
     for layer in layers {
         match existing.iter_mut().find(|l| l.name == layer.name) {
             Some(target) if mode == WriteMode::Append => append_features(target, layer),
@@ -701,6 +735,22 @@ fn append_features(target: &mut Layer, src: &Layer) {
 mod tests {
     use super::*;
     use wbvector::{FieldDef, FieldType};
+
+    #[cfg(feature = "xlsx")]
+    #[test]
+    fn layer_modes_leave_an_existing_workbook_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("o.xlsx");
+        let path = path.to_str().unwrap();
+        let layers = [Layer::new("a"), Layer::new("b")];
+        crate::write_vector(&layers, path, &Default::default()).unwrap();
+        let before = std::fs::read(path).unwrap();
+        for mode in [WriteMode::Append, WriteMode::Overwrite] {
+            let result = write_vector_with_mode(&layers[..1], path, &Default::default(), mode);
+            assert!(matches!(result, Err(crate::Error::Unsupported(m)) if m.contains("XLSX")));
+            assert_eq!(std::fs::read(path).unwrap(), before);
+        }
+    }
 
     #[test]
     fn named_selection_rejects_partial_matches() {

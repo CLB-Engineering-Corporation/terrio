@@ -9,9 +9,11 @@ use serde_json::Value;
 use std::sync::Arc;
 use wbraster::raster::RasterData;
 
+mod mosaic;
 #[cfg(feature = "netcdf-hdf5")]
 mod netcdf;
 pub(crate) mod write;
+pub use mosaic::{MosaicOptions, mosaic};
 
 fn bad(message: impl std::fmt::Display) -> Error {
     Error::InvalidArgument(format!("multidim: {message}"))
@@ -131,6 +133,15 @@ impl Group {
     fn find(&self, p: &str) -> Option<&Array> {
         self.arrays.iter().find(|a| a.info.path == p).or_else(|| self.groups.iter().find_map(|g| g.find(p)))
     }
+    /// All numeric and unsupported array paths, recursively in group order.
+    pub(crate) fn array_paths_recursive(&self) -> Vec<&str> {
+        self.arrays
+            .iter()
+            .map(|a| a.info.path.as_str())
+            .chain(self.unsupported_arrays.iter().map(|a| a.path.as_str()))
+            .chain(self.groups.iter().flat_map(|g| g.array_paths_recursive()))
+            .collect()
+    }
     /// All numeric arrays, recursively in group order.
     pub fn arrays_recursive(&self) -> Vec<&Array> {
         self.arrays.iter().chain(self.groups.iter().flat_map(|g| g.arrays_recursive())).collect()
@@ -190,6 +201,7 @@ impl Dataset {
 #[derive(Clone)]
 pub(crate) enum Source {
     Memory(Arc<Vec<u8>>),
+    Mosaic(Arc<mosaic::MosaicSource>),
     #[cfg(feature = "netcdf-hdf5")]
     Netcdf(Arc<netcdf_reader::NcFile>),
     #[cfg(feature = "zarr")]
@@ -363,6 +375,7 @@ impl View {
             return Ok(Buffer { data_type: self.data_type(), shape, bytes: Vec::new() });
         }
         let raw = match &self.array.source {
+            Source::Mosaic(source) => source.read(&self.axes)?,
             Source::Memory(b) => select_bytes(b, &self.array.shape(), &self.axes, size)?,
             #[cfg(feature = "netcdf-hdf5")]
             Source::Netcdf(f) => netcdf::read(f, &self.array.info.path, self.data_type(), &self.axes)?,
@@ -379,7 +392,8 @@ impl View {
         let source_shape: Vec<_> = natural.iter().map(|&i| self.axes[i].count).collect();
         let strides = strides(&source_shape)?;
         let permuted: Vec<_> = self.order.iter().map(|axis| strides[natural.iter().position(|a| a == axis).unwrap()]).collect();
-        let mut out = vec![0u8; bytes];
+        // Beside the selection read, as large: allocated fallibly.
+        let mut out = crate::dataset::fallible::filled(bytes, 0u8, "a transposed selection")?;
         for flat in 0..n {
             let mut remaining = flat;
             let mut src = 0;
@@ -417,7 +431,8 @@ pub(crate) fn select_bytes(raw: &[u8], shape: &[usize], selection: &[Selection],
     let output: Vec<_> = selection.iter().map(|s| s.count).collect();
     let n = elements(&output)?;
     let st = strides(shape)?;
-    let mut out = Vec::with_capacity(n.checked_mul(size).ok_or_else(|| bad("array byte length overflows"))?);
+    let mut out = Vec::new();
+    crate::dataset::fallible::reserve(&mut out, n.checked_mul(size).ok_or_else(|| bad("array byte length overflows"))?, "a selection")?;
     for flat in 0..n {
         let mut remaining = flat;
         let mut offset = 0;
@@ -486,6 +501,9 @@ pub fn open(name: &str) -> Result<Dataset> {
         || crate::drivers::zarr::parse_name(name).is_some()
         || crate::drivers::zarr::is_zarr(std::path::Path::new(name))
     {
+        // Opened as Zarr, by its name or its directory's layout: only if the process-wide raster
+        // allow-list has Zarr, as a de-registered GDAL driver opens no store.
+        crate::formats::check_driver_allowed("Zarr", name, crate::formats::Kind::Raster)?;
         return crate::drivers::zarr::md_open(name, None);
     }
     #[cfg(feature = "netcdf-hdf5")]
@@ -503,6 +521,21 @@ pub fn open_bytes(bytes: &[u8]) -> Result<Dataset> {
     #[cfg(feature = "netcdf-hdf5")]
     {
         netcdf::open_bytes(bytes)
+    }
+    #[cfg(not(feature = "netcdf-hdf5"))]
+    {
+        let _ = bytes;
+        Err(Error::disabled("netcdf-hdf5"))
+    }
+}
+/// Opens owned netCDF/HDF5 bytes without an intermediate input-buffer clone.
+/// The storage backend may copy when converting to its retained representation.
+/// Lazy arrays and views retain the storage, including any HDF5 userblock,
+/// until their last handle is dropped. Numeric reads preserve raw packed values.
+pub fn open_bytes_owned(bytes: Vec<u8>) -> Result<Dataset> {
+    #[cfg(feature = "netcdf-hdf5")]
+    {
+        netcdf::open_bytes_owned(bytes)
     }
     #[cfg(not(feature = "netcdf-hdf5"))]
     {
@@ -534,6 +567,9 @@ pub fn open_zarr_store(files: Vec<(String, Vec<u8>)>) -> Result<Dataset> {
             return Err(bad("in-memory input contains multiple Zarr store roots; provide one store"));
         }
         let prefix = roots.first().map_or("", |s| s.as_str());
+        // Opened as Zarr by its caller, as `memory::open_zarr_store` opens one.
+        let shown = if prefix.is_empty() { "the Zarr store" } else { prefix };
+        crate::formats::check_driver_allowed("Zarr", shown, crate::formats::Kind::Raster)?;
         let mount = Arc::new(crate::memfs::Mount::new(files));
         let root = mount.path().join(prefix).to_string_lossy().to_string();
         crate::drivers::zarr::md_open(&root, Some(mount))
@@ -543,4 +579,78 @@ pub fn open_zarr_store(files: Vec<(String, Vec<u8>)>) -> Result<Dataset> {
         let _ = files;
         Err(Error::disabled("zarr"))
     }
+}
+
+/// Resolves CF paths without allowing an explicit relative path to fall back to
+/// another ancestor. Known unsupported variables still participate in scope.
+pub(crate) fn reference_path(owner: &str, name: &str, names: &std::collections::HashSet<String>) -> Option<String> {
+    fn normalized(path: &str) -> Option<String> {
+        let mut parts = Vec::new();
+        for part in path.split('/') {
+            match part {
+                "" | "." => (),
+                ".." => {
+                    parts.pop()?;
+                }
+                _ => parts.push(part),
+            }
+        }
+        Some(format!("/{}", parts.join("/")))
+    }
+    if name.is_empty() {
+        return None;
+    }
+    let mut group = owner.rsplit_once('/').map_or("/", |(group, _)| if group.is_empty() { "/" } else { group });
+    if name.contains('/') {
+        let path =
+            if name.starts_with('/') { normalized(name)? } else { normalized(&format!("{}/{}", group.trim_end_matches('/'), name))? };
+        return names.contains(&path).then_some(path);
+    }
+    loop {
+        let path = format!("{}/{}", group.trim_end_matches('/'), name);
+        if names.contains(&path) {
+            return Some(path);
+        }
+        if group == "/" {
+            return None;
+        }
+        group = group.rsplit_once('/').map_or("/", |(parent, _)| if parent.is_empty() { "/" } else { parent });
+    }
+}
+
+pub(crate) fn coordinate_reference_path(info: &ArrayInfo, name: &str, names: &std::collections::HashSet<String>) -> Option<String> {
+    reference_path(&info.path, name, names).or_else(|| {
+        // Only a declared NUG coordinate can use a lateral dimension link.
+        (!name.contains('/'))
+            .then(|| {
+                info.dimensions.iter().find_map(|d| {
+                    let path = d.indexing_variable.as_ref()?;
+                    (d.name == name && path.rsplit('/').next() == Some(name) && names.contains(path)).then(|| path.clone())
+                })
+            })
+            .flatten()
+    })
+}
+
+#[cfg(any(feature = "netcdf-hdf5", feature = "zarr"))]
+pub(crate) fn resolve_coordinates(root: &mut Group) {
+    let names: std::collections::HashSet<_> = root.array_paths_recursive().into_iter().map(str::to_string).collect();
+    fn visit(group: &mut Group, names: &std::collections::HashSet<String>) {
+        for a in &mut group.arrays {
+            if let Some(raw) = a.info.attributes.get("coordinates").and_then(Value::as_str) {
+                for name in raw.split_whitespace() {
+                    let coordinate = coordinate_reference_path(&a.info, name, names);
+                    if let Some(c) = coordinate
+                        && !a.info.coordinates.contains(&c)
+                    {
+                        a.info.coordinates.push(c);
+                    }
+                }
+            }
+        }
+        for child in &mut group.groups {
+            visit(child, names);
+        }
+    }
+    visit(root, &names);
 }

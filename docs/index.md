@@ -1,5 +1,7 @@
 # terrio
 
+[![crates.io](https://img.shields.io/crates/v/terrio.svg)](https://crates.io/crates/terrio) [![PyPI](https://img.shields.io/pypi/v/terrio.svg)](https://pypi.org/project/terrio/) [![conda-forge](https://img.shields.io/conda/vn/conda-forge/terrio.svg)](https://anaconda.org/conda-forge/terrio) [![npm](https://img.shields.io/npm/v/terrio-js.svg)](https://www.npmjs.com/package/terrio-js) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/opengeos/terrio/blob/main/LICENSE) [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.23642204.svg)](https://doi.org/10.5281/zenodo.23642204)
+
 **Pure-Rust geospatial raster, vector and point cloud data I/O.**
 
 ![terrio: geospatial data I/O in pure Rust. Rasters, vectors and point clouds, from the command line, Python, JavaScript and Rust, with an MCP server for AI agents](assets/terrio-banner.webp)
@@ -20,9 +22,13 @@ terrio rasterize counties.gpkg counties.tif -a FIPS --tr 0.01 0.01
 - **Rasters**: GeoTIFF, Cloud Optimized GeoTIFF, JPEG 2000, Zarr v2/v3, netCDF (classic and
   netCDF-4, with groups), HDF5, ERDAS Imagine,
   ENVI, Esri grids, GeoPackage tiles, VRT and more. See [Formats](formats.md).
-- **Vectors**: GeoPackage, GeoParquet, FlatGeobuf, Shapefile, GeoJSON (and GeoJSONSeq), CSV,
-  KML/KMZ, GML, GPX, TopoJSON, MapInfo and OpenStreetMap PBF; layers larger than memory read and
-  converted as streams of features.
+- **Vectors**: GeoPackage, GeoParquet, FlatGeobuf, Shapefile, GeoJSON (and GeoJSONSeq), CSV, XLSX,
+  KML/KMZ, GML, GPX, TopoJSON, MapInfo and OpenStreetMap PBF, with layers larger than memory read
+  and converted as streams of features in the formats that allow it; and ArcGIS feature-service
+  JSON and protocol buffers, whose layers are read into memory whole.
+- **HEC-RAS**: the 2D meshes, cross sections, structures and other features of HEC-RAS geometry
+  and plan HDF files, with their stored attributes and results, as vector layers. See
+  [HEC-RAS](hecras.md).
 - **Point clouds**: LAS 1.0 to 1.4 (with waveforms), LAZ, COPC, PLY and E57, read and written,
   and EPT read; remote COPC and EPT read by bounds and octree level; files larger than memory in
   chunks; PDAL's filters (SMRF ground classification, outliers, ranges, sampling, voxels);
@@ -31,11 +37,28 @@ terrio rasterize counties.gpkg counties.tif -a FIPS --tr 0.01 0.01
   archives, and GDAL's `/vsicurl/`, `/vsis3/`, `/vsizip/` prefixes. Remote COGs are read window by
   window. See [Remote Data](remote-data.md).
 - **GDAL-style operations**: `translate`, `warp` (14 resampling methods), `mosaic` and VRTs,
-  `rasterize`, `polygonize`, and `convert` with OGR SQL filters. See [Command Line](cli.md).
+  `rasterize`, `polygonize`, `dem`, `calc`, `contour`, overviews, and `convert` with OGR SQL filters. See [Command Line](cli.md).
 - **Coordinate reference systems**: EPSG codes, WKT, PROJ strings and `.prj` files, identified and
   transformed the way GDAL does. See [Coordinate Systems](crs.md).
-- **Three interfaces**: a [Rust library](rust.md), a [Python package](python.md) with NumPy arrays,
-  and an [npm package](javascript.md) compiled to WebAssembly.
+- **Every interface**: the [command line](cli.md), a [Rust library](rust.md), a
+  [Python package](python.md) with NumPy arrays, an [npm package](javascript.md) compiled to
+  WebAssembly, an [MCP server](mcp.md) for AI agents, and a [browser UI](#browser-ui) for the
+  commands. Try it in the [playground](playground.md) or the [notebooks](notebooks.md), with
+  nothing to install.
+
+## Browser UI
+
+`terrio ui` serves every command as a form in your browser, from your own computer:
+
+```sh
+terrio ui
+```
+
+![The terrio ui page: a searchable list of commands beside the form for terrio info, with the equivalent command line and the output of a run on a remote GeoTIFF](assets/terrio-ui.webp)
+
+Pick files with the built-in file browser or enter a URL, run or cancel the command, read its
+output, and copy the equivalent command line into a script. See [`ui`](cli.md#ui) for the options,
+the security model and the limits.
 
 ## How terrio relates to GDAL
 
@@ -56,4 +79,5 @@ terrio is in early development. The API may change before 1.0. See the
 
 ## License
 
-MIT.
+MIT, except the point cloud eigensolver (MPL-2.0). See
+[NOTICE](https://github.com/opengeos/terrio/blob/main/NOTICE).

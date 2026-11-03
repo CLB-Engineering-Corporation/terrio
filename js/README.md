@@ -52,7 +52,7 @@ In WebAssembly, these formats are read from and written to memory:
 | | Read | Write |
 |---|---|---|
 | Raster | GeoTIFF/COG (LZW, Deflate, PackBits, ZSTD, LZMA, JPEG, WebP, LERC, JPEG XL), JPEG 2000 (JP2 and J2K), GRIB 1 and 2 (read band by band), netCDF, HDF5, Zarr and GeoZarr (zipped, or with `openZarr`), Esri ASCII grid, GeoPackage, PMTiles and MBTiles (read by window, zoom levels as overviews) | GeoTIFF, COG (lossless compressions, ZSTD included), JPEG 2000, Esri ASCII grid, GeoPackage, PMTiles, MBTiles |
-| Vector | GeoJSON, TopoJSON, FlatGeobuf\*, GeoPackage, GeoParquet, CSV, KML, KMZ, GML, GPX, DWG and DXF (full module), OSM PBF, zip archives of these, Shapefile and MapInfo (MIF/MID) in zip archives | GeoJSON, TopoJSON, FlatGeobuf, GeoPackage, KML, KMZ, GML, GPX, DWG and DXF (full module) |
+| Vector | GeoJSON, TopoJSON, ESRIJSON, ESRIPBF, FlatGeobuf\*, GeoPackage, GeoParquet, CSV, XLSX, KML, KMZ, GML, GPX, DWG and DXF (full module), OSM PBF, zip archives of these, Shapefile and MapInfo (MIF/MID) in zip archives | GeoJSON, TopoJSON, FlatGeobuf, GeoPackage, XLSX, KML, KMZ, GML, GPX, DWG and DXF (full module) |
 | Point cloud | LAS, LAZ, COPC, PLY, E57 | LAS, LAZ, COPC, PLY, E57 |
 
 \* FlatGeobuf files are read by terrio's own driver, with 64-bit offsets. `open` decodes a layer
@@ -169,16 +169,14 @@ wasm32 only, so `js/build.mjs` runs cargo and wasm-bindgen (which supports wasm6
 wasm-opt wasm-pack downloads (binaryen 117) cannot read 64-bit tables, so the module is not
 passed through it. Three crates treat WebAssembly as wasm32 only, and the build patches copies of
 them (`target_arch = "wasm32"` read as `target_family = "wasm"`): `tar`, which wbraster depends
-on, `zstd-sys` (its libc shim, for GeoParquet's Zstandard) and `arrow-buffer`; getrandom, which
-seeds ahash's hash maps, has no wasm64 backend and is given one (`crypto.getRandomValues`). The C
-code (Zstandard) needs clang 20 or later: older ones index the function table with 32 bits,
-where Rust's code uses a 64-bit table, and the module they link together does not validate.
+on, acadrust and `arrow-buffer`; getrandom, which seeds ahash's hash maps, has no wasm64 backend
+and is given one (`crypto.getRandomValues`).
 
 ## Building
 
 ```sh
 node js/build.mjs                         # the npm package in js/pkg: all modules, built for size
-node --test js/tests/package.test.mjs     # (threads and memory64 need the nightly js/build.mjs names; memory64, clang 20+)
+node --test js/tests/package.test.mjs     # (threads and memory64 need the nightly js/build.mjs names)
 TERRIO_JS_LOAD=../pkg/load.js node --test js/tests/node.test.mjs   # the suite on the threaded module
 TERRIO_JS_LOAD=../pkg/load.js TERRIO_MEMORY64=1 TERRIO_LARGE_TESTS=1 node --test js/tests/node.test.mjs  # memory64, > 4 GB
 node js/tests/browser.mjs ../terrio-data  # in headless browsers (Playwright), timings included
@@ -269,3 +267,160 @@ including `locationName`, `sourceCrsFieldName`, `sourceCrsFormat`, `fetchMetadat
 `sourceLayerNames`/`sourceLayerIndexes`; the latter remain original zero-based layer
 numbers. Acceptance flags and `datasetNameOnly` match the CLI. Strings represent
 non-finite nodata, e.g. `["nan"]`.
+
+### Contours, footprints and geometry analysis
+
+```js
+const lines = terrio.contour(raster, {interval: 10, withZ: true, fieldName: "elevation"});
+const area = terrio.footprint(raster, {bands: [1], singlepart: true, attributes: {source: "scene"}});
+const report = terrio.checkGeometry(vector);
+const repaired = terrio.makeValid(vector);
+const buffered = terrio.buffer(repaired, 100, {quadrantSegments: 30});
+const groups = terrio.dissolve(buffered, {fields: ["region"]});
+```
+
+Results are vector `Dataset` objects. Raster inputs accept uploaded bytes or
+shared datasets; contour/footprint hold full input pixels in memory. Contour
+also supports `band`, `levels`, `offset`, `nodata`, `ignoreNodata` and `layerName`. Nonfinite nodata overrides use strings `"nan"`,
+`"inf"` or `"-inf"`; raw nonfinite numbers and null are rejected.
+Footprint supports `intersection`, a same-grid `mask` dataset/upload and explicit
+text `attributes`; no source-path field is added automatically.
+
+Omitted or empty footprint bands selects every band, combined by union unless
+intersection is requested. Footprint attribute fields are sorted alphabetically.
+Footprint validity uses finite samples and the dataset nodata value. Alpha bands
+and external mask files are not interpreted implicitly; supply an explicit mask
+when those pixels should be excluded.
+
+Vector functions process every input layer, accepting datasets, uploaded files
+or GeoJSON. This deliberately differs from Python, whose analysis functions return
+one selected `Layer`; JavaScript returns a `Dataset` retaining all layers.
+When exporting with `toBytes`, single-layer formats require explicit selection
+(e.g. `{layers: ["roads"]}`); they now reject multi-layer input instead of
+silently writing the first layer. Layer-preserving formats retain every layer.
+Buffers use planar CRS units and preserve attributes/IDs. Dissolve
+can group by field names. `checkGeometry` retains geometry and appends validity
+and reason fields. `makeValid` keeps attributes/IDs/CRS and already-valid Z/M;
+repaired geometry is constructed in XY. These use the CLI's shared Rust engines
+and retain their documented scope and limits.
+
+### Zonal statistics and multipart splitting
+
+```js
+const stats = terrio.zonalStats(zones, [dem, imagery], {
+  bands: [1], prefixes: ["dem", "scene"], stats: ["count", "mean", "median"],
+  allTouched: true, tSrs: "EPSG:3857", decimalPlaces: 2,
+});
+const parts = terrio.singlepart(countries);
+```
+
+Results are vector `Dataset` objects containing every input layer. This follows the
+other JavaScript analysis functions; Python returns one selected `Layer`. Zones accept
+datasets, uploads or GeoJSON. Rasters accept datasets/uploads, one or an array; all
+pixels are materialized, including lazy sources. Repeated raster entries are
+materialized separately; inputs are not cached or deduplicated. Options and limits
+match Python/CLI:
+bands default to `[1]`; count/min/max/mean/sum/population stddev default statistics,
+optional median; center or `allTouched` membership; per-raster CRS transforms;
+nodata/nonfinite exclusion; zero count/null statistics for empty zones; output
+reprojection and 0–15 decimal rounding. Default prefixes are `raster1`, `raster2`, etc.,
+producing `PREFIX_bN_STATISTIC`; the CLI instead defaults to each input path stem. Set
+explicit prefixes for identical field names. Explicit prefixes must be nonblank, one per
+raster. Field-name collisions, including repeated prefixes/bands or existing zone
+fields, receive `_2`, `_3`, etc. suffixes from the shared engine. Weighted/fractional
+statistics are unsupported.
+
+`singlepart` recursively splits collections/multipart geometry, preserving
+attributes, Z/M and CRS, and assigns sequential IDs from one per layer. Null and
+empty single geometries remain; empty multipart geometries yield no features.
+Single-layer exports of multi-layer results require explicit layer selection.
+
+### Pipelines
+
+`pipeline(command, inputs?, options?)` uses the same Rust pipeline engine as the
+CLI and Python. `command` accepts supported GDAL-style steps or saved GDALG JSON
+text. Steps follow POSIX quoting, so a backslash outside quotes escapes the next
+character: quote Windows paths in single quotes (`'C:\data\in.tif'`) or use
+forward slashes. Browser inputs are aliases mapped to `Dataset`, `Uint8Array`,
+`{ bytes, filename }`, or GeoJSON values; no filesystem path is opened implicitly.
+
+```js
+const result = terrio.pipeline(
+  "read image ! select 1 ! materialize ! write selected.tif",
+  { image: dataset },
+);
+const selected = result.dataset;
+const files = result.outputBytes(); // { "selected.tif": Uint8Array }
+```
+
+`outputNames` lists explicitly requested outputs. `dataset` is undefined for a
+saved-definition output; its JSON is available through `outputBytes()`. Imported
+GDALG JSON can use `{ baseFile: "folder/definition.gdalg.json" }` for relative
+reference resolution; supply corresponding input aliases. Outputs remain in
+memory. Raster band/crop views retain window and overview reads. Vector `select`
+requires `_ogr_geometry_` to retain geometry and CRS. Supported steps and their
+limits are listed in the CLI pipeline reference.
+
+Use `{ inputKind: "raster" }` or `{ inputKind: "vector" }` to force the input
+family, including ambiguous uploaded files; `"auto"` chooses detection. This
+option overrides a `raster` or `vector` prefix in the command string.
+
+## RPF table of contents
+
+```js
+const toc = terrio.rpftocCreate([
+  {filename: "zone/000C9010.ON2", bytes: frameBytes},
+], {producerId: "ACME", countryCode: "US", classification: "U"});
+```
+
+`rpftocCreate` returns A.TOC bytes referring to existing CADRG frame files. Keep
+the named frames at those safe relative paths beside the TOC. The adapter copies
+only bounded metadata ranges from each uploaded `Uint8Array`, without decoding
+compressed pixels. Options are `scale` (otherwise inferred per series),
+`producerId` (five ASCII bytes), `producerName` (27), `countryCode` (two uppercase
+letters or empty) and `classification` (`U`, `R`, `C`, `S`, `T`). Corners must
+match the selected scale/zone; legacy polar interval fields are normalized.
+CIB/non-CADRG products are unsupported and fail the operation; unsupported or
+malformed recognized NITF inputs are not skipped. Encoded TRE metadata must fit 99,999
+bytes; oversized indexes fail. Frame images are referenced rather than embedded.
+
+## Retile and publish raster folders
+
+```js
+const files = new Map();
+const options = {tileSize: [512, 512], overlap: 16, levels: 3, csv: "tiles.csv"};
+const plan = terrio.planRetile(dataset, options);
+const report = terrio.retile(dataset, options,
+  (name, bytes) => files.set(name, bytes),
+  name => files.get(name) ?? null);
+```
+
+Inputs accept shared datasets, uploaded bytes or arrays of them. The synchronous
+output callback receives each image and CSV/index companion. Optional read-back
+returns a `Uint8Array` or null; it avoids regenerating parents evicted from the
+64 MiB/256-tile cache. Callback exceptions propagate unchanged. Keeping every
+file in a `Map` uses caller memory; persistent stores can retain the bytes
+outside WASM. Native filesystem resume is not exposed in JavaScript. Inputs must remain
+unchanged during generation; write-only regeneration assumes stable samples.
+
+Retile uses matching-CRS north-up inputs, recursive factor-two pyramids and
+one-based row/column filenames. Options accept camelCase or snake_case.
+`rasterTiles(input, {publication: {viewers: ["all"], kml: true}}, onFile)`
+adds applicable browser viewers, MapML, STACTA and KML files. The callback must
+save companion files as well as images. See the [CLI reference](../docs/cli.md#retile)
+for output layouts, supported options, limits and measured GDAL differences.
+
+## Selective scientific package
+
+For a single-threaded NetCDF/HDF5 package using the existing `netcdf-hdf5`
+Cargo feature, see [Scientific WASM builds](../docs/scientific-wasm-build.md).
+`node js/build.mjs --no-default-features --features netcdf-hdf5 --out-dir pkg-scientific`
+builds only that module, with generated declarations and project license notices.
+Use a fresh output directory. This is a custom feature selection, not another
+published npm preset; `terrio-js/core` does not include NetCDF/HDF5.
+
+Packaging regressions run without Rust or WASM tools:
+
+```sh
+node --test js/tests/build*.test.mjs
+```

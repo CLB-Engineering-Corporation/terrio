@@ -1,3 +1,9 @@
+// Written to match the behavior of:
+//   GDAL v3.13.3:
+//     frmts/hdf5/hdf5dataset.cpp
+//     frmts/hdf5/hdf5imagedataset.cpp
+// No code is translated from these sources.
+
 //! HDF5 rasters, read with the pure-Rust `hdf5-reader` crate as GDAL's HDF5 driver reads them.
 //!
 //! A file is a container of subdatasets: every two- or three-dimensional dataset of a numeric
@@ -45,13 +51,14 @@ pub(crate) fn parse_subdataset(s: &str) -> Option<(String, String)> {
     Some((rest[..at].to_string(), rest[at + 1..].to_string()))
 }
 
+/// The extensions of the formats whose drivers read a file even when it is HDF5 inside: GDAL's HDF5
+/// driver leaves them to the others.
+pub(crate) const OTHER_DRIVERS: &[&str] = &["nc", "cdf", "nc2", "nc3", "nc4", "grd", "gmac", "kea", "bag"];
+
 /// Whether a file is HDF5 and, as GDAL decides between its drivers, not one for another: netCDF-4
 /// files carry netCDF's extensions, and KEA and BAG files (HDF5 too) have drivers of their own.
 pub(crate) fn is_hdf5(path: &Path) -> bool {
-    let other_driver = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .is_some_and(|e| ["nc", "cdf", "nc2", "nc3", "nc4", "grd", "gmac", "kea", "bag"].iter().any(|n| e.eq_ignore_ascii_case(n)));
+    let other_driver = path.extension().and_then(|e| e.to_str()).is_some_and(|e| OTHER_DRIVERS.iter().any(|n| e.eq_ignore_ascii_case(n)));
     !other_driver && has_signature(path)
 }
 
@@ -457,6 +464,56 @@ pub(crate) fn open_bytes(mut bytes: Vec<u8>, name: &str) -> Result<Hdf5File> {
     let offset = signature_offset_in(&bytes).ok_or_else(|| err(Path::new(name), "not an HDF5 file"))?;
     bytes.drain(..offset);
     Hdf5File::from_vec(bytes).map_err(|e| err(Path::new(name), e))
+}
+
+/// The root group's `File Type` attribute of an HDF5 file held in memory, when it has one (HEC-RAS
+/// writes it): see [`root_file_type`]. Reads only the file's metadata, from a temporary copy of the
+/// bytes.
+#[cfg(feature = "hecras")]
+pub(crate) fn root_file_type_in(bytes: &[u8]) -> Option<String> {
+    root_file_type(&Hdf5File::from_bytes(&bytes[signature_offset_in(bytes)?..]).ok()?)
+}
+
+/// The largest root `File Type` attribute [`root_file_type`] decodes.
+#[cfg(feature = "hecras")]
+const FILE_TYPE_MAX_BYTES: usize = 4096;
+
+/// The root group's `File Type` attribute, as h5py decodes it, when it is a single fixed-length
+/// string of at most 4 KiB: a scalar, as HEC-RAS writes it, or a one-element array, which the
+/// HEC-RAS engine accepts too. No other root attribute is decoded, and a `File Type` of any other
+/// type, element count or size is `None`, so detection never decodes more than a few bytes of
+/// metadata whatever the file stores.
+#[cfg(feature = "hecras")]
+pub(crate) fn root_file_type(f: &Hdf5File) -> Option<String> {
+    use hdf5_reader::messages::datatype::StringPadding;
+    let attributes = f.root_group().ok()?.raw_attributes().ok()?;
+    let m = attributes.iter().find(|a| a.name() == "File Type")?.message();
+    let Datatype::String { size: StringSize::Fixed(size), padding, .. } = &m.datatype else { return None };
+    if m.raw_data.len() > FILE_TYPE_MAX_BYTES || m.raw_data.len() != usize::try_from(*size).ok()? {
+        return None;
+    }
+    let mut bytes = m.raw_data.split(|b| *b == 0).next().unwrap_or_default();
+    if *padding == StringPadding::SpacePad {
+        bytes = bytes.trim_ascii_end();
+    }
+    String::from_utf8(bytes.to_vec()).ok()
+}
+
+/// The stored bytes of the root group's attribute values (a variable-length value counts its heap
+/// reference), from the attribute messages, without decoding any of them. `path` names the file
+/// in errors.
+#[cfg(feature = "hecras")]
+pub(crate) fn root_attribute_bytes(f: &Hdf5File, path: &Path) -> Result<usize> {
+    let attributes = f.root_group().and_then(|g| g.raw_attributes()).map_err(|e| err(path, e))?;
+    Ok(attributes.iter().fold(0usize, |n, a| n.saturating_add(a.message().raw_data.len())))
+}
+
+/// [`root_attribute_bytes`] of an HDF5 file held in memory. `name` names it in errors.
+#[cfg(feature = "hecras")]
+pub(crate) fn root_attribute_bytes_in(bytes: &[u8], name: &str) -> Result<usize> {
+    let path = Path::new(name);
+    let offset = signature_offset_in(bytes).ok_or_else(|| err(path, "not an HDF5 file"))?;
+    root_attribute_bytes(&Hdf5File::from_bytes(&bytes[offset..]).map_err(|e| err(path, e))?, path)
 }
 
 /// Reads an HDF5 dataset held in memory as a raster: see [`read`]. `name` is the file name.
