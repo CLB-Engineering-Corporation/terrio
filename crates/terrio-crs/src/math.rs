@@ -1,3 +1,24 @@
+// SPDX-FileCopyrightText: PROJ contributors
+// SPDX-FileCopyrightText: Copyright (c) 2000, Frank Warmerdam
+// SPDX-FileCopyrightText: Copyright (c) 2025 Javier Jimenez Shaw
+// SPDX-FileCopyrightText: Copyright (c) 2026 Qiusheng Wu and Terrio contributors
+// SPDX-License-Identifier: MIT
+//
+// Derived from (translated to Rust and modified):
+//   PROJ 9.8.1:
+//     src/ellps.cpp
+//     src/units.cpp
+//     src/datums.cpp
+//     src/adjlon.cpp
+//     src/aasincos.cpp
+//     src/tsfn.cpp
+//     src/msfn.cpp
+//     src/phi2.cpp
+//     src/mlfn.cpp
+//     src/latitudes.cpp
+//   PROJ 9.9.0:
+//     src/latitudes.cpp
+
 //! Ellipsoids, units and the helper functions map projections share, after PROJ's
 //! (<https://proj.org>, MIT licence) definitions and algorithms; PROJ's notice is in `NOTICE`.
 
@@ -156,15 +177,57 @@ pub(crate) fn adjlon(lon: f64) -> f64 {
     if l == -PI && lon > 0.0 { PI } else { l }
 }
 
+// PROJ calls the C library's `asinh` and `atanh`, whose results change between glibc releases (2.44
+// rounds differently from 2.39 for about a quarter of the `atanh` inputs in a Conus Albers latitude
+// range), and Rust's `f64` methods have formulas of their own. So on linux-gnu, where Rust's `ln`,
+// `ln_1p`, `sin` and `cos` are the same C library's already, call them too: whichever glibc is
+// installed, Terrio and a PROJ using that glibc get the same bits.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+mod c_library {
+    unsafe extern "C" {
+        pub(super) safe fn asinh(x: f64) -> f64;
+        pub(super) safe fn atanh(x: f64) -> f64;
+    }
+}
+
+/// `asinh`: the C library's on linux-gnu.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+pub(crate) fn asinh(x: f64) -> f64 {
+    c_library::asinh(x)
+}
+
+/// `atanh`: the C library's on linux-gnu.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+pub(crate) fn atanh(x: f64) -> f64 {
+    c_library::atanh(x)
+}
+
+/// `asinh`: Rust's where PROJ uses another C library.
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+pub(crate) fn asinh(x: f64) -> f64 {
+    x.asinh()
+}
+
+/// `atanh`: Rust's where PROJ uses another C library.
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+pub(crate) fn atanh(x: f64) -> f64 {
+    x.atanh()
+}
+
 /// `asin` clamped to [-1, 1].
 pub(crate) fn aasin(v: f64) -> f64 {
     v.clamp(-1.0, 1.0).asin()
 }
 
-/// PROJ's `pj_tsfn`: the conformal latitude function t.
+/// PROJ's `pj_tsfn`: the conformal latitude function t = exp(-ψ), ψ the isometric latitude, in
+/// PROJ 9's form (`src/tsfn.cpp`, 9.7.1): `exp(e atanh(e sin φ))` times `cos φ / (1 + sin φ)`
+/// where sin φ > 0, else `(1 - sin φ) / cos φ`, with the C library's `atanh` (see [`atanh`]).
+/// PROJ's earlier `tan((π/2 - φ) / 2) / ((1 - e sin φ) / (1 + e sin φ))^(e/2)` is the same
+/// function but not the same bits: through a Lambert conformal conic's constants it moved
+/// latitudes by a few units in the last place from GDAL's.
 pub(crate) fn tsfn(phi: f64, sinphi: f64, e: f64) -> f64 {
-    let c = e * sinphi;
-    (0.5 * (FRAC_PI_2 - phi)).tan() / ((1.0 - c) / (1.0 + c)).powf(0.5 * e)
+    let cosphi = phi.cos();
+    (e * atanh(e * sinphi)).exp() * if sinphi > 0.0 { cosphi / (1.0 + sinphi) } else { (1.0 - sinphi) / cosphi }
 }
 
 /// PROJ's `pj_msfn`: cos φ / sqrt(1 - e² sin² φ).
@@ -180,7 +243,7 @@ pub(crate) fn qsfn(sinphi: f64, e: f64, one_es: f64) -> f64 {
         if div1 == 0.0 {
             return f64::INFINITY;
         }
-        one_es * (sinphi / div1 + con.atanh() / e)
+        one_es * (sinphi / div1 + atanh(con) / e)
     } else {
         sinphi + sinphi
     }
@@ -194,13 +257,13 @@ pub(crate) fn sinhpsi2tanphi(taup: f64, e: f64) -> f64 {
     let tmax = 2.0 / rooteps;
     let e2m = 1.0 - e * e;
     let stol = tol * taup.abs().max(1.0);
-    let mut tau = if taup.abs() > 70.0 { taup * (e * e.atanh()).exp() } else { taup / e2m };
+    let mut tau = if taup.abs() > 70.0 { taup * (e * atanh(e)).exp() } else { taup / e2m };
     if tau.abs() >= tmax {
         return tau;
     }
     for _ in 0..5 {
         let tau1 = (1.0 + tau * tau).sqrt();
-        let sig = (e * (e * tau / tau1).atanh()).sinh();
+        let sig = (e * atanh(e * tau / tau1)).sinh();
         let taupa = (1.0 + sig * sig).sqrt() * tau - sig * tau1;
         let dtau = (taup - taupa) * (1.0 + e2m * tau * tau) / (e2m * tau1 * (1.0 + taupa * taupa).sqrt());
         tau += dtau;
@@ -286,36 +349,72 @@ impl Mlfn {
 /// in the authalic latitude whose coefficients are Taylor series in the third flattening n, to
 /// order 6 (Karney, "On auxiliary latitudes", 2024; PROJ's `pj_auxlat_coeffs`, `C[phi,xi]`).
 pub(crate) fn authset(es: f64) -> [f64; 6] {
-    const C: [f64; 21] = [
-        4.0 / 3.0,
-        4.0 / 45.0,
-        -16.0 / 35.0,
-        -2582.0 / 14175.0,
-        60136.0 / 467775.0,
-        28112932.0 / 212837625.0,
-        46.0 / 45.0,
-        152.0 / 945.0,
-        -11966.0 / 14175.0,
-        -21016.0 / 51975.0,
-        251310128.0 / 638512875.0,
-        3044.0 / 2835.0,
-        3802.0 / 14175.0,
-        -94388.0 / 66825.0,
-        -8797648.0 / 10945935.0,
-        6059.0 / 4725.0,
-        41072.0 / 93555.0,
-        -1472637812.0 / 638512875.0,
-        768272.0 / 467775.0,
-        455935736.0 / 638512875.0,
-        4210684958.0 / 1915538625.0,
-    ];
+    auxlat_coeffs(es, &C_PHI_XI)
+}
+
+/// Coefficients converting geodetic to authalic latitudes, as PROJ since 9.7 (`C[xi,phi]`): the
+/// authalic latitude of a geodetic latitude is [`authlat`] with them, for |n| < 0.01.
+pub(crate) fn authset_forward(es: f64) -> [f64; 6] {
+    auxlat_coeffs(es, &C_XI_PHI)
+}
+
+const C_PHI_XI: [f64; 21] = [
+    4.0 / 3.0,
+    4.0 / 45.0,
+    -16.0 / 35.0,
+    -2582.0 / 14175.0,
+    60136.0 / 467775.0,
+    28112932.0 / 212837625.0,
+    46.0 / 45.0,
+    152.0 / 945.0,
+    -11966.0 / 14175.0,
+    -21016.0 / 51975.0,
+    251310128.0 / 638512875.0,
+    3044.0 / 2835.0,
+    3802.0 / 14175.0,
+    -94388.0 / 66825.0,
+    -8797648.0 / 10945935.0,
+    6059.0 / 4725.0,
+    41072.0 / 93555.0,
+    -1472637812.0 / 638512875.0,
+    768272.0 / 467775.0,
+    455935736.0 / 638512875.0,
+    4210684958.0 / 1915538625.0,
+];
+
+const C_XI_PHI: [f64; 21] = [
+    -4.0 / 3.0,
+    -4.0 / 45.0,
+    88.0 / 315.0,
+    538.0 / 4725.0,
+    20824.0 / 467775.0,
+    -44732.0 / 2837835.0,
+    34.0 / 45.0,
+    8.0 / 105.0,
+    -2482.0 / 14175.0,
+    -37192.0 / 467775.0,
+    -12467764.0 / 212837625.0,
+    -1532.0 / 2835.0,
+    -898.0 / 14175.0,
+    54968.0 / 467775.0,
+    100320856.0 / 1915538625.0,
+    6007.0 / 14175.0,
+    24496.0 / 467775.0,
+    -5884124.0 / 70945875.0,
+    -23356.0 / 66825.0,
+    -839792.0 / 19348875.0,
+    570284222.0 / 1915538625.0,
+];
+
+/// The six coefficients of a series in the third flattening n from PROJ's table of 21.
+fn auxlat_coeffs(es: f64, c: &[f64; 21]) -> [f64; 6] {
     let b = (1.0 - es).sqrt();
     let n = (1.0 - b) / (1.0 + b);
     let mut apa = [0.0; 6];
     let (mut o, mut d) = (0, n);
     for (l, a) in apa.iter_mut().enumerate() {
         // A polynomial in n of degree 5 - l, by Horner's method.
-        let p = &C[o..o + 6 - l];
+        let p = &c[o..o + 6 - l];
         *a = d * p.iter().rev().fold(0.0, |y, c| y * n + c);
         o += 6 - l;
         d *= n;
@@ -356,7 +455,7 @@ pub(crate) fn authlat_inverse(beta: f64, apa: &[f64; 6], e: f64, one_es: f64, qp
     for _ in 0..10 {
         let (sinphi, cosphi) = phi.sin_cos();
         let t = 1.0 - es * (sinphi * sinphi);
-        let delta = t * t / (2.0 * cosphi) * (q_div_one_es - sinphi / t - (e * sinphi).atanh() / e);
+        let delta = t * t / (2.0 * cosphi) * (q_div_one_es - sinphi / t - atanh(e * sinphi) / e);
         if !delta.is_finite() || delta.abs() < 1e-15 {
             break;
         }
@@ -388,6 +487,19 @@ mod tests {
         for sine in [1e-12, -1e-12] {
             let expected = 2.0 * ellipsoid.one_es * sine;
             assert!((qsfn(sine, ellipsoid.e, ellipsoid.one_es) - expected).abs() < 1e-27);
+        }
+    }
+
+    #[test]
+    // Away from the poles, where asin(q / qp) loses precision.
+    fn forward_authalic_series_is_the_closed_form_on_wgs84() {
+        let ellipsoid = Ell::named("WGS84").unwrap();
+        let apa = authset_forward(ellipsoid.es);
+        let qp = qsfn(1.0, ellipsoid.e, ellipsoid.one_es);
+        for degrees in [-80.0_f64, -60.0, -10.0, 1.0, 45.0, 75.0] {
+            let phi = degrees.to_radians();
+            let closed = (qsfn(phi.sin(), ellipsoid.e, ellipsoid.one_es) / qp).asin();
+            assert!((authlat(phi, &apa) - closed).abs() < 1e-14, "{degrees}");
         }
     }
 }

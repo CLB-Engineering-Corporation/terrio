@@ -1,3 +1,8 @@
+// Written to match the behavior of:
+//   GDAL v3.13.3:
+//     frmts/mbtiles/mbtilesdataset.cpp; ogr/ogrsf_frmts/mvt/ogrmvtdataset.cpp; frmts/pmtiles/
+// No code is translated from these sources.
+
 //! Tile archives: PMTiles (v3) and MBTiles, holding raster tiles (PNG, JPEG, WebP, AVIF) or Mapbox
 //! Vector Tiles, in the Web Mercator tiling scheme (EPSG:3857, 256-pixel tiles).
 //!
@@ -26,11 +31,15 @@
 #[cfg(feature = "tiles")]
 mod archive;
 #[cfg(feature = "tiles")]
+mod boxes;
+#[cfg(feature = "tiles")]
 pub(crate) mod clip;
 #[cfg(feature = "tiles")]
 pub(crate) mod mbtiles;
 #[cfg(feature = "tiles")]
 pub(crate) mod mvt;
+#[cfg(feature = "tiles")]
+mod overlay_envelope;
 #[cfg(feature = "tiles")]
 pub(crate) mod pmtiles;
 #[cfg(feature = "tiles")]
@@ -38,9 +47,13 @@ pub(crate) mod pyramid;
 #[cfg(feature = "tiles")]
 pub(crate) mod raster;
 #[cfg(feature = "tiles")]
+mod repair;
+#[cfg(all(test, feature = "tiles"))]
+mod repair_checks;
+#[cfg(feature = "tiles")]
 pub(crate) mod source;
 #[cfg(feature = "tiles")]
-pub(crate) mod valid;
+mod validity;
 #[cfg(feature = "tiles")]
 pub(crate) mod vector;
 

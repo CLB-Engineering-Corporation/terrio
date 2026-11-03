@@ -1,3 +1,8 @@
+// Written to match the behavior of:
+//   GDAL v3.12.2:
+//     frmts/vrt/vrtpansharpened.cpp
+// No code is translated from these sources.
+
 //! Serialized, lazy GDAL pansharpened VRTs and bounded materialization.
 use super::{PansharpenExtent, PansharpenNodata, PansharpenOptions, Plan, SpectralBand, blocks, plan};
 use crate::cog::WindowSource;
@@ -76,7 +81,9 @@ fn resampling(text: &str) -> Result<Resampling> {
 impl PansharpenVrt {
     /// Parse GDAL's minimal or fully declared VRTPansharpenedDataset XML.
     /// Weighted Brovey, selected bands and an unsharpened pan passthrough are supported.
+    /// Under a process-wide raster allow-list, only with the VRT driver allowed.
     pub fn from_xml(text: &str) -> Result<Self> {
+        crate::formats::check_driver_allowed("VRT", "a VRT description", crate::formats::Kind::Raster)?;
         let root = xml::parse(text)?;
         if root.name != "VRTDataset" || root.attr("subClass") != Some("VRTPansharpenedDataset") {
             return Err(invalid("expected VRTPansharpenedDataset"));

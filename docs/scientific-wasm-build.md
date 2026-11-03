@@ -1,7 +1,10 @@
 # Scientific WASM builds
 
 The existing `js/Cargo.toml` feature `netcdf-hdf5` enables classic NetCDF,
-NetCDF-4 and HDF5. No new API or published preset is required. The build script's
+NetCDF-4 and HDF5. On upstream a2a359a4, Cargo.lock selects netcdf-reader
+0.10.1, hdf5-reader 0.10.1 and wasm-bindgen 0.2.129. The separate `hecras`
+feature includes `netcdf-hdf5`; this minimal recipe does not enable `hecras`.
+No new API or published preset is required. The build script's
 `--no-default-features` selects a single module; `--features` forwards a Cargo
 feature list. Supplying features without disabling defaults is rejected to avoid
 accidentally shipping the full build. Selective builds do not build core,
@@ -84,7 +87,7 @@ It still copies file bytes into WASM; it does not provide remote lazy HDF5 acces
 GeoTIFF/COG, the CRS engine, text raster/vector formats and operations remain
 compiled in. This is not a NetCDF-only binary. Optional GeoParquet/Arrow, CAD,
 FlatGeobuf, SQLite/GeoPackage, tile archives, LZMA, LERC, AVIF, OSM, JPEG 2000,
-point clouds, Zarr and GRIB are not enabled by this recipe. Always inspect
+point clouds, Zarr, GRIB and HEC-RAS are not enabled by this recipe. Always inspect
 `features()` and test representative files: compile-time declarations can retain
 methods whose implementations return feature-disabled errors. Numeric reads,
 metadata and excluded-format error messages require tests against the real WASM;
@@ -99,7 +102,7 @@ Record exact raw and compressed bytes for scientific, full and core artifacts:
 node --input-type=module -e 'import{readFileSync}from"node:fs";import{gzipSync,brotliCompressSync}from"node:zlib";for(const p of process.argv.slice(1)){const b=readFileSync(p);console.log(JSON.stringify({path:p,raw:b.length,gzip:gzipSync(b,{level:9}).length,brotli:brotliCompressSync(b).length}));}' js/pkg-scientific/terrio_bg.wasm js/pkg-comparison/terrio_bg.wasm js/pkg-comparison/core/terrio_bg.wasm
 ```
 
-Measure initialization and selected-slice decoding separately in B's browser-worker
+Measure initialization and selected-slice decoding separately in a browser-worker
 harness using identical fixtures and browser versions. Report cold versus warm
 runs, sample count, medians and tail times; compare full/core only on formats each
 supports. Check numeric type/values, attributes, malformed data, excluded-format
@@ -107,7 +110,7 @@ errors, declarations, worker URLs and all requested assets. Never infer decoder
 performance or correctness from compressed size.
 
 Final coordinator checks after integration include the two web builds above, the
-Node scientific build, real npm pack inspection, B's browser tests and:
+Node scientific build, real npm pack inspection, browser tests and:
 
 ```powershell
 cargo fmt --all -- --check

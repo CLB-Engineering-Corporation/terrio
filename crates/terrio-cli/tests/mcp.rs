@@ -249,6 +249,30 @@ fn pansharpen_tool_uses_all_spectral_bands() {
     assert_eq!(out.raster.get(1, 0, 0), 107.0);
 }
 
+/// The HECRAS driver through the CLI-derived tools: `info` (read-only) and `convert`, with open
+/// options, as an MCP client calls them.
+#[test]
+fn hec_ras_files_through_the_tools() {
+    let plan = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../terrio/tests/data/hecras/results_mesh_xs.h5");
+    let plan = plan.to_string_lossy();
+    let dir = tempfile::tempdir().unwrap();
+    let dst = dir.path().join("sections.fgb");
+    let dst = dst.to_string_lossy();
+    let replies = session(&[
+        json!({"jsonrpc": "2.0", "id": 0, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "test", "version": "0"}}}),
+        json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+        call(1, "info", &["--json", &plan]),
+        call(2, "convert", &[&plan, &dst, "-l", "cross_sections", "--oo", "XS_SUMMARIES=Maximum Water Surface"]),
+    ]);
+    let info = &replies[&1]["result"];
+    assert_eq!(info["isError"], false, "{info}");
+    let v: Value = serde_json::from_str(info["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(v["driver"], "HECRAS");
+    assert_eq!(replies[&2]["result"]["isError"], false, "{}", replies[&2]);
+    let back = terrio::open_vector(&dst, &Default::default()).unwrap();
+    assert!(back.layers[0].schema.fields().iter().any(|f| f.name == "maximum_water_surface_flow_at_max_wsel"));
+}
+
 #[test]
 fn coordinate_operation_warnings_and_controls_reach_mcp() {
     let replies = session(&[
@@ -368,6 +392,72 @@ fn oblique_mollweide_coordinates_and_refusal_through_mcp() {
     assert!(values[0].abs() < 0.001);
     assert!((values[1] + 8921410.650523769).abs() < 0.001);
     assert_eq!(replies[&2]["result"]["isError"], true);
+}
+
+#[test]
+fn quadrilateralized_spherical_cube_coordinates_through_mcp() {
+    // rust-proj-capability's method-qsc fixture (PROJ 9.9.0), forward and back.
+    let target = "+proj=qsc +lat_0=0 +lon_0=0 +datum=WGS84 +units=m +no_defs";
+    let replies = session(&[
+        call(1, "crs", &["OGC:CRS84", "--to", target, "10", "10"]),
+        call(2, "crs", &[target, "--to", "OGC:CRS84", "1689641.80879759", "1701418.7180670935"]),
+    ]);
+    let values = |id: u64| -> Vec<f64> {
+        assert_eq!(replies[&id]["result"]["isError"], false);
+        replies[&id]["result"]["content"][0]["text"].as_str().unwrap().split_whitespace().filter_map(|v| v.parse().ok()).collect()
+    };
+    let forward = values(1);
+    assert_eq!(forward.len(), 2);
+    assert!((forward[0] - 1689641.80879759).abs() < 0.001);
+    assert!((forward[1] - 1701418.7180670935).abs() < 0.001);
+    let inverse = values(2);
+    assert_eq!(inverse.len(), 2);
+    assert!((inverse[0] - 10.0).abs() < 1e-8 && (inverse[1] - 10.0).abs() < 1e-8);
+}
+
+#[test]
+fn healpix_and_rhealpix_coordinates_through_mcp() {
+    // rust-proj-capability's method-healpix and method-rhealpix fixtures (PROJ 9.9.0), forward
+    // and back.
+    for (target, x, y) in [
+        ("+proj=healpix +datum=WGS84 +units=m +no_defs", 16344055.09510788, -5009843.133575987),
+        ("+proj=rhealpix +datum=WGS84 +units=m +no_defs", -20009043.56085063, -8674831.599318739),
+    ] {
+        let (xs, ys) = (x.to_string(), y.to_string());
+        let replies = session(&[
+            call(1, "crs", &["OGC:CRS84", "--to", target, "147", "-42"]),
+            call(2, "crs", &[target, "--to", "OGC:CRS84", &xs, &ys]),
+        ]);
+        let values = |id: u64| -> Vec<f64> {
+            assert_eq!(replies[&id]["result"]["isError"], false);
+            replies[&id]["result"]["content"][0]["text"].as_str().unwrap().split_whitespace().filter_map(|v| v.parse().ok()).collect()
+        };
+        let forward = values(1);
+        assert_eq!(forward.len(), 2);
+        assert!((forward[0] - x).abs() < 0.001 && (forward[1] - y).abs() < 0.001, "{target} {forward:?}");
+        let inverse = values(2);
+        assert_eq!(inverse.len(), 2);
+        assert!((inverse[0] - 147.0).abs() < 1e-8 && (inverse[1] + 42.0).abs() < 1e-8, "{target} {inverse:?}");
+    }
+}
+
+#[test]
+fn isea_coordinates_through_mcp() {
+    // PROJ 9.8.1 on the authalic sphere of WGS 84, forward and back.
+    let (source, target) = ("+proj=longlat +R=6371007.1809184747", "+proj=isea +R=6371007.1809184747 +units=m");
+    let (x, y) = (11127619.110975388, -6172668.500855954);
+    let (xs, ys) = (x.to_string(), y.to_string());
+    let replies = session(&[call(1, "crs", &[source, "--to", target, "147", "-42"]), call(2, "crs", &[target, "--to", source, &xs, &ys])]);
+    let values = |id: u64| -> Vec<f64> {
+        assert_eq!(replies[&id]["result"]["isError"], false);
+        replies[&id]["result"]["content"][0]["text"].as_str().unwrap().split_whitespace().filter_map(|v| v.parse().ok()).collect()
+    };
+    let forward = values(1);
+    assert_eq!(forward.len(), 2);
+    assert!((forward[0] - x).abs() < 0.001 && (forward[1] - y).abs() < 0.001, "{forward:?}");
+    let inverse = values(2);
+    assert_eq!(inverse.len(), 2);
+    assert!((inverse[0] - 147.0).abs() < 1e-8 && (inverse[1] + 42.0).abs() < 1e-8, "{inverse:?}");
 }
 
 #[test]
@@ -552,4 +642,42 @@ fn index_tools_are_discoverable_and_execute() {
     }
     assert_eq!(replies[&2]["result"]["isError"], false);
     assert_eq!(terrio::open_vector(output.to_str().unwrap(), &Default::default()).unwrap().layers[0].len(), 1);
+}
+
+#[test]
+fn gpkg_repack_is_a_mutating_tool_and_preserves_vector_data() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("sites.geojson");
+    let target = dir.path().join("sites.gpkg");
+    let geojson = r#"{"type":"FeatureCollection","features":[{"type":"Feature","properties":{"name":"kept"},"geometry":{"type":"Point","coordinates":[12,45]}}]}"#;
+    std::fs::write(&source, geojson).unwrap();
+    let input = terrio::open_vector(source.to_str().unwrap(), &Default::default()).unwrap();
+    terrio::write_vector(&input.layers, target.to_str().unwrap(), &Default::default()).unwrap();
+    let expected = terrio::open_vector(target.to_str().unwrap(), &Default::default()).unwrap();
+    let replies =
+        session(&[json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}), call(2, "gpkg-repack", &[target.to_str().unwrap(), "--json"])]);
+    let tool = replies[&1]["result"]["tools"].as_array().unwrap().iter().find(|tool| tool["name"] == "gpkg-repack").unwrap();
+    assert_eq!(tool["annotations"]["readOnlyHint"], false);
+    assert_eq!(replies[&2]["result"]["isError"], false);
+    let output = terrio::open_vector(target.to_str().unwrap(), &Default::default()).unwrap();
+    let encode = |layers: &[terrio::Layer]| terrio::memory::write_vector_bytes(layers, "sites.geojson", &Default::default()).unwrap();
+    assert_eq!(encode(&expected.layers), encode(&output.layers));
+}
+
+#[test]
+fn two_point_oblique_mercator_coordinates_and_refusal_through_mcp() {
+    // rust-proj-capability's method-omerc-2pt fixture (PROJ 9.9.0), and PROJ's refusal of equal latitudes.
+    let target = "+proj=omerc +lat_1=-40 +lon_1=140 +lat_2=-44 +lon_2=150 +k=1 +datum=WGS84 +units=m +no_defs";
+    let equal = "+proj=omerc +lat_1=-40 +lon_1=140 +lat_2=-40 +lon_2=150 +datum=WGS84";
+    let replies = session(&[
+        call(1, "crs", &["OGC:CRS84", "--to", target, "147", "-42"]),
+        call(2, "crs", &["OGC:CRS84", "--to", equal, "147", "-42"]),
+    ]);
+    assert_eq!(replies[&1]["result"]["isError"], false);
+    let values: Vec<f64> =
+        replies[&1]["result"]["content"][0]["text"].as_str().unwrap().split_whitespace().filter_map(|v| v.parse().ok()).collect();
+    assert_eq!(values.len(), 2);
+    assert!((values[0] - 4687059.434028593).abs() < 0.001);
+    assert!((values[1] - -5279802.3632845115).abs() < 0.001);
+    assert_eq!(replies[&2]["result"]["isError"], true);
 }

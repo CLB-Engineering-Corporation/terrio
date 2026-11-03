@@ -59,7 +59,7 @@ pub(crate) fn input_raster(v: &JsValue) -> Result<RasterDataset, JsError> {
 }
 
 /// Rasters given to an operation: one, or an array of them.
-fn input_rasters(v: &JsValue) -> Result<Vec<RasterDataset>, JsError> {
+pub(crate) fn input_rasters(v: &JsValue) -> Result<Vec<RasterDataset>, JsError> {
     let out: Vec<RasterDataset> = if js_sys::Array::is_array(v) {
         js_sys::Array::from(v).iter().map(|i| input_raster(&i)).collect::<Result<_, _>>()?
     } else {
@@ -76,12 +76,15 @@ fn input_rasters(v: &JsValue) -> Result<Vec<RasterDataset>, JsError> {
 pub(crate) fn input_layers(v: &JsValue) -> Result<Vec<Layer>, JsError> {
     if let Some(inner) = Dataset::lookup(v) {
         return match &*inner.borrow() {
-            Inner::Vector(layers, _) => Ok(layers.clone()),
+            Inner::Vector(layers, _) => match Dataset::lookup_style_table(v) {
+                Some(table) => Ok(crate::resolve_styles(layers.clone(), &table)),
+                None => Ok(layers.clone()),
+            },
             Inner::Raster(_) => Err(invalid("expected a vector dataset, got a raster")),
         };
     }
     if let Some((bytes, name)) = file_bytes(v) {
-        return terrio::memory::open_vector_bytes(bytes, &name, &Default::default()).map(|d| d.layers).map_err(js_err);
+        return terrio::memory::open_vector_bytes(bytes, &name, &Default::default()).map(|d| d.into_resolved_layers()).map_err(js_err);
     }
     if v.is_object() || v.is_string() {
         let ds = crate::from_geojson(v.clone(), None, None)?;
@@ -153,12 +156,36 @@ fn tuple4(v: Option<[f64; 4]>) -> Option<(f64, f64, f64, f64)> {
 }
 
 /// A file or a shared dataset, borrowed only for each metadata/window request.
-enum WarpInput {
+pub(crate) enum WarpInput {
     File(Box<terrio::LazyRaster>),
     Shared(std::rc::Rc<std::cell::RefCell<Inner>>),
 }
 
 impl terrio::ops::warp::WarpSource for WarpInput {
+    fn has_mask(&mut self) -> terrio::Result<bool> {
+        match self {
+            Self::File(reader) => Ok(reader.has_mask()),
+            Self::Shared(inner) => {
+                let inner = inner.try_borrow().map_err(|_| terrio::Error::InvalidArgument("raster is already in use".into()))?;
+                match &*inner {
+                    Inner::Raster(reader) => Ok(reader.has_mask()),
+                    _ => Err(terrio::Error::InvalidArgument("expected a raster".into())),
+                }
+            }
+        }
+    }
+    fn read_mask(&mut self, window: terrio::Window, overview: Option<usize>) -> terrio::Result<Option<Vec<u8>>> {
+        match self {
+            Self::File(reader) => reader.read_mask(window, overview),
+            Self::Shared(inner) => {
+                let mut inner = inner.try_borrow_mut().map_err(|_| terrio::Error::InvalidArgument("raster is already in use".into()))?;
+                match &mut *inner {
+                    Inner::Raster(reader) => reader.read_mask(window, overview),
+                    _ => Err(terrio::Error::InvalidArgument("expected a raster".into())),
+                }
+            }
+        }
+    }
     fn with_dataset(&self, visit: &mut dyn FnMut(&terrio::RasterDataset)) -> terrio::Result<bool> {
         match self {
             Self::File(reader) => terrio::ops::warp::WarpSource::with_dataset(reader.as_ref(), visit),
@@ -241,7 +268,7 @@ pub fn warp(src: JsValue, options: JsValue) -> Result<Dataset, JsError> {
     }
     let cutline = match &taken[0] {
         Some(c) => {
-            let ds = terrio::VectorDataset { layers: input_layers(c)?, driver: VectorDriver::GeoJSON };
+            let ds = terrio::VectorDataset::new(input_layers(c)?, VectorDriver::GeoJSON);
             Some(Cutline::from_vector(&ds).map_err(js_err)?)
         }
         None => None,
@@ -1514,4 +1541,154 @@ pub fn enhance_luts(src: JsValue, options: JsValue) -> Result<String, JsError> {
     a.equalize = true;
     let ds = input_raster(&src)?;
     Ok(terrio::ops::enhance::format_luts(&enhance_tables(&ds, &a)?))
+}
+
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase", default, deny_unknown_fields)]
+struct CheckCoverageArgs {
+    maximum_gap_width: f64,
+    include_valid: bool,
+}
+
+/// Polygon coverage errors as MultiLineStrings, with CRS retained, empty attributes and new IDs.
+/// Each polygon must individually be valid. Options: `maximumGapWidth` (input CRS
+/// units; zero disables narrow gaps), `includeValid` (empty lines for valid features).
+#[wasm_bindgen(js_name = checkCoverage)]
+pub fn check_coverage(src: JsValue, options: JsValue) -> Result<Dataset, JsError> {
+    let args: CheckCoverageArgs = parse_options(&options)?;
+    let options =
+        terrio::ops::coverage::CoverageCheckOptions { maximum_gap_width: args.maximum_gap_width, include_valid: args.include_valid };
+    let input = input_layers(&src)?;
+    let layers = terrio::ops::coverage::check_coverage_layers(&input, &options).map_err(js_err)?;
+    Ok(Dataset::from_layers(layers, VectorDriver::GeoJSON))
+}
+
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase", default, deny_unknown_fields)]
+struct SimplifyCoverageArgs {
+    layer: Option<String>,
+    preserve_boundary: bool,
+    active_layer: Option<String>,
+}
+
+/// Simplify shared polygon coverage edges while preserving topology. `tolerance`
+/// is the square root of the triangle-area threshold, in input CRS units.
+/// Options: `preserveBoundary`, `layer` (select one), `activeLayer` (copy other layers unchanged).
+/// `layer` and `activeLayer` are mutually exclusive.
+/// Inputs must form a valid polygon coverage. Attributes and CRS are retained;
+/// output feature IDs are sequential from 1 in each layer.
+#[wasm_bindgen(js_name = simplifyCoverage)]
+pub fn simplify_coverage(src: JsValue, tolerance: f64, options: JsValue) -> Result<Dataset, JsError> {
+    let args: SimplifyCoverageArgs = parse_options(&options)?;
+    if args.layer.is_some() && args.active_layer.is_some() {
+        return Err(invalid("layer and activeLayer are mutually exclusive"));
+    }
+    let mut input = input_layers(&src)?;
+    if let Some(name) = args.layer {
+        input.retain(|l| l.name == name);
+        if input.is_empty() {
+            return Err(invalid(format!("layer {name:?} not found")));
+        }
+    }
+    let options = terrio::ops::coverage_simplify::CoverageSimplifyOptions { tolerance, preserve_boundary: args.preserve_boundary };
+    let out = terrio::ops::coverage_simplify::simplify_coverage_layers(&input, &options, args.active_layer.as_deref()).map_err(js_err)?;
+    Ok(Dataset::from_layers(out, VectorDriver::GeoJSON))
+}
+
+/// A tile/window source without eagerly reading uploaded or shared datasets.
+pub(crate) fn tile_input(input: &JsValue) -> Result<WarpInput, JsError> {
+    if let Some(inner) = Dataset::lookup(input) {
+        return Ok(WarpInput::Shared(inner));
+    }
+    if let Some((bytes, name)) = file_bytes(input) {
+        return terrio::memory::open_raster_lazy_bytes(bytes, &name).map(Box::new).map(WarpInput::File).map_err(js_err);
+    }
+    Err(invalid("expected a raster Dataset, Uint8Array or { bytes, filename }"))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", default, deny_unknown_fields)]
+struct LayerAlgebraArgs {
+    layer: Option<String>,
+    method_layer: Option<String>,
+    keep_lower_dimension_geometries: bool,
+    input_prefix: Option<String>,
+    method_prefix: Option<String>,
+}
+impl Default for LayerAlgebraArgs {
+    fn default() -> Self {
+        Self { layer: None, method_layer: None, keep_lower_dimension_geometries: true, input_prefix: None, method_prefix: None }
+    }
+}
+/// Attribute-preserving planar XY layer algebra. Operations: intersection, union,
+/// sym-difference, identity, update, clip, erase. CRS must match. Options: layer,
+/// methodLayer, keepLowerDimensionGeometries (true), inputPrefix, methodPrefix.
+/// Each source must have one layer unless selected. Sources are materialized;
+/// output IDs are sequential. All polygon, line and point types are supported.
+#[wasm_bindgen(js_name=layerAlgebra)]
+pub fn layer_algebra(src: JsValue, method: JsValue, operation: &str, options: JsValue) -> Result<Dataset, JsError> {
+    let args: LayerAlgebraArgs = parse_options(&options)?;
+    let select = |value: &JsValue, name: Option<String>| -> Result<Layer, JsError> {
+        let mut layers = input_layers(value)?;
+        if let Some(name) = name {
+            return layers.into_iter().find(|l| l.name == name).ok_or_else(|| invalid(format!("layer {name:?} not found")));
+        }
+        if layers.len() != 1 {
+            return Err(invalid("layer algebra requires one layer per source; choose layer or methodLayer"));
+        }
+        Ok(layers.remove(0))
+    };
+    let a = select(&src, args.layer)?;
+    let b = select(&method, args.method_layer)?;
+    let op = operation.parse().map_err(js_err)?;
+    let options = terrio::ops::layer_algebra::LayerAlgebraOptions {
+        keep_lower_dimension_geometries: args.keep_lower_dimension_geometries,
+        input_prefix: args.input_prefix,
+        method_prefix: args.method_prefix,
+    };
+    let output = terrio::ops::layer_algebra::layer_algebra(&a, &b, op, &options).map_err(js_err)?;
+    Ok(Dataset::from_layers(vec![output], VectorDriver::GeoJSON))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", default, deny_unknown_fields)]
+struct CleanCoverageArgs {
+    layer: Option<String>,
+    snapping_distance: f64,
+    merge_strategy: String,
+    maximum_gap_width: f64,
+    active_layer: Option<String>,
+}
+impl Default for CleanCoverageArgs {
+    fn default() -> Self {
+        Self { layer: None, snapping_distance: -1., merge_strategy: "longest-border".into(), maximum_gap_width: 0., active_layer: None }
+    }
+}
+/// Clean polygon coverage boundaries. Options: snappingDistance (-1 selects the
+/// extent-based default, 0 disables proximity snapping), mergeStrategy
+/// (longest-border|max-area|min-area|min-index), maximumGapWidth (0), layer, activeLayer.
+/// layer selects one output layer and is mutually exclusive with activeLayer.
+/// Topology uses XY; representative Z is retained/interpolated and active M is dropped.
+/// Attributes and CRS remain. Inactive layers are copied.
+#[wasm_bindgen(js_name = cleanCoverage)]
+pub fn clean_coverage(src: JsValue, options: JsValue) -> Result<Dataset, JsError> {
+    let args: CleanCoverageArgs = parse_options(&options)?;
+    if args.layer.is_some() && args.active_layer.is_some() {
+        return Err(invalid("layer and activeLayer are mutually exclusive"));
+    }
+    let options = terrio::ops::coverage_clean::CoverageCleanOptions {
+        snapping_distance: args.snapping_distance,
+        merge_strategy: args.merge_strategy.parse().map_err(js_err)?,
+        maximum_gap_width: args.maximum_gap_width,
+    };
+    let input = input_layers(&src)?;
+    let mut input = input;
+    if let Some(name) = args.layer {
+        input.retain(|l| l.name == name);
+        if input.is_empty() {
+            return Err(invalid(format!("layer {name:?} not found")));
+        }
+    }
+    let layers = terrio::ops::coverage_clean::clean_coverage_layers(&input, args.active_layer.as_deref(), &options).map_err(js_err)?;
+    Ok(Dataset::from_layers(layers, VectorDriver::GeoJSON))
 }

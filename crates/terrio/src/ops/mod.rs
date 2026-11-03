@@ -1,3 +1,10 @@
+// Written to match the behavior of:
+//   GDAL v3.13.3:
+//     gcore/gdal_priv.h
+//     alg/gdalwarpkernel.cpp
+//     ogr/ogr_srs_api / ogrct.cpp
+// No code is translated from these sources.
+
 //! GDAL-style processing operations: [`translate`] (`gdal_translate`), [`warp`] (`gdalwarp`),
 //! [`mosaic`] (`gdalbuildvrt` and `gdal_merge.py`), [`vrt`] (GDAL's virtual raster format),
 //! [`rasterize`] (`gdal_rasterize`), [`polygonize`] (`gdal_polygonize`), [`dem`] (`gdaldem`),
@@ -35,6 +42,9 @@ pub mod calc;
 pub mod compare;
 pub mod concat;
 pub mod contour;
+pub mod coverage;
+pub mod coverage_clean;
+pub mod coverage_simplify;
 pub mod create;
 pub mod dem;
 pub mod edit;
@@ -45,6 +55,8 @@ pub mod gcp;
 pub mod geolocation;
 pub mod geometry;
 pub mod hull;
+pub(crate) mod jts_cdt;
+pub(crate) mod jts_delaunay;
 pub mod lineref;
 pub mod make_point;
 pub mod mosaic;
@@ -52,6 +64,7 @@ pub mod nearblack;
 pub mod neighbors;
 pub mod overview;
 pub(crate) mod overview_kernel;
+pub mod palette;
 pub mod pansharpen;
 pub mod partition;
 
@@ -59,6 +72,10 @@ pub mod pixel;
 pub mod pixel_info;
 pub mod polygonize;
 pub mod proximity;
+pub mod raster_publication;
+pub mod raster_retile;
+pub mod raster_tile;
+pub mod rasterio;
 pub mod rasterize;
 pub mod rpc;
 pub mod sample;
@@ -66,10 +83,12 @@ pub mod sieve;
 pub mod simplify;
 pub mod sql;
 pub(crate) mod strips;
+pub(crate) mod strtree;
 pub mod tile_index;
 pub mod topology;
 pub mod translate;
 pub mod update;
+pub mod vector_clip;
 pub mod vector_edit;
 pub mod vector_filter;
 pub mod vector_geom;
@@ -744,3 +763,12 @@ mod tests {
         assert!((c - 3.0).abs() < 1e-12 && (r - 4.0).abs() < 1e-12);
     }
 }
+
+/// Attribute-preserving polygon, line and point layer algebra.
+pub mod layer_algebra;
+
+/// In-memory raster/vector pipelines and GDALG saved definitions.
+pub mod pipeline;
+
+/// CADRG frame metadata and RPF table-of-contents support.
+pub mod rpftoc;

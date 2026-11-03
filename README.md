@@ -7,7 +7,7 @@
 
 # terrio
 
-[![crates.io](https://img.shields.io/crates/v/terrio.svg)](https://crates.io/crates/terrio) [![docs.rs](https://img.shields.io/docsrs/terrio)](https://docs.rs/terrio) [![PyPI](https://img.shields.io/pypi/v/terrio.svg)](https://pypi.org/project/terrio/) [![npm](https://img.shields.io/npm/v/terrio-js.svg)](https://www.npmjs.com/package/terrio-js) [![CI](https://github.com/opengeos/terrio/actions/workflows/ci.yml/badge.svg)](https://github.com/opengeos/terrio/actions/workflows/ci.yml) [![Docs](https://github.com/opengeos/terrio/actions/workflows/docs.yml/badge.svg)](https://terrio.opengeos.org) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/opengeos/terrio/blob/main/LICENSE) [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.23642204.svg)](https://doi.org/10.5281/zenodo.23642204)
+[![crates.io](https://img.shields.io/crates/v/terrio.svg)](https://crates.io/crates/terrio) [![PyPI](https://img.shields.io/pypi/v/terrio.svg)](https://pypi.org/project/terrio/) [![conda-forge](https://img.shields.io/conda/vn/conda-forge/terrio.svg)](https://anaconda.org/conda-forge/terrio) [![npm](https://img.shields.io/npm/v/terrio-js.svg)](https://www.npmjs.com/package/terrio-js) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/opengeos/terrio/blob/main/LICENSE) [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.23642204.svg)](https://doi.org/10.5281/zenodo.23642204)
 
 Pure-Rust geospatial raster, vector and point cloud data I/O.
 
@@ -15,19 +15,20 @@ Pure-Rust geospatial raster, vector and point cloud data I/O.
   <img src="https://raw.githubusercontent.com/opengeos/terrio/main/docs/assets/terrio-banner.webp" alt="terrio: geospatial data I/O in pure Rust. Rasters, vectors and point clouds, from the command line, Python, JavaScript and Rust, with an MCP server for AI agents" width="800">
 </p>
 
-Documentation: <https://terrio.opengeos.org>
+Documentation: <https://terrio.dev> · [Playground](https://terrio.dev/playground/) · [Notebooks](https://terrio.dev/notebooks/)
 
-terrio aims to read, write, convert and reproject the geospatial formats most workflows use, without
+terrio reads, writes, converts and reprojects the geospatial formats most workflows use, without
 C dependencies, so that it builds anywhere Rust does, including WebAssembly.
 
-**Status:** early development. Reading, writing and converting work; the processing operations are
-in progress. See [ROADMAP.md](ROADMAP.md).
+**Status:** early development. The API may change before 1.0. See [ROADMAP.md](ROADMAP.md).
 
 terrio builds on the pure-Rust format libraries of
 [whitebox_next_gen](https://github.com/jblindsay/whitebox_next_gen) (`wbraster`, `wbvector`,
-`wbprojection`) and adds format detection, remote and archived inputs, a GeoTIFF reader built on
-the [`tiff`](https://crates.io/crates/tiff) crate, fixes for what the format libraries miss, and
-GDAL-style operations.
+`wbprojection`) and adds format detection, remote and archived inputs, a GeoTIFF reader built on the
+[`tiff`](https://crates.io/crates/tiff) crate, fixes for what the format libraries miss, and
+GDAL-style operations. terrio runs without installing GDAL, but it is not independent of GDAL: its
+commands and options follow GDAL's, many of its algorithms and drivers are ports of GDAL, PROJ and
+PDAL code, and its results are tested against them (see [Acknowledgements](#acknowledgements)).
 
 Coordinate transformations match GDAL's: terrio carries the EPSG CRSs with the coordinate
 operations GDAL uses for them (generated from GDAL and PROJ by `scripts/gen_epsg_table.py`) and
@@ -41,12 +42,13 @@ centimetre, and 99 % of a sample of transformations between two CRSs within a me
 Install the `terrio` command, a standalone binary, with:
 
 ```sh
-curl -LsSf https://terrio.opengeos.org/install.sh | sh                                # Linux, macOS
-powershell -ExecutionPolicy ByPass -c "irm https://terrio.opengeos.org/install.ps1 | iex"  # Windows
+curl -LsSf https://terrio.dev/install.sh | sh                                # Linux, macOS
+powershell -ExecutionPolicy ByPass -c "irm https://terrio.dev/install.ps1 | iex"  # Windows
 ```
 
-`pip install terrio` installs it too, and `cargo install terrio-cli` builds it from source (see
-[Installation](https://terrio.opengeos.org/installation/)).
+`brew install --cask opengeos/terrio/terrio` and `pip install terrio` install it too, and
+`cargo install terrio-cli` builds it from source (see
+[Installation](https://terrio.dev/installation/)).
 
 ```sh
 terrio info countries.gpkg                       # summarize a dataset (--json, --stats)
@@ -122,7 +124,26 @@ terrio convert tile.laz tile-ept/ept.json                               # write 
 
 `terrio mcp` serves the commands to AI agents (Claude Code, Claude Desktop, Cursor, VS Code) over
 the Model Context Protocol: `claude mcp add terrio -- terrio mcp` (see
-[AI Agents](https://terrio.opengeos.org/mcp/)).
+[AI Agents](https://terrio.dev/mcp/)).
+
+## Browser UI
+
+`terrio ui` serves the same commands as forms in your browser, from your own computer:
+
+```sh
+terrio ui                        # opens your browser
+terrio ui --port 8080 --no-open  # prints the address instead
+```
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/opengeos/terrio/main/docs/assets/terrio-ui.webp" alt="The terrio ui page: a searchable list of commands beside the form for terrio info, with the equivalent command line and the output of a run on a remote GeoTIFF" width="800">
+</p>
+
+Every command and option gets a form, generated from the catalog of the binary you run. Pick files
+with the built-in file browser or enter a URL, run or cancel the command, read its output, and copy
+the equivalent command line into a script. The server listens on 127.0.0.1 only and runs commands
+with your permissions, so treat its printed address, which contains a random token, as a password
+(see [`ui`](https://terrio.dev/cli/#ui)).
 
 ## Library
 
@@ -151,23 +172,24 @@ module) for HTTP.
 Datasets can also be opened from bytes and written to bytes (`terrio::memory`), for data
 already in memory and for WebAssembly, which has no file system.
 
-An optional GDAL backend (the `gdal` cargo feature, off by default and the only C dependency)
+An optional GDAL backend (the `gdal` cargo feature, off by default, and a C dependency)
 opens what terrio has no driver for (HDF4, NITF and the rest of GDAL's formats)
 into the same data model, and writes rasters with GDAL's drivers: `terrio::open("GDAL:file.hdf")`,
 `terrio info --driver gdal`, or a plain path when terrio's own drivers cannot open it.
 
 Every driver is on by default; each family of them is a cargo feature that can be turned off,
-for a smaller dependency tree and WebAssembly module: `parquet`, `remote` (URLs and object
+for a smaller dependency tree and WebAssembly module: `cad` (DWG and DXF), `parquet`, `remote` (URLs and object
 storage), `netcdf-hdf5`, `sqlite` (GeoPackage), `tiles` (MBTiles, PMTiles, MVT), `avif`, `zarr`,
-`jp2`, `grib`, `flatgeobuf`, `osm`, `pointcloud`, `lerc` and `lzma`. GeoTIFF and COG, the plain raster
+`jp2`, `grib`, `flatgeobuf`, `osm`, `pointcloud`, `lerc`, `lzma` and `hecras` (HEC-RAS geometry and
+plan HDF files). GeoTIFF and COG, the plain raster
 and vector formats, the CRS engine and the operations are always built. A COG writer, say,
 needs only:
 
 ```toml
-terrio = { version = "0.3", default-features = false, features = ["geotiff"] }
+terrio = { version = "0.6", default-features = false, features = ["geotiff"] }
 ```
 
-See [the features](https://terrio.opengeos.org/rust/#features) for what each one adds.
+See [the features](https://terrio.dev/rust/#features) for what each one adds.
 
 Point clouds are read into columns, one typed vector per dimension (`terrio::pointcloud`):
 
@@ -193,6 +215,9 @@ COPC octrees itself.
 
 ```sh
 pip install terrio
+# or, from conda-forge, with either of
+conda install -c conda-forge terrio
+mamba install -c conda-forge terrio
 ```
 
 ```python
@@ -224,21 +249,26 @@ The operations (`convert`, `translate`, `warp`, `mosaic`, `rasterize`, `polygoni
 
 rasterio scripts run with an import change, `import terrio.rio as rasterio`: datasets, windows,
 CRSs, features, warping, merging, masking and memory files follow rasterio's API, compared with
-rasterio on real files. See [Coming from rasterio](https://terrio.opengeos.org/rasterio/).
+rasterio on real files. See [Coming from rasterio](https://terrio.dev/rasterio/).
 
-`terrio.xarray` is rioxarray's API without GDAL (`pip install "terrio[xarray]"`):
+`terrio.xarray` is rioxarray's API without installing GDAL (`pip install "terrio[xarray]"`):
 `terrio.xarray.open_rasterio` and `xr.open_dataset(path, engine="terrio")` open rasters lazily
 (remote COGs fetch only the tiles a window needs, chunked with dask), and the `.terrio` accessor
 has rioxarray's `.rio` methods (`clip_box`, `clip`, `reproject`, `reproject_match`, `pad_box`,
 `to_raster`...), compared with rioxarray on real files. See
-[xarray](https://terrio.opengeos.org/xarray/).
+[xarray](https://terrio.dev/xarray/).
+
+To build the Linux wheel for glibc 2.28 and later (`manylinux_2_28`) without Docker, run
+`scripts/build_wheel_manylinux_2_28.sh [OUT_DIR]` with Rust and `pip install "maturin[zig]"`: the
+wheel lands in `python/dist` by default, and only if it needs no newer glibc and holds no path of
+the build machine.
 
 ## JavaScript
 
 The `terrio-js` npm package is the library compiled to WebAssembly, for browsers and Node.js:
 
 ```js
-import init, { open, transformPoints } from "terrio-js";
+import init, { open, readPoints, transformPoints } from "terrio-js";
 
 await init();
 const dem = open(new Uint8Array(await (await fetch("dem.tif")).arrayBuffer()), "dem.tif");
@@ -302,19 +332,33 @@ TERRIO_TEST_DATA=../terrio-data cargo test --release --test epsg_accuracy -- --n
 | `crates/terrio-crs` | Standalone coordinate systems, transformations and datum grids |
 | `crates/terrio-cli` | The `terrio` command-line tool |
 | `python` | Python bindings (PyO3, NumPy), the `terrio` package on PyPI |
-| `js` | WebAssembly bindings (wasm-bindgen), the `terrio` package on npm |
+| `js` | WebAssembly bindings (wasm-bindgen), the `terrio-js` package on npm |
 
 See [ROADMAP.md](ROADMAP.md) for what is planned and in what order.
 
+New to Rust? [Contributing](docs/contributing.md) walks you through a first change.
+
 ## Acknowledgements
 
-terrio builds on the work of many projects and their authors:
+terrio builds on the work of many projects and their authors, who hold the copyright in the code
+and data terrio adapts from them:
 
 - [whitebox_next_gen](https://github.com/jblindsay/whitebox_next_gen) by John Lindsay, whose
   pure-Rust format libraries (`wbraster`, `wbvector`, `wbprojection`) terrio began on.
-- [GDAL](https://gdal.org), [PROJ](https://proj.org) and [PDAL](https://pdal.io), the reference terrio
-  follows and tests against; its projections are ported from PROJ, its point cloud filters follow
-  PDAL's (the cloth simulation filter of Zhang et al., 2016, is a port of the CSF code PDAL vendors).
+- [GDAL](https://gdal.org), by Frank Warmerdam, Even Rouault and hundreds of contributors over more
+  than twenty-five years. terrio's commands, options and much of its behavior follow GDAL's; many
+  of its algorithms and drivers are ports of GDAL code (contours, nodata filling, gridding,
+  overviews, pansharpening, the GRIB and SRTMHGT drivers and more, each attributed in
+  [NOTICE](NOTICE)); and GDAL is the reference it is tested against and its optional backend.
+  If terrio is useful to you, please consider
+  [sponsoring GDAL](https://gdal.org/en/stable/sponsors/index.html).
+- [PROJ](https://proj.org) and [PDAL](https://pdal.io), with GDAL the reference terrio tests
+  against; its projections are ported from PROJ, its point cloud filters follow PDAL's (the cloth
+  simulation filter of Zhang et al., 2016, is a port of the CSF code PDAL vendors).
+- The [JTS Topology Suite](https://github.com/locationtech/jts), the source of terrio's
+  simplification, hull and tile-validity ports; [GEOS](https://libgeos.org), their executable
+  behavior reference; and [GeoRust](https://georust.org)'s `geo`, which
+  its vector processing is built on.
 - The [EPSG Geodetic Parameter Dataset](https://epsg.org) of IOGP and Esri's
   [projection engine data](https://github.com/Esri/projection-engine-db-doc), for the coordinate
   reference systems.
@@ -326,7 +370,7 @@ terrio builds on the work of many projects and their authors:
   Parquet, `netcdf-reader`, `hdf5-reader`, `laz` and `e57`; and clap, rayon, serde, PyO3 and
   wasm-bindgen.
 
-See the [acknowledgements](https://terrio.opengeos.org/acknowledgements/) for the full list.
+See the [acknowledgements](https://terrio.dev/acknowledgements/) for the full list.
 
 ## Citation
 
@@ -334,9 +378,9 @@ If you use terrio in your work, please cite it. terrio is archived on [Zenodo](h
 
 [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.23642204.svg)](https://doi.org/10.5281/zenodo.23642204)
 
-> Wu, Q. (2026). terrio: Pure-Rust geospatial raster, vector and point cloud data I/O. Zenodo. <https://doi.org/10.5281/zenodo.23642204>
+> Wu, Q., & Fitzgerald, M. (2026). terrio: Pure-Rust geospatial raster, vector and point cloud data I/O. Zenodo. <https://doi.org/10.5281/zenodo.23642204>
 
-You can also use GitHub's **"Cite this repository"** button (which reads [`CITATION.cff`](CITATION.cff)) to copy a ready-made APA or BibTeX entry. See the [How to Cite](https://terrio.opengeos.org/citation/) page for more formats.
+You can also use GitHub's **"Cite this repository"** button (which reads [`CITATION.cff`](CITATION.cff)) to copy a ready-made APA or BibTeX entry. See the [How to Cite](https://terrio.dev/citation/) page for more formats.
 
 ## Disclaimer
 
@@ -347,7 +391,12 @@ anything that looks wrong.
 
 ## License
 
-MIT
+terrio is released under the [MIT License](LICENSE). Much of it is ported or adapted from other
+projects, among them GDAL, PROJ and PDAL, and the copyright in that code and data remains with
+their authors: Frank Warmerdam, Even Rouault and the GDAL contributors; Gerald Evenden, Frank
+Warmerdam, Even Rouault and the PROJ contributors; Hobu, Inc. and the PDAL contributors; and the
+authors of JTS, CSF, rasterio, rioxarray and the other projects [`NOTICE`](NOTICE) lists with
+their licenses.
 
 terrio's EPSG table and datum names (`crates/terrio-crs/data/epsg.tsv.zst`, `datums.tsv.zst`) are
 derived from the [EPSG Geodetic Parameter Dataset](https://epsg.org), copyright the International

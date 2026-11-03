@@ -1,3 +1,8 @@
+// Written to match the behavior of:
+//   PROJ 9.8.1:
+//     src/iso19111/io.cpp
+// No code is translated from these sources.
+
 //! A WKT 2 (ISO 19162, 2015 and 2019) reader for geographic and projected CRSs, turning them
 //! into PROJ strings as [`super::wkt1`] does for WKT 1, so they go through terrio's projections.
 //!
@@ -272,6 +277,17 @@ pub(crate) fn to_proj(root: &Node) -> Result<Converted> {
         push("gamma", p.get(GAMMA).or(alpha));
         push("k", Some(p.get(K_CENTRE).or_else(|| p.get(K_NAT)).unwrap_or(1.0)));
         "omerc"
+    } else if is(&["hotineobliquemercatortwopointnaturalorigin"], &[]) {
+        // PROJ's two-point form (`+proj=omerc +lat_1 +lon_1 +lat_2 +lon_2`), as GDAL writes it.
+        fe = p.get(FE_CENTRE).unwrap_or(fe);
+        fn_ = p.get(FN_CENTRE).unwrap_or(fn_);
+        push("lat_0", p.get(LAT_CENTRE).or_else(lat_0));
+        push("lat_1", p.get(LAT_P1));
+        push("lon_1", p.get(LON_P1));
+        push("lat_2", p.get(LAT_P2));
+        push("lon_2", p.get(LON_P2));
+        push("k", Some(p.get(K_CENTRE).or_else(|| p.get(K_NAT)).unwrap_or(1.0)));
+        "omerc"
     } else if is(&["cassinisoldner"], &[9806]) {
         push("lat_0", lat_0());
         push("lon_0", lon_0());
@@ -318,6 +334,10 @@ pub(crate) fn to_proj(root: &Node) -> Result<Converted> {
         push("lat_1", p.get(SP1));
         push("lat_2", p.get(SP2));
         "eqdc"
+    } else if is(&["quadrilateralizedsphericalcube"], &[]) {
+        push("lat_0", lat_0());
+        push("lon_0", lon_0());
+        "qsc"
     } else if is(&["gnomonic"], &[]) {
         push("lat_0", lat_0());
         push("lon_0", lon_0());
@@ -383,11 +403,7 @@ pub(crate) fn to_proj(root: &Node) -> Result<Converted> {
             match k.as_str() {
                 "x_0" => fe = *v,
                 "y_0" => fn_ = *v,
-                // The figure, datum, units and axes come from the CRS, not from the method.
-                "proj" | "ellps" | "datum" | "a" | "b" | "rf" | "f" | "es" | "e" | "R" | "R_A" | "units" | "to_meter" | "towgs84"
-                | "nadgrids" | "geoidgrids" | "init" | "type" | "pm" | "axis" | "no_defs" | "wktext" | "over" => {
-                    return Err(bad(&format!("parameter '{k}' of the method 'PROJ {proj}'")));
-                }
+                k if RESERVED.contains(&k) => return Err(bad(&format!("parameter '{k}' of the method 'PROJ {proj}'"))),
                 _ => push(k, Some(*v)),
             }
         }
@@ -476,6 +492,38 @@ fn derived(root: &Node, conv: &Node) -> Result<Converted> {
     Ok(geog.converted(out.join(" ")))
 }
 
+/// PROJ parameters a `PROJ name` method may not take as PARAMETERs: the figure, datum, units and
+/// axes come from the CRS, not from the method.
+const RESERVED: [&str; 27] = [
+    "proj",
+    "ellps",
+    "datum",
+    "a",
+    "b",
+    "rf",
+    "f",
+    "es",
+    "e",
+    "R",
+    "R_A",
+    "R_C",
+    "units",
+    "to_meter",
+    "towgs84",
+    "nadgrids",
+    "geoidgrids",
+    "vunits",
+    "vto_meter",
+    "geoc",
+    "init",
+    "type",
+    "pm",
+    "axis",
+    "no_defs",
+    "wktext",
+    "over",
+];
+
 /// A PROJ projection and its parameters by their PROJ names.
 type ProjMethod = (String, Vec<(String, f64)>);
 
@@ -485,16 +533,36 @@ type ProjMethod = (String, Vec<(String, f64)>);
 fn proj_method(conv: &Node, method: &Node, ang: f64, to_meter: f64) -> Result<Option<ProjMethod>> {
     let Some(name) = method.name().and_then(|n| n.strip_prefix("PROJ ")) else { return Ok(None) };
     let word = |w: &str| !w.is_empty() && w.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_');
-    // PROJ's `ob_tran` names the rotated projection in the method: `PROJ ob_tran o_proj=moll`.
-    let name = match name.strip_prefix("ob_tran o_proj=") {
-        Some(o_proj) if word(o_proj) => format!("ob_tran +o_proj={o_proj}"),
-        _ if word(name) => name.to_string(),
+    // PROJ writes a projection's string-valued parameters in the method's name:
+    // `PROJ ob_tran o_proj=moll`, `PROJ isea orient=pole`.
+    let mut words = name.split(' ');
+    let mut name = match words.next() {
+        Some(w) if word(w) => w.to_string(),
         _ => return Ok(None),
     };
+    // The string-valued parameters each projection takes; the others are PARAMETERs.
+    let strings: &[&str] = match name.as_str() {
+        "ob_tran" => &["o_proj"],
+        "isea" => &["orient", "mode"],
+        _ => &[],
+    };
+    let mut keys: Vec<&str> = Vec::new();
+    for w in words {
+        match w.split_once('=') {
+            Some((k, v)) if word(k) && word(v) => {
+                if !strings.contains(&k) || keys.contains(&k) {
+                    return Err(bad(&format!("parameter '{k}' of the method 'PROJ {}'", method.name().unwrap_or(""))));
+                }
+                keys.push(k);
+                name.push_str(&format!(" +{k}={v}"));
+            }
+            _ => return Ok(None),
+        }
+    }
     let mut params = Vec::new();
     for n in conv.children("PARAMETER") {
         let key = n.name().unwrap_or("");
-        if key.is_empty() || !key.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_') {
+        if key.is_empty() || !key.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_') || keys.contains(&key) {
             return Err(bad(&format!("parameter '{key}' of the method 'PROJ {name}'")));
         }
         let v = n.num(1).ok_or_else(|| bad(&format!("parameter '{key}' without a value")))?;

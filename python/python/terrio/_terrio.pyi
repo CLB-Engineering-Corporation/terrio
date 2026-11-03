@@ -1,7 +1,7 @@
 """Type stubs for the `terrio._terrio` extension module."""
 
 import os
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from typing import Any, Literal, Protocol, TypeAlias, TypedDict, final, overload
 
 import numpy as np
@@ -9,6 +9,8 @@ from numpy.typing import DTypeLike, NDArray
 
 # PyO3 sets `__all__` to the names added to the module.
 __all__ = [
+    "PipelineResult",
+    "pipeline",
     "create_raster",
     "edit_raster",
     "move_raster",
@@ -17,7 +19,16 @@ __all__ = [
     "refresh_overviews",
     "update_raster",
     "validate_cog",
+    "validate_gpkg",
+    "check_dataset",
+    "identify",
+    "dataset_copy",
+    "dataset_delete",
+    "dataset_files",
+    "dataset_rename",
     "__version__",
+    "gpkg_repack",
+    "gpkg_repack_bytes",
     "Raster",
     "GeoTiffWriter",
     "Layer",
@@ -38,8 +49,14 @@ __all__ = [
     "write_vector",
     "convert",
     "sql",
+    "clip_vector",
+    "layer_algebra",
     "rasterize",
     "raster_index",
+    "raster_tiles",
+    "rpftoc_create",
+    "rpftoc_bytes",
+    "retile",
     "vector_index",
     "DatasetIndex",
     "pansharpen",
@@ -53,6 +70,7 @@ __all__ = [
     "MultidimDataset",
     "MultidimArray",
     "open_multidim",
+    "mosaic_multidim",
     "dem",
     "calc",
     "proximity",
@@ -74,6 +92,18 @@ __all__ = [
     "enhance_luts",
     "unscale",
     "blend",
+    "buffer",
+    "check_geometry",
+    "contour",
+    "dissolve",
+    "footprint",
+    "make_valid",
+    "singlepart",
+    "zonal_stats",
+    "rgb_to_palette",
+    "palette_to_rgb",
+    "attach_palette",
+    "read_color_table",
     "nodata_to_alpha",
     "reclassify",
     "as_features",
@@ -92,11 +122,15 @@ __all__ = [
     "crs_info",
     "crs_to_projjson",
     "suggested_grid",
+    "warped_vrt_type",
     "gcp_transform",
     "RpcTransformer",
     "FeatureStream",
     "open_stream",
+    "check_coverage",
+    "clean_coverage",
     "simplify",
+    "simplify_coverage",
     "segmentize",
     "convex_hull",
     "concave_hull",
@@ -108,11 +142,16 @@ __all__ = [
     "vsi_stat",
     "vsi_read",
     "vsi_write",
+    "sozip_create",
+    "sozip_list",
+    "sozip_optimize",
+    "sozip_validate",
     "vsi_copy",
     "vsi_delete",
     "vsi_move",
     "vsi_sync",
     "concat",
+    "parquet_create_metadata",
     "partition",
     "set_field_type",
     "make_point",
@@ -122,6 +161,30 @@ __all__ = [
     "edit_vector",
     "update_vector",
     "cli_main",
+    "CogWriter",
+    "_panic_for_tests",
+    "usable_memory",
+    "_set_http_retry_logger",
+    "_set_warp_nodata_logger",
+    "RegionWarp",
+    "config_push",
+    "config_pop",
+    "config_get",
+    "set_path_specific_option",
+    "clear_path_specific_options",
+    "get_path_specific_option",
+    "set_allowed_drivers",
+    "allowed_drivers",
+    "check_drivers",
+    "identify_drivers",
+    "network_stats",
+    "reset_network_stats",
+    "clear_http_cache",
+    "config_options",
+    "pyogrio_read",
+    "resampled_region",
+    "resampled_read",
+    "crs_projjson",
 ]
 
 __version__: str
@@ -180,6 +243,34 @@ class GeoTiffWriter:
     def close(self) -> None: ...
 
 @final
+class CogWriter:
+    def __new__(
+        cls,
+        path: str,
+        width: int,
+        height: int,
+        count: int,
+        dtype: str,
+        transform: Sequence[float],
+        crs: str | None = None,
+        nodata: float | None = None,
+        metadata: Mapping[str, Any] | Sequence[tuple[Any, Any]] | None = None,
+        *,
+        compress: str | None = None,
+        bigtiff: bool = False,
+        options: Mapping[str, str] | None = None,
+        band_metadata: Sequence[Mapping[str, Any]] | None = None,
+        colormap: Sequence[tuple[int, int, int, int]] | None = None,
+        gcps: Sequence[tuple[float, float, float, float, float]] | None = None,
+        rpc: Sequence[float] | None = None,
+        overview_resampling: str | None = None,
+    ) -> CogWriter: ...
+    @property
+    def rows_written(self) -> int: ...
+    def write(self, array: NDArray[Any]) -> None: ...
+    def close(self) -> None: ...
+
+@final
 class Raster:
     """A raster dataset: a grid of pixels in one or more bands, with georeferencing."""
 
@@ -194,7 +285,17 @@ class Raster:
     @property
     def dtype(self) -> str: ...
     @property
+    def data_type(self) -> str: ...
+    @property
     def geolocation(self) -> list[tuple[str, str]] | None: ...
+    @property
+    def band_metadata(self) -> list[dict[str, Any]]: ...
+    @property
+    def band_nodata(self) -> list[float | None]: ...
+    @property
+    def metadata_domains(self) -> list[tuple[int, str, list[tuple[str, str]]]]: ...
+    @property
+    def color_table(self) -> list[tuple[int, int, int, int]] | None: ...
     @property
     def metadata(self) -> list[tuple[str, str]]: ...
     @property
@@ -205,6 +306,8 @@ class Raster:
     def crs_wkt(self) -> str | None: ...
     @property
     def transform(self) -> tuple[float, float, float, float, float, float]: ...
+    @property
+    def has_transform(self) -> bool | None: ...
     @property
     def res(self) -> tuple[float, float]: ...
     @property
@@ -225,6 +328,13 @@ class Raster:
         window: _Window | None = None,
         overview: int | None = None,
     ) -> NDArray[Any]: ...
+    def read_sampled(
+        self,
+        bands: Sequence[int],
+        cols: Sequence[int],
+        rows: Sequence[int],
+        overview: int | None = None,
+    ) -> NDArray[Any] | None: ...
     def read_mask(
         self, window: _Window | None = None, overview: int | None = None
     ) -> NDArray[Any] | None: ...
@@ -309,8 +419,30 @@ class Layer:
         name: str | None = None,
         crs: str | None = None,
     ) -> Layer: ...
-    def write(self, path: str, driver: str | None = None) -> None: ...
-    def to_bytes(self, filename: str = "layer.geojson", driver: str | None = None) -> bytes: ...
+    def write(
+        self,
+        path: str,
+        driver: str | None = None,
+        *,
+        kmz_resources: Mapping[str, bytes] | None = None,
+        style_table: Sequence[tuple[str, str]] | None = None,
+        preserve_declared_geometry_type: bool = False,
+        cityjson_version: Literal["1.1", "2.0"] | None = None,
+        citygml_version: Literal["2.0", "3.0"] | None = None,
+        citygml_lod0_surface: Literal["footprint", "roof-edge"] | None = None,
+    ) -> None: ...
+    def to_bytes(
+        self,
+        filename: str = "layer.geojson",
+        driver: str | None = None,
+        *,
+        kmz_resources: Mapping[str, bytes] | None = None,
+        style_table: Sequence[tuple[str, str]] | None = None,
+        preserve_declared_geometry_type: bool = False,
+        cityjson_version: Literal["1.1", "2.0"] | None = None,
+        citygml_version: Literal["2.0", "3.0"] | None = None,
+        citygml_lod0_surface: Literal["footprint", "roof-edge"] | None = None,
+    ) -> bytes: ...
 
 @final
 class VectorDataset:
@@ -322,10 +454,22 @@ class VectorDataset:
     def layer_names(self) -> list[str]: ...
     @property
     def driver(self) -> str: ...
+    @property
+    def style_table(self) -> list[tuple[str, str]]: ...
     def __len__(self) -> int: ...
     def __getitem__(self, key: int | str, /) -> Layer: ...
     def __iter__(self) -> Iterator[Layer]: ...
-    def write(self, path: str, driver: str | None = None) -> None: ...
+    def write(
+        self,
+        path: str,
+        driver: str | None = None,
+        *,
+        kmz_resources: Mapping[str, bytes] | None = None,
+        preserve_declared_geometry_type: bool = False,
+        cityjson_version: Literal["1.1", "2.0"] | None = None,
+        citygml_version: Literal["2.0", "3.0"] | None = None,
+        citygml_lod0_surface: Literal["footprint", "roof-edge"] | None = None,
+    ) -> None: ...
 
 @final
 class ArrowTable:
@@ -695,14 +839,27 @@ def open(path: str) -> Raster | VectorDataset: ...
 def open_raster(path: str, lazy: bool = False) -> Raster: ...
 def open_vrt(xml: str, sources: Mapping[str, bytes | str | os.PathLike[str]]) -> Raster: ...
 def open_vector(
-    path: str, layers: Sequence[str] | None = None, bbox: _Bounds | None = None
+    path: str,
+    layers: Sequence[str] | None = None,
+    bbox: _Bounds | None = None,
+    options: Mapping[str, str] | None = None,
 ) -> VectorDataset: ...
+def pyogrio_read(
+    path: str,
+    skip_features: int = 0,
+    max_features: int | None = None,
+    read_geometry: bool = True,
+) -> dict[str, Any]: ...
 def open_bytes(
     data: bytes | bytearray, filename: str, lazy: bool = False
 ) -> Raster | VectorDataset: ...
 def list_layers(path: str) -> list[str]: ...
 def info(
-    path: str, stats: bool = False, layers: Sequence[str] | None = None, hist: bool = False
+    path: str,
+    stats: bool = False,
+    layers: Sequence[str] | None = None,
+    hist: bool = False,
+    options: Mapping[str, str] | None = None,
 ) -> dict[str, Any]: ...
 def drivers() -> list[dict[str, Any]]: ...
 def write_raster(
@@ -726,6 +883,11 @@ def write_vector(
     crs: str | None = None,
     append: bool = False,
     overwrite: bool = False,
+    *,
+    preserve_declared_geometry_type: bool = False,
+    cityjson_version: Literal["1.1", "2.0"] | None = None,
+    citygml_version: Literal["2.0", "3.0"] | None = None,
+    citygml_lod0_surface: Literal["footprint", "roof-edge"] | None = None,
 ) -> None: ...
 @final
 class FeatureStream:
@@ -780,7 +942,12 @@ def convert(
     a_srs: str | None = None,
     append: bool = False,
     overwrite: bool = False,
+    options: Mapping[str, str] | Sequence[tuple[str, str]] | None = None,
+    overview_resampling: str | None = None,
     ct_opt: Mapping[str, str] | None = None,
+    cityjson_version: Literal["1.1", "2.0"] | None = None,
+    citygml_version: Literal["2.0", "3.0"] | None = None,
+    citygml_lod0_surface: Literal["footprint", "roof-edge"] | None = None,
 ) -> None: ...
 
 # Operations.
@@ -850,6 +1017,26 @@ def transform_points(
     only_best: bool = False,
     promote_to_3d: bool = False,
 ) -> tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.float64]]: ...
+def config_push(options: dict[str, str | None]) -> None: ...
+def config_pop() -> bool: ...
+def usable_memory() -> int | None: ...
+def _set_http_retry_logger(callback: object) -> None: ...
+def _set_warp_nodata_logger(callback: object) -> None: ...
+def _panic_for_tests(message: str) -> None: ...
+def config_get(key: str) -> str | None: ...
+def set_path_specific_option(prefix: str, key: str, value: str | None = None) -> None: ...
+def clear_path_specific_options(prefix: str | None = None) -> None: ...
+def get_path_specific_option(path: str, key: str) -> str | None: ...
+def set_allowed_drivers(
+    drivers: Sequence[str] | None, kind: Literal["raster", "vector"] | None = None
+) -> None: ...
+def allowed_drivers(kind: Literal["raster", "vector"] | None = None) -> list[str] | None: ...
+def check_drivers(path: str, drivers: Sequence[str]) -> None: ...
+def identify_drivers(path: str) -> tuple[list[str], str | None]: ...
+def network_stats() -> dict[str, Any]: ...
+def reset_network_stats() -> None: ...
+def clear_http_cache() -> None: ...
+def config_options() -> dict[str, str | None]: ...
 def set_grid_search_paths(paths: Sequence[str | os.PathLike[str]] | None) -> None: ...
 def set_network_enabled(enabled: bool | None) -> None: ...
 def translate(
@@ -908,6 +1095,7 @@ def warp(
     geolocation: Mapping[str, Any] | None = None,
     kernel_version: str = "3.12",
     max_memory_mib: float | None = None,
+    init: Raster | None = None,
 ) -> Raster: ...
 def mosaic(
     srcs: _RasterSource | Sequence[_RasterSource],
@@ -1377,8 +1565,31 @@ def grid_points(
 # Helpers of terrio.rio.
 
 def tiff_tags(path: str) -> list[dict[int, str | bytes | list[int] | list[float]]] | None: ...
+def resampled_region(
+    resampling: str,
+    raster_size: tuple[int, int],
+    window: tuple[int, int, int, int],
+    fwindow: tuple[float, float, float, float],
+    buf: tuple[int, int],
+    block_width: int,
+    dataset: bool = False,
+) -> tuple[int, int, int, int]: ...
+def resampled_read(
+    data: Any,
+    region: tuple[int, int, int, int],
+    resampling: str,
+    raster_size: tuple[int, int],
+    window: tuple[int, int, int, int],
+    fwindow: tuple[float, float, float, float],
+    buf: tuple[int, int],
+    block_width: int,
+    nodata: float | None = None,
+    masks: Any = None,
+    dataset: bool = False,
+) -> Any: ...
 def crs_info(crs: str) -> dict[str, Any]: ...
 def crs_to_projjson(crs: str) -> str: ...
+def crs_projjson(crs: str, database: bool) -> str: ...
 def gcp_transform(
     gcps: Sequence[tuple[float, float, float, float, float]],
     xs: Sequence[float],
@@ -1399,6 +1610,40 @@ def suggested_grid(
     rpc: Mapping[str, str] | None = None,
     rpc_options: Mapping[str, str] | None = None,
 ) -> tuple[tuple[float, float, float, float, float, float], int, int]: ...
+def warped_vrt_type(
+    src_type: str, src_nodata: Sequence[float | None], dst_nodata: Sequence[float | None]
+) -> tuple[str, list[float | None]]: ...
+@final
+class RegionWarp:
+    def __new__(
+        cls,
+        src_size: tuple[int, int],
+        src_transform: Sequence[float],
+        src_crs: str,
+        dst_crs: str,
+        dst_transform: Sequence[float],
+        resampling: str,
+        error_threshold: float,
+        dtype: str,
+        src_nodata: Sequence[float | None],
+        dst_nodata: float | None = None,
+        gcps: Sequence[tuple[float, float, float, float, float]] | None = None,
+        gcp_order: int = 0,
+        gcp_method: str = "auto",
+        rpc: Mapping[str, str] | None = None,
+        rpc_options: Mapping[str, str] | None = None,
+    ) -> RegionWarp: ...
+    def source_window(self, region: _Window) -> _Window | None: ...
+    def warp(
+        self,
+        region: _Window,
+        window: _Window,
+        data: NDArray[Any],
+        mask: NDArray[Any] | None = None,
+        init: float = 0.0,
+        padded_scale: bool = False,
+    ) -> tuple[NDArray[Any], NDArray[np.bool_]]: ...
+
 @final
 class RpcTransformer:
     def __new__(
@@ -1419,6 +1664,7 @@ class MultidimDataset:
     def array_paths(self) -> list[str]: ...
     @property
     def group_paths(self) -> list[str]: ...
+    def check(self) -> dict[str, int]: ...
     def info(self) -> dict[str, Any]: ...
     def array(self, name: str) -> MultidimArray: ...
     def __getitem__(self, key: str, /) -> MultidimArray: ...
@@ -1777,7 +2023,13 @@ def refresh_overviews(
     external: bool = False,
     ignore_cog_layout_break: bool = False,
 ) -> list[tuple[int, int]]: ...
-def validate_cog(path: str, *, strict: bool = False) -> tuple[bool, list[str], list[str]]: ...
+def validate_cog(
+    path: str | os.PathLike[str] | bytes,
+    *,
+    strict: bool = False,
+    profile: str = "rio-cogeo",
+    full_check: bool | None = None,
+) -> tuple[bool, list[str], list[str]]: ...
 def update_raster(
     src: str | os.PathLike[str] | Raster,
     dst: str,
@@ -1832,6 +2084,28 @@ def raster_index(sources: Any, dst: str | None = None, **kwargs: Any) -> Dataset
     """Create raster extent polygons; keyword options use CLI names with underscores."""
     ...
 
+def raster_tiles(
+    source: str | os.PathLike[str] | Raster,
+    output: str | os.PathLike[str],
+    *,
+    resume: bool = False,
+    dry_run: bool = False,
+    **kwargs: Any,
+) -> dict[str, Any]:
+    """Plan or write separate raster tiles, with nested grid options."""
+    ...
+
+def retile(
+    sources: str | os.PathLike[str] | Raster | Sequence[str | os.PathLike[str] | Raster],
+    output: str | os.PathLike[str],
+    *,
+    resume: bool = False,
+    dry_run: bool = False,
+    **kwargs: Any,
+) -> dict[str, Any]:
+    """Retile mosaics into overlapping files and recursive pyramid levels."""
+    ...
+
 def vector_index(sources: Any, dst: str | None = None, **kwargs: Any) -> DatasetIndex:
     """Create source layer envelope polygons, retaining original layer indexes."""
     ...
@@ -1849,4 +2123,352 @@ def blend(
     bigtiff: bool = False,
 ) -> Raster:
     """Blends equal-sized Byte images, with GDAL operators and opacity 0..100."""
+    ...
+
+def gpkg_repack(path: str | os.PathLike[str]) -> dict[str, Any]: ...
+def gpkg_repack_bytes(data: bytes) -> bytes: ...
+def mosaic_multidim(
+    sources: Sequence[MultidimDataset | str | os.PathLike[str] | bytes | dict[str, bytes]],
+    dst: str | os.PathLike[str] | None = None,
+    *,
+    arrays: Sequence[str] | None = None,
+) -> MultidimDataset: ...
+
+_PaletteSource: TypeAlias = Raster | str | os.PathLike[str] | bytes | Sequence[Sequence[int]]
+
+def read_color_table(source: _PaletteSource, filename: str | None = None) -> list[list[int]]: ...
+def rgb_to_palette(
+    src: Raster | str | os.PathLike[str],
+    dst: str | None = None,
+    *,
+    color_count: int = 256,
+    bit_depth: int = 5,
+    dither: bool = True,
+    color_map: _PaletteSource | None = None,
+    output_nodata: int | None = None,
+    mask: NDArray[np.uint8] | None = None,
+    format: str | None = None,
+    compress: str | None = None,
+    tile_size: int | None = None,
+    bigtiff: bool = False,
+    overwrite: bool = False,
+) -> Raster: ...
+def palette_to_rgb(
+    src: Raster | str | os.PathLike[str],
+    dst: str | None = None,
+    *,
+    rgba: bool = False,
+    format: str | None = None,
+    compress: str | None = None,
+    tile_size: int | None = None,
+    bigtiff: bool = False,
+    overwrite: bool = False,
+) -> Raster: ...
+def attach_palette(
+    src: Raster | str | os.PathLike[str],
+    color_map: _PaletteSource,
+    dst: str | None = None,
+    *,
+    format: str | None = None,
+    compress: str | None = None,
+    tile_size: int | None = None,
+    bigtiff: bool = False,
+    overwrite: bool = False,
+) -> Raster: ...
+def identify(
+    sources: str | os.PathLike[str] | Iterable[str | os.PathLike[str]] | bytes,
+    *,
+    filename: str | None = None,
+    recursive: bool = False,
+    force_recursive: bool = False,
+    deep: bool = False,
+    report_failures: bool = False,
+) -> list[dict[str, Any]]:
+    """Return named records as a list, including for one upload.
+
+    JavaScript's single-upload API returns format metadata or null instead.
+    """
+    ...
+
+def dataset_files(
+    source: str | os.PathLike[str], *, format: str | None = None
+) -> dict[str, Any]: ...
+def dataset_copy(
+    source: str | os.PathLike[str],
+    destination: str | os.PathLike[str],
+    *,
+    format: str | None = None,
+    overwrite: bool = False,
+    allow_external_references: bool = False,
+) -> dict[str, Any]: ...
+def dataset_rename(
+    source: str | os.PathLike[str],
+    destination: str | os.PathLike[str],
+    *,
+    format: str | None = None,
+    overwrite: bool = False,
+    allow_external_references: bool = False,
+) -> dict[str, Any]: ...
+def dataset_delete(
+    sources: str | os.PathLike[str] | Iterable[str | os.PathLike[str]], *, format: str | None = None
+) -> list[dict[str, Any]]: ...
+def parquet_create_metadata(
+    inputs: Sequence[str | os.PathLike[str]],
+    output: str | os.PathLike[str],
+    *,
+    overwrite: bool = False,
+) -> dict[str, Any]: ...
+def check_dataset(
+    source: str | os.PathLike[str] | bytes,
+    *,
+    filename: str | None = None,
+    overviews: bool = False,
+    masks: bool = False,
+) -> dict[str, int]: ...
+
+class _SozipReport(TypedDict):
+    added: int
+    seek_optimized: int
+    bytes: int
+
+class _SozipMember(TypedDict):
+    name: str
+    size: int
+    compressed_size: int
+    modified: int | None
+    method: int
+    sozip_chunk_size: int | None
+    properties: list[str]
+
+class _SozipValidation(TypedDict):
+    valid: bool
+    sozip_files: list[str]
+    messages: list[str]
+    errors: list[str]
+
+def sozip_create(
+    inputs: list[str] | tuple[str, ...],
+    output: str,
+    *,
+    enable: Literal["auto", "yes", "no"] = "auto",
+    chunk_size: int = 32768,
+    min_file_size: int = 1048576,
+    overwrite: bool = False,
+    recursive: bool = False,
+    junk_paths: bool = False,
+    content_type: str | None = None,
+) -> _SozipReport:
+    """Create a Seek-Optimized ZIP archive, like `gdal vsi sozip create`."""
+    ...
+
+def sozip_optimize(
+    input: str,
+    output: str,
+    *,
+    enable: Literal["auto", "yes", "no"] = "auto",
+    chunk_size: int = 32768,
+    min_file_size: int = 1048576,
+    overwrite: bool = False,
+) -> _SozipReport:
+    """Rewrite a zip archive as a SOZip archive, like `gdal vsi sozip optimize`."""
+    ...
+
+def sozip_list(input: str) -> list[_SozipMember]:
+    """List a zip archive's members with their SOZip status, like `gdal vsi sozip list`."""
+    ...
+
+def sozip_validate(input: str) -> _SozipValidation:
+    """Validate a zip archive and its SOZip indexes, like `gdal vsi sozip validate`."""
+    ...
+
+def validate_gpkg(
+    path: str | os.PathLike[str] | bytes,
+    *,
+    full_check: bool = False,
+    strict: bool = False,
+    unicode_case: bool = False,
+) -> dict[str, Any]: ...
+def clip_vector(
+    src: Any,
+    *,
+    bbox: Sequence[float] | None = None,
+    geometry: str | None = None,
+    like: Any = None,
+    crs: str | None = None,
+    layer: str | None = None,
+    like_layer: str | None = None,
+    like_where: str | None = None,
+    like_sql: str | None = None,
+) -> Layer:
+    """Clip vector features to a bbox, polygon or vector/raster template."""
+
+def check_coverage(
+    src: Any,
+    *,
+    maximum_gap_width: float = 0.0,
+    include_valid: bool = False,
+    layer: str | None = None,
+) -> Layer:
+    """Invalid coverage edges, retaining CRS; XY diagnostics, empty schema and new IDs."""
+    ...
+
+@overload
+def simplify_coverage(
+    src: Any,
+    tolerance: float,
+    *,
+    preserve_boundary: bool = False,
+    layer: str | None = None,
+    active_layer: None = None,
+) -> Layer: ...
+@overload
+def simplify_coverage(
+    src: Any,
+    tolerance: float,
+    *,
+    preserve_boundary: bool = False,
+    layer: None = None,
+    active_layer: str,
+) -> VectorDataset: ...
+def layer_algebra(
+    src: Any,
+    method: Any,
+    operation: str,
+    *,
+    layer: str | None = None,
+    method_layer: str | None = None,
+    keep_lower_dimension_geometries: bool = True,
+    input_prefix: str | None = None,
+    method_prefix: str | None = None,
+) -> Layer:
+    """Attribute-preserving planar XY layer algebra, with matching input CRS."""
+    ...
+@final
+class PipelineResult:
+    @property
+    def dataset(self) -> Raster | VectorDataset | None: ...
+    @property
+    def output_names(self) -> list[str]: ...
+    def output_bytes(self) -> dict[str, bytes]: ...
+    def write_outputs(self) -> None: ...
+
+def pipeline(
+    command: str,
+    inputs: dict[str, Any] | None = None,
+    *,
+    write: bool = False,
+    base_file: str | None = None,
+    input_kind: Literal["auto", "raster", "vector"] | None = None,
+) -> PipelineResult: ...
+@overload
+def clean_coverage(
+    src: Any,
+    *,
+    snapping_distance: float = -1.0,
+    merge_strategy: Literal[
+        "longest-border", "max-area", "min-area", "min-index"
+    ] = "longest-border",
+    maximum_gap_width: float = 0.0,
+    layer: str | None = None,
+    active_layer: None = None,
+) -> Layer: ...
+@overload
+def clean_coverage(
+    src: Any,
+    *,
+    snapping_distance: float = -1.0,
+    merge_strategy: Literal[
+        "longest-border", "max-area", "min-area", "min-index"
+    ] = "longest-border",
+    maximum_gap_width: float = 0.0,
+    layer: None = None,
+    active_layer: str,
+) -> VectorDataset: ...
+def rpftoc_create(
+    input: str | os.PathLike[str],
+    output: str | os.PathLike[str] | None = None,
+    *,
+    scale: int | None = None,
+    producer_id: str = "TERRI",
+    producer_name: str = "Terrio",
+    country_code: str = "",
+    classification: str = "U",
+    overwrite: bool = False,
+) -> dict[str, int]: ...
+def rpftoc_bytes(
+    frames: Sequence[tuple[str, bytes]],
+    *,
+    scale: int | None = None,
+    producer_id: str = "TERRI",
+    producer_name: str = "Terrio",
+    country_code: str = "",
+    classification: str = "U",
+) -> bytes: ...
+def contour(
+    src: str | os.PathLike[str] | Raster,
+    *,
+    band: int = 1,
+    interval: float | None = None,
+    offset: float = 0.0,
+    levels: Sequence[float] | None = None,
+    nodata: float | None = None,
+    ignore_nodata: bool = False,
+    with_z: bool = False,
+    field_name: str = "ELEV",
+    layer_name: str = "contour",
+) -> Layer:
+    """Extract contours, materializing source pixels; options match the shared engine."""
+    ...
+
+def footprint(
+    src: str | os.PathLike[str] | Raster,
+    *,
+    bands: Sequence[int] | None = None,
+    intersection: bool = False,
+    mask: str | os.PathLike[str] | Raster | None = None,
+    singlepart: bool = False,
+    attributes: Mapping[str, str] | None = None,
+) -> Layer:
+    """Return valid-data polygons; omitted/empty bands selects every band (union by default)."""
+    ...
+
+def buffer(
+    src: Any, distance: float, *, quadrant_segments: int = 30, layer: str | None = None
+) -> Layer:
+    """Planar buffers of one vector layer, preserving attributes, IDs and CRS."""
+    ...
+
+def dissolve(src: Any, *, fields: Sequence[str] | None = None, layer: str | None = None) -> Layer:
+    """Dissolve one vector layer, optionally grouped by field names."""
+    ...
+
+def check_geometry(src: Any, *, layer: str | None = None) -> Layer:
+    """Annotate one layer with is_valid and valid_reason fields."""
+    ...
+
+def make_valid(src: Any, *, layer: str | None = None) -> Layer:
+    """Repair invalid geometries in one layer, preserving attributes and IDs."""
+    ...
+
+def zonal_stats(
+    zones: Any,
+    rasters: str | os.PathLike[str] | Raster | Sequence[str | os.PathLike[str] | Raster],
+    *,
+    bands: Sequence[int] | None = None,
+    prefixes: Sequence[str] | None = None,
+    stats: Sequence[str] | None = None,
+    all_touched: bool = False,
+    t_srs: str | None = None,
+    decimal_places: int | None = None,
+    layer: str | None = None,
+) -> Layer:
+    """Summarize bands for polygon zones; materializes source raster pixels.
+
+    Field-name collisions receive _2, _3, etc. suffixes. Repeated raster path
+    entries are read separately, without a path cache.
+    """
+    ...
+
+def singlepart(src: Any, *, layer: str | None = None) -> Layer:
+    """Split multipart/collection geometry recursively; output IDs start at one."""
     ...

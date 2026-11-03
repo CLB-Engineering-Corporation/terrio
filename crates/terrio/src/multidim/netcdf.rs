@@ -180,37 +180,6 @@ fn group(g: &NcGroup, p: &str, file: &Arc<NcFile>, hdf: Option<&hdf5_reader::Hdf
     }
     Ok(out)
 }
-fn resolve_coordinates(root: &mut Group) {
-    let names: std::collections::HashSet<_> = root.arrays_recursive().iter().map(|a| a.info.path.clone()).collect();
-    fn visit(group: &mut Group, names: &std::collections::HashSet<String>) {
-        for a in &mut group.arrays {
-            if let Some(raw) = a.info.attributes.get("coordinates").and_then(Value::as_str) {
-                for name in raw.split_whitespace() {
-                    let mut parent = group.path.as_str();
-                    let coordinate = loop {
-                        let candidate = if name.starts_with('/') { name.to_owned() } else { path(parent, name) };
-                        if names.contains(&candidate) {
-                            break Some(candidate);
-                        }
-                        if name.starts_with('/') || parent == "/" {
-                            break None;
-                        }
-                        parent = parent.rsplit_once('/').map(|(p, _)| if p.is_empty() { "/" } else { p }).unwrap_or("/");
-                    };
-                    if let Some(c) = coordinate
-                        && !a.info.coordinates.contains(&c)
-                    {
-                        a.info.coordinates.push(c);
-                    }
-                }
-            }
-        }
-        for child in &mut group.groups {
-            visit(child, names);
-        }
-    }
-    visit(root, &names);
-}
 fn dataset(file: NcFile, hdf: Option<hdf5_reader::Hdf5File>, driver: &str) -> Result<Dataset> {
     let file = Arc::new(file);
     let mut root = group(file.root_group().map_err(error)?, "/", &file, hdf.as_ref(), &[])?;
@@ -231,6 +200,10 @@ impl hdf5_reader::storage::Storage for OffsetStorage {
 }
 pub(super) fn open(name: &str) -> Result<Dataset> {
     let mut storage: hdf5_reader::storage::DynStorage = Arc::new(hdf5_reader::storage::FileStorage::open(name).map_err(error)?);
+    // The driver the dataset is opened with, as the raster read names it (netCDF for a classic file
+    // or an HDF5 one under netCDF's names, HDF5 otherwise): judged before either reader runs.
+    let driver = if crate::drivers::netcdf::is_netcdf(std::path::Path::new(name)) { "netCDF" } else { "HDF5" };
+    crate::formats::check_driver_allowed(driver, name, crate::formats::Kind::Raster)?;
     let header = storage.read_range(0, storage.len().min(8) as usize).map_err(error)?;
     let classic = header.starts_with(b"CDF");
     if !classic {
@@ -254,10 +227,13 @@ pub(super) fn open(name: &str) -> Result<Dataset> {
     )
     .map_err(error)?;
     let hdf = (!classic).then(|| hdf5_reader::Hdf5File::from_storage(storage).ok()).flatten();
-    let driver = if crate::drivers::netcdf::is_netcdf(std::path::Path::new(name)) { "netCDF" } else { "HDF5" };
     dataset(file, hdf, driver)
 }
 pub(super) fn open_bytes(bytes: &[u8]) -> Result<Dataset> {
+    // Bytes have no name: a classic file is netCDF's, any other is read as HDF5 (netCDF-4 too), as
+    // a file named for neither driver is. Judged before either reader runs.
+    let driver = if bytes.starts_with(b"CDF") { "netCDF" } else { "HDF5" };
+    crate::formats::check_driver_allowed(driver, "a file in memory", crate::formats::Kind::Raster)?;
     let body = crate::drivers::hdf5::signature_offset_in(bytes).map(|offset| &bytes[offset..]).unwrap_or(bytes);
     open_bytes_owned(body.to_vec())
 }

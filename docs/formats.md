@@ -17,7 +17,7 @@ GDAL's drivers (the formats marked * are written that way): see
 | Zarr | Zarr v2 and v3, GeoZarr (`spatial:`, `proj:`, `multiscales`) | ✓ | ✓ | zarr |
 | netCDF | netCDF classic and netCDF-4 (groups included); writes CDF-1/2/5 and netCDF-4 | ✓ | ✓ | nc, nc4, cdf |
 | HDF5 | HDF5 datasets, as GDAL's HDF5 driver reads them | ✓ | | h5, hdf5, he5 |
-| GRIB | GRIB editions 1 and 2, as GDAL's GRIB driver reads them | ✓ | | grb, grb2, grib, grib2 |
+| GRIB | GRIB editions 1 and 2, as GDAL's GRIB driver reads them | ✓ | ✓ | grb, grb2, grib, grib2 |
 | HFA | ERDAS Imagine (written with the `gdal` feature) | ✓ | ✓* | img |
 | GPKG | GeoPackage tiles and gridded coverages | ✓ | ✓ | gpkg |
 | PMTiles | PMTiles v3 raster tiles (PNG, JPEG, WebP; AVIF read) | ✓ | ✓ | pmtiles |
@@ -38,9 +38,24 @@ GDAL's drivers (the formats marked * are written that way): see
 | ERS | ER Mapper | ✓ | ✓ | ers |
 | PNG | PNG with world file | ✓ | ✓ | png |
 | JPEG | JPEG with world file | ✓ | ✓ | jpg, jpeg |
+| WEBP | WebP with world file (written lossless) | ✓ | ✓ | webp |
 | XYZ | XYZ ASCII grid | ✓ | ✓ | xyz |
 | DTED | DTED elevation | ✓ | ✓ | dt0, dt1, dt2 |
 | SRTMHGT | SRTM HGT tiles (`N37W120.hgt`, zipped or not; NASADEM `.hgts`, `.err`, `.img`, `.num` and water body `.raw`, `.swb` read) | ✓ | ✓ | hgt |
+
+PNG, JPEG and WebP files are written with a world file (`.wld`) and the CRS in a `.aux.xml`
+sidecar. JPEG files are written as GDAL's JPEG driver writes them: one band as grayscale, three as
+YCbCr with 4:2:0 chroma subsampling (each 2 x 2 block's chroma averaged, as libjpeg averages it),
+quantized at the `QUALITY` creation option (1 to 100, default 75) as libjpeg scales its tables,
+with optimized Huffman tables. Other data types are rounded and saturated to Byte; GDAL's 4-band
+(CMYK) and 12-bit JPEGs are not written. WebP files hold 3 (RGB) or 4 (RGBA) Byte bands of at most
+16383 x 16383 pixels, as GDAL's WEBP driver requires, and are always lossless (encoded in Rust,
+without libwebp), every sample kept: `LOSSLESS=NO`, GDAL's default, still gives a lossless file,
+not the size of GDAL's lossy one, and `QUALITY` (checked to be 0 to 100) and `EXACT` (0 or 1) have
+no effect. The RGB values under fully transparent pixels are kept, as GDAL keeps them with `EXACT=1`;
+with GDAL's default, `EXACT=0`, libwebp writes values of its own choosing there. An alpha band
+that is opaque everywhere is left out, so the file reads back as 3 bands, in GDAL as in terrio.
+WebP files are read lossless or lossy, as 3 bands, or 4 with an alpha channel.
 
 Native TIFF readers limit each decoded tile or strip to 256 MiB by default. For trusted
 files with larger chunks, use `TiffReadLimits` with `LazyRaster::open_tiff_with_limits`
@@ -56,11 +71,15 @@ Zstandard, LZMA, LERC (alone, with Deflate or with Zstandard, lossless or not, w
 JPEG XL, with horizontal and floating-point predictors, tiled or striped, chunky or planar. JPEG
 (in GeoTIFFs, GeoPackage and tile archive tiles, and `.jpg` files) is decoded exactly as GDAL's
 libjpeg decodes it: the same integer IDCT, chroma upsampling and YCbCr conversion, so the pixels are
-GDAL's. Lossy JPEG XL can differ from libjxl's by 1 in a few pixels. LZMA is
-read, not written; LERC (lossless or within `MAX_Z_ERROR`, alone or with Deflate or Zstandard) and lossless JPEG XL are written too. Unsigned samples packed in 9 to 15 or 17 to 31 bits (GDAL's
+GDAL's. Lossy JPEG XL can differ from libjxl's by 1 in a few pixels. LERC (`--compress LERC`,
+`LERC_DEFLATE`, `LERC_ZSTD`) and lossless JPEG XL (`JXL`, for Byte and UInt16) are written too;
+LZMA is read, not written. Unsigned samples packed in 9 to 15 or 17 to 31 bits (GDAL's
 `NBITS`, as GDAL writes Sentinel-2's 15-bit bands) are read as UInt16 or UInt32, as GDAL reads them,
 in either bit order (`FillOrder`); packed signed samples and packed samples with a predictor are
-not supported (GDAL writes neither).
+not supported (GDAL writes neither). WhiteIsZero samples are read as stored, as GDAL reads them,
+under every compression terrio reads: terrio decodes them itself (the `tiff` crate inverts those of
+8 bits and more uncompressed or under LZW, Deflate and PackBits, and refuses some), and
+`terrio.rio` gives those of at most 16 bits GDAL's inverted gray color table.
 
 JPEG 2000 is decoded and encoded with the Rust port of OpenJPEG, the codec of GDAL's JP2OpenJPEG
 driver, so pixels are GDAL's (Sentinel-2 L1C and L2A bands included). Georeferencing comes from
@@ -75,6 +94,52 @@ thread) and 1.7 GB, and the smallest overview 0.05 s (GDAL: 0.09 s, 1.1 s and 0.
 window and overview is identical to GDAL's. GeoTIFFs compressed with JPEG XL are read tile by tile
 the same way (JPEG XL files themselves are not a format terrio reads).
 
+GRIB files (editions 1 and 2) are read as GDAL's GRIB driver reads them, also when found by
+their content rather than their extension: each field of each GRIB2 message, and each GRIB1
+message, is a Float64 band, in file order; the geotransform and CRS are GDAL's for regular,
+rotated and Gaussian latitude/longitude grids (templates 3.0, 3.1 and 3.40, 0-360 longitudes
+shifted and split at the antimeridian as GDAL does), Mercator (3.10), transverse Mercator (3.12),
+polar stereographic (3.20) and Lambert conformal (3.30) grids, on every shape of the earth GRIB2
+defines, and for GRIB1's latitude/longitude, Gaussian, rotated, polar stereographic, Lambert
+conformal and Mercator grids. Simple packing (5.0), complex packing with and without spatial
+differencing (5.2, 5.3), IEEE floats (5.4), JPEG 2000 (5.40), PNG (5.41) and CCSDS (5.42, with the
+pure-Rust `rust-aec` decoder) are unpacked with GDAL's arithmetic (GRIB1 simple packing in double
+precision, as degrib does), so the pixels are GDAL's: temperatures in Celsius (GDAL's default
+`GRIB_NORMALIZE_UNITS=YES`), points a bitmap masks set to 9999 and complex packing's missing
+values kept, both reported as the band's nodata. Bands carry GDAL's description (the level) and
+metadata (`GRIB_ELEMENT`, `GRIB_UNIT`, `GRIB_COMMENT`, `GRIB_SHORT_NAME`, `GRIB_REF_TIME`,
+`GRIB_VALID_TIME`, `GRIB_FORECAST_SECONDS`, `GRIB_DISCIPLINE`, `GRIB_IDS`, `GRIB_PDS_PDTN`,
+`GRIB_PDS_TEMPLATE_NUMBERS` and, for common product templates, `GRIB_PDS_TEMPLATE_ASSEMBLED_VALUES`),
+named from GDAL's GRIB2 and degrib's GRIB1 tables. Every allocation a header sizes is fallible: a
+damaged file is an error, never an abort. Not read: other grids (Albers, Lambert azimuthal...),
+spectral and run-length packings, GRIB1 complex packing; NDFD's and MOS's own product names.
+Opened lazily (`terrio.rio.open`, `open_raster(..., lazy=True)`), only the bands read are decoded,
+as GDAL decodes them. Remote files are read by range, message by message as GDAL reads them, with
+no `.idx` or `.index` sidecar: at open one 16 KiB block per message for its section headers, then a
+band's message when the band is read; a server that ignores range requests is refused.
+
+Terrio's GRIB driver limits each field to 16,777,216 points by default, including constant and
+compressed fields. This is 128 MiB of decoded Float64 values; decoder buffers and multi-band reads
+use additional memory. To allow larger fields, set the environment variable `TERRIO_GRIB_MAX_POINTS`
+to a larger positive integer. The limit is checked on the raster's grid (the first field's) when
+a file is opened, and on each field before it is decoded, for local, remote and in-memory files.
+A resource-limit or allocation refusal is not retried with GDAL, including when `open` detects a file by its content.
+
+GRIB2 is written as GDAL's GRIB driver writes it (`terrio.rio.open(path, "w", driver="GRIB")`,
+`terrio.rio.shutil.copy(..., driver="GRIB")`, `write_raster`), byte for byte: one message per band,
+on latitude/longitude (3.0), transverse Mercator (3.12, UTM included), Lambert conformal with two
+standard parallels (3.30) and Albers equal area (3.31) grids, with simple packing (5.0) or IEEE
+floats (5.4) chosen as GDAL's `DATA_ENCODING=AUTO` chooses (IEEE for floating-point bands). The
+options are GDAL's (`DISCIPLINE`, `IDS` and `IDS_*`, `PDS_PDTN`, `PDS_TEMPLATE_NUMBERS`, `INPUT_UNIT`,
+`DATA_ENCODING`, `NBITS`, `DECIMAL_SCALE_FACTOR`, each also as `BAND_<n>_<KEY>`); the product ones
+default to the bands' `GRIB_*` metadata, so a GRIB file copied to GRIB keeps its products, and
+temperatures in Celsius are written in Kelvin. One deliberate difference: values spanning exactly a
+power of two get the bit GDAL's packing leaves out (GDAL writes 0 for the largest). Not written:
+complex packing (so bands whose nodata value occurs in the data are refused unless an encoding that
+stores it as data is asked for), PNG and JPEG 2000 packing, Mercator, polar stereographic, Lambert
+azimuthal equal area and one-parallel Lambert conformal grids, `PDS_TEMPLATE_ASSEMBLED_VALUES`, and
+several fields in one message (`WRITE_SUBGRIDS`).
+
 Raw-layout rasters (SRTM HGT tiles, EHdr, ENVI, SAGA, ERS, Idrisi and Surfer 6 binary grids) are
 read in place, as GDAL's raw drivers read them: opening reads the header (for SRTM tiles, only the
 file's name and size), and a window reads each row it covers at its offset in the data file, of the
@@ -83,10 +148,14 @@ window of one band reads the row's samples of every band). `terrio info` reads n
 asked for statistics, computed a strip of rows at a time, or a histogram, which reads the raster
 whole, and `terrio convert` to a GeoTIFF or COG writes them a strip at a time (when named with
 their formats' own extensions: an ENVI `.img` is read whole, then written). Remote SRTM tiles
-(HTTP(S) and `s3://`) are read with range requests; remote rasters of the other raw formats, and
-zipped tiles, are downloaded whole. A 512 x 512 window of a 0.5" tile (103.7 MB) reads 524,288
-bytes and peaks at 31 MB, where reading the tile whole peaked at 211 MB; over HTTP, a summary of a
-1" tile fetches its first 64 KiB block and a 300 x 20 window three more.
+(HTTP(S) and `s3://`) are read with range requests, once their first request has shown a tile's
+name and size (the process-wide allow-list then applies to SRTMHGT, as for a local tile); remote
+rasters of the other raw formats, and zipped tiles, are downloaded whole. The samples a read
+returns, and each run of rows read, are checked against the memory the process can use and
+allocated fallibly. A 512 x 512 window of a 0.5" tile (103.7 MB) reads 524,288 bytes and peaks at
+31 MB, where reading the tile whole peaked at 211 MB; over HTTP, a summary of a 1" tile fetches its
+first 16 KiB, as GDAL does, and a 300 x 20 window one more request (212,992 bytes in all; GDAL
+262,144 in 12 requests).
 
 netCDF variables are opened as `NETCDF:"file.nc":variable`, as in GDAL, and those below the
 root group by their path, `NETCDF:"file.nc":/group/variable`. A file of several variables opens
@@ -178,54 +247,6 @@ GDAL computes them), and writes complex GeoTIFFs (`SampleFormat` 5 and 6) that G
 `CInt16`... `CFloat64`. Python's `read()` returns complex arrays. Other formats write the parts as
 bands. Groups that contain themselves (hard links to an ancestor) are walked once.
 
-GRIB files (editions 1 and 2, local, remote or in memory) are read as GDAL's GRIB driver reads
-them, with GDAL's `GRIB_NORMALIZE_UNITS=YES` default and as with `-oo USE_IDX=NO`: a Float64
-band per message (per field of GRIB2 messages that repeat their sections, sub-fields reusing a
-bitmap included), the size and georeferencing of the first, rasters north-up whatever the scanning
-mode, and global grids from 0 to 360 degrees rewrapped to start at -180. Each band has GDAL's
-metadata, `GRIB_ELEMENT`, `GRIB_COMMENT`, `GRIB_UNIT`, `GRIB_SHORT_NAME`, `GRIB_REF_TIME`,
-`GRIB_VALID_TIME`, `GRIB_FORECAST_SECONDS` and, for GRIB2, `GRIB_DISCIPLINE`, `GRIB_IDS`,
-`GRIB_PDS_PDTN`, `GRIB_PDS_TEMPLATE_NUMBERS` and `GRIB_PDS_TEMPLATE_ASSEMBLED_VALUES`
-(`BAND_<n>#GRIB_...` items), and GDAL's description (`2[m] HTGL="Specified height level above
-ground"`): terrio names fields with GDAL's tables (the WMO's, NCEP's, NDFD's, MRMS's and the
-Canadian ones for GRIB2; NCEP's, ECMWF's, DWD's and the others of degrib for GRIB1) and degrib's
-rules (probabilities, percentiles, accumulations, ensemble spreads). Kelvin values are converted to
-Celsius (`[C]` units) unless `GRIB_NORMALIZE_UNITS=NO` is set in the environment. Points a bitmap
-masks are 9999, and the missing values of complex packing its primary missing value, the band's
-nodata value, as GDAL gives them. terrio's raster model holds one nodata value: bands without one
-(GDAL reports none) are listed as such in the `TERRIO#BAND_<n>_NODATA` items, which `terrio.rio`
-reads as its `nodatavals`.
-
-The grids are those GDAL georeferences: GRIB2 regular and rotated latitude/longitude (3.0, 3.1),
-Mercator (3.10), transverse Mercator (3.12), polar stereographic (3.20), Lambert conformal and
-Albers (3.30, 3.31), regular Gaussian (3.40), GDAL's full-disk geostationary view (3.90) and
-Lambert azimuthal equal area (3.140); GRIB1 latitude/longitude, Gaussian, rotated, polar
-stereographic, Lambert conformal and Mercator, with GDAL's earth shapes (NCEP's 6371.2 km sphere
-for GRIB1). GRIB2 values are decoded as GDAL's copy of NCEP's g2clib decodes them, in single
-precision, so that they are GDAL's to the bit: simple packing (5.0), complex packing with and
-without spatial differencing (5.2, 5.3), IEEE floats (5.4), JPEG 2000 (5.40, with the OpenJPEG
-port of the `jp2` feature), PNG (5.41) and CCSDS (5.42, with the pure-Rust decoder of
-[gribberish](https://github.com/mpiannucci/gribberish)); GRIB1 simple packing in double precision,
-as degrib does. Like GDAL, terrio does not read GRIB1 complex (second-order) packing, spherical
-harmonics, reduced (quasi-regular) Gaussian grids, or the unstructured and other GRIB2 grids
-(GDAL reads GRIB1 complex packing as zeros; terrio fails), and the data of a message is decoded when
-its band is read, the decoded bands kept up to 100 MB (GDAL's `GRIB_CACHEMAX`). On GDAL's GRIB
-test files, ecCodes' and real forecasts (every field of a GFS file, HRRR's and ECMWF's open data),
-every band is identical to GDAL's, metadata and pixels (`scripts/compare_grib_with_gdal.py`); a
-1-degree GFS file (696 bands) reads in 0.12 s, GDAL's in 1.0 s.
-
-Terrio's GRIB driver limits each field to 16,777,216 points by default, including constant and
-compressed fields. This is 128 MiB of decoded Float64 values; decoder buffers and multi-band reads use
-additional memory. To allow larger fields, set `TERRIO_GRIB_MAX_POINTS` to a larger positive
-integer. The limit is checked when opening the grid and before decoding it, for local, remote
-and in-memory files. A limit error does not trigger the optional GDAL fallback.
-
-```sh
-terrio info gfs.t00z.pgrb2.0p25.f000                 # bands, GRIB_* metadata
-terrio translate hrrr.t00z.wrfsfcf00.grib2 t2m.tif -b 71
-GRIB_NORMALIZE_UNITS=NO terrio convert era.grib1 era.tif
-```
-
 GeoPackage rasters are written as GDAL writes them: Byte rasters (1 to 4 bands) as PNG tiles, or
 JPEG with `--compress JPEG`; one-band Int16, UInt16 and Float32 rasters as gridded coverages
 (16-bit PNG or float TIFF tiles), with every zoom level of the pyramid. A GeoPackage holding
@@ -245,7 +266,16 @@ and coordinate arrays and grid mappings are looked for in the groups above the a
 are read chunk by chunk, local or remote (see [Remote data](remote-data.md)), with the codecs
 none, zlib, gzip, Zstandard, LZ4 and Blosc, transposition, CRC32C checksums, v3 sharding
 (`sharding_indexed`, inner chunks read by range), and the `scale_offset` and `cast_value` codecs
-of the EOPF GeoZarr samples; `float16` arrays (NOAA's HRRR) are read as Float32. Arrays of more
+of the EOPF GeoZarr samples; `float16` arrays (NOAA's HRRR) are read as Float32. A chunk whose
+elements take more than 1 GiB as stored (for a shard read by parts, an inner chunk), or more than
+512 MiB in a v2 chunk in Fortran order (GDAL counts the copy it transposes such a chunk into), is
+refused at read, as GDAL refuses it, unless `TERRIO_ZARR_ALLOW_BIG_TILE_SIZE` (or GDAL's
+`ZARR_ALLOW_BIG_TILE_SIZE`) is `YES`; chunk dimensions whose product overflows are an error. A
+chunk in Fortran order, or transposed, is read in place, held once, and a chunk whose decoding
+takes more than the memory the process can use is an error. A
+chunk is decoded no further than the bytes of its elements and 64 bytes (a shard, than its inner
+chunks at their largest encoded and its index): a codec's output past that is an error, and an
+LZ4 or Blosc chunk stating a larger size is refused before that size is allocated. Arrays of more
 than three dimensions (`time, level, y, x`) are rasters whose bands are every combination of the
 other dimensions, the last varying fastest, as GDAL numbers them, each band's position given as
 GDAL's `DIM_<name>_INDEX`, `DIM_<name>_VALUE` and `DIM_<name>_UNIT` band metadata (terrio's
@@ -332,8 +362,14 @@ terrio convert 'STACTA:"https://example.com/pyramid/stacta.json":bands' preview.
 | FlatGeobuf | FlatGeobuf | ✓ | ✓ | fgb |
 | ESRI Shapefile | Shapefile | ✓ | ✓ | shp |
 | GeoJSON | GeoJSON | ✓ | ✓ | geojson, json |
+| CityJSON | CityJSON 1.1 and 2.0 (flat XYZ view) | ✓ | ✓ | city.json, cityjson, json (by content) |
+| CityGML | CityGML 2.0 and 3.0 (flat XYZ view) | ✓ | ✓ | citygml, gml/xml (by content) |
+| WFS | Read-only WFS 1.0, 1.1 and 2.0 services | ✓ | — | WFS: endpoint or GetCapabilities URL |
+| ESRIJSON | JSON of ArcGIS feature-service queries, from files and URLs | ✓ | — | json (by content), query URLs |
+| ESRIPBF | Protocol buffers of ArcGIS feature-service queries, from files and URLs | ✓ | — | pbf (by content), query URLs |
 | GeoJSONSeq | GeoJSON text sequences (a feature per line) | ✓ | ✓ | geojsonl, geojsons, geojsonseq |
 | CSV | CSV with X/Y or WKT columns | ✓ | ✓ | csv, tsv |
+| XLSX | Office Open XML spreadsheets, a layer per worksheet | ✓ | ✓ | xlsx, xlsm |
 | KML | KML | ✓ | ✓ | kml |
 | KMZ | Zipped KML | ✓ | ✓ | kmz |
 | GML | GML | ✓ | ✓ | gml |
@@ -343,9 +379,405 @@ terrio convert 'STACTA:"https://example.com/pyramid/stacta.json":bands' preview.
 | TopoJSON | TopoJSON | ✓ | ✓ | topojson |
 | MapInfo File | MapInfo TAB and interchange format | ✓ | ✓ | tab, mif |
 | OSM | OpenStreetMap PBF and XML | ✓ | | osm.pbf, osm |
+| HECRAS | HEC-RAS geometry and plan HDF5 (the `hecras` feature) | ✓ | | g##.hdf, p##.hdf (by content) |
 | PMTiles | PMTiles v3 vector tiles (MVT) | ✓ | ✓ | pmtiles |
 | MBTiles | MBTiles vector tiles (MVT) | ✓ | ✓ | mbtiles |
 | MVT | Mapbox Vector Tiles: a tile, or a directory of tiles | ✓ | ✓ | mvt, pbf |
+
+### CityJSON
+
+The pure-Rust `CityJSON` reader accepts versions 1.1 and 2.0, including quantized XYZ
+vertices, affine geometry templates, MultiSurface/CompositeSurface, Solid (all shells),
+MultiSolid/CompositeSolid, MultiPoint and MultiLineString. Use `.city.json` or
+`.cityjson`; `.json` is distinguished from GeoJSON by its root `type`, even when
+the type follows a large vertex/object payload. Bounded header identification can
+only report a root type present within its header limit.
+The top-level `transform` object is required by both supported versions; template
+vertices remain unquantized as specified.
+
+The single `CityJSON` layer is a **flat vector view**: each face is a polygon with Z
+and interior rings; lines and points are separate features. Nonspatial objects
+remain null-geometry features. Fields are `city_id`, `city_type`, `lod`, `parents`
+(a JSON array), `attributes` (a JSON object), `geometry_type` and `semantics` (the
+source geometry's complete JSON semantics object, repeated on its primitives).
+`surface_semantics` contains the JSON semantic record resolved for that particular
+face (for example `RoofSurface` with its properties), or null for unclassified faces.
+Rings with fewer than three distinct XYZ positions cannot form polygons in this
+view. Degenerate interior rings are omitted; a degenerate exterior omits its face.
+Surviving faces keep their original semantic records. Integer `skipped_rings` and
+`skipped_faces` fields report totals for the source geometry, repeated on each
+surviving primitive. If no primitive survives, a null-geometry feature retains the
+object metadata and counts. These counts are not totals to sum across features.
+The test is limited to distinct XYZ positions; collinear rings with at least three
+distinct positions are retained. No area or general polygon-validity test is applied.
+Invalid indices and malformed boundary/semantic nesting still fail explicitly.
+`metadata.referenceSystem` supplies the CRS; absent CRS stays unknown. Coordinates
+retain the source XYZ order rather than applying geographic axis swapping.
+An explicitly declared CRS must be a supported string; malformed or unsupported
+declarations fail instead of silently assigning an unknown or guessed CRS.
+
+This view retains vertical faces but does not model solids, shell membership or
+the object hierarchy as geometry. It does not preserve textures, materials,
+extensions or general city-model metadata. CityJSONFeature sequences are outside
+this reader. Unsupported geometry types and invalid vertex/template references
+fail explicitly. Reading currently materializes the document and flat features;
+there is no spatial/window index.
+The flat view owns repeated attributes and semantics text. Its estimated feature
+payload (text, coordinates and feature containers) is limited to 256 MiB; larger
+expansions fail with a request to split the model. This is an expansion limit,
+not a bound on total process memory or input parsing. Template vertices are
+decoded once, and only referenced template coordinates are transformed per instance.
+Whole source semantics are repeated as owned text. A local connected 1,000-face
+CompositeSurface example used 68,723 input bytes and 26,966,000 bytes of owned field
+text; larger single geometries can reach the expansion limit. Run
+`python scripts/benchmark_json_dispatch.py DATA` to reproduce this observation.
+The JSON parse also uses the existing GeoJSON allocation preflight; neither probe
+nor payload accounting is a total resident-memory guarantee.
+The `.city.json` extension selects the CityJSON driver for both reading and writing.
+
+The `.json` root-type probe scans the already-read buffer without reopening the
+file and borrows valid UTF-8; malformed UTF-8 is rejected without an owned decoded
+copy. A local Linux development-build observation on equal 16,777,271-byte files
+read 16,875,575–16,875,576 bytes in five calls for either root-type position,
+including bounded header probes. Mean opens were 52 ms with an early type and
+114 ms with a late type (three warmed runs). These observations are not performance
+thresholds; the benchmark above records actual counters and timings.
+
+The writer produces CityJSON 2.0 by default, or 1.1 with
+`terrio convert input.city.json output.city.json --cityjson-version 1.1`.
+Rust uses `VectorWriteOptions.cityjson_version`, Python uses `cityjson_version`
+on `write_vector`, `convert`, layer/dataset `write` and layer `to_bytes`, and
+JavaScript uses `toBytes("output.city.json", {cityjsonVersion: "1.1"})`.
+
+Layers with `city_id` and `city_type` fields use the city-object convention:
+`lod` is optional (null or empty text defaults to `"0"`), and `parents`, `attributes` and
+`surface_semantics` contain JSON text when present. Other columns become object
+attributes. Features sharing an ID are grouped by LoD and primitive type;
+conflicting attributes, types or parents are errors. Core second-level types
+(parts, installations, constructive elements, furnishings, rooms and building
+subdivisions) require exactly one parent, as specified in CityJSON section 2.
+This flat projection requires other core types to be unparented; it does not
+reconstruct group membership or same-type transportation subdivisions.
+Null-geometry objects remain.
+Other layers become one `GenericCityObject` per feature, with generated IDs and
+all columns as attributes. That generic type requires version 2.0. Several layers
+can share a file when their CRSs are consistent and explicit IDs do not collide.
+
+Polygons become `MultiSurface` (`CompositeSurface` for triangular `TINRelief`),
+lines become `MultiLineString`, and points become `MultiPoint`. XYZ and holes are
+retained; 2D input receives Z=0. A shared integer vertex pool and per-axis power-of-two
+scales encode the coordinates within JavaScript's safe integer range. Quantization
+can change the last floating-point bits; comparisons allow half a step plus four
+ULPs (constant axes use ULPs only). Rings or lines that collapse are rejected.
+Measured M coordinates are not representable and must be removed before writing.
+A declared CRS needs a valid EPSG URI; unsupported or unregistered CRSs must be
+reprojected first. Unknown CRS remains absent.
+
+The writer retains supported per-face classification and properties, not source
+solid/shell topology or semantic parent/child indices. It rebuilds object children
+from the retained structural parent IDs. Group membership, same-type transportation
+subdivisions, materials, textures, templates and extensions are not reconstructed. Supported
+CityGML Window/Door objects use a lossy `BuildingConstructiveElement` projection,
+with the original class in `terrio:sourceCityType`. This is Terrio’s identity-preserving
+projection, not a normative CityGML-to-CityJSON equivalence: the CityJSON
+[specification](https://www.cityjson.org/specs/2.0.2/#3.3) represents Window/Door
+as surface semantics, while its core object types omit filling elements. Other
+supported aliases are Room/Storey, BridgeConstructionElement, HollowSpace/TunnelRoom,
+Square, GenericOccupiedSpace/GenericUnoccupiedSpace and the IntBuilding/Bridge/TunnelInstallation
+classes. They retain the original type in `terrio:sourceCityType`. Other CityGML
+classes, including traffic subdivisions and relief aggregations, fail explicitly.
+Second-level target objects need their required containing parent; a standalone
+Door, Window, installation or Storey is refused rather than assigned an invented parent.
+Unsupported object/classification
+types fail explicitly. Reader diagnostics are not city-model attributes and are
+not written. Both `city_id` and `city_type` columns enable the flat city-model
+interpretation. Without that pair, ordinary vector columns (including a lone
+`city_id` or `city_type`) remain ordinary attributes on generated generic objects.
+Null-valued columns remain explicit JSON null attributes. Conflicting values or
+number types between the JSON attributes and scalar columns are rejected.
+Writers build the complete vertex pool, JSON tree and output buffer in memory;
+large models can require several times their encoded size. These are flat conversions, not lossless city-model round trips.
+
+The [CityJSON 1.1](https://www.cityjson.org/specs/1.1.3/) and
+[2.0 specifications](https://www.cityjson.org/specs/2.0.2/) and their published JSON
+Schemas define conformance. GDAL 3.13.3 has no CityJSON driver.
+
+### CityGML
+
+The pure-Rust `CityGML` reader accepts 2.0 and 3.0 city models, using namespace
+URIs rather than prefix names. `.gml` is distinguished from ordinary GML by the
+root CityModel; `.citygml` selects this driver explicitly. Ordinary GML retains
+its sibling application-schema lookup. XML and local geometry XLinks are parsed
+without fetching external resources; invalid XML, duplicate IDs, unresolved
+references, reference cycles and malformed coordinate lists fail explicitly.
+Reference expansion is limited to 1,000,000 visits within expanded subtrees,
+including acyclic branching graphs; ordinary inline traversal does not consume
+this budget. Reference-expanded primitive conversions additionally have a 64 MiB
+coordinate-text work budget; repeated references with an already validated
+CRS/dimension reuse validation. A global nesting limit of 256 includes linked city objects. Repeated
+object references share their feature records and accumulate parent IDs. Repeated source properties are retained as JSON arrays.
+
+The `CityGML` layer uses the eight common flat fields described for CityJSON,
+without its skipped-ring/face counters. Rings with fewer than three distinct XYZ
+positions fail explicitly rather than being skipped. Polygon faces retain
+Z and interior rings; solids (including interior shells), composite surfaces,
+triangle/rectangle patches, linear curves and point collections become ordinary
+primitives. Local polygon references shared by a solid and its thematic boundary
+produce one face per owner/LoD/orientation, with the boundary's semantic record in
+`surface_semantics`. `semantics` stays null because CityGML has no CityJSON-style
+indexed semantics object. Nested city objects retain parent IDs and nonspatial
+containers. Missing object IDs receive generated IDs. Object properties are JSON
+text; measurement units and code spaces are retained with their values.
+
+Affine implicit geometry uses its matrix before adding the reference point and
+promotes positions to XYZ, using zero for an absent input Z. Conflicting anchor
+and relative-geometry CRSs are rejected.
+Explicit and inherited coordinate dimensions override dimensions inferred from
+the CRS when omitted. Position-level CRS declarations, legacy compound OGC URNs and
+geographic authority-axis order are supported. A flat layer requires a consistent
+CRS; mixing unknown and known CRSs, or distinct CRSs, fails explicitly.
+
+UTF-8, Latin-1 and UTF-16 XML are supported. Undeclared input that is not valid
+UTF-8 intentionally falls back to Latin-1 for compatibility; declare Windows-1252
+explicitly when its additional characters are intended. Other declared encodings recognized
+by `encoding_rs`, including Windows-1252, are decoded using their declaration. Identification examines at most
+16 KiB; opening a named `.gml` can inspect beyond a long leading comment.
+
+This is a materialized vector view with a 256 MiB raw XML limit checked before
+decoding/tree construction and the shared 256 MiB estimated flat-feature payload
+limit. A separate 256 MiB estimate bounds XML tree storage, including element,
+attribute and text allocations with capacity slack. Local CityGML paths are
+size-checked before payload allocation. Oversized shared XML names with an
+inconclusive 16 KiB root prefix are refused; identified non-CityGML XML keeps its
+existing read policy. These are allocation safeguards, not a total process-memory
+ceiling. Transcoding can allocate an additional UTF-8 buffer; for example, Latin-1
+can expand to twice its source size. The raw input and decoded text are separate
+from the XML-tree and flat-payload estimates. Reference expansion has whole-document totals of one million node visits
+and 64 MiB of coordinate text parsed through XLinks. A shared primitive with
+contradictory thematic classifications is rejected. It does not
+retain solid/shell topology, full city-model hierarchy,
+textures/materials, ADE semantics or general metadata for lossless round trips.
+External geometry references, linked coordinate/ring content, nonlinear curve
+segments, RasterRelief coverage data and DTD/entity declarations are outside this
+native reader. Builds with the optional GDAL backend retain Terrio’s normal
+fallback policy; an explicit
+`GDAL:` input selects GDAL directly.
+
+The native writer defaults to CityGML 3.0. Select 2.0 with
+`terrio convert source.city.json output.citygml --citygml-version 2.0`,
+Python `citygml_version="2.0"`, or JavaScript `citygmlVersion: "2.0"`.
+For a `.gml` filename, select `--format CityGML` explicitly; the default `.gml`
+writer remains ordinary GML. Version options on other formats are rejected.
+
+CityGML 2.0 building LoD 0 distinguishes a ground footprint from a roof outline.
+Native GML reads retain `lod0FootPrint`/`lod0RoofEdge` in `geometry_type` and the
+writer preserves those hints. GroundSurface/RoofSurface classification also
+selects the corresponding property. For an unclassified flat input, choose
+`--citygml-lod0-surface footprint` or `roof-edge` (Python
+`citygml_lod0_surface`, JavaScript `citygmlLod0Surface`); otherwise the writer
+rejects the ambiguity. This fallback requires CityGML 2.0 and never overrides a
+source property or classification. Conflicting source hints fail explicitly.
+
+The writer groups the common flat fields by `city_id` and emits supported native
+object types, owning relationships and geometry properties in schema order.
+Ordinary vector features become GenericCityObject in 2.0 and GenericOccupiedSpace
+in 3.0. Faces use MultiSurface, curves use MultiCurve, and compatible point
+properties retain points. TINRelief requires triangles without holes. Coordinates
+are written as full-precision floating-point XYZ without integer quantization;
+missing Z becomes zero, while M and nonfinite values are rejected.
+
+Typed JSON attributes and original object IDs/types are retained in standard
+GenericAttributeSet annotations with code space `urn:terrio:citygml:flat-object`.
+Each ordinary primitive has a GML name annotation with code space
+`urn:terrio:citygml:flat-primitive` retaining its fractional LoD and per-face source
+properties. TIN triangles use an ordered table on their containing
+TriangulatedSurface, with code space `urn:terrio:citygml:flat-patches`, because
+GML surface patches cannot carry names. The table must match the native triangle
+count. The native LoD is the integer part; a relief object requires one
+unambiguous integer LoD. A geometry-free ReliefFeature retains an explicit
+source LoD or derives it from agreeing components. Terrio reads these annotations
+back into the flat fields; other software can read the native objects and geometry
+and access the JSON as generic text. Geometry is always in the native GML
+coordinates, never in an annotation. Standard generic attributes from other
+producers retain scalar types, whitespace and set code spaces too.
+
+Native thematic boundaries are used where the target class and LoD allow them.
+CityGML 3.0 LoD 1 unclassified faces use GenericThematicSurface boundaries.
+This flat conversion does not reconstruct solids/shells, appearance, templates,
+indexed semantic tables or ADEs. Target classes, owning relationships and
+class/LoD/geometry combinations unavailable in the selected version fail
+explicitly. Multiple owning parents are rejected. In particular, CityGML 3.0 has
+one explicit point property per object at LoD 0; other point arrangements need an
+implicit representation, which this flat writer does not reconstruct.
+
+A declared CRS needs an EPSG identifier or registered EPSG compound components;
+unknown CRS stays absent. Nonspatial models retain their CRS in a GML name
+annotation with code space `urn:terrio:citygml:crs`, without inventing an envelope.
+Create mode replaces the complete model. Layer append/overwrite modes refuse an
+existing CityGML model before modifying it, because layer names are not persistent
+city-model identifiers.
+
+Conformance follows the OGC [CityGML 2.0 encoding](https://schemas.opengis.net/citygml/2.0/)
+and [CityGML 3.0 encoding](https://docs.ogc.org/is/21-006r2/21-006r2.html) and published
+schemas. GDAL 3.13.3's partial CityGML reader is informational.
+
+### WFS
+
+Native builds with HTTP support read WFS 1.0.0, 1.1.0, 2.0.0 and 2.0.2 simple features without
+GDAL. Use a `WFS:` prefix before an HTTP(S) endpoint, or open a URL containing
+`SERVICE=WFS` and `REQUEST=GetCapabilities` directly. The capabilities document is
+identified as WFS, rather than GML feature data.
+
+```sh
+terrio info 'WFS:https://example.org/ows' --json
+terrio info 'WFS:https://example.org/ows' --layer 'namespace:roads'
+terrio convert 'WFS:https://example.org/ows' roads.gpkg --layer 'namespace:roads' --oo WFS_PAGE_SIZE=500
+```
+
+A service summary and `list_layers` fetch capabilities only. JSON summaries have
+`metadata_only: true` and null feature counts, not zero; fields are empty until a
+layer is read. Selecting a layer for CLI `info` reads its schema and features to
+report actual counts. Reads use `DescribeFeatureType` and `GetFeature`, preserving
+the source namespace-qualified names, declared fields, source `gml_id` and default
+CRS. Numeric feature IDs are zero-based offsets in the query's response order;
+skipping features retains their original offsets in both paging modes. Source
+`gml_id` values provide the service's identifiers. Empty layers retain their
+schema and CRS. A read without a layer selection reads all advertised layers.
+
+`VectorOpenOptions.wfs` in Rust and the `options` mapping in Python accept the
+same options as CLI/MCP `--oo`:
+
+| Option | Default | Behavior |
+| --- | --- | --- |
+| `WFS_PAGE_SIZE` | 1000 | Positive feature count requested per page. |
+| `WFS_PAGING` | automatic | WFS 2 pages unless the service disables paging; WFS 1 reads one response. `YES` also requests the WFS 1 vendor paging extension; `NO` requests a single page. |
+| `WFS_MAX_VECTOR_BYTES` | 1073741824 | Positive retained-data estimate across selected layers, including dense attribute cells. |
+
+WFS 1 services can cap an unpaged response; enable paging only if the server
+supports it. WFS 1 `numberOfFeatures` describes the returned page, so it is not
+used as a total matching count. With paging disabled explicitly, the single response is limited to
+`WFS_PAGE_SIZE` returned features unless a feature limit is supplied. Skip is
+included in the requested count. An advertised matching count larger than an
+unpaged read produces a warning when no explicit feature limit was requested.
+Pages are retained in memory, with fallible
+allocation checks. Each feature response is capped at 64 MiB and metadata at
+16 MiB, also respecting `TERRIO_JSON_MAX_SIZE`. These limits bound individual
+responses and estimated retained data, not total process memory. XML decoding also
+preflights a workspace estimate of 64 times the response size plus retained data,
+checking usable memory and virtual address space. A 64 MiB feature page therefore
+requires a 4 GiB workspace estimate and may be refused before reaching its byte cap.
+On platforms where allocations commit backing storage, this temporary reservation
+also requires that commit capacity. Service errors,
+malformed XML and repeated pages are errors. Spatial filters use the advertised
+CRS and authority axis order; CRS84 keeps longitude first.
+
+This driver reads inline GML 2/3/3.2 simple features. Local scalar restrictions
+and feature-type extensions are resolved with a maximum derivation depth of 256.
+Schemas supply field types and whitespace rules; other restriction facets are
+not validated. Integer fields use signed 64-bit values; `xs:unsignedLong` is kept
+as text to preserve its full range. The source `gml_id` field is nullable when
+features omit source identifiers. Malformed numeric and boolean field values are errors.
+Property namespaces follow schema qualification and element references. Standard
+GML base metadata (`name`, `description`, `identifier`, `metaDataProperty` and
+`boundedBy`) is omitted; `gml:id` is retained as `gml_id`, and application fields
+with those local names remain fields. Imported application type
+definitions, list/union property types and mixed geometry CRS/axis orders are
+rejected. Transactions, complex or repeated properties, linked geometries, multiple geometry columns, nonlinear
+curves and composite surface patches are unsupported and reported as errors.
+It has no WebAssembly network interface: fetch a GetFeature response and open its
+bytes as GML or GeoJSON there. An extensionless HTTP GetFeature URL returning
+GeoJSON or GML also opens directly, using the detected response format; it reads
+that response rather than discovering or paging the service, following the
+corresponding file reader's schema inference and parsing rules. Query strings are
+preserved for requests and omitted from dataset names. HTTP diagnostics mask the
+credential parameter names recognized by the common HTTP layer; arbitrary vendor
+query parameters can still appear in transport errors.
+
+The protocol references are [OGC WFS 2.0](https://docs.ogc.org/is/09-025r2/09-025r2.html)
+and [GDAL's WFS driver](https://gdal.org/en/stable/drivers/vector/wfs.html).
+
+### ESRIJSON
+
+The `ESRIJSON` driver reads the JSON of ArcGIS feature-service queries (`f=json`) as GDAL's
+ESRIJSON driver does. A `.json` file, or one without an extension, is recognized by its first
+6,000 bytes, as in GDAL: `geometryType`, `fieldAliases`, `esriFieldType` names, features with rings
+or attributes, or a `spatialReference` by WKID; a file whose signs come later needs the `ESRIJSON:`
+prefix. Opening judges the whole document: a GeoJSON or TopoJSON root `type` anywhere in it rules
+ESRI JSON out, and a query URL's answer is judged the same way. `terrio identify` sees only the
+first 16 KiB, so it can report ESRIJSON for a `.json` GeoJSON file with such signs and a root `type`
+past that point, which still opens as GeoJSON. A `.geojson` file stays GeoJSON. A URL is read as a
+query when it has a parameter `f=json`, `f=pjson` or `resultRecordCount=` and answers ESRI JSON;
+`ESRIJSON:` before a URL or a path names the driver. A
+document without `features`, such as a layer's description (a URL without its `/query`), is an
+error.
+
+```sh
+terrio info "https://example.org/arcgis/rest/services/A/FeatureServer/0/query?where=1%3D1&outFields=*&f=json"
+```
+
+Without a `resultOffset` in the URL, the following pages are read while the service answers
+`exceededTransferLimit`, asking for as many features as its first page holds unless the URL gives
+a `resultRecordCount`. Format values are case-insensitive (`JSON`, `PJSON` and `PBF` also work).
+The open option `FEATURE_SERVER_PAGING=YES` or `NO` decides otherwise, as in
+GDAL. A page over `TERRIO_JSON_MAX_SIZE` (100 MiB by default) is an error, as are cumulative response bytes over
+4 GiB (a transfer cap, not a decoded-memory bound), a page that adds nothing while saying there are more, a page with other fields than the
+first, and a page the same as the one before it (a service that ignores the offset; rows without
+an object id that happen to repeat a whole page need `FEATURE_SERVER_PAGING=NO` and an offset of
+their own). Features without an object id are numbered by their place in the whole layer, or after
+every object id when another feature's object id holds that number. As GDAL's documentation
+advises, order by the layer's object id field (`orderByFields=OBJECTID+ASC` when it is named so) so
+that pages don't overlap. Authentication goes in the URL (`token=`) or the usual HTTP options. All
+the pages are held in memory, and `terrio info` reads them all to count the features: a
+`resultOffset` in the URL describes just that page. In builds with the GDAL backend, an answer
+recognized as a query's and found wrong stays an error rather than going to GDAL, which would read
+what it can of it.
+
+Fields follow `fields`, else `fieldAliases` (as text), else the attributes' values. Terrio has no
+field subtypes: small integers are integers, single-precision numbers are reals, GUIDs are text,
+and `esriFieldTypeTimeOnly` is text. `esriFieldTypeDate` values, milliseconds since 1970, are UTC
+date-times. The object id field is kept, and gives the features their ids. Polygon rings are sorted
+into polygons by containment, whatever their orientation. The CRS is the first known of `latestWkid`,
+`wkid` and `wkt` (a WKID of 0 names none; GDAL 3.13.3 stops at an unknown `latestWkid`, with no
+CRS); a WKID that is not an EPSG code is tried as an ESRI one. A service's error answer is an error with its message, and curve geometries
+(`curvePaths`, `curveRings`) are refused rather than read without their arcs. Query URLs are not
+read in WebAssembly builds, which have no network stack: fetch the JSON and open its bytes.
+
+### ESRIPBF
+
+The `ESRIPBF` driver reads the protocol buffer of the same queries (`f=pbf`), which GDAL has no
+driver for. It gives the same fields, values and geometries as `ESRIJSON`, to the scale the service
+quantizes coordinates to, in fewer bytes and faster to decode: use it for large queries, on services
+that list `PBF` in their `supportedQueryFormats`. Single-precision fields keep digits that `f=json`
+prints rounded to seven.
+
+```sh
+terrio convert "https://example.org/arcgis/rest/services/A/FeatureServer/0/query?where=1%3D1&outFields=*&orderByFields=OBJECTID&f=pbf" out.gpkg
+```
+
+A URL is read as a query when it has `f=pbf` and answers one, and paging works as above, with the
+same `TERRIO_JSON_MAX_SIZE` cap on each page. Before decoding PBF, an address-space estimate of
+64 times the encoded page size is checked, allowing for packed coordinate expansion and vector
+growth. Decoded attribute cells are also checked against the usable-memory ceiling where
+available. These conservative preflights are not a process-memory limit. A `.pbf` file, or one whose extension no driver
+claims, is recognized by its content; `.pbf` names OpenStreetMap otherwise, and `.osm.pbf` always
+names and opens OpenStreetMap. X and Y are differences from the previous vertex; Z and M are each
+vertex's own, and an M of 0 is none, as the same answer in JSON gives it (a Z of 0 is the transform's
+Z translate, as no answer seen leaves Z out that way). An answer with coordinates must have the
+`transform` the format sends with them. The reader follows Esri's `FeatureCollection.proto`
+(Apache-2.0; see [Acknowledgements](acknowledgements.md)).
+`ESRIPBF:` before a URL or a path names the driver. A service answers a query it refuses with
+nothing: from a URL whose path ends in `/query`, that is an error, and `f=json` shows the reason; a
+JSON error answer is reported as this driver's. An answer with a count, ids or an extent
+is refused, as are curve and shape-buffer geometries and a point with more than one vertex. The
+format gives no field widths, which `f=json` does. Query URLs are not read in WebAssembly builds:
+fetch the bytes and open them.
+
+### Other vector formats
+
+HEC-RAS geometry and plan files (`HECRAS`, which GDAL does not have) are recognized by content,
+an HDF5 signature and the root `File Type` HEC-RAS writes, and give the mesh, 1D and 2D feature
+layers with the results HEC-RAS stored; `open_raster` still reads them as HDF5. See
+[HEC-RAS](hecras.md).
 
 Layer and field models follow GDAL's: GPX has GDAL's five layers, KML has the LIBKML driver's
 fields, OSM has the `points`, `lines`, `multilinestrings`, `multipolygons` and `other_relations`
@@ -353,6 +785,31 @@ layers, and shapefile field names are truncated and made unique as `ogr2ogr` doe
 files are written with a `crs` member naming their CRS, which GDAL reads (it assumes none
 otherwise), and a CSV file's CRS is read from a `.prj` file next to it, as GDAL's CSV driver
 reads it.
+
+- **XLSX** workbooks are read and written without GDAL, in WebAssembly too, as GDAL's XLSX driver
+  does: a layer per worksheet, feature ids that are row numbers, and the open options `HEADERS`
+  (`AUTO`, `FORCE`, `DISABLE`) and `FIELD_TYPES` (`AUTO`, `STRING`). Formulas are not evaluated: a
+  cell reads as its cached value. Beyond GDAL, sheets of coordinates become points when their
+  columns are named (`--oo X_POSSIBLE_NAMES=lon --oo Y_POSSIBLE_NAMES=lat`, optionally
+  `Z_POSSIBLE_NAMES`; `GEOM_POSSIBLE_NAMES` for WKT; `KEEP_GEOM_COLUMNS`), with no default names
+  so that sheets stay attribute tables by default, and the `GEOMETRY` layer creation option
+  (`AS_XY`, `AS_WKT`) writes geometries, which are otherwise left out as GDAL leaves them out.
+  Differences from GDAL 3.13.3, on purpose but for one: repeated headings get unique names (`a`,
+  `a_2`), as layers cannot repeat a name; `date1904` workbooks' dates are honored (GDAL reads them
+  four years early); a boolean column that also holds other numbers becomes an integer field (GDAL
+  keeps it boolean and loses the values); phonetic guides stay out of the text; and written sheet
+  names are made valid and unique for Excel. The exception, whose cause in GDAL is not known:
+  `HEADERS=DISABLE` applies here to sheets whose cells have no references, where GDAL was seen to
+  ignore it. A layer without features is written without a header row, as GDAL writes it, so its
+  fields are not kept. The first feature's nulls are written as blank cells, so that its row still
+  marks the one above as a header; a layer whose first feature is all text reads back with
+  `Field1`, `Field2` and its names as a first row, as in GDAL, unless read with `HEADERS=FORCE`.
+  Layers have no time type, so a time of day reads as `HH:MM:SS` text and is written back as text.
+  Beyond 2,000 fields, where GDAL fails, sheets still read. Cells out of column order are refused, where GDAL shifts the row's values. Excel's limits are refused when writing: 1,048,576 rows, 16,384 columns and 32,767 characters
+  per cell. Workbooks of more than 100 million cells, with rows, shared strings and repeated long
+  strings counting towards that, of a sheet past Excel's row or column limit, or with a part that expands
+  past 2 GiB, are refused when reading. Append and overwrite layer modes refuse an existing workbook, which they would rewrite without its layout. Beyond GDAL, `--oo HEADER_ROWS=n` reads a header of several rows, a merged heading naming each column under it and a column's headings joined with ` / ` (`Quantity / Phase Type / 1PH`), and `--oo RANGE=A5:K40` or `--oo FIRST_ROW=n` read a table that does not start at A1 (the later of the two sets the first row); feature ids stay the sheet's row numbers. The layer creation options `HEADER_STYLE=BOLD`, `FREEZE_HEADER=YES`, `AUTOFILTER=YES`, `COLUMN_WIDTH=AUTO|<n>`, `DATE_FORMAT`, `DATETIME_FORMAT` and `CREATION_TIME` lay out what is written; without them sheets are written as GDAL writes them. A date format must keep `dd` or `yy`, and a date-time format also `hh`, for the driver to read its cells back as dates. Other than merges in header rows, styles, merged cells, charts and other workbook content
+  are not read or kept yet ([#405](https://github.com/opengeos/terrio/issues/405)).
 
 - **GeoPackage** layers are read with spatial filters through their R-tree index (`terrio convert
   --spat`, `VectorOpenOptions::spatial_filter`, Python's `open_vector(bbox=...)`): the
@@ -383,6 +840,11 @@ reads it.
   the types of the features seen so far (re-encoded if a later feature widens them), then written
   in the order of the spatial index. A streamed file is identical to the one written from the
   whole layer.
+- **GeoJSON feature ids** are read as GDAL reads them: integer `id` members become the feature
+  ids, and string or mixed ones an `id` field. When writing GeoJSON or GeoJSONSeq, the `ID_FIELD`
+  creation option (`GeoJsonOptions::id_field`) writes a field as each feature's `id` member
+  instead of a property: a number for integer and boolean fields, a string otherwise, or as
+  `ID_TYPE` (`GeoJsonOptions::id_type`: `String` or `Integer`) asks.
 - **GeoJSONSeq** files hold a GeoJSON feature per line (RFC 8142, optionally with record
   separators), written in WGS 84 with counter-clockwise exterior rings, as GDAL's GeoJSONSeq
   driver writes them.
@@ -394,14 +856,47 @@ reads it.
 - **MapInfo TAB** native tables (`.tab` with its `.dat`, `.map` and `.id`) are read with every
   object type and field type, in their charset, and seamless tables; they are written with their
   spatial index, which GDAL uses for spatial filters. Views and DBF-backed tables are not read.
+- **Shapefile polygons** are made from their rings as GDAL's shapefile driver makes them. By
+  default (`ONLY_CCW`), clockwise rings are exteriors and each counter-clockwise ring is a hole of
+  the smallest exterior around it. The `ORGANIZE_POLYGONS` open option (`--oo`,
+  `VectorOpenOptions::shapefile`) or the `OGR_ORGANIZE_POLYGONS` environment variable chooses one
+  of GDAL's other methods. `DEFAULT` groups rings by containment, whatever their winding, so
+  files that wind every ring one way keep their holes. `CCW_INNER_JUST_AFTER_CW_OUTER` makes each
+  counter-clockwise ring a hole of the clockwise ring before it, and `SKIP` makes every ring a
+  polygon. With every method, a ring of a multi-part record that touches itself at a vertex to
+  enclose a hole is first split into its exterior and holes, as GDAL 3.13 does.
 - **OSM XML** (`.osm`) gives the same five layers as PBF, with tags in the file's order.
+- **KMZ archives** are written as GDAL writes them, a `doc.kml` linking to one document per
+  layer under `layers/`. Files given as KMZ resources (Rust `KmzOptions::resources`, CLI
+  `--kmz-resource`, Python `kmz_resources`, JavaScript `kmzResources`), such as the icon images
+  of `SYMBOL` styles, are packed beside those documents, so relative icon links resolve inside
+  the archive.
 - **KML styles** (`<Style>`, `<StyleMap>`) are read into an `OGR_STYLE` field holding GDAL's style
-  strings (`PEN(c:#FF0000FF,w:2.000000px);BRUSH(fc:#00FF0040)`), and written back as KML styles.
+  strings (`PEN(c:#FF0000FF,w:2.000000px);BRUSH(fc:#00FF0040)`), and written back as KML styles;
+  OGR's null brush (`BRUSH(id:"ogr-brush-1")`) and null pen (`PEN(id:"ogr-pen-1")`) are written as
+  PolyStyle `<fill>0</fill>` and `<outline>0</outline>`.
+- **KML shared styles** are kept as GDAL's LIBKML driver keeps them: a placemark that only refers
+  to a style of its document has `@id` in `OGR_STYLE`, and the definitions make the dataset's style
+  table (Rust `VectorDataset::style_table`, Python `style_table`, JavaScript `styleTable`), a
+  `StyleMap` standing for its `normal` style. Writing to KML or KMZ emits shared `<Style id>`
+  elements: Rust takes the table in `VectorWriteOptions::style_table`, and Python, JavaScript `toBytes` and
+  `terrio convert` pass it themselves. Other output formats, operations and CLI commands that work
+  on layers get each feature's style in place of `@id` (`VectorDataset::resolve_styles`). Rust
+  `write_vector` on `dataset.layers` without the table writes `@id` as it is, and so does a Python
+  layer made by a method of another layer.
+- **Known differences from GDAL 3.13** when reading KML styles, where KML says more than GDAL
+  keeps: `<fill>0</fill>` reads as OGR's null brush (`BRUSH(id:"ogr-brush-1")`, without the
+  PolyStyle color) and `<outline>0</outline>` as its null pen, where GDAL ignores both. A
+  placemark's inline sub-styles merge field by field over its shared style, as KML viewers merge
+  them, where GDAL takes the inline style alone. A `styleUrl` into another document of a KMZ
+  resolves against that document, relative to the referring one, where GDAL keeps the URL.
 
 ### CAD drawings (DWG and DXF)
 
-**The native reader is strict:** an unsupported geometric entity fails the entire drawing.
-The optional GDAL backend can provide fallback for entities outside the native subset below.
+**The native reader skips what it cannot represent:** an entity outside the subset below is left
+out, and a warning names how many of each type and the top-level entity holding the first one. In
+a build with the optional GDAL backend, a drawing with such entities goes to GDAL when GDAL can
+open it.
 
 The default-enabled `cad` Cargo feature uses [acadrust](https://github.com/hakanaktt/acadrust)
 without native libraries or its optional thread pool. It is included in the full JavaScript/WASM
@@ -426,22 +921,25 @@ upstream codec's input file size. Layer filters select `entities`; attribute fil
 `--where "Layer = 'survey'"` select drawing layers.
 
 Supported entities are POINT, LINE, straight and bulged LWPOLYLINE/POLYLINE, 3D polylines,
-CIRCLE, ARC, ELLIPSE, TEXT/MTEXT, SOLID/TRACE, 3DFACE and HATCH with polyline, line or circular-arc
-boundaries. INSERT expands block geometry (up to 32 levels, one million output features and a shared
+CIRCLE, ARC, ELLIPSE, TEXT/MTEXT, SOLID/TRACE, 3DFACE, polyface mesh POLYLINE, MESH (its base cage,
+without subdivision) and HATCH with polyline, line or circular-arc boundaries. Meshes become 3D
+multipolygons with one polygon per face; faces with fewer than three distinct corners are dropped.
+INSERT expands block geometry (up to 32 levels, one million output features and a shared
 work budget of one million entity visits/clones, including skipped leaves and generated segments);
-unused block definitions are excluded. Empty ordinary block references are skipped; missing
-blocks, array inserts and external/non-explodable references produce errors. Expanded entities
+unused block definitions are excluded. Empty ordinary block references are skipped silently; array
+inserts and external/non-explodable references are skipped with the warning above, as is, under a
+non-uniformly scaled INSERT, a nested reference to a block holding an entity refused before
+expansion (thick entities, 3DSOLID, REGION, BODY); missing blocks and exceeded limits produce errors. Expanded entities
 receive new handles. Viewports and
 sequence markers carry no exported geometry.
 Closed polylines remain lines. Curves are linearized at a maximum four-degree step; curve samples
 can differ from GDAL's. Hatch rings are organized by containment into polygons with holes. Edge boundaries must be
 listed in connected sequence; individual edges and the first edge may be reversed, but arbitrary
 edge reordering is unsupported. Endpoint joins use an absolute tolerance of 1e-7 drawing units.
-Unsupported entities (including splines, dimensions, ACIS solids and mesh entities), unsupported
-hatch boundaries, fitted polylines and extruded/thick geometry produce an error identifying the
-unsupported data rather than silently discarding it. The optional GDAL backend can read entities
-outside the native subset through its existing fallback; there is no skip-and-discard mode. Text is returned as raw CAD text; font styles
-and MTEXT formatting are not interpreted. Styling, external references and CAD object dictionaries
+Unsupported entities (including splines, dimensions, ACIS solids and polygon meshes), hatches with
+unsupported boundaries, fitted polylines and extruded/thick geometry are left out with the warning
+above, as are meshes with no face of three distinct corners. Text is returned as raw CAD text; font
+styles and MTEXT formatting are not interpreted. Styling, external references and CAD object dictionaries
 are outside Terrio's vector model.
 
 On export, points become POINT (or TEXT when the `Text` attribute is nonempty), lines become LINE
@@ -575,12 +1073,15 @@ Rust read and write Arrow IPC streams.
 | LAS | ASPRS LAS 1.0 to 1.4, point formats 0 to 10 | ✓ | ✓ | las |
 | LAZ | LASzip-compressed LAS | ✓ | ✓ | laz |
 | COPC | Cloud Optimized Point Cloud | ✓ | ✓ | copc.laz |
+| EPT | Entwine Point Tile | ✓ | ✓ | ept.json |
+| PLY | Polygon File Format | ✓ | ✓ | ply |
+| E57 | ASTM E57 3D imaging data | ✓ | ✓ | e57 |
 
 See [Point Clouds](point-clouds.md).
 
 ## In WebAssembly
 
-The browser and Node.js package reads from bytes. GRIB files are read there too, band by band
+The browser and Node.js package reads from bytes, or by range with `openUrl`. GRIB files are read there too, band by band
 (the full module). JPEG 2000 is read and written there with the same
 codec as natively (written with a nodata value, it comes back as a zip archive of the JP2 file and
 its `.aux.xml` sidecar), and GeoTIFFs in every compression above are read. Formats made

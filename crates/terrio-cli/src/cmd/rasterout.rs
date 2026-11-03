@@ -1,3 +1,8 @@
+// Written to match the behavior of:
+//   GDAL v3.13.3:
+//     doc/source/programs/gdal_translate.rst
+// No code is translated from these sources.
+
 //! Output options shared by the raster processing commands.
 
 use terrio::formats::RasterDriver;
@@ -10,7 +15,7 @@ pub struct OutputArgs {
     /// extension.
     #[arg(short = 'f', long = "format", visible_alias = "of")]
     pub format: Option<String>,
-    /// GeoTIFF/COG compression: NONE, LZW, DEFLATE, PACKBITS, JPEG, WEBP. GeoPackage tiles: PNG, JPEG.
+    /// GeoTIFF/COG compression: NONE, LZW, DEFLATE, ZSTD, PACKBITS, LERC, LERC_DEFLATE, LERC_ZSTD, JXL, JPEG, WEBP. GeoPackage tiles: PNG, JPEG.
     #[arg(long)]
     pub compress: Option<String>,
     /// GeoTIFF/COG tile size.

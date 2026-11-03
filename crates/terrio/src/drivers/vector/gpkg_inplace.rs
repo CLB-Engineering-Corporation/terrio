@@ -1,3 +1,10 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 Qiusheng Wu and Terrio contributors
+// SPDX-License-Identifier: MIT
+//
+// Derived from (translated to Rust and modified):
+//   SQLite version-3.54.1 (public domain):
+//     ext/rtree/rtree.c
+
 //! GeoPackage updates in place, as GDAL makes them through SQLite: features appended to a
 //! layer's table (new b-tree cells and pages), its R-tree index grown by inserting boxes and
 //! splitting nodes, and the tables describing layers (`gpkg_contents`, `gpkg_ogr_contents`,
@@ -59,11 +66,20 @@ fn eq(a: &str, b: &str) -> bool {
 /// Updates a GeoPackage file in place: see [`gu::update`]. `Ok(false)` when the file cannot be
 /// changed in place; it is then untouched.
 pub(super) fn update_in_place(path: &Path, layers: &[Layer], mode: UpdateMode) -> Result<bool> {
+    update_in_place_with_geometry_types(path, layers, mode, false)
+}
+
+pub(super) fn update_in_place_with_geometry_types(
+    path: &Path,
+    layers: &[Layer],
+    mode: UpdateMode,
+    preserve_declared_geometry_type: bool,
+) -> Result<bool> {
     let mut ed = match Editor::open(path)? {
         Ok(e) => e,
         Err(_) => return Ok(false),
     };
-    match apply(&mut ed, layers, mode)? {
+    match apply(&mut ed, layers, mode, preserve_declared_geometry_type)? {
         Ok(()) => {
             ed.commit()?;
             Ok(true)
@@ -72,7 +88,7 @@ pub(super) fn update_in_place(path: &Path, layers: &[Layer], mode: UpdateMode) -
     }
 }
 
-fn apply(ed: &mut Editor, layers: &[Layer], mode: UpdateMode) -> Result<Outcome> {
+fn apply(ed: &mut Editor, layers: &[Layer], mode: UpdateMode, preserve_declared_geometry_type: bool) -> Result<Outcome> {
     // The schema.
     let mut entries = Vec::new();
     for (rowid, payload) in ed.scan(1)? {
@@ -141,7 +157,11 @@ fn apply(ed: &mut Editor, layers: &[Layer], mode: UpdateMode) -> Result<Outcome>
                     }
                 }
                 d.remove_layer(&name);
-                d.add_layer(layer)?;
+                if preserve_declared_geometry_type {
+                    d.add_layer_with_geometry_type(layer, true)?;
+                } else {
+                    d.add_layer(layer)?;
+                }
             }
             (None, _) => {
                 let taken = entries.iter().any(|e| !dropped.contains(&e.rowid) && eq(&e.name, &layer.name)) || d.has(&layer.name);
@@ -151,7 +171,11 @@ fn apply(ed: &mut Editor, layers: &[Layer], mode: UpdateMode) -> Result<Outcome>
                         layer.name
                     )));
                 }
-                d.add_layer(layer)?;
+                if preserve_declared_geometry_type {
+                    d.add_layer_with_geometry_type(layer, true)?;
+                } else {
+                    d.add_layer(layer)?;
+                }
             }
         }
     }

@@ -1,3 +1,8 @@
+// Written to match the behavior of:
+//   GDAL v3.13.3:
+//     apps/gdalinfo_lib.cpp, apps/ogrinfo_lib.cpp
+// No code is translated from these sources.
+
 //! Dataset summaries, like `gdalinfo` and `ogrinfo`: [`info`] for an open dataset, [`info_path`]
 //! for a path (reading GeoTIFFs and point clouds by their headers). Summaries print as text
 //! ([`Info::to_text`]) and serialize to JSON.
@@ -8,6 +13,8 @@ use crate::dataset::{Dataset, RasterDataset, VectorDataset};
 use serde::Serialize;
 use std::fmt::Write as _;
 
+#[cfg(remote)]
+pub use crate::drivers::vector::wfs::{ServiceInfo, ServiceLayerInfo};
 pub use crate::histogram::Histogram;
 
 /// The prefix of metadata items for terrio's own use (a netCDF band's packing, for
@@ -22,6 +29,10 @@ pub enum Info {
     Raster(Box<RasterInfo>),
     /// A vector summary.
     Vector(VectorInfo),
+    /// Vector service metadata without materializing its feature layers.
+    #[cfg(remote)]
+    #[serde(rename = "vector")]
+    VectorService(ServiceInfo),
     /// A point cloud summary.
     #[cfg(feature = "pointcloud")]
     #[cfg_attr(docsrs, doc(cfg(feature = "pointcloud")))]
@@ -86,6 +97,12 @@ pub struct BandInfo {
     /// The histogram, when requested: `gdalinfo -hist`'s (see [`InfoOptions::histogram`]).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub histogram: Option<Histogram>,
+    /// The band's description, for drivers that give one (GRIB: its level).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// The band's metadata items (GDAL's default domain), for drivers that give them (GRIB).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub metadata: Vec<(String, String)>,
 }
 
 fn serialize_nodata<S: serde::Serializer>(v: &Option<f64>, s: S) -> Result<S::Ok, S::Error> {
@@ -219,7 +236,12 @@ pub fn raster_info(ds: &RasterDataset, options: &InfoOptions) -> RasterInfo {
 fn raster_info_at(ds: &RasterDataset, options: &InfoOptions, path: Option<&str>, mut lazy: Option<&mut LazyRaster>) -> RasterInfo {
     let r = &ds.raster;
     let crs = ds.crs();
-    let extent = [r.x_min, r.y_min, r.x_max(), r.y_max()];
+    let gt = ds.geo_transform();
+    let extent = if crate::dataset::is_north_up(&gt) {
+        [r.x_min, r.y_min, r.x_max(), r.y_max()]
+    } else {
+        corner_extent(&corners(&gt, r.cols, r.rows))
+    };
     // A complex band's statistics and histogram are those of its real parts, as GDAL's.
     let part = if ds.complex { 2 } else { 1 };
     let bands = (0..ds.band_count())
@@ -232,15 +254,24 @@ fn raster_info_at(ds: &RasterDataset, options: &InfoOptions, path: Option<&str>,
                     crate::histogram::default_histogram(ds, b * part, &ctx, statistics.map(|s| (s.min, s.max)))
                 })
                 .flatten();
-            BandInfo { band: b + 1, data_type: ds.data_type_name(), nodata: ds.band_nodata(b * part + 1), statistics, histogram }
+            let md = ds.band_metadata.get(b);
+            BandInfo {
+                band: b + 1,
+                data_type: ds.data_type_name(),
+                nodata: ds.band_nodata(b * part + 1),
+                statistics,
+                histogram,
+                description: md.and_then(|m| m.description.clone()),
+                metadata: md.map(|m| m.items.clone()).unwrap_or_default(),
+            }
         })
         .collect();
     RasterInfo {
         driver: ds.driver.name().to_string(),
         size: [r.cols, r.rows],
         band_count: ds.band_count(),
-        geo_transform: ds.geo_transform(),
-        wgs84_extent: wgs84_extent(&crs, extent),
+        geo_transform: gt,
+        wgs84_extent: raster_wgs84_extent(&crs, &gt, r.cols, r.rows, extent),
         crs: CrsSummary::new(&crs),
         extent,
         bands,
@@ -335,7 +366,8 @@ fn lazy_raster_info_at(r: &mut LazyRaster, options: &InfoOptions, path: Option<&
         let stats = lazy_band_statistics(r)?;
         let header = r.header();
         let mut info = raster_info_at(&header, &InfoOptions { statistics: false, ..*options }, path, None);
-        for (band, s) in info.bands.iter_mut().zip(stats) {
+        // A complex band's statistics are those of its real parts, as GDAL's.
+        for (band, s) in info.bands.iter_mut().zip(stats.into_iter().step_by(if header.complex { 2 } else { 1 })) {
             band.statistics = s;
         }
         info.overviews = overviews;
@@ -343,23 +375,30 @@ fn lazy_raster_info_at(r: &mut LazyRaster, options: &InfoOptions, path: Option<&
     }
     let crs = r.crs();
     let gt = r.geo_transform();
-    let (w, h) = (r.width() as f64, r.height() as f64);
-    let extent = [gt[0], gt[3] + h * gt[5], gt[0] + w * gt[1], gt[3]];
-    let bands = (0..r.band_count())
-        .map(|b| BandInfo {
-            band: b + 1,
-            data_type: gdal_type_name(r.data_type()).to_string(),
-            nodata: r.band_nodata(b + 1),
-            statistics: None,
-            histogram: None,
+    let extent = corner_extent(&corners(&gt, r.width(), r.height()));
+    // Complex bands count once, typed as GDAL types them (`CFloat32`), as for a dataset read whole.
+    let part = if r.is_complex() { 2 } else { 1 };
+    let data_type = if r.is_complex() { format!("C{}", gdal_type_name(r.data_type())) } else { gdal_type_name(r.data_type()).to_string() };
+    let bands = (0..r.band_count() / part)
+        .map(|b| {
+            let md = r.band_metadata().get(b);
+            BandInfo {
+                band: b + 1,
+                data_type: data_type.clone(),
+                nodata: r.band_nodata(b * part + 1),
+                statistics: None,
+                histogram: None,
+                description: md.and_then(|m| m.description.clone()),
+                metadata: md.map(|m| m.items.clone()).unwrap_or_default(),
+            }
         })
         .collect();
     Ok(RasterInfo {
         driver: r.driver().name().to_string(),
         size: [r.width(), r.height()],
-        band_count: r.band_count(),
+        band_count: r.band_count() / part,
         geo_transform: gt,
-        wgs84_extent: wgs84_extent(&crs, extent),
+        wgs84_extent: raster_wgs84_extent(&crs, &gt, r.width(), r.height(), extent),
         crs: CrsSummary::new(&crs),
         extent,
         bands,
@@ -385,11 +424,32 @@ fn lazy_raster_info_at(r: &mut LazyRaster, options: &InfoOptions, path: Option<&
 /// # Ok::<(), terrio::Error>(())
 /// ```
 pub fn info_path(path: &str, options: &InfoOptions) -> crate::Result<Info> {
+    // Judged as `crate::open` judges a dataset of either kind, by its name and first bytes; a point
+    // cloud against the allow-list of its kind (`TERRIO_ALLOWED_DRIVERS` alone), as its reader is.
+    #[cfg(feature = "pointcloud")]
+    let kind = crate::pointcloud::is_point_cloud_path(path).then_some(crate::formats::Kind::PointCloud);
+    #[cfg(not(feature = "pointcloud"))]
+    let kind = None;
+    crate::formats::check_allowed(path, kind)?;
+    if let Some(target) = crate::drivers::vector::wfs::service_target(path) {
+        #[cfg(remote)]
+        return Ok(Info::VectorService(crate::drivers::vector::wfs::info(target)?));
+        #[cfg(not(remote))]
+        {
+            let _ = target;
+            return Err(crate::Error::disabled("remote"));
+        }
+    }
     if let Some(result) = crate::catalog::open_lazy(path) {
         return Ok(Info::Raster(Box::new(lazy_raster_info(&mut result?, options)?)));
     }
     if let Some(result) = crate::stac::info(path, options) {
         return result;
+    }
+    // A feature-service query's server may ignore the ranges the probes below ask for.
+    #[cfg(remote)]
+    if let Some(result) = crate::dataset::open_remote_vector(path, &Default::default()) {
+        return Ok(Info::Vector(vector_info(&result?)));
     }
     if let Some(r) = crate::drivers::open_lazy(path) {
         return Ok(Info::Raster(Box::new(lazy_raster_info_at(&mut r?, options, Some(path))?)));
@@ -442,6 +502,8 @@ pub fn info_path(path: &str, options: &InfoOptions) -> crate::Result<Info> {
             .collect();
         match &mut summary {
             Info::Vector(v) => v.subdatasets = subdatasets,
+            #[cfg(remote)]
+            Info::VectorService(_) => {}
             Info::Raster(r) if subdatasets.len() > 1 => r.subdatasets = subdatasets,
             #[cfg(feature = "pointcloud")]
             Info::PointCloud(_) => {}
@@ -651,6 +713,38 @@ fn osm_vector_info(_path: &str) -> crate::Result<Option<VectorInfo>> {
     Ok(None)
 }
 
+/// Whether a geotransform has no rotation terms: its grid is north-up or south-up.
+fn is_axis_aligned(gt: &[f64; 6]) -> bool {
+    gt[2] == 0.0 && gt[4] == 0.0
+}
+
+/// The four corners of a raster's grid under its geotransform.
+fn corners(gt: &[f64; 6], cols: usize, rows: usize) -> [(f64, f64); 4] {
+    let (w, h) = (cols as f64, rows as f64);
+    [(0.0, 0.0), (w, 0.0), (w, h), (0.0, h)].map(|(p, l)| (gt[0] + p * gt[1] + l * gt[2], gt[3] + p * gt[4] + l * gt[5]))
+}
+
+/// The bounds `[min_x, min_y, max_x, max_y]` of the corners of a raster's grid.
+fn corner_extent(corners: &[(f64, f64); 4]) -> [f64; 4] {
+    corners.iter().fold([f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY], |e, &(x, y)| {
+        [e[0].min(x), e[1].min(y), e[2].max(x), e[3].max(y)]
+    })
+}
+
+/// The WGS 84 bounds of a raster: of its extent when north-up or south-up, and of its four
+/// corners when rotated, whose axis-aligned extent reaches beyond the grid.
+fn raster_wgs84_extent(crs: &SpatialRef, gt: &[f64; 6], cols: usize, rows: usize, extent: [f64; 4]) -> Option<[f64; 4]> {
+    if is_axis_aligned(gt) || crs.is_unknown() {
+        return wgs84_extent(crs, extent);
+    }
+    let t = Transformer::new(crs, &SpatialRef::from_epsg(4326).ok()?).ok()?;
+    let mut points = corners(gt, cols, rows);
+    for p in &mut points {
+        *p = t.transform(p.0, p.1).ok()?;
+    }
+    Some(corner_extent(&points))
+}
+
 fn wgs84_extent(crs: &SpatialRef, e: [f64; 4]) -> Option<[f64; 4]> {
     if crs.is_unknown() {
         return None;
@@ -672,7 +766,11 @@ impl Info {
                 let _ = writeln!(s, "CRS: {}", r.crs.line());
                 let g = r.geo_transform;
                 let _ = writeln!(s, "Origin: ({}, {})", g[0], g[3]);
-                let _ = writeln!(s, "Pixel size: ({}, {})", g[1], g[5]);
+                if is_axis_aligned(&g) {
+                    let _ = writeln!(s, "Pixel size: ({}, {})", g[1], g[5]);
+                } else {
+                    let _ = writeln!(s, "Geotransform: ({}, {}, {}, {}, {}, {})", g[0], g[1], g[2], g[3], g[4], g[5]);
+                }
                 let _ = writeln!(s, "Extent: {}", fmt_box(&r.extent));
                 if let Some(w) = &r.wgs84_extent {
                     let _ = writeln!(s, "WGS 84 extent: {}", fmt_box(w));
@@ -697,6 +795,12 @@ impl Info {
                         let _ = write!(s, ", nodata={nd}");
                     }
                     let _ = writeln!(s);
+                    if let Some(d) = &b.description {
+                        let _ = writeln!(s, "  Description = {d}");
+                    }
+                    for (k, v) in &b.metadata {
+                        let _ = writeln!(s, "  Metadata: {k}={v}");
+                    }
                     if let Some(st) = &b.statistics {
                         let _ = writeln!(
                             s,
@@ -711,6 +815,8 @@ impl Info {
             }
             #[cfg(feature = "pointcloud")]
             Info::PointCloud(p) => s.push_str(&p.to_text()),
+            #[cfg(remote)]
+            Info::VectorService(v) => s.push_str(&v.to_text()),
             Info::Vector(v) => {
                 let _ = writeln!(s, "Driver: {}", v.driver);
                 for l in &v.layers {

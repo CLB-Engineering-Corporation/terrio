@@ -8,8 +8,8 @@ of GDAL: the long tail of formats stays reachable through an optional GDAL backe
 
 - Pure Rust by default. Every default feature builds for `wasm32-unknown-unknown`; anything that
   needs C sits behind an opt-in feature.
-- Reuse the ecosystem. The format codecs and projections come from whitebox_next_gen's pure-Rust
-  crates (`wbraster`, `wbvector`, `wbprojection`), plus `tiff` for GeoTIFF decoding. Where a
+- Reuse the ecosystem. Many format codecs come from whitebox_next_gen's pure-Rust
+  crates (`wbraster`, `wbvector`), with `wbprojection` as a projection fallback, plus `tiff` for GeoTIFF decoding. Where a
   codec is wrong or missing, terrio supplies its own driver and reports the problem upstream.
 - One data model across formats, so a driver is a small amount of code and conversions are free.
 - Read cloud data in place: range requests, lazy tiles and chunks, no full download.
@@ -22,10 +22,35 @@ of GDAL: the long tail of formats stays reachable through an optional GDAL backe
 - Proprietary formats that need vendor SDKs (MrSID, ECW, FileGDB raster).
 - Database drivers (PostGIS, Oracle, SQL Server) in the core crate.
 
+## City models (#462)
+
+Use the existing flat vector model and the published schemas as the conformance
+reference. Preserve XYZ faces and object fields; lossless solid topology and
+appearance require a separate future design.
+
+- [x] CityJSON 1.1/2.0 reader, merged in [#464](https://github.com/opengeos/terrio/pull/464).
+- [x] CityGML 2.0/3.0 reader ([#470](https://github.com/opengeos/terrio/pull/470)).
+- [x] CityJSON 1.1/2.0 writer ([#473](https://github.com/opengeos/terrio/pull/473)).
+- [ ] CityGML 2.0/3.0 writer ([#480](https://github.com/opengeos/terrio/pull/480)).
+
+## Local browser interface
+
+- [x] `terrio ui`: forms generated from the command catalog, served on the loopback
+      interface with a session token, with a file browser, the equivalent command line
+      and cancellation. No map or preview; output arrives when a command ends.
+
+## Machine-readable CLI metadata (#386)
+
+- [x] Unstable v0.1 `--json-usage` catalog from the shared clap/MCP command tree:
+      nested command paths, aliases, typed argument metadata, defaults, choices and
+      arity, a checked-in JSON Schema, and the Python CLI entrypoint.
+- [ ] Mutation/idempotency metadata and conditional command effects, shared with
+      MCP hints, as a separate follow-up.
+
 ## Completed: Practical GDAL feature parity
 
 All nine items in [#238](https://github.com/opengeos/terrio/issues/238) are complete
-as of 2026-10-24. The [gap analysis](docs/gdal-parity-recommendations.md) records the
+as of 2026-10-24. The [gap analysis](https://terrio.dev/gdal-parity-recommendations/) records the
 supported scope and validation criteria. These additions build on the operations
 and drivers below.
 
@@ -64,26 +89,121 @@ and drivers below.
 - [x] Native multidimensional API: groups, named dimensions, coordinate arrays, lazy time/depth
       slicing and transposition across netCDF/HDF5/Zarr, retaining the existing raster views.
       Done in [#252](https://github.com/opengeos/terrio/pull/252); the supported numeric/raw-CF
-      subset is documented in the [multidimensional guide](docs/multidim.md).
+      subset is documented in the [multidimensional guide](https://terrio.dev/multidim/).
 
 The completed scope preserves pure-Rust/default WebAssembly builds, registers real-data
 comparisons in the GDAL conformance workflow, and exposes applicable functionality through
 Rust, CLI, Python, JavaScript and MCP. Supported subsets and numerical tolerances remain
 documented; additional feature scope belongs in separate tracking issues.
 
-## In progress: Additional GDAL command coverage
+## Additional GDAL command coverage
 
-[#289](https://github.com/opengeos/terrio/issues/289) tracks the remaining unified GDAL
-commands. Command-group progress:
+[#289](https://github.com/opengeos/terrio/issues/289) tracks unified GDAL command
+equivalents and their documented subsets. It remains open at the maintainer's request;
+additional option and output depth is tracked in [#288](https://github.com/opengeos/terrio/issues/288).
+Command-group progress:
+
+- [x] Palette conversion: RGB median cut, supplied palettes, RGB/RGBA expansion and
+      attachment across Rust, CLI/MCP, Python and JavaScript; real Landsat/OPERA
+      GDAL 3.13.3 comparisons registered as `palette`. Landed in
+      [#372](https://github.com/opengeos/terrio/pull/372).
+
+- [x] COG validation: GDAL 3.13 structural rules and full compressed-block checks,
+      uploaded TIFF bytes through Rust/Python/JavaScript, and CLI/MCP options.
+      Landed in [#374](https://github.com/opengeos/terrio/pull/374), with real-data
+      conformance and measured remote header/full-check I/O.
+
+- [x] Seek-optimized ZIP archives: create, append, list, optimize and validate through
+      Rust, CLI/MCP, Python and JavaScript, with lazy native/HTTP GeoTIFF member reads.
+      Landed in [#404](https://github.com/opengeos/terrio/pull/404); 34 GDAL 3.13.3
+      VSI comparisons include nine SOZip archive/window checks and measured HTTP I/O.
+
+- [x] Multidimensional mosaics: lazy coordinate-aligned numeric arrays across
+      Rust, CLI/MCP, Python and JavaScript, with netCDF/Zarr output and real
+      NOAA wind comparisons registered as `mdmosaic`. Landed in
+      [#373](https://github.com/opengeos/terrio/pull/373).
+
+- [x] Separate-file raster tiles: XYZ/TMS PNG and typed GeoTIFF output through
+      Rust, CLI/MCP, Python and JavaScript, with bounded source windows and
+      non-overwriting resume. Real Landsat/USGS comparisons are registered as
+      `raster-tiles`; direct-source lower zooms differ from GDAL's generated-image
+      pyramid. Retile layouts, recursive pyramids, CSV/vector indexes and
+      Leaflet/OpenLayers, MapML, STACTA and KML publication helpers are implemented
+      in [#440](https://github.com/opengeos/terrio/pull/440), with registered
+      `retile` and `tile-publication` comparisons against GDAL 3.13.3.
+
+- [x] Vector clipping: points, lines, polygons and collections, with bbox,
+      geometry, filtered vector/raster templates and region CRS transforms through
+      Rust, CLI/MCP, Python and JavaScript. Landed in
+      [#419](https://github.com/opengeos/terrio/pull/419), with 27 GDAL 3.13.3
+      comparisons and measured remote template I/O.
+
+- [x] Polygon coverage validation: indexed overlap, shared-node and narrow-gap
+      checks through Rust, CLI/MCP, Python and JavaScript. Landed in
+      [#420](https://github.com/opengeos/terrio/pull/420), with 24 exact
+      GDAL 3.13.3 comparisons, including real counties and dimensional inputs.
+
+- [x] Raster/vector pipelines: linear processing chains with read, write and
+      materialize steps, saved GDALG definitions and deferred named outputs through
+      Rust, CLI/MCP, Python and JavaScript. Landed in
+      [#428](https://github.com/opengeos/terrio/pull/428), with 45 registered
+      GDAL 3.13.3 comparisons covering pipelines and direct metadata regressions.
+
+- [x] Coverage simplification: shared-edge topology preservation, boundary options
+      and active-layer copying across Rust, CLI/MCP, Python and JavaScript. Landed in
+      [#424](https://github.com/opengeos/terrio/pull/424), with 48 exact GDAL 3.13.3
+      simplification comparisons and documented dimensional metadata behavior.
+
+- [x] Layer algebra: intersection, union, symmetric difference, identity, update,
+      clip and erase for polygon, line, point and collection inputs across
+      Rust, CLI/MCP, Python and JavaScript. Landed in
+      [#427](https://github.com/opengeos/terrio/pull/427).
+
+- [x] Coverage cleaning: snapping, progressive overlap assignment and enclosed-gap
+      filling across Rust, CLI/MCP, Python and JavaScript. Landed in
+      [#426](https://github.com/opengeos/terrio/pull/426), with 236 GDAL 3.13.3
+      comparisons and documented, independently checked ordering-dependent results.
 
 - [x] Vector geometry operations: simplify, segmentize, convex and concave hulls, swap XY,
       geometry-type conversion, grouped combine and spatial sort. Landed in
       [#306](https://github.com/opengeos/terrio/pull/306), through Rust, CLI/MCP, Python and
       JavaScript, with GDAL/GEOS comparisons and documented tolerances.
-- [ ] Vector gridding and linear referencing: every `gdal_grid` algorithm (search ellipses,
+- [x] Vector gridding and linear referencing: every `gdal_grid` algorithm (search ellipses,
       quadtree order, per-quadrant limits) as `terrio vector-grid`, and `ogrlineref` as
-      `terrio lineref`. Proposed in [#305](https://github.com/opengeos/terrio/pull/305), through Rust,
+      `terrio lineref`. Landed in [#305](https://github.com/opengeos/terrio/pull/305), through Rust,
       CLI/MCP, Python and JavaScript, with real-data comparisons registered in conformance.
+
+- [x] GeoPackage repacking: encoded-record B-tree rebuilds, preserved rowids and SQL objects,
+      auto-vacuum maps and journaled native replacement through Rust, CLI/MCP, Python and
+      JavaScript. Landed in [#384](https://github.com/opengeos/terrio/pull/384); real-data
+      comparisons are registered as `gpkg-repack`.
+
+- [x] GeoPackage validation: SQLite integrity, core and extension metadata, geometries,
+      raster tiles and supported registered views through Rust, CLI/MCP, Python and JavaScript.
+      Landed in [#403](https://github.com/opengeos/terrio/pull/403), with explicit incomplete
+      reports for unsupported SQL; 50 GDAL 3.13.3 validation attempts (34 compared,
+      16 not compared because GDAL refuses the malformed inputs), registered as `gpkg-validate`.
+
+- [x] Dataset identification: bounded 16 KiB headers, ordered input batches, recursive local
+      discovery and explicit companion-file reader fallback through Rust, CLI/MCP, Python and
+      JavaScript. Landed in [#375](https://github.com/opengeos/terrio/pull/375);
+      real-data GDAL comparisons are registered as `identify`.
+
+- [x] Dataset file management: encoded copies, renames and deletion of owned companions,
+      with staged replacement and source alias protection through Rust, CLI/MCP, Python and
+      WebAssembly. Landed in [#382](https://github.com/opengeos/terrio/pull/382);
+      real Landsat and Natural Earth comparisons are registered as `dataset-files`.
+
+- [x] Parquet metadata aggregation: explicit compatible partitions, relative column paths,
+      merged GeoParquet metadata and overwrite guards through Rust, CLI/MCP, Python and
+      JavaScript. Landed in [#382](https://github.com/opengeos/terrio/pull/382), including
+      [#383](https://github.com/opengeos/terrio/pull/383); real-data
+      and measured S3 range-read comparisons are registered as `parquet-metadata`.
+
+- [x] Dataset content checks: all exposed raster bands, vector layers, numeric scientific
+      arrays and point records, with optional raster overviews and masks. Rust, CLI/MCP,
+      Python and JavaScript share the checks. Landed in
+      [#378](https://github.com/opengeos/terrio/pull/378); conformance is registered as `dataset-check`.
 
 ## 0.1: Foundations
 
@@ -105,7 +225,10 @@ commands. Command-group progress:
 - [x] Raster: Cloud Optimized GeoTIFF (overviews, internal tiling, all common compressions), ASCII
       grids.
 - [x] Vector: Shapefile (with `.prj`, `.cpg` and zipped), FlatGeobuf (with its spatial index),
-      GeoParquet 1.1 (with bounding-box filtering), CSV with point or WKT columns.
+      GeoParquet 1.1 (with bounding-box filtering), CSV with point or WKT columns, XLSX as GDAL's
+      driver reads and writes it.
+- [ ] XLSX layout options and a workbook model beyond GDAL
+      ([#405](https://github.com/opengeos/terrio/issues/405)).
 - [x] Attribute and spatial filters pushed down to the drivers that support them.
 - [x] `terrio convert` between any two supported formats.
 
@@ -139,6 +262,15 @@ commands. Command-group progress:
       point sampling across multiple rasters, through the Rust API, CLI and MCP.
 - [x] Polygonization preserves exterior rings and holes on south-up and rotated grids, and
       classifies rings correctly for small pixels at large coordinate origins.
+- [x] Metadata-only CADRG RPF table-of-contents creation through Rust, CLI/MCP,
+      Python and WebAssembly, with bounded frame reads, polar grids and atomic native output
+      ([#446](https://github.com/opengeos/terrio/pull/446)).
+      Part of [#289](https://github.com/opengeos/terrio/issues/289).
+- [x] Python and WebAssembly contour, footprint, buffer, grouped dissolve, geometry validity
+      and repair functions, using the shared Rust engines.
+- [x] Python and WebAssembly zonal statistics and recursive multipart splitting, using the
+      shared Rust engines with explicit eager-raster and dimensional limits
+      ([#447](https://github.com/opengeos/terrio/pull/447)).
 - [x] Contour lines with interval/fixed levels, nodata handling and optional elevations in Z;
       multi-raster zonal statistics with GDAL's centre/all-touched pixel rules and per-raster CRS
       transformations; a standalone read-only SQL command using the existing query engine.
@@ -180,7 +312,8 @@ commands. Command-group progress:
       zoom levels as overviews, and vector tiles (MVT) as layers, as GDAL's MBTiles, PMTiles and MVT
       drivers read them; PMTiles read in place over HTTP; rasters written as tile pyramids and vector
       layers as MVT tiles (archives or directories), as GDAL writes them; invalid polygons repaired
-      as GDAL's MVT writer repairs them with GEOS; AVIF tiles; existing archives updated (rasters
+      by an independent tile-grid implementation, checked against GDAL/GEOS with documented
+      [compatibility limits](https://terrio.dev/make-valid-implementation/); AVIF tiles; existing archives updated (rasters
       and vector layers appended). Checked against GDAL (`scripts/compare_tiles_with_gdal.py`).
 - [x] STAC items and collections as datasets. Done: items, item collections, collections and STAC
       API searches (local or remote, following `next` links) as footprint layers read as GDAL reads
@@ -197,16 +330,16 @@ commands. Command-group progress:
       as nodata with `GDAL_STACTA_SKIP_MISSING_METATILE`; summaries, whole rasters, windows and
       overviews identical to GDAL's on its STACTA test data and on `gdal raster tile` pyramids,
       local and over HTTP (`scripts/compare_stac_geozarr.py stacta`).
-- [x] GRIB 1 and 2, read only. Done: a pure-Rust driver read as GDAL's GRIB driver reads files (a
+- [x] GRIB 1 and 2 read, GRIB2 written. Done: a pure-Rust driver read as GDAL's GRIB driver reads files (a
       Float64 band per message or field, GDAL's `GRIB_*` band metadata and descriptions from its
       tables and degrib's naming rules, its grids, earth shapes and 0-360 rewrapping, units
       normalized, nodata where bitmaps mask points), GRIB2 packings decoded as g2clib decodes them
       (simple, complex, spatial differencing, IEEE, JPEG 2000 with the OpenJPEG port, PNG, and CCSDS
-      with gribberish's pure-Rust decoder), GRIB1 simple packing; local files, bytes, and remote
-      files read message by message (NOAA `.idx` and ECMWF `.index` sidecars for the offsets, the
-      headers fetched in parallel); in WebAssembly too. Identical to GDAL, metadata and pixels, on
-      GDAL's GRIB test files, ecCodes', every field of a GFS file, HRRR's and ECMWF's open data
-      (`scripts/compare_grib_with_gdal.py`, the conformance suite's `grib`).
+      with the pure-Rust `rust-aec` decoder), GRIB1 simple packing; local files, bytes, and remote
+      files read message by message (one 16 KiB block per message for its headers, no sidecar;
+      servers that ignore range requests refused), every allocation a header sizes fallible; in
+      WebAssembly too. Identical to GDAL, metadata and pixels, on files GDAL writes in each of its
+      encodings and on NOAA's GFS, GEFS, HRRR and MRMS products (`scripts/compare_grib_with_gdal.py`).
 
 ## 0.5: Bindings and the GDAL backend
 
@@ -235,7 +368,7 @@ commands. Command-group progress:
 - [x] The command line without a Rust toolchain: `pip install terrio` installs the `terrio`
       command, standalone binaries for Linux, macOS and Windows are attached to each release
       (`cargo binstall terrio-cli`), and one-line installers download them
-      (`curl -LsSf https://terrio.opengeos.org/install.sh | sh`, `install.ps1` on Windows).
+      (`curl -LsSf https://terrio.dev/install.sh | sh`, `install.ps1` on Windows).
 - [x] An MCP server (`terrio mcp`): AI agents run the commands as tools, each described by its
       `--help`.
 
@@ -290,8 +423,10 @@ commands. Command-group progress:
       `filters.skewnessbalancing`, `filters.head`, `filters.tail`, `filters.sort`, `filters.locate`,
       `filters.iqr`, `filters.mad`, `filters.dem`, `filters.colorization`, `filters.overlay` and
       `filters.hexbin` (boundaries on hexer's hexagons; not its H3 grids), identical to PDAL's on
-      autzen (nanoflann's neighbours, libstdc++'s sort and Eigen's
-      eigensolver as PDAL runs them; `terrio filter`, Python and JavaScript).
+      autzen (nanoflann's neighbours, sorted radius results and Eigen's
+      eigensolver as PDAL runs them; in radius results of more than 16 points, points at exactly
+      the same distance may be ordered differently, see Point clouds; `terrio filter`, Python and
+      JavaScript).
 - [ ] PDAL's long tail of filters (`filters.optimalneighborhood`, `filters.neighborclassifier`,
       `filters.radiusassign`, `filters.hag_dem`, `filters.voxelcentroidnearestneighbor`,
       `filters.farthestpointsampling`, `filters.transformation`, `filters.ferry`, `filters.returns`,
@@ -371,7 +506,8 @@ Python:
       window and overview is identical to GDAL's.
 - [x] Wheels for more platforms (musl aarch64, Windows ARM64) and for Pyodide, to run in the browser.
       Done: musllinux aarch64 and Windows ARM64 wheels; a Pyodide 0.29 wheel (Python 3.13) attached
-      to each GitHub release, tested in Pyodide under Node.js in the release workflow.
+      to each GitHub release, tested in Pyodide under Node.js in the release workflow. The documentation
+      site runs notebooks on it with JupyterLite, tested in a browser in the docs workflow.
 
 WebAssembly (the `terrio-js` npm package):
 
@@ -418,6 +554,25 @@ WebAssembly (the `terrio-js` npm package):
 
 ## Later
 
+- [x] ArcGIS feature-service JSON (the `ESRIJSON` driver): files by content and query URLs page by
+      page, as GDAL's driver reads them.
+- [x] ArcGIS feature-service protocol buffers (the `ESRIPBF` driver, `f=pbf`): files by content and
+      query URLs page by page.
+- [x] HEC-RAS geometry and plan HDF files as vector layers (the `HECRAS` driver, `hecras` feature).
+      Done: the 2D mesh cells, cell centres, faces and perimeters, the 1D cross
+      sections, rivers, structures and storage areas, boundary-condition lines, reference lines and
+      points, through the `ras-commander-fast-hdf` engine, with the stored results joined by open
+      options (summaries, static mesh arrays, time-step values, series extremes, cross-section,
+      structure, boundary and reference series); the stored projection text as the CRS, never a
+      guessed EPSG code; refusals as errors. Recognized by content, so HDF5 rasters are unchanged.
+      CLI (`info --oo`, `convert --oo`), MCP, Python (`options=`) and JavaScript (`openVector`,
+      in memory). Tested on HEC-RAS 7.0.1 files against h5py, bit for bit
+      (`scripts/compare_hecras_with_h5py.py`, the `hecras` conformance suite); older versions best
+      effort.
+- [ ] HEC-RAS files read in place over HTTP and S3 by range requests: needs an engine byte-source
+      interface (plan the ranges from the HDF5 metadata, fetch them, then decode, as
+      `sparse::SparseFile` reads).
+- [x] One HDF5 reader for terrio and the HEC-RAS engine: both on crates.io `hdf5-reader` 0.10.1.
 - [x] CRS: datum shift grids (NTv2, GeoTIFF grids), vertical datums, time-dependent transformations
       between dynamic datums (coordinate epochs). Done: PROJ's GeoTIFF grids (PROJ-data), NTv2 and GTX
       read in pure Rust and interpolated as PROJ does (`hgridshift`, `vgridshift`, NADCON5's
@@ -484,8 +639,11 @@ WebAssembly (the `terrio-js` npm package):
       exposed by the existing Rust, CLI/MCP, Python and full JavaScript/WASM vector APIs.
       Common linework, curves, text, faces, polygon hatches and inserted blocks are supported;
       output includes horizontal polygon holes. Drawing coordinates have no inferred CRS.
-      See [supported entities and limits](docs/formats.md#cad-drawings-dwg-and-dxf).
-- [ ] Additional CAD entities (splines, dimensions, meshes, ACIS solids) and acadrust's optional
+      See [supported entities and limits](https://terrio.dev/formats/#cad-drawings-dwg-and-dxf).
+- [x] Polyface and MESH (base cage, no subdivision) entities as 3D multipolygons; entities outside the native subset are
+      skipped with a warning rather than failing the drawing (#501), or read by GDAL when a
+      build has that backend and it can open the drawing.
+- [ ] Additional CAD entities (splines, dimensions, polygon meshes, ACIS solids) and acadrust's optional
       STL, COLLADA, OBJ, glTF/GLB and FBX importers.
 
 ## Standalone CRS crate (#268)
@@ -501,7 +659,7 @@ WebAssembly (the `terrio-js` npm package):
   measured first CRS use increases from about 10.6 ms to 17.9–18.1 ms. Repeated
   calls remain about 3.4–3.7 µs. This initialization tradeoff removes the duplicate
   table-decoder dependency; TIFF codecs remain supported. See
-  [the measurement report](docs/crs-footprint.md#native-first-use-cost).
+  [the measurement report](https://terrio.dev/crs-footprint/#native-first-use-cost).
 - [x] Geocentric Cartesian XYZ endpoints, EPSG/PROJ/WKT definitions, datum and
       projected composition, and Rust/CLI/MCP/Python/JavaScript/WASM validation
       against pinned and live GDAL/PROJ references (#269, #286).
@@ -512,7 +670,10 @@ WebAssembly (the `terrio-js` npm package):
       vertical, compound, bound and IAU planetary CRSs, refusing what it would describe wrongly:
       Rust, CLI and MCP (`terrio crs --projjson`), Python (`CRS.to_projjson()`) and JavaScript
       (`crsToProjjson`), compared with live PROJ/GDAL by `scripts/conformance.py`.
-- IAU and additional projection capabilities remain scoped separately in #271–#272.
+- IAU_2015 CRSs are done (#271). Additional projection coverage (#272) includes near-sided and
+  tilted perspective, projected `ob_tran`, interrupted Goode homolosine, quadrilateralized
+  spherical cube, HEALPix/rHEALPix, ISEA and two-point oblique Mercator. See the CRS documentation
+  for the supported parameters, numerical allowances and the PROJ-version-specific ISEA scope.
 
 ## ndarray interoperability (#298)
 
@@ -528,6 +689,21 @@ copying, converting or reordering them.
 - Out of scope: complex bands as `Complex<T>` (they are viewed as their component bands),
   `multidim::Buffer`, and decoding into caller-provided buffers.
 
+## Analysis-ready floating-point reads (#422)
+
+Windows read as `f32` or `f64` values, NaN where GDAL's mask band marks pixels invalid.
+
+- [x] `LazyRaster::read_window_f32` and `read_window_f64` (`FloatReadOptions`: bands, overview and
+      optional unscaling with each band's scale and offset or a netCDF variable's packing), and
+      their `RasterDataset` counterparts: per-dataset masks (internal, `.msk`, overviews') in place
+      of nodata values, which are compared in each band's own type as GDAL's nodata mask band
+      compares them. Identical to GDAL 3.13.2 on 38 cases (`tests/data/float_reads`), and to
+      rasterio on the 35 its GDAL opens.
+- [x] With the `ndarray` feature, owned `Array3` and `Array2` arrays, bands first or last
+      (`BandLayout`), written in that layout as the pixels are converted.
+- Out of scope: alpha bands as masks (GDAL's `GMF_ALPHA`), the Python and JavaScript bindings
+  (Python's `terrio.rio` reads masked arrays already), and writing NaN back as nodata values.
+
 ## Decisions
 
 - The core API is synchronous and reads datasets into memory; remote files are downloaded first.
@@ -540,8 +716,8 @@ copying, converting or reordering them.
 - HTTP goes through `ureq` (with rustls) and S3 requests are signed by terrio itself, rather than
   through `object_store`, to keep the API synchronous and the dependencies small.
 - GeoPackage is read and written by terrio's own SQLite file reader and writer (pure Rust): no
-  C dependency, and files written in one go.
-- terrio carries its own EPSG table (`crates/terrio-crs/data/epsg.tsv.zst`, about 220 KB, generated
+  C dependency; existing files are updated in place.
+- terrio carries its own EPSG table (`crates/terrio-crs/data/epsg.tsv.zst`, about 350 KB, generated
   from GDAL and PROJ by `scripts/gen_epsg_table.py`): the PROJ strings of the CRSs, their WKT and
   the datum transformations GDAL lists for them, so that terrio picks the same transformation as
   GDAL for each point. The projection formulas are PROJ's, ported to Rust; `wbprojection` remains

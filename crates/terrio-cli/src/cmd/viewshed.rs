@@ -1,3 +1,8 @@
+// Written to match the behavior of:
+//   GDAL v3.13.3:
+//     doc/source/programs/gdal_viewshed.rst
+// No code is translated from these sources.
+
 //! `terrio viewshed` (also exposed automatically as an MCP tool).
 use super::rasterout::{OutputArgs, open};
 use terrio::ops::viewshed::{ViewshedMode, ViewshedOptions, viewshed};
@@ -59,9 +64,18 @@ mod tests {
     use clap::Parser;
     #[test]
     fn parses_negative_curvature() {
-        let cli =
-            crate::Cli::try_parse_from(["terrio", "viewshed", "dem.tif", "out.tif", "--ox", "5", "--oy", "5", "--cc", "-0.5"]).unwrap();
-        let crate::Command::Viewshed(args) = cli.command else { panic!("wrong command") };
-        assert_eq!(args.cc, Some(-0.5));
+        // Full-parser tests need the same stack as the CLI worker on Windows.
+        std::thread::Builder::new()
+            .stack_size(crate::STACK_SIZE)
+            .spawn(|| {
+                let cli =
+                    crate::Cli::try_parse_from(["terrio", "viewshed", "dem.tif", "out.tif", "--ox", "5", "--oy", "5", "--cc", "-0.5"])
+                        .unwrap();
+                let crate::Command::Viewshed(args) = cli.command else { panic!("wrong command") };
+                assert_eq!(args.cc, Some(-0.5));
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 }

@@ -1,3 +1,21 @@
+// SPDX-FileCopyrightText: Copyright (c) 2001, Frank Warmerdam <warmerdam@pobox.com>
+// SPDX-FileCopyrightText: Copyright (c) 2008-2013, Even Rouault <even dot rouault at spatialys.com>
+// SPDX-FileCopyrightText: Copyright (c) 1998, Frank Warmerdam
+// SPDX-FileCopyrightText: Copyright (c) 2007-2014, Even Rouault <even dot rouault at spatialys.com>
+// SPDX-FileCopyrightText: Copyright (c) 2000, Frank Warmerdam
+// SPDX-FileCopyrightText: Copyright (c) 2007-2010, Even Rouault <even dot rouault at spatialys.com>
+// SPDX-FileCopyrightText: Copyright (c) 1999, Frank Warmerdam
+// SPDX-FileCopyrightText: Copyright (c) 2007-2013, Even Rouault <even dot rouault at spatialys.com>
+// SPDX-FileCopyrightText: Copyright (c) 2026 Qiusheng Wu and Terrio contributors
+// SPDX-License-Identifier: MIT
+//
+// Derived from (translated to Rust and modified):
+//   GDAL v3.13.3:
+//     frmts/vrt/vrtsources.cpp
+//     gcore/rasterio.cpp
+//     gcore/overview.cpp
+//     gcore/gdal_misc.cpp
+
 //! GDAL virtual rasters (`.vrt`): reading, writing, and the source windowing they share with
 //! [`translate`](super::translate).
 //!
@@ -9,7 +27,7 @@
 //! lazy warped VRTs, built-in scalar derived bands, kernel sources and validity masks.
 
 mod virtual_raster;
-pub(crate) use virtual_raster::{SourceInventoryScope, resolve_reference, source_input_paths};
+pub(crate) use virtual_raster::{SourceInventoryScope, resolve_reference, source_input_paths, subdataset_parts};
 pub use virtual_raster::{VirtualRaster, open_virtual_raster};
 
 use super::{Grid, Resampling, convert_value, data_type_name, parse_data_type};
@@ -20,6 +38,19 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use wbraster::DataType;
 use wbraster::raster::RasterData;
+
+/// GDAL sourced bands use an integer flag; raw bands use CPLTestBool.
+pub(crate) fn relative_reference_flag(value: Option<&str>, raw: bool) -> bool {
+    let Some(value) = value else {
+        return raw;
+    };
+    if raw {
+        return !matches!(value.to_ascii_lowercase().as_str(), "0" | "no" | "off" | "false");
+    }
+    let value = value.trim_start_matches([' ', '\t', '\n', '\r', '\x0b', '\x0c']);
+    let digits = value.strip_prefix('+').or_else(|| value.strip_prefix('-')).unwrap_or(value);
+    digits.chars().take_while(char::is_ascii_digit).any(|digit| digit != '0')
+}
 
 /// A virtual raster.
 #[derive(Debug, Clone, PartialEq)]
@@ -123,11 +154,14 @@ impl VrtDataset {
     /// Reads a VRT file's description.
     #[cfg(not(target_family = "wasm"))]
     pub fn open(path: &str) -> Result<Self> {
+        crate::formats::check_driver_allowed("VRT", path, crate::formats::Kind::Raster)?;
         Self::from_xml(&std::fs::read_to_string(path)?)
     }
 
-    /// Parses a VRT description.
+    /// Parses a VRT description. Under a process-wide raster allow-list, only with the VRT driver
+    /// allowed, as GDAL's VRT driver reads one.
     pub fn from_xml(text: &str) -> Result<Self> {
+        crate::formats::check_driver_allowed("VRT", "a VRT description", crate::formats::Kind::Raster)?;
         let root = xml::parse(text)?;
         if root.name != "VRTDataset" {
             return Err(Error::InvalidData(format!("not a VRT: root element is <{}>", root.name)));
@@ -205,8 +239,8 @@ impl VrtDataset {
                     None => Resampling::Nearest,
                 };
                 sources.push(VrtSource {
-                    filename: fname.text.trim().to_string(),
-                    relative_to_vrt: fname.attr("relativeToVRT").is_some_and(|v| v.trim() == "1"),
+                    filename: fname.text.clone(),
+                    relative_to_vrt: relative_reference_flag(fname.attr("relativeToVRT"), false),
                     band,
                     src_rect,
                     dst_rect,
@@ -258,7 +292,7 @@ impl VrtDataset {
                 s += &format!(
                     "      <SourceFilename relativeToVRT=\"{}\">{}</SourceFilename>\n",
                     u8::from(src.relative_to_vrt),
-                    xml::escape(&src.filename)
+                    xml::escape_filename(&src.filename)
                 );
                 s += &format!("      <SourceBand>{}</SourceBand>\n", src.band);
                 if let Some((w, h, dt)) = src.properties {
@@ -1372,7 +1406,12 @@ pub(crate) mod xml {
         pub fn to_xml(&self) -> String {
             let attrs = self.attrs.iter().map(|(k, v)| format!(" {k}=\"{}\"", escape(v))).collect::<String>();
             let children = self.children.iter().map(Self::to_xml).collect::<String>();
-            format!("<{}{attrs}>{}{children}</{}>", self.name, escape(&self.text), self.name)
+            let text = if matches!(self.name.as_str(), "SourceFilename" | "SourceDataset") {
+                escape_filename(&self.text)
+            } else {
+                escape(&self.text)
+            };
+            format!("<{}{attrs}>{text}{children}</{}>", self.name, self.name)
         }
 
         pub fn attr(&self, name: &str) -> Option<&str> {
@@ -1386,6 +1425,17 @@ pub(crate) mod xml {
 
     pub fn escape(s: &str) -> String {
         s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
+    }
+
+    /// Preserve leading filename whitespace through CPL MiniXML's literal-space skipping.
+    pub fn escape_filename(s: &str) -> String {
+        let prefix = s.len() - s.trim_start_matches([' ', '\t', '\r', '\n']).len();
+        let mut text = String::new();
+        for byte in s[..prefix].bytes() {
+            text.push_str(&format!("&#{byte};"));
+        }
+        text.push_str(&escape(&s[prefix..]));
+        text
     }
 
     fn unescape(s: &str) -> String {
@@ -1430,16 +1480,41 @@ pub(crate) mod xml {
         let b = text.as_bytes();
         let mut i = 0;
         let mut stack: Vec<Element> = vec![Element::default()];
+        let mut cdata_end = usize::MAX;
         while i < b.len() {
             if b[i] != b'<' {
                 let end = text[i..].find('<').map_or(b.len(), |k| i + k);
                 if let Some(top) = stack.last_mut() {
-                    top.text.push_str(&unescape(&text[i..end]));
+                    let mut value = &text[i..end];
+                    if matches!(top.name.as_str(), "SourceFilename" | "SourceDataset") {
+                        if i == cdata_end {
+                            if !value.trim().is_empty() {
+                                return Err(err("mixed XML source filename content"));
+                            }
+                            value = "";
+                        } else if top.text.is_empty() {
+                            value = value.trim_start_matches([' ', '\t', '\r', '\n']);
+                        }
+                    }
+                    top.text.push_str(&unescape(value));
                 }
                 i = end;
                 continue;
             }
-            if text[i..].starts_with("<!--") {
+            if text[i..].starts_with("<![CDATA[") {
+                let end = text[i + 9..].find("]]>").map(|k| i + 9 + k).ok_or_else(|| err("unterminated CDATA"))?;
+                if let Some(top) = stack.last_mut() {
+                    if matches!(top.name.as_str(), "SourceFilename" | "SourceDataset") && !top.text.is_empty() {
+                        return Err(err("mixed XML source filename content"));
+                    }
+                    top.text.push_str(&text[i + 9..end]);
+                }
+                i = end + 3;
+                cdata_end = i;
+            } else if text[i..].starts_with("<!--") {
+                if stack.last().is_some_and(|top| matches!(top.name.as_str(), "SourceFilename" | "SourceDataset")) {
+                    return Err(err("invalid XML source filename content"));
+                }
                 i = text[i..].find("-->").map(|k| i + k + 3).ok_or_else(|| err("unterminated comment"))?;
             } else if text[i..].starts_with("<?") || text[i..].starts_with("<!") {
                 i = text[i..].find('>').map(|k| i + k + 1).ok_or_else(|| err("unterminated declaration"))?;

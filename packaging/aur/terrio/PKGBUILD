@@ -4,8 +4,8 @@ pkgver=0.4.1
 pkgrel=1
 pkgdesc="Pure-Rust geospatial raster and vector data I/O: the terrio command"
 arch=('x86_64' 'aarch64')
-url="https://terrio.opengeos.org"
-license=('MIT')
+url="https://terrio.dev"
+license=('MIT' 'MPL-2.0')
 depends=('gcc-libs' 'glibc')
 makedepends=('cargo')
 # Its C dependencies (zstd, ring) are linked by Rust's linker, which cannot read GCC's LTO objects.

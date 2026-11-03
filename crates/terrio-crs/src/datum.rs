@@ -1,3 +1,25 @@
+// SPDX-FileCopyrightText: Copyright (c) 2016, Thomas Knudsen / SDFE
+// SPDX-FileCopyrightText: Copyright (c) 2017, Kristian Evers
+// SPDX-FileCopyrightText: Copyright (c) 2019, Even Rouault, <even.rouault at spatialys.com>
+// SPDX-FileCopyrightText: Copyright (c) 2022, Even Rouault <even.rouault at spatialys.com>
+// SPDX-FileCopyrightText: PROJ contributors
+// SPDX-FileCopyrightText: Copyright (c) 2018-2024, Even Rouault, <even.rouault at spatialys.com>
+// SPDX-FileCopyrightText: Copyright (c) 2016, 2017 Thomas Knudsen/SDFE
+// SPDX-FileCopyrightText: Copyright (c) 2026 Qiusheng Wu and Terrio contributors
+// SPDX-License-Identifier: MIT
+//
+// Derived from (translated to Rust and modified):
+//   PROJ 9.7.0:
+//     src/conversions/cart.cpp
+//   PROJ 9.8.1:
+//     src/transformations/helmert.cpp
+//     src/transformations/deformation.cpp
+//     src/transformations/xyzgridshift.cpp
+//     src/transformations/vertoffset.cpp
+//     src/transformations/hgridshift.cpp
+//     src/coord_operation.cpp
+//     src/trans.cpp
+
 //! Datum transformations: the geodetic steps of PROJ pipelines (geocentric conversion, Helmert
 //! with or without rates of change, Molodensky-Badekas, geographic offsets and the grid-based
 //! steps `hgridshift`, `vgridshift`, `gridshift`, `xyzgridshift` and `deformation`), run as PROJ
@@ -594,6 +616,11 @@ impl Op {
     pub fn available(&self) -> bool {
         self.grids().iter().all(|(name, optional)| *optional || grid::available(name))
     }
+
+    /// Whether a grid it requires was asked for on the network and not obtained.
+    pub fn network_failed(&self) -> bool {
+        self.grids().iter().any(|(name, optional)| !*optional && grid::fetch_failed(name))
+    }
 }
 
 /// A point being transformed: longitude and latitude in radians, height in metres, and time
@@ -671,7 +698,8 @@ pub(crate) fn pick_index<T: AsRef<Op>>(ops: &[T], excluded: &[usize], contains: 
 
 /// Transforms a point with the operations of a list as PROJ's `proj_trans` does: the best one
 /// for the point (see [`pick_index`]), and when it fails (outside its grid), the next best, up
-/// to three attempts; then the first operation that needs no grid.
+/// to three attempts; then the first operation that needs no grid. A failure to get a grid from
+/// the network fails the point, as a network error stops `proj_trans`.
 pub(crate) fn transform_with<T: AsRef<Op>>(
     ops: &[T],
     contains: impl Fn(&Op, usize) -> bool,
@@ -682,6 +710,9 @@ pub(crate) fn transform_with<T: AsRef<Op>>(
         let Some(i) = pick_index(ops, &excluded, &contains) else { break };
         if let Some(p) = apply(i) {
             return Some(p);
+        }
+        if ops[i].as_ref().network_failed() {
+            return None;
         }
         excluded.push(i);
     }

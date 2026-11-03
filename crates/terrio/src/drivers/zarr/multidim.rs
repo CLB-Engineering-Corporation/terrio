@@ -43,7 +43,10 @@ impl MdSource {
             .collect();
         let size = self.array.data_type.size_bytes();
         let n = counts.iter().try_fold(1usize, |n, &c| n.checked_mul(c).ok_or_else(|| bad("selected size overflows")))?;
-        let mut out = vec![0; n.checked_mul(size).ok_or_else(|| bad("selected byte size overflows"))?];
+        // Refused past the memory the process can use, allocated fallibly, as a region is.
+        let bytes = crate::dataset::fallible::check_usable(n.checked_mul(size), || format!("a selection of shape {counts:?} is too large"))
+            .map_err(limited)?;
+        let mut out = crate::dataset::fallible::filled(bytes, 0u8, "a Zarr selection")?;
         let grid: Vec<_> = runs.iter().map(Vec::len).collect();
         let total = grid.iter().try_fold(1usize, |n, &c| n.checked_mul(c).ok_or_else(|| bad("chunk grid overflows")))?;
         for tile in 0..total {
@@ -167,15 +170,7 @@ pub(crate) fn md_open(name: &str, mount: Option<std::sync::Arc<crate::memfs::Mou
                     return Err(bad("saved dimension metadata does not match the array shape"));
                 }
             }
-            let mut coordinates: Vec<_> = dimensions.iter().filter_map(|d| d.indexing_variable.clone()).collect();
-            if let Some(raw) = a.attrs.get("coordinates").and_then(Value::as_str) {
-                for n in raw.split_whitespace() {
-                    let n = if n.starts_with('/') { n.to_string() } else { format!("{}/{}", p.trim_end_matches('/'), n) };
-                    if !coordinates.contains(&n) {
-                        coordinates.push(n);
-                    }
-                }
-            }
+            let coordinates = dimensions.iter().filter_map(|d| d.indexing_variable.clone()).collect();
             let mut attributes = if a.attrs.is_object() { a.attrs.clone() } else { json!({}) };
             let attribute_types = crate::multidim::take_attribute_types(&mut attributes)?;
             let info = ArrayInfo {
@@ -236,7 +231,8 @@ pub(crate) fn md_open(name: &str, mount: Option<std::sync::Arc<crate::memfs::Mou
     fn dimension_scope_exists(g: &Group, d: &Dimension) -> bool {
         d.path == format!("{}/{}", g.path.trim_end_matches('/'), d.name) || g.groups.iter().any(|g| dimension_scope_exists(g, d))
     }
-    let root = visit(&node, "/", &mount, 0)?;
+    let mut root = visit(&node, "/", &mount, 0)?;
+    crate::multidim::resolve_coordinates(&mut root);
     // A selected subgroup/array may legitimately refer to dimensions and indexing
     // variables outside that subset. Full stores must resolve every declaration.
     let partial = selected.is_some() || read_array_opt(&node).is_ok_and(|a| a.is_some());

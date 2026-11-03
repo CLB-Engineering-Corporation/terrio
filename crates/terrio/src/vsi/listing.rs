@@ -1,3 +1,8 @@
+// Written to match the behavior of:
+//   GDAL v3.13.3:
+//     port/cpl_vsil_curl.cpp, cpl_vsil_s3.cpp, cpl_vsil_az.cpp
+// No code is translated from these sources.
+
 //! Listing object stores and HTTP directory index pages, without doing any I/O: what to request
 //! and how to read the answers. Native builds send the requests with [`crate::http`] (signing S3
 //! ones); WebAssembly hosts send them with `fetch` (see [`RemoteLister`]).
@@ -94,7 +99,7 @@ pub(crate) fn uri_encode(s: &str, encode_slash: bool) -> String {
 }
 
 /// Decodes a URL path once; malformed escapes or non-UTF-8 keys retain their spelling.
-fn uri_decode(s: &str) -> String {
+pub(super) fn uri_decode(s: &str) -> String {
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
@@ -655,7 +660,7 @@ impl RemoteLister {
         self.pages += 1;
         if self.is_html() {
             if body.len() > Self::HTML_BODY_LIMIT {
-                return Err(Error::InvalidData("HTTP directory index exceeds 4 MiB".into()));
+                return Err(Error::ResourceLimit("HTTP directory index exceeds 4 MiB".into()));
             }
             self.check_html_prefix(body)?;
             if !String::from_utf8_lossy(body).to_ascii_lowercase().contains("<a ") {
@@ -682,13 +687,13 @@ impl RemoteLister {
             }
             if self.pages >= MAX_PAGES && !self.html_pending.is_empty() {
                 self.done = true;
-                return Err(Error::InvalidData("remote listing exceeds the page budget".into()));
+                return Err(Error::ResourceLimit("remote listing exceeds the page budget".into()));
             }
             self.done = self.html_pending.is_empty();
             return Ok(());
         }
         if body.len() > Self::OBJECT_BODY_LIMIT {
-            return Err(Error::InvalidData("object-store listing page exceeds 16 MiB".into()));
+            return Err(Error::ResourceLimit("object-store listing page exceeds 16 MiB".into()));
         }
         if !self.api.is_listing_page(body) {
             return Err(Error::InvalidData("not an XML object-store listing".into()));
@@ -713,7 +718,7 @@ impl RemoteLister {
         }
         if self.pages >= MAX_PAGES && (self.token.is_some() || !self.object_pending.is_empty()) {
             self.done = true;
-            return Err(Error::InvalidData("remote listing exceeds the page budget".into()));
+            return Err(Error::ResourceLimit("remote listing exceeds the page budget".into()));
         }
         if self.token.is_none() {
             if let Some((api, relative, level)) = self.object_pending.pop() {
@@ -765,7 +770,13 @@ mod tests {
         let mut lister = super::RemoteLister::new("s3://bucket/dir", true, None).unwrap();
         lister.pages = super::MAX_PAGES - 1;
         assert!(lister.next_url().is_some());
-        assert!(lister.feed(200, b"<ListBucketResult><IsTruncated>true</IsTruncated><NextContinuationToken>more</NextContinuationToken></ListBucketResult>").is_err());
+        assert!(matches!(
+            lister.feed(
+                200,
+                b"<ListBucketResult><IsTruncated>true</IsTruncated><NextContinuationToken>more</NextContinuationToken></ListBucketResult>"
+            ),
+            Err(crate::Error::ResourceLimit(_))
+        ));
     }
 
     #[test]

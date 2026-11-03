@@ -1,3 +1,11 @@
+// SPDX-FileCopyrightText: Copyright (c) 2025, Even Rouault <even dot rouault at spatialys.com>
+// SPDX-FileCopyrightText: Copyright (c) 2026 Qiusheng Wu and Terrio contributors
+// SPDX-License-Identifier: MIT
+//
+// Derived from (translated to Rust and modified):
+//   GDAL v3.13.3:
+//     apps/gdalalg_raster_compare.cpp
+
 //! Compare two rasters, as GDAL's `gdal raster compare` (and `gdalcompare.py`) do: their files
 //! byte for byte, CRS, geotransform, sizes, bands (description, data type, nodata, color
 //! interpretation, pixels), overviews, masks, metadata (default, `RPC` and `GEOLOCATION`
@@ -1116,16 +1124,24 @@ mod tests {
                     stream.set_read_timeout(Some(std::time::Duration::from_secs(2))).unwrap();
                     let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
                     let mut line = String::new();
+                    // The range asked: terrio's reader refuses a response larger than its range
+                    // (`http::tests::a_partial_response_is_read_no_further_than_the_range`).
+                    let (mut begin, mut end) = (count * 65536, count * 65536 + 65535);
                     loop {
                         line.clear();
                         reader.read_line(&mut line).unwrap();
                         if line == "\r\n" || line.is_empty() {
                             break;
                         }
+                        if let Some((a, b)) = line.to_ascii_lowercase().trim().strip_prefix("range: bytes=").and_then(|r| r.split_once('-'))
+                        {
+                            begin = a.parse().unwrap();
+                            end = b.parse::<usize>().unwrap().min(131071);
+                        }
                     }
-                    let begin = count * 65536;
-                    write!(stream, "HTTP/1.1 206 Partial Content\r\nContent-Length: 65536\r\nContent-Range: bytes {}-{}/131072\r\nConnection: close\r\n\r\n", begin, begin + 65535).unwrap();
-                    stream.write_all(&vec![b'a'; if count == 0 { 65536 } else { 512 }]).unwrap();
+                    let length = end - begin + 1;
+                    write!(stream, "HTTP/1.1 206 Partial Content\r\nContent-Length: {length}\r\nContent-Range: bytes {begin}-{end}/131072\r\nConnection: close\r\n\r\n").unwrap();
+                    stream.write_all(&vec![b'a'; if count == 0 { length } else { 512 }]).unwrap();
                     count += 1;
                 }
                 count

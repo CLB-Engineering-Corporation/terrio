@@ -4,7 +4,9 @@ description = "WebAssembly bindings for terrio"
 publish = false
 version.workspace = true
 edition.workspace = true
-license.workspace = true
+# Bundles terrio, whose point cloud eigensolver is MPL-2.0. wasm-pack copies this into the npm
+# package.json, where npm asks for compound expressions in parentheses.
+license = "(MIT AND MPL-2.0)"
 rust-version.workspace = true
 repository.workspace = true
 
@@ -31,8 +33,8 @@ serde_json.workspace = true
 # `core` is its lighter build (`terrio-js/core`), without the heaviest codecs.
 [features]
 default = ["full"]
-full = ["cad", "core", "parquet", "avif", "netcdf-hdf5", "osm", "jp2", "pointcloud", "zarr", "grib"]
-core = ["flatgeobuf", "sqlite", "tiles", "lzma", "lerc"]
+full = ["cad", "core", "parquet", "avif", "netcdf-hdf5", "osm", "jp2", "pointcloud", "zarr", "grib", "hecras"]
+core = ["flatgeobuf", "sqlite", "tiles", "lzma", "lerc", "xlsx"]
 cad = ["terrio/cad"]
 parquet = ["terrio/parquet"]
 avif = ["tiles", "terrio/avif"]
@@ -42,9 +44,11 @@ lzma = ["terrio/lzma"]
 flatgeobuf = ["terrio/flatgeobuf"]
 jp2 = ["terrio/jp2"]
 grib = ["terrio/grib"]
+hecras = ["netcdf-hdf5", "terrio/hecras"]
 lerc = ["terrio/lerc"]
 pointcloud = ["terrio/pointcloud"]
 tiles = ["sqlite", "terrio/tiles"]
+xlsx = ["terrio/xlsx"]
 zarr = ["terrio/zarr"]
 sqlite = ["terrio/sqlite"]
 # `terrio-js/threads`: every format, and `initThreadPool`. It builds only for WebAssembly with

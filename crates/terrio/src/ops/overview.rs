@@ -1,3 +1,15 @@
+// SPDX-FileCopyrightText: Copyright (c) 2000, Frank Warmerdam
+// SPDX-FileCopyrightText: Copyright (c) 2007-2010, Even Rouault <even dot rouault at spatialys.com>
+// SPDX-FileCopyrightText: Copyright (c) 2000, 2007, Frank Warmerdam
+// SPDX-FileCopyrightText: Copyright (c) 2007-2013, Even Rouault <even dot rouault at spatialys.com>
+// SPDX-FileCopyrightText: Copyright (c) 2026 Qiusheng Wu and Terrio contributors
+// SPDX-License-Identifier: MIT
+//
+// Derived from (translated to Rust and modified):
+//   GDAL v3.12.0:
+//     gcore/overview.cpp
+//     gcore/gdaldefaultoverviews.cpp
+
 //! Overviews: their selection for warping, following GDAL's `-ovr` choices, and their management
 //! in GeoTIFFs as `gdaladdo` and `gdal raster overview add/delete/refresh` manage them
 //! ([`add_overviews`], [`delete_overviews`], [`refresh_overviews`]).
@@ -26,7 +38,7 @@
 //! ```
 
 use crate::drivers::gtiff_update::{self, Appender, Directory, Entry, Tiff};
-use crate::drivers::gtiff_write::{self as gw, CodecParams, Compression, Layout, OverviewResampling, Value};
+use crate::drivers::gtiff_write::{self as gw, AddOverviewsResampling as OverviewResampling, CodecParams, Compression, Layout, Value};
 use crate::ops::Resampling;
 use crate::ops::overview_kernel as kernel;
 use crate::{Error, LazyRaster, Result, Window, WindowOptions};
@@ -288,6 +300,7 @@ pub fn delete_overviews(path: &str, options: &DeleteOptions) -> Result<()> {
     if options.external {
         let ovr = ovr_path(std::path::Path::new(path));
         if ovr.is_file() {
+            crate::geotiff::check_tiff_allowed(&ovr, &ovr.to_string_lossy())?;
             let tiff = parse_file(&ovr)?;
             if tiff.dirs.is_empty() || !tiff.dirs.iter().all(|d| d.is_overview() || d.is_mask()) {
                 return Err(Error::InvalidArgument(format!("refusing to remove '{}': not an overview sidecar", ovr.display())));
@@ -296,6 +309,7 @@ pub fn delete_overviews(path: &str, options: &DeleteOptions) -> Result<()> {
         }
         return Ok(());
     }
+    crate::geotiff::check_tiff_allowed(std::path::Path::new(path), path)?;
     gtiff_update::update_file(&file, |f| delete_internal(f, options.ignore_cog_layout_break))
 }
 
@@ -303,6 +317,10 @@ pub fn delete_overviews(path: &str, options: &DeleteOptions) -> Result<()> {
 pub fn delete_overviews_from_bytes(tiff: &[u8], options: &DeleteOptions) -> Result<Vec<u8>> {
     if options.external {
         return Err(Error::Unsupported("a GeoTIFF in memory has no external overviews".into()));
+    }
+    // Read by the GeoTIFF reader to be rewritten: only if the GTiff driver is allowed.
+    if crate::formats::sniff(&tiff[..tiff.len().min(4)]) == Some("GTIFF") {
+        crate::formats::check_driver_allowed("GTiff", "a GeoTIFF in memory", crate::formats::Kind::Raster)?;
     }
     let mut out = std::io::Cursor::new(tiff.to_vec());
     delete_internal(&mut out, options.ignore_cog_layout_break)?;
@@ -529,6 +547,13 @@ fn chunk_size(layout: &Layout, cols: usize) -> (usize, usize) {
         Some((w, h)) => (w as usize, h as usize),
         None => (cols, layout.rows_per_strip.map_or(usize::MAX, |r| r.max(1) as usize)),
     }
+}
+
+/// The block of a mask image of `rows` rows in chunks of `chunk`, for [`gw::mask_image`]: tiles
+/// keep their height, padded, however few rows there are (libtiff reads whole tiles, and TIFF 6.0
+/// requires a `TileLength` multiple of 16); strips span at most the rows.
+fn mask_block(chunk: (usize, usize), rows: usize, tiled: bool) -> (usize, usize, bool) {
+    (chunk.0, if tiled { chunk.1 } else { chunk.1.min(rows) }, tiled)
 }
 
 /// One overview level being computed: its pixels over rows `rows` (all columns), and its mask
@@ -1209,8 +1234,8 @@ fn new_level_image(
     img.tags.push((42112, Value::Ascii(resampling_item(method))));
     let mask = match &c.mask {
         Some(m) => {
-            let (cw, ch) = chunk_size(&layout, c.size.0);
-            let mut mi = gw::mask_image(m, c.size.0, c.size.1, (cw, ch.min(c.size.1), layout.tile.is_some()))?;
+            let block = mask_block(chunk_size(&layout, c.size.0), c.size.1, layout.tile.is_some());
+            let mut mi = gw::mask_image(m, c.size.0, c.size.1, block)?;
             for (t, v) in &mut mi.tags {
                 if *t == 254 {
                     *v = Value::Longs(vec![5]);
@@ -1465,7 +1490,7 @@ pub(crate) fn replace_chunks<F: Write + Seek>(
             } else {
                 std::borrow::Cow::Owned(m.chunks(w).flat_map(|row| &row[x0..x1]).copied().collect())
             };
-            (gw::mask_image(&m, x1 - x0, rows_n, (chunk.0, chunk.1.min(rows_n), tiled))?, chunk)
+            (gw::mask_image(&m, x1 - x0, rows_n, mask_block(chunk, rows_n, tiled))?, chunk)
         }
     };
     let (cw, ch) = (chunk.0, chunk.1.min(h.max(1)));

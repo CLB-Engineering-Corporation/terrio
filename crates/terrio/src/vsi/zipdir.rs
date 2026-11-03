@@ -28,6 +28,10 @@ pub(crate) struct CdEntry {
     pub uncompressed_size: u64,
     /// The offset of the member's local header.
     pub local_offset: u64,
+    /// The extra fields of the central directory record.
+    pub extra: Vec<u8>,
+    /// The whole central directory record, as stored.
+    pub raw: Vec<u8>,
 }
 
 impl CdEntry {
@@ -95,6 +99,20 @@ pub(crate) fn decode_name(bytes: &[u8], utf8: bool) -> String {
 
 /// The entries of the central directory.
 pub(crate) fn central_directory(r: &mut dyn ReadSeek) -> Result<Vec<CdEntry>> {
+    Ok(read_directory(r, None, false)?.0)
+}
+
+/// The entries of the central directory, within the archive limits of a raster open: the entries
+/// its end record declares and the directory's size are checked before the directory is read.
+pub(crate) fn central_directory_within(r: &mut dyn ReadSeek, limits: &crate::vfs::ZipLimits) -> Result<Vec<CdEntry>> {
+    Ok(read_directory(r, Some(limits), false)?.0)
+}
+
+/// The entries of the central directory, and its offset.
+pub(crate) fn central_directory_at(r: &mut dyn ReadSeek) -> Result<(Vec<CdEntry>, u64, Vec<u8>)> {
+    read_directory(r, None, true)
+}
+fn read_directory(r: &mut dyn ReadSeek, limits: Option<&crate::vfs::ZipLimits>, details: bool) -> Result<(Vec<CdEntry>, u64, Vec<u8>)> {
     let len = r.seek(SeekFrom::End(0))?;
     if len < 22 {
         return Err(invalid("too short"));
@@ -113,6 +131,11 @@ pub(crate) fn central_directory(r: &mut dyn ReadSeek) -> Result<Vec<CdEntry>> {
     let tail_start = len - tail_len as u64;
     let at = found.ok_or_else(|| invalid("no end of central directory"))?;
     let e = &tail[at..];
+    let comment = if details {
+        e.get(22..22 + usize::from(u16_at(e, 20))).ok_or_else(|| invalid("truncated archive comment"))?.to_vec()
+    } else {
+        Vec::new()
+    };
     let mut count = u16_at(e, 10) as u64;
     let mut cd_size = u32_at(e, 12) as u64;
     let mut cd_offset = u32_at(e, 16) as u64;
@@ -131,6 +154,12 @@ pub(crate) fn central_directory(r: &mut dyn ReadSeek) -> Result<Vec<CdEntry>> {
     }
     if cd_offset.checked_add(cd_size).is_none_or(|end| end > len) {
         return Err(invalid("central directory out of bounds"));
+    }
+    if let Some(limits) = limits {
+        limits.check_entries("zip", count)?;
+        if cd_size > crate::vfs::MAX_DIRECTORY_BYTES {
+            return Err(Error::ResourceLimit(format!("zip: a central directory of {cd_size} bytes in an archive of {len}")));
+        }
     }
     r.seek(SeekFrom::Start(cd_offset))?;
     // Do not allocate the advertised directory size or entry count. Both can be
@@ -183,7 +212,9 @@ pub(crate) fn central_directory(r: &mut dyn ReadSeek) -> Result<Vec<CdEntry>> {
         if size as u64 > remaining {
             return Err(invalid("truncated central directory"));
         }
-        let mut fields = vec![0; size];
+        let mut fields = Vec::new();
+        fields.try_reserve_exact(size).map_err(|_| Error::ResourceLimit("zip: cannot allocate a central directory record".into()))?;
+        fields.resize(size, 0);
         cd.read_exact(&mut fields)?;
         remaining -= size as u64;
         let name = decode_name(&fields[..name_len], flags & 0x800 != 0);
@@ -203,23 +234,63 @@ pub(crate) fn central_directory(r: &mut dyn ReadSeek) -> Result<Vec<CdEntry>> {
             }
             extra = &extra[(4 + size).min(extra.len())..];
         }
-        out.try_reserve(1).map_err(|_| invalid("cannot allocate central directory entries"))?;
-        out.push(CdEntry { name, flags, method, dos_time, dos_date, crc32, compressed_size, uncompressed_size, local_offset });
+        let extra_bytes = if details { fields[name_len..name_len + extra_len].to_vec() } else { Vec::new() };
+        let mut raw = if details { h.to_vec() } else { Vec::new() };
+        if details {
+            raw.extend_from_slice(&fields);
+        }
+        out.try_reserve(1).map_err(|_| Error::ResourceLimit("zip: cannot allocate central directory entries".into()))?;
+        out.push(CdEntry {
+            name,
+            flags,
+            method,
+            dos_time,
+            dos_date,
+            crc32,
+            compressed_size,
+            uncompressed_size,
+            local_offset,
+            extra: extra_bytes,
+            raw,
+        });
     }
     if out.len() as u64 != count {
         return Err(invalid("central directory entry count mismatch"));
     }
-    Ok(out)
+    Ok((out, cd_offset, comment))
 }
 
 /// The offset of a member's data: past its local header.
 pub(crate) fn data_offset(r: &mut dyn ReadSeek, e: &CdEntry) -> Result<u64> {
+    Ok(data_layout(r, e, false)?.0)
+}
+
+/// Local layout, including the presence of ZIP64 local sizes for data descriptors.
+pub(crate) fn data_layout(r: &mut dyn ReadSeek, e: &CdEntry, descriptor: bool) -> Result<(u64, bool)> {
     let header_end = e.local_offset.checked_add(30).ok_or_else(|| invalid("local header offset overflow"))?;
     let h = read_at(r, e.local_offset, 30)?;
     if u32_at(&h, 0) != LOCAL {
         return Err(invalid(&format!("no local header for '{}'", e.name)));
     }
-    header_end.checked_add(u16_at(&h, 26) as u64 + u16_at(&h, 28) as u64).ok_or_else(|| invalid("member data offset overflow"))
+    let offset =
+        header_end.checked_add(u16_at(&h, 26) as u64 + u16_at(&h, 28) as u64).ok_or_else(|| invalid("member data offset overflow"))?;
+    let mut zip64 = u32_at(&h, 18) == u32::MAX || u32_at(&h, 22) == u32::MAX;
+    if descriptor {
+        let extra = read_at(r, header_end + u64::from(u16_at(&h, 26)), usize::from(u16_at(&h, 28)))?;
+        let mut fields = extra.as_slice();
+        while !fields.is_empty() {
+            if fields.len() < 4 {
+                return Err(invalid("truncated local extra field"));
+            }
+            let size = usize::from(u16_at(fields, 2));
+            if size > fields.len() - 4 {
+                return Err(invalid("truncated local extra field"));
+            }
+            zip64 |= u16_at(fields, 0) == 1;
+            fields = &fields[4 + size..];
+        }
+    }
+    Ok((offset, zip64))
 }
 
 /// Copies a member's uncompressed bytes into `out`, checking its CRC-32.
@@ -283,6 +354,8 @@ mod tests {
             compressed_size: 0,
             uncompressed_size: 0,
             local_offset: 0,
+            extra: Vec::new(),
+            raw: Vec::new(),
         };
         assert!(entry.modified().is_some()); // 2024 is a leap year.
         entry.dos_date = (43 << 9) | (2 << 5) | 29;

@@ -1,13 +1,14 @@
 //! Native scientific groups and lazy named-dimension array views.
-use crate::{PyResultExt, invalid};
+use crate::{Detach, PyResultExt, invalid};
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyDict, PyTuple};
+use pyo3::types::{PyBytes, PyDict, PyString, PyTuple};
 use terrio::multidim::{self, ArrayInfo, View};
 
 pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyMdDataset>()?;
     m.add_class::<PyMdArray>()?;
     m.add_function(wrap_pyfunction!(open_multidim, m)?)?;
+    m.add_function(wrap_pyfunction!(mosaic_multidim, m)?)?;
     Ok(())
 }
 fn path(value: &Bound<'_, PyAny>) -> PyResult<String> {
@@ -23,6 +24,11 @@ pub struct PyMdDataset {
 }
 #[pymethods]
 impl PyMdDataset {
+    /// Reads every numeric array and coordinate; unsupported arrays fail explicitly.
+    fn check<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let summary = crate::with_warnings(py, || terrio::check::check_multidim(&self.inner))?;
+        json(py, &summary)
+    }
     /// Complete metadata, without reading coordinate or data array payloads.
     fn info<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         json(py, &self.inner)
@@ -56,16 +62,16 @@ impl PyMdDataset {
     /// Write a new .nc or .zarr numeric snapshot, preserving coordinates and source chunks.
     fn write(&self, py: Python<'_>, destination: &Bound<'_, PyAny>) -> PyResult<()> {
         let destination = path(destination)?;
-        py.detach(|| self.inner.write(&destination)).py()
+        py.detach_result(|| self.inner.write(&destination)).py()
     }
     /// Serialize a numeric snapshot as netCDF-4 bytes.
     fn to_bytes<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
-        let bytes = py.detach(|| self.inner.to_netcdf_bytes()).py()?;
+        let bytes = py.detach_result(|| self.inner.to_netcdf_bytes()).py()?;
         Ok(PyBytes::new(py, &bytes))
     }
     /// Serialize a Zarr v2 snapshot as a dictionary of relative keys and bytes.
     fn to_zarr_store<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let files = py.detach(|| self.inner.to_zarr_store()).py()?;
+        let files = py.detach_result(|| self.inner.to_zarr_store()).py()?;
         let out = PyDict::new(py);
         for (name, bytes) in files {
             out.set_item(name, PyBytes::new(py, &bytes))?;
@@ -154,7 +160,7 @@ impl PyMdArray {
     }
     /// Read the selected hyperslab as a writable NumPy array of its native type and shape.
     fn read<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let buffer = py.detach(|| self.view.read()).py()?;
+        let buffer = py.detach_result(|| self.view.read()).py()?;
         let np = py.import("numpy")?;
         let flat = np.call_method1("frombuffer", (PyBytes::new(py, &buffer.bytes), dtype(buffer.data_type)))?.call_method0("copy")?;
         flat.call_method1("reshape", (PyTuple::new(py, buffer.shape)?,))
@@ -180,13 +186,56 @@ fn dtype(t: terrio::DataType) -> &'static str {
 fn open_multidim(py: Python<'_>, src: &Bound<'_, PyAny>) -> PyResult<PyMdDataset> {
     let inner = if src.cast::<PyBytes>().is_ok() {
         let bytes: Vec<u8> = src.extract()?;
-        py.detach(|| multidim::open_bytes(&bytes)).py()?
+        py.detach_result(|| multidim::open_bytes(&bytes)).py()?
     } else if src.cast::<PyDict>().is_ok() {
         let files: std::collections::HashMap<String, Vec<u8>> = src.extract()?;
-        py.detach(|| multidim::open_zarr_store(files.into_iter().collect())).py()?
+        py.detach_result(|| multidim::open_zarr_store(files.into_iter().collect())).py()?
     } else {
         let source = path(src)?;
-        py.detach(|| multidim::open(&source)).py()?
+        py.detach_result(|| multidim::open(&source)).py()?
     };
+    Ok(PyMdDataset { inner })
+}
+
+/// Build a lazy coordinate-aligned mosaic from MultidimDataset objects or scientific inputs.
+/// arrays selects array paths/names; None selects all arrays with at least two dimensions.
+/// Last input wins overlaps. Reading a view fetches only intersecting source hyperslabs.
+/// dst optionally writes a new netCDF/Zarr snapshot; existing outputs are refused.
+#[pyfunction]
+#[pyo3(signature=(sources, dst=None, *, arrays=None))]
+fn mosaic_multidim(
+    py: Python<'_>,
+    sources: &Bound<'_, PyAny>,
+    dst: Option<&Bound<'_, PyAny>>,
+    arrays: Option<Vec<String>>,
+) -> PyResult<PyMdDataset> {
+    let message = "sources must be a sequence of multidimensional inputs; wrap a single input in a list";
+    if sources.is_instance_of::<PyString>()
+        || sources.is_instance_of::<PyBytes>()
+        || sources.is_instance_of::<PyDict>()
+        || sources.hasattr("__fspath__")?
+        || sources.cast::<PyMdDataset>().is_ok()
+    {
+        return Err(invalid(message));
+    }
+    let mut datasets = Vec::new();
+    for source in sources.try_iter().map_err(|_| invalid(message))? {
+        let source = source?;
+        if let Ok(dataset) = source.cast::<PyMdDataset>() {
+            datasets.push(dataset.try_borrow().map_err(|e| invalid(e.to_string()))?.inner.clone());
+        } else {
+            datasets.push(open_multidim(py, &source)?.inner);
+        }
+    }
+    let destination = dst.map(path).transpose()?;
+    let inner = py
+        .detach_result(|| {
+            let output = multidim::mosaic(&datasets, &multidim::MosaicOptions { arrays: arrays.unwrap_or_default() })?;
+            if let Some(path) = destination {
+                output.write(&path)?;
+            }
+            Ok(output)
+        })
+        .py()?;
     Ok(PyMdDataset { inner })
 }

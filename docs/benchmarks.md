@@ -52,13 +52,18 @@ They are machine-specific snapshots, not guarantees of performance on other data
 
 ## Output mismatch follow-up
 
-The [#253 investigation](benchmark-parity.md) records complete error measurements,
-metadata/schema fixes, native WebP corrections and explicit GDAL 3.13 COG/terrain
-profiles. [All eight affected cases were rerun](benchmark-253-rerun.md), including
-fresh timing samples and CPU tuning at budgets one and two. Six pass exact output
-validation; warp and counties retain documented numerical residuals. Background
-CPU activity exceeded the unchanged measurement limit, so no new speed ratios are
-eligible. The tables below retain their original samples.
+The [#253 investigation](benchmark-parity.md) records the underlying corrections.
+A [current release recheck](benchmark-253-current.md) at `328c3cc2` passes the established
+output validation on all eight original public-fixture cases against GDAL 3.13.3.
+It includes fresh timing samples and independent tuning at CPU budgets one and
+two; all eight rows pass the unchanged background-load gate. Separate checks at
+one, two, four and twelve CPUs match both GDAL and each tool's single-thread
+outputs. Full-image diagnostics and raw commands/samples are retained with the report.
+
+The [earlier rerun](benchmark-253-rerun.md), its six-pass result, and the older
+tables below are historical snapshots. Their samples are preserved rather than
+combined with the current measurements. The five vendor-reported reproductions
+still lack their exact inputs and commands, so #253 remains open for that scope.
 
 ## Correctness gates
 
@@ -91,8 +96,10 @@ A controlled check used the same `gdalinfo -json -stats srtm90.tif` command with
 GDAL 3.13.3 with `GDAL_NUM_THREADS=1` matched the full-resolution NumPy reduction (minimum 15,
 maximum 4338); with eight threads it returned minimum 26 and maximum 4148. GDAL 3.12.2 matched
 NumPy at both thread counts. This identifies a thread-dependent discrepancy in the tested GDAL
-3.13.3 build, not a requested approximate-statistics mode or a stored-statistics cache. Its internal
-cause remains unisolated; the invalid eight-thread result is excluded from speed comparisons.
+3.13.3 build, not a requested approximate-statistics mode or a stored-statistics cache. GDAL's
+reported valid percentage falls with the thread count, 12.54 at eight threads, as
+[measured here](benchmark-parity.md#gdal-multithreaded-statistics). Its internal cause remains
+unisolated; the invalid eight-thread result is excluded from speed comparisons.
 
 ## Rerun on 24 October 2026
 

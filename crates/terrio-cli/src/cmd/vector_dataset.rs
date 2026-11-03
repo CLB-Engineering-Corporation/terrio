@@ -1,3 +1,14 @@
+// Written to match the behavior of:
+//   GDAL v3.13.3:
+//     doc/source/programs/gdal_vector_concat.rst
+//     doc/source/programs/ogrmerge.rst
+//     doc/source/programs/gdal_vector_partition.rst
+//     doc/source/programs/gdal_vector_set_field_type.rst
+//     doc/source/programs/gdal_vector_create.rst
+//     doc/source/programs/gdal_vector_export_schema.rst
+//     doc/source/programs/gdal_vector_update.rst
+// No code is translated from these sources.
+
 //! Dataset-level vector commands: `concat`, `partition`, `set-field-type`, `make-point`,
 //! `create` and `export-schema` (GDAL's `gdal vector concat`, `partition`, `set-field-type`,
 //! `make-point`, `create` and `export-schema`).
@@ -70,7 +81,7 @@ pub fn concat(a: ConcatArgs) -> Result<()> {
     let options = terrio::VectorOpenOptions { layers: Vec::new(), ..Default::default() };
     let mut sources = Vec::with_capacity(inputs.len());
     for input in inputs {
-        let mut layers = super::quiet(|| terrio::open_vector(input, &options))?.layers;
+        let mut layers = super::quiet(|| terrio::open_vector(input, &options))?.into_resolved_layers();
         if !a.layers.is_empty() {
             layers.retain(|l| a.layers.contains(&l.name));
         }
@@ -245,7 +256,7 @@ pub struct MakePointArgs {
 pub fn make_point(a: MakePointArgs) -> Result<()> {
     let layers = a.layer.iter().cloned().collect();
     let ds = super::quiet(|| terrio::open_vector(&a.input, &terrio::VectorOpenOptions { layers, ..Default::default() }))?;
-    let layer = ds.layers.into_iter().next().ok_or_else(|| Error::InvalidArgument("no input vector layer".into()))?;
+    let layer = ds.into_resolved_layers().into_iter().next().ok_or_else(|| Error::InvalidArgument("no input vector layer".into()))?;
     let o = terrio::ops::make_point::MakePointOptions { x: a.x, y: a.y, z: a.z, m: a.m, crs: srs(&a.dst_crs)? };
     a.output.write(vec![terrio::ops::make_point::make_point(&layer, &o)?])
 }
@@ -412,7 +423,7 @@ pub fn rename_layer(a: RenameLayerArgs) -> Result<()> {
             Ok(())
         }
         Some(out) => {
-            let mut layers = super::quiet(|| terrio::open_vector(&a.input, &Default::default()))?.layers;
+            let mut layers = super::quiet(|| terrio::open_vector(&a.input, &Default::default()))?.into_resolved_layers();
             terrio::ops::vector_edit::rename_layers(&mut layers, &o)?;
             existing_output(out, a.overwrite)?;
             let options = terrio::VectorWriteOptions { driver: driver(a.format.as_deref())?, ..Default::default() };
@@ -519,7 +530,8 @@ pub fn update(a: UpdateArgs) -> Result<()> {
         return Err(Error::InvalidArgument("input and output datasets must be different".into()));
     }
     let layers = a.input_layer.iter().cloned().collect();
-    let src = super::quiet(|| terrio::open_vector(&a.input, &terrio::VectorOpenOptions { layers, ..Default::default() }))?.layers;
+    let src =
+        super::quiet(|| terrio::open_vector(&a.input, &terrio::VectorOpenOptions { layers, ..Default::default() }))?.into_resolved_layers();
     let o =
         ve::UpdateOptions { input_layer: a.input_layer, output_layer: a.output_layer, key: a.key, mode: ve::UpdateMode::parse(&a.mode)? };
     let c = super::quiet(|| ve::update(&src, &a.output, &o))?;

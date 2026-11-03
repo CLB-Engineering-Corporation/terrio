@@ -1,3 +1,11 @@
+// Written to match the behavior of:
+//   GDAL v3.13.3:
+//     apps/gdalalg_vector_rename_layer.cpp
+//     apps/gdalalg_vector_edit.cpp
+//     apps/gdalalg_vector_update.cpp
+//     ogr/ogrsf_frmts/gpkg/ogrgeopackagedatasource.cpp
+// No code is translated from these sources.
+
 //! Editing GeoPackage files in place: renaming layers, changing a layer's CRS (without
 //! reprojecting) or declared geometry type, dataset and layer metadata (GDAL's
 //! `<GDALMultiDomainMetadata>` in `gpkg_metadata`), and updating features matched by feature
@@ -71,10 +79,7 @@ pub(crate) fn modify_file<T>(path: &str, f: impl FnOnce(&mut Database) -> Result
             "'{path}' has a hot rollback journal (a transaction interrupted or under way); open it with SQLite to recover it first"
         )));
     }
-    let wal = format!("{path}-wal");
-    if std::fs::metadata(&wal).is_ok_and(|m| m.len() > 0) {
-        return Err(Error::Unsupported(format!("'{path}' has a write-ahead log: checkpoint it with SQLite first")));
-    }
+    crate::drivers::sqlite_edit::ensure_no_wal(p)?;
     let (bytes, value) = modify_bytes(std::fs::read(p)?, f)?;
     use std::io::Write;
     let mut tmp = tempfile::NamedTempFile::new_in(p.parent().unwrap_or(Path::new(".")))?;
@@ -674,7 +679,7 @@ pub(crate) fn update_features(d: &mut Database, name: &str, src: &Layer, keys: &
             values[gi] = match &f.geometry {
                 Some(g) => {
                     bbox = g.bbox().filter(|b| b.min_x.is_finite() && b.min_y.is_finite());
-                    z = crate::vector::geometry_has_z(g);
+                    z = crate::vector::geometry_dims(g).0;
                     w::Value::Blob(gw::gpkg_geometry(g, srs as i32))
                 }
                 None => w::Value::Null,
@@ -696,6 +701,9 @@ pub(crate) fn update_features(d: &mut Database, name: &str, src: &Layer, keys: &
     let mut added: Vec<(i64, Vec<w::Value>)> = Vec::new();
     let mut bounds: Option<[f64; 4]> = None;
     let mut has_z = false;
+    let mut missing_z = false;
+    let mut has_m = false;
+    let mut missing_m = false;
     let max_rowid = t.rows.iter().map(|(id, _)| *id).max().unwrap_or(0);
     let mut next = d.sequence(&name).max(max_rowid) + 1;
     let existing: HashMap<i64, &Vec<w::Value>> = t.rows.iter().map(|(id, v)| (*id, v)).collect();
@@ -747,6 +755,15 @@ pub(crate) fn update_features(d: &mut Database, name: &str, src: &Layer, keys: &
             });
         }
         has_z |= z;
+        if geom_col.is_some()
+            && let Some(g) = &f.geometry
+        {
+            let (az, m) = crate::vector::geometry_dims(g);
+            has_z |= az;
+            missing_z |= !az;
+            has_m |= m;
+            missing_m |= !m;
+        }
     }
     if changed.is_empty() && added.is_empty() {
         return Ok(counts);
@@ -765,7 +782,7 @@ pub(crate) fn update_features(d: &mut Database, name: &str, src: &Layer, keys: &
     if let (Some((g, ..)), Some(gi)) = (&geometry, geom_col) {
         d.rebuild_rtree(&name, g, gi);
     }
-    let enc = gu::Encoded { rows: added, geom_col, bounds, has_z };
+    let enc = gu::Encoded { rows: added, geom_col, bounds, has_z, missing_z, has_m, missing_m };
     d.appended(&name, &sql, &enc, total as i64);
     Ok(counts)
 }
@@ -937,6 +954,27 @@ mod tests {
         let l = &read(&out)[0];
         assert_eq!(l.features[1].attributes[1], FieldValue::Integer(1));
         assert_eq!(l.len(), 4);
+    }
+
+    #[test]
+    fn height_updates_relax_mandatory_z_without_losing_remaining_heights() {
+        let mut layer = Layer::new("points").with_epsg(4326);
+        layer.features = (1..=2)
+            .map(|fid| Feature { fid, attributes: vec![], geometry: Some(Geometry::Point(Coord::xyz(fid as f64, 2., 3.))) })
+            .collect();
+        let base = gw::to_bytes(std::slice::from_ref(&layer)).unwrap();
+        layer.features.truncate(1);
+        layer.features[0].geometry = Some(Geometry::point(7., 8.));
+        let (bytes, counts) = modify_bytes(base, |d| update_features(d, "points", &layer, &[], Upsert::UpdateOnly)).unwrap();
+        assert_eq!(counts.updated, 1);
+        let db = Db::new(bytes.clone()).unwrap();
+        let table = db.table("gpkg_geometry_columns").unwrap();
+        assert_eq!(table.get(&table.rows[0], "z").unwrap().as_i64(), Some(2));
+        let back = read(&bytes);
+        assert_eq!(back[0].features[0].geometry, layer.features[0].geometry);
+        assert_eq!(back[0].features[1].geometry.as_ref().unwrap().all_coords()[0].z, Some(3.));
+        let report = crate::gpkg_validate::validate_gpkg_bytes(&bytes, &Default::default()).unwrap();
+        assert!(report.is_valid, "{:?}", report.errors);
     }
 
     #[test]

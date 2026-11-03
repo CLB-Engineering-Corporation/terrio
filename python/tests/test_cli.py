@@ -5,6 +5,8 @@ import os
 import subprocess
 import sys
 import sysconfig
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 import pytest
@@ -134,3 +136,73 @@ def test_warp_dst_transform(tmp_path):
     assert np.array_equal(np.asarray(r.read())[0], values[0].T)
     result = run("warp", src, out, "--dst-transform", "0", "0", "1", "4", "-1", "0")
     assert result.returncode != 0 and "size" in result.stderr
+
+
+@pytest.mark.parametrize("path", [[], ["warp"], ["vsi", "sync"], ["vsi", "sozip", "create"]])
+def test_json_usage_without_dataset_arguments(path):
+    result = run(*path, "--json-usage")
+    assert result.returncode == 0, result.stderr
+    catalog = json.loads(result.stdout)
+    assert catalog["schema_version"] == "0.1"
+    assert catalog["unstable"] is True
+    assert catalog["command"]["path"] == ["terrio", *path]
+    assert catalog["command"]["arguments"]
+    if not path:
+        names = {c["name"] for c in catalog["command"]["subcommands"]}
+        assert {"warp", "vsi", "lineref", "filter"} <= names
+        assert not {"mcp", "ui", "help"} & names
+
+
+def test_json_usage_literal_dataset_name(tmp_path):
+    (tmp_path / "--json-usage").write_text(json.dumps(POINTS))
+    result = run("vsi", "list", "--", "--json-usage", cwd=tmp_path)
+    assert result.returncode == 0, result.stderr
+    assert '"schema_version"' not in result.stdout
+    assert "--json-usage" in result.stdout
+
+
+@pytest.mark.parametrize("path", [[], ["vsi", "sync"], ["warp"]])
+def test_json_usage_matches_published_schema(path):
+    from jsonschema import Draft202012Validator
+
+    schema = json.loads(
+        (Path(__file__).resolve().parents[2] / "schemas/cli-usage-v0.1.schema.json").read_text()
+    )
+    Draft202012Validator.check_schema(schema)
+    result = run(*path, "--json-usage")
+    assert result.returncode == 0, result.stderr
+    Draft202012Validator(schema).validate(json.loads(result.stdout))
+
+
+def test_ui_runs_commands_with_the_token_and_refuses_without(tmp_path):
+    """Serves the forms' API through ``python -m terrio``, running commands in this interpreter."""
+    (tmp_path / "points.geojson").write_text(json.dumps(POINTS))
+    server = subprocess.Popen(
+        [sys.executable, "-m", "terrio", "ui", "--no-open"],
+        cwd=tmp_path,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        line = server.stdout.readline().strip()
+        base, token = line.removeprefix("terrio ui: ").split("/#token=")
+        headers = {"X-Terrio-Token": token}
+
+        def run(*args):
+            """Runs ``terrio info`` through the server and returns the decoded result."""
+            body = json.dumps({"name": "info", "arguments": {"args": list(args)}})
+            request = urllib.request.Request(f"{base}/api/run", body.encode(), headers)
+            with urllib.request.urlopen(request, timeout=60) as reply:
+                return json.load(reply)
+
+        result = run("points.geojson", "--json")
+        assert result["isError"] is False
+        assert json.loads(result["content"][0]["text"])["type"] == "vector"
+        with pytest.raises(urllib.error.HTTPError) as refused:
+            urllib.request.urlopen(f"{base}/api/catalog", timeout=60)
+        assert refused.value.code == 403
+    finally:
+        server.kill()
+        server.wait()
+        server.stdout.close()

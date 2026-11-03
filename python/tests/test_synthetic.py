@@ -296,6 +296,24 @@ def test_errors():
         terrio.open_bytes(b"not a dataset", "x.unknown")
 
 
+def test_local_open_errors_name_the_path(tmp_path):
+    """`open_raster` (eager or lazy) and `validate_cog` name a missing file in their errors, and
+    `validate_cog` a directory, which it reads as a file; the exception classes are unchanged."""
+    missing = str(tmp_path / "missing.tif")
+    directory = tmp_path / "directory.tif"
+    directory.mkdir()
+    cases = [
+        (terrio.open_raster, missing, terrio.NotFoundError),
+        (lambda path: terrio.open_raster(path, lazy=True), missing, terrio.NotFoundError),
+        (terrio.validate_cog, missing, terrio.NotFoundError),
+        (terrio.validate_cog, str(directory), terrio.TerrioIOError),
+    ]
+    for function, path, error in cases:
+        with pytest.raises(terrio.TerrioError) as e:
+            function(path)
+        assert type(e.value) is error and path in str(e.value), e.value
+
+
 def test_to_geopandas():
     gpd = pytest.importorskip("geopandas")
     layer = terrio.Layer.from_geojson(POLYGONS, name="squares")
@@ -492,8 +510,27 @@ def test_dem_path_to_path_is_streamed(tmp_path):
             assert r.is_lazy
             np.testing.assert_array_equal(r.read(), whole.read())
             assert r.nodata == whole.nodata and r.count == whole.count
+            assert r.crs == whole.crs
+            assert r.transform == whole.transform
+    # A pathlib.Path source takes the same path to path route, and so the budget.
+    r = terrio.dem(src, "slope", dst=str(tmp_path / "path.tif"), max_memory_mib=0.001)
+    assert r.is_lazy
+    np.testing.assert_array_equal(
+        r.read(), terrio.dem(terrio.open_raster(str(src)), "slope").read()
+    )
     with pytest.raises(terrio.InvalidArgumentError):
         terrio.dem(str(src), "slope", max_memory_mib=10)
+    with pytest.raises(terrio.InvalidArgumentError, match="VRT output"):
+        terrio.dem(
+            str(src),
+            "color-relief",
+            color_file=str(colors),
+            dst=str(tmp_path / "x.vrt"),
+            max_memory_mib=10,
+        )
+    # An output that is also the input is read whole: a budget cannot apply.
+    with pytest.raises(terrio.InvalidArgumentError):
+        terrio.dem(str(src), "slope", dst=str(src), max_memory_mib=10)
 
 
 def test_shaded_relief_matches_the_numpy_blend(tmp_path):

@@ -37,6 +37,9 @@
 //!
 //! [`open_raster_lazy`] opens a GeoTIFF or COG, local or remote, by its headers; a
 //! [`LazyRaster::read_window`] decodes only the tiles it needs, fetched with HTTP range requests.
+//! [`LazyRaster::read_window_f32`] reads a window as `f32` values instead, NaN where GDAL's mask
+//! band marks pixels invalid (their nodata value, or the raster's mask), scales and offsets
+//! applied on request ([`FloatReadOptions`]).
 //!
 //! ```no_run
 //! let mut cog = terrio::open_raster_lazy("https://example.com/cog.tif")?;
@@ -138,6 +141,7 @@
 //! - `sqlite`: GeoPackage and SQLite/SpatiaLite;
 //! - `tiles`: MBTiles, PMTiles and MVT ([`tiles`]); `avif`: their AVIF tiles;
 //! - `zarr`, `jp2` (JPEG 2000), `flatgeobuf`, `osm` (OpenStreetMap);
+//! - `xlsx`: XLSX and XLSM workbooks, in pure Rust;
 //! - `pointcloud`: LAS, LAZ, COPC, EPT, PLY and E57 ([`pointcloud`]);
 //! - `lerc` and `lzma`: GeoTIFFs with those compressions.
 //!
@@ -152,7 +156,9 @@
 //!   a raster's pixels, of shape `(bands, rows, cols)` or of one band, borrowed or mutable
 //!   (`RasterArrayExt`); moves of a dataset's pixels into an owned array and back
 //!   (`RasterDataset::into_array3` and `RasterDataset::from_array3`); the masks of lazy reads as
-//!   arrays (`LazyRaster::read_mask_array2`). The crate is re-exported as `terrio::ndarray`.
+//!   arrays (`LazyRaster::read_mask_array2`); floating-point windows, NaN where pixels are
+//!   invalid, as owned arrays, bands first or last (`LazyRaster::read_window_array3`). The crate is
+//!   re-exported as `terrio::ndarray`.
 //!
 //! # Minimum supported Rust version
 //!
@@ -190,20 +196,34 @@ mod avif;
 mod civil_time;
 mod cog;
 mod cog_validate;
+pub mod config;
 pub mod crs;
 mod dataset;
+pub mod dataset_files;
 mod drivers;
+#[cfg(test)]
+mod entry_allow_list_tests;
 mod error;
+mod float_read;
 pub mod formats;
+#[cfg(feature = "hecras")]
+#[cfg_attr(docsrs, doc(cfg(feature = "hecras")))]
+pub use drivers::hecras;
 #[cfg(feature = "gdal")]
 #[cfg_attr(docsrs, doc(cfg(feature = "gdal")))]
 pub mod gdal_backend;
 mod geotiff;
+pub mod gpkg_maintenance;
+mod gpkg_validate;
+#[cfg(feature = "sqlite")]
+mod gpkg_validation;
+pub use gpkg_validate::{GpkgRequirement, GpkgValidation, GpkgValidationOptions, GpkgViolation, validate_gpkg, validate_gpkg_bytes};
 mod histogram;
 #[cfg(remote)]
 #[cfg_attr(docsrs, doc(cfg(feature = "remote")))]
 pub mod http;
 pub mod info;
+pub mod inspection;
 mod jpeg;
 mod memfs;
 pub mod memory;
@@ -212,6 +232,7 @@ pub mod multidim;
 mod ndarray_ext;
 pub mod ops;
 mod par;
+pub mod parquet_metadata;
 mod pixel;
 #[cfg(feature = "pointcloud")]
 #[cfg_attr(docsrs, doc(cfg(feature = "pointcloud")))]
@@ -232,6 +253,7 @@ pub mod raster {
     pub use wbraster::{CrsInfo, RasterError, ReprojectOptions, ResampleMethod};
 }
 pub mod catalog;
+pub mod check;
 pub mod stac;
 mod stacta;
 pub mod stream;
@@ -241,16 +263,28 @@ pub mod vsi;
 pub mod warnings;
 
 pub use cog::{LazyRaster, TiffReadLimits, Window, WindowOptions, open_raster_lazy};
-pub use cog_validate::{CogValidation, validate_cog};
+pub use cog_validate::{
+    CogValidation, CogValidationOptions, CogValidationProfile, validate_cog, validate_cog_bytes, validate_cog_with_options,
+};
+/// The memory the process can use, which reads refuse windows past.
+pub use dataset::fallible::usable_memory;
 pub use dataset::{
     BandMetadata, Dataset, Gcp, Geolocation, OVERVIEW_REPORT_DOMAIN, OverviewReport, RasterDataset, RasterWriteOptions, VectorDataset,
     VectorOpenOptions, VectorWriteOptions, geo_transform, is_north_up, list_layers, open, open_raster, open_raster_with_tiff_limits,
     open_vector, read_gcps, write_netcdf_groups, write_raster, write_raster_dataset, write_raster_dataset_with_report, write_vector,
 };
 pub use drivers::gtiff_write::GeoTiffWriter;
+pub use drivers::vector::citygml_write::{CityGmlLod0Surface, CityGmlVersion};
+pub use drivers::vector::cityjson_write::CityJsonVersion;
 pub use drivers::vector::csv::{CsvGeometry, CsvOptions};
-pub use drivers::vector::geojson::GeoJsonOptions;
+pub use drivers::vector::geojson::{GeoJsonIdType, GeoJsonOptions};
+pub use drivers::vector::hecras_options::HecRasOpenOptions;
+pub use drivers::vector::kml::KmzOptions;
+pub use drivers::vector::shapefile::{OrganizePolygons, ShapefileOptions};
+pub use drivers::vector::wfs::WfsOpenOptions;
+pub use drivers::vector::xlsx_options::{XlsxColumnWidth, XlsxFieldTypes, XlsxHeaders, XlsxOptions};
 pub use error::{Error, Result};
+pub use float_read::FloatReadOptions;
 /// The `ndarray` crate, of the version terrio's array views of raster pixels use.
 #[cfg(feature = "ndarray")]
 #[cfg_attr(docsrs, doc(cfg(feature = "ndarray")))]
@@ -258,7 +292,7 @@ pub use ndarray;
 // Raster pixels as `ndarray` arrays, without copying them.
 #[cfg(feature = "ndarray")]
 #[cfg_attr(docsrs, doc(cfg(feature = "ndarray")))]
-pub use ndarray_ext::{ArrayError, RasterArrayExt, RasterElement};
+pub use ndarray_ext::{ArrayError, BandLayout, FloatElement, RasterArrayExt, RasterElement};
 
 /// The raster type: pixels, georeferencing and CRS, in memory.
 pub use wbraster::{DataType, Raster, RasterConfig};

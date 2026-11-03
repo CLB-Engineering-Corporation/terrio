@@ -1,3 +1,13 @@
+// SPDX-FileCopyrightText: Copyright (c) 2005, Frank Warmerdam <warmerdam@pobox.com>
+// SPDX-FileCopyrightText: Copyright (c) 2010-2015, Even Rouault <even dot rouault at spatialys dot com>
+// SPDX-FileCopyrightText: Copyright (c) 2015, European Union Satellite Centre
+// SPDX-FileCopyrightText: Copyright (c) 2026 Qiusheng Wu and Terrio contributors
+// SPDX-License-Identifier: MIT
+//
+// Derived from (translated to Rust and modified):
+//   GDAL v3.13.3:
+//     gcore/gdaljp2metadata.cpp
+
 //! JPEG 2000 (`.jp2`, `.j2k`), coded with `openjp2`, a pure-Rust port of OpenJPEG (the codec
 //! behind GDAL's JP2OpenJPEG driver), so decoded pixels match GDAL's, signed samples included, in
 //! native and WebAssembly builds alike.
@@ -145,22 +155,23 @@ mod codec {
 
     /// Copies the components into one buffer, band after band, of the type their precision and
     /// signedness need.
-    fn collect(comps: &[&[i32]], precision: u32, signed: bool) -> RasterData {
-        fn gather<T>(comps: &[&[i32]], f: impl Fn(i32) -> T) -> Vec<T> {
-            let mut out = Vec::with_capacity(comps.iter().map(|c| c.len()).sum());
+    fn collect(comps: &[&[i32]], precision: u32, signed: bool) -> Result<RasterData> {
+        fn gather<T>(comps: &[&[i32]], f: impl Fn(i32) -> T) -> Result<Vec<T>> {
+            let mut out = Vec::new();
+            crate::dataset::fallible::reserve(&mut out, comps.iter().map(|c| c.len()).sum(), "a JPEG 2000 image")?;
             for c in comps {
                 out.extend(c.iter().map(|&v| f(v)));
             }
-            out
+            Ok(out)
         }
-        match (precision, signed) {
-            (0..=8, false) => RasterData::U8(gather(comps, |v| v as u8)),
-            (0..=8, true) => RasterData::I8(gather(comps, |v| v as i8)),
-            (9..=16, false) => RasterData::U16(gather(comps, |v| v as u16)),
-            (9..=16, true) => RasterData::I16(gather(comps, |v| v as i16)),
-            (_, false) => RasterData::U32(gather(comps, |v| v as u32)),
-            (_, true) => RasterData::I32(gather(comps, |v| v)),
-        }
+        Ok(match (precision, signed) {
+            (0..=8, false) => RasterData::U8(gather(comps, |v| v as u8)?),
+            (0..=8, true) => RasterData::I8(gather(comps, |v| v as i8)?),
+            (9..=16, false) => RasterData::U16(gather(comps, |v| v as u16)?),
+            (9..=16, true) => RasterData::I16(gather(comps, |v| v as i16)?),
+            (_, false) => RasterData::U32(gather(comps, |v| v as u32)?),
+            (_, true) => RasterData::I32(gather(comps, |v| v)?),
+        })
     }
 
     /// What a codestream's main header tells: the image area on the reference grid, the
@@ -316,7 +327,7 @@ mod codec {
                 }
                 let precision = precisions.iter().copied().max().unwrap_or(8);
                 let signed = comps[0].sgnd != 0;
-                Ok((w, h, collect(&planes, precision, signed)))
+                Ok((w, h, collect(&planes, precision, signed)?))
             })
         }
     }
@@ -720,6 +731,7 @@ impl StreamSource {
 /// the resolution levels as overviews, a window decoding only the tiles, precincts and code blocks
 /// it covers (the tiles in parallel).
 struct Jp2Window {
+    referenced: bool,
     source: StreamSource,
     len: u64,
     j2k: bool,
@@ -782,7 +794,15 @@ impl Jp2Window {
         // Without georeferencing, unit pixels with the image's bottom at y = 0, as terrio's other
         // readers do.
         ds.set_geo_transform(gt.unwrap_or([0.0, 1.0, 0.0, h as f64, 0.0, -1.0]));
-        Ok((Self { source, len, j2k, header, alpha, overviews, block }, ds))
+        let reversibility = reversibility(source.open()?.as_mut(), len, j2k).unwrap_or(None);
+        ds.metadata_domains = image_structure(&header.precisions, alpha, reversibility);
+        if !palette {
+            ds.band_metadata = color_interpretation(&boxes_bytes, bands)
+                .into_iter()
+                .map(|c| crate::BandMetadata { color_interp: Some(c.to_string()), ..Default::default() })
+                .collect();
+        }
+        Ok((Self { referenced: gt.is_some(), source, len, j2k, header, alpha, overviews, block }, ds))
     }
 
     /// Decodes an area of the reference grid at a resolution level, on a stream of its own.
@@ -790,6 +810,172 @@ impl Jp2Window {
         let mut stream = self.source.open()?;
         codec::decode_area(stream.as_mut(), self.len, self.j2k, Some(area), reduce, self.alpha)
     }
+}
+
+/// The colour interpretation GDAL gives each band (`JP2OPJLikeRasterBand::GetColorInterpretation`):
+/// the alpha channel of the `cdef` box; gray for one or two bands in the greyscale colour space;
+/// red, green and blue (the `cdef` box's, else the first three) in the sRGB and sYCC spaces
+/// (`colr` box enumerations 16, 18, 20 and 21; 17 is greyscale); undefined otherwise, codestreams
+/// without a JP2 header included.
+fn color_interpretation(b: &[u8], bands: usize) -> Vec<&'static str> {
+    #[derive(PartialEq)]
+    enum Space {
+        Gray,
+        Rgb,
+        Other,
+    }
+    let header = boxes(b).into_iter().find(|(t, _)| t == b"jp2h").map(|(_, p)| boxes(p)).unwrap_or_default();
+    let space = header
+        .iter()
+        .find(|(t, _)| t == b"colr")
+        .and_then(|(_, c)| (c.first() == Some(&1) && c.len() >= 7).then(|| u32::from_be_bytes([c[3], c[4], c[5], c[6]])))
+        .map_or(Space::Other, |e| match e {
+            17 => Space::Gray,
+            16 | 18 | 20 | 21 => Space::Rgb,
+            _ => Space::Other,
+        });
+    let (mut rgb, mut alpha) = ([Some(0usize), Some(1), Some(2)], None);
+    if let Some((_, c)) = header.iter().find(|(t, _)| t == b"cdef")
+        && c.len() == 2 + bands * 6
+        && u16::from_be_bytes([c[0], c[1]]) as usize == bands
+    {
+        rgb = [None; 3];
+        for e in c[2..].as_chunks::<6>().0.iter() {
+            let (cn, typ, asoc) =
+                (u16::from_be_bytes([e[0], e[1]]) as usize, u16::from_be_bytes([e[2], e[3]]), u16::from_be_bytes([e[4], e[5]]));
+            if cn >= bands {
+                break;
+            }
+            match (typ, asoc) {
+                (0, 1..=3) => rgb[asoc as usize - 1] = Some(cn),
+                (1, _) => alpha = Some(cn),
+                _ => {}
+            }
+        }
+    }
+    (0..bands)
+        .map(|i| {
+            if alpha == Some(i) {
+                "Alpha"
+            } else if bands <= 2 && space == Space::Gray {
+                "Gray"
+            } else if space == Space::Rgb && rgb.contains(&Some(i)) {
+                ["Red", "Green", "Blue"][rgb.iter().position(|&c| c == Some(i)).unwrap_or(0)]
+            } else {
+                "Undefined"
+            }
+        })
+        .collect()
+}
+
+/// GDAL's `IMAGE_STRUCTURE` metadata of a JPEG 2000 dataset and of its bands: the pixel
+/// interleave of several bands and the compression's reversibility
+/// (`GDALJP2AbstractDataset::GetMetadata`), each band's compression and its bit depth when not a
+/// whole number of bytes, a 1-bit alpha band of 8-bit colours counting as 8 bits
+/// (`JP2OPJLikeRasterBand`).
+fn image_structure(precisions: &[u32], alpha: Option<usize>, reversibility: Option<&'static str>) -> Vec<crate::dataset::MetadataDomain> {
+    let domain = || "IMAGE_STRUCTURE".to_string();
+    let mut dataset = Vec::new();
+    if precisions.len() > 1 {
+        dataset.push(("INTERLEAVE".to_string(), "PIXEL".to_string()));
+    }
+    if let Some(r) = reversibility {
+        dataset.push(("COMPRESSION_REVERSIBILITY".to_string(), r.to_string()));
+    }
+    let mut out = Vec::new();
+    if !dataset.is_empty() {
+        out.push((None, domain(), dataset));
+    }
+    let colour = |a: usize| if a == 0 && precisions.len() > 1 { 1 } else { 0 };
+    for (b, &p) in precisions.iter().enumerate() {
+        let promoted = alpha == Some(b) && p == 1 && precisions.get(colour(b)) == Some(&8);
+        let mut items = Vec::new();
+        if p % 8 != 0 && !promoted {
+            items.push(("NBITS".to_string(), p.to_string()));
+        }
+        items.push(("COMPRESSION".to_string(), "JPEG2000".to_string()));
+        out.push((Some(b), domain(), items));
+    }
+    out
+}
+
+/// The reversibility GDAL reports for a JPEG 2000 codestream (`GDALGetJPEG2000Reversibility`):
+/// from the wavelet of the last COD marker before the first tile's data (9-7 lossy, 5-3 lossless
+/// "possibly"), and for the 5-3 wavelet, from the last COM marker of Kakadu's or GDAL's
+/// OpenJPEG writer. `None` without a COD marker.
+fn reversibility(r: &mut dyn codec::ReadSeek, len: u64, j2k: bool) -> Result<Option<&'static str>> {
+    use std::io::SeekFrom;
+    // The codestream: the whole file, or the `jp2c` box.
+    let mut start = 0u64;
+    if !j2k {
+        let mut pos = 0u64;
+        loop {
+            if pos + 8 > len {
+                return Ok(None);
+            }
+            r.seek(SeekFrom::Start(pos))?;
+            let mut h = [0u8; 16];
+            r.read_exact(&mut h[..8])?;
+            let size = u32::from_be_bytes([h[0], h[1], h[2], h[3]]) as u64;
+            let (header, total) = match size {
+                0 => (8, len - pos),
+                1 => {
+                    r.read_exact(&mut h[8..16])?;
+                    (16, u64::from_be_bytes([h[8], h[9], h[10], h[11], h[12], h[13], h[14], h[15]]))
+                }
+                n => (8, n),
+            };
+            if &h[4..8] == b"jp2c" {
+                start = pos + header;
+                break;
+            }
+            match pos.checked_add(total) {
+                Some(end) if total >= header && end <= len => pos = end,
+                _ => return Ok(None),
+            }
+        }
+    }
+    // The main header and the first tile-part header, up to its data (SOD): small.
+    let n = (len - start).min(1 << 20) as usize;
+    let mut cs = vec![0u8; n];
+    r.seek(SeekFrom::Start(start))?;
+    r.read_exact(&mut cs)?;
+    let (mut transformation, mut comment) = (None, None);
+    let mut pos = 2;
+    while pos + 4 <= cs.len() && cs[pos] == 0xff {
+        let marker = cs[pos + 1];
+        if marker == 0x93 || marker == 0xd9 {
+            break;
+        }
+        let seg = u16::from_be_bytes([cs[pos + 2], cs[pos + 3]]) as usize;
+        let body = cs.get(pos + 4..pos + 2 + seg).unwrap_or_default();
+        match marker {
+            0x52 => transformation = body.get(9).copied(),
+            0x64 => comment = body.get(2..).map(|t| String::from_utf8_lossy(t).into_owned()),
+            _ => {}
+        }
+        if seg < 2 {
+            break;
+        }
+        pos += 2 + seg;
+    }
+    Ok(match transformation {
+        Some(0) => Some("LOSSY"),
+        Some(1) => {
+            Some(match comment.as_deref() {
+                Some(c) if c.starts_with("Kdu-Layer-Info: log_2{Delta-D(squared-error)/Delta-L(bytes)}, L(bytes)") => {
+                    if c.contains("-192.0,") { "LOSSLESS" } else { "LOSSY" }
+                }
+                Some(c) if c.starts_with("Kdu-Layer-Info: log_2{Delta-D(MSE)/[2^16*Delta-L(bytes)]}, L(bytes)") => {
+                    if c.contains("-256.0,") { "LOSSLESS" } else { "LOSSY" }
+                }
+                Some(c) if c.starts_with("Created by OpenJPEG") && c.contains("LOSSLESS settings used") => "LOSSLESS",
+                Some(c) if c.starts_with("Created by OpenJPEG") && c.contains("LOSSY settings used") => "LOSSY",
+                _ => "LOSSLESS (possibly)",
+            })
+        }
+        _ => None,
+    })
 }
 
 /// `ceil(a / 2^r)`, as JPEG 2000 maps reference grid coordinates to a resolution level.
@@ -803,7 +989,8 @@ fn ceil_shift(a: u32, r: u32) -> usize {
 fn levels(w: usize, h: usize, tile: (u32, u32), resolutions: u32) -> (Vec<(usize, usize)>, (usize, usize)) {
     let (mut tw, mut th) = (tile.0 as usize, tile.1 as usize);
     let single = w == tw && h == th;
-    let mut block = (tw.min(w), th.min(h));
+    // The tile is the block (`JP2OPJLikeDataset::Open`), unless one of the cases below applies.
+    let mut block = (tw, th);
     let decode_area = if w <= 1024 && h <= 1024 && tw < 32 && th < 32 {
         block = (w, h);
         true
@@ -832,6 +1019,9 @@ fn levels(w: usize, h: usize, tile: (u32, u32), resolutions: u32) -> (Vec<(usize
 }
 
 impl crate::cog::WindowSource for Jp2Window {
+    fn geotransform_present(&self) -> Option<bool> {
+        Some(self.referenced)
+    }
     fn overviews(&self) -> Vec<(usize, usize)> {
         self.overviews.clone()
     }
@@ -887,13 +1077,19 @@ impl Jp2Window {
             .collect();
         let (w, h) = (window.width, window.height);
         let all = self.header.precisions.len();
+        let len = crate::dataset::fallible::len(&[w, h, all], "the JPEG 2000 window")?;
+        let window_buffer = |t| crate::dataset::fallible::raster_data(t, len, 0.0, "the JPEG 2000 window");
+        // A window of several parts: its buffer first, fallibly, as its size comes from the header.
+        let mut out: Option<RasterData> = None;
+        if parts.len() > 1 {
+            out = Some(window_buffer(codec::data_type(&self.header.precisions, self.header.signed, self.alpha))?);
+        }
         let decoded: Vec<Result<(usize, usize, RasterData)>> = if parts.len() == 1 {
             vec![self.decode(area, r)]
         } else {
             crate::par::map_range_coarse(parts.len(), |k| self.decode(parts[k], r))
         };
         let (ox, oy) = (ceil_shift(area[0], r), ceil_shift(area[1], r));
-        let mut out: Option<RasterData> = None;
         for (part, d) in parts.iter().zip(decoded) {
             let (pw, ph, data) = d?;
             let (px, py) = (ceil_shift(part[0], r) - ox, ceil_shift(part[1], r) - oy);
@@ -904,7 +1100,11 @@ impl Jp2Window {
                 out = Some(data);
                 break;
             }
-            let dst = out.get_or_insert_with(|| RasterData::new_filled(data.data_type(), w * h * all, 0.0));
+            if out.as_ref().is_none_or(|o| o.data_type() != data.data_type()) {
+                drop(out.take());
+                out = Some(window_buffer(data.data_type())?);
+            }
+            let Some(dst) = out.as_mut() else { unreachable!("allocated above") };
             macro_rules! place {
                 ($($v:ident),*) => {
                     match (dst, &data) {
@@ -935,7 +1135,8 @@ impl Jp2Window {
             ($($v:ident),*) => {
                 match &data {
                     $(RasterData::$v(src) => {
-                        let mut out = Vec::with_capacity(bands.len() * n);
+                        let mut out = Vec::new();
+                        crate::dataset::fallible::reserve(&mut out, crate::dataset::fallible::len(&[bands.len(), n], "the JPEG 2000 window")?, "the JPEG 2000 window")?;
                         for b in bands {
                             out.extend_from_slice(&src[(b - 1) * n..b * n]);
                         }
@@ -980,6 +1181,11 @@ pub(crate) fn open_lazy(path: &str) -> Option<Result<crate::LazyRaster>> {
         }
         _ => return None,
     };
+    // Read as JPEG 2000, found by its content (a local file, whatever its name) or its name: only
+    // if the JP2 driver is allowed.
+    if let Err(e) = super::check_recognised(crate::formats::RasterDriver::JP2, path) {
+        return Some(Err(e));
+    }
     Some(open_lazy_source(source, Some(path)))
 }
 
@@ -990,6 +1196,7 @@ pub(crate) fn open_lazy_bytes(bytes: Vec<u8>) -> Result<crate::LazyRaster> {
 
 fn open_lazy_source(source: StreamSource, path: Option<&str>) -> Result<crate::LazyRaster> {
     let (reader, mut ds) = Jp2Window::open(source).map_err(|e| match path {
+        _ if e.is_resource_refusal() => e,
         Some(p) => Error::InvalidData(format!("{p}: {e}")),
         None => e,
     })?;
@@ -1001,7 +1208,16 @@ fn open_lazy_source(source: StreamSource, path: Option<&str>) -> Result<crate::L
 
 /// Reads a JPEG 2000 file, its tiles decoded in parallel.
 pub(crate) fn read(path: &Path) -> Result<RasterDataset> {
-    read_source(StreamSource::File(path.to_path_buf())).map_err(|e| Error::InvalidData(format!("{}: {e}", path.display())))
+    read_source(StreamSource::File(path.to_path_buf()))
+        .map_err(|e| if e.is_resource_refusal() { e } else { Error::InvalidData(format!("{}: {e}", path.display())) })
+}
+
+/// The width, height and band count of a JP2 file or J2K codestream held in memory, from its
+/// headers, without decoding it.
+#[cfg_attr(not(feature = "grib"), allow(dead_code))]
+pub(crate) fn size_of_bytes(bytes: &[u8]) -> Result<(usize, usize, usize)> {
+    let (_, ds) = Jp2Window::open(StreamSource::Bytes(bytes.into()))?;
+    Ok((ds.raster.cols, ds.raster.rows, ds.raster.bands))
 }
 
 /// Reads a JP2 file or a J2K codestream held in memory.
@@ -1016,21 +1232,6 @@ fn read_source(source: StreamSource) -> Result<RasterDataset> {
     let all: Vec<usize> = (1..=bands).collect();
     ds.raster.data = reader.read(0, crate::Window::full(w, h), &all)?;
     Ok(ds)
-}
-
-/// The samples of the first component of a JP2 file or J2K codestream held in memory, as
-/// integers (the values GRIB2's JPEG 2000 packing stores).
-pub(crate) fn decode_ints(bytes: &[u8]) -> Result<Vec<i32>> {
-    let ds = read_bytes(bytes)?;
-    let n = ds.raster.cols * ds.raster.rows;
-    macro_rules! ints {
-        ($($v:ident),*) => {
-            match &ds.raster.data {
-                $(RasterData::$v(v) => v[..n.min(v.len())].iter().map(|x| *x as i32).collect(),)*
-            }
-        };
-    }
-    Ok(ints!(U8, I8, U16, I16, U32, I32, U64, I64, F32, F64))
 }
 
 /// Writes a lossless JP2 with a GeoJP2 box; nodata goes to a `.aux.xml` sidecar.
@@ -1117,6 +1318,23 @@ pub(crate) fn to_bytes(r: &Raster) -> Result<Vec<u8>> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn pipeline_exports_unreferenced_codestream_without_inventing_a_transform() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("image.j2k");
+        let output = directory.path().join("image.tif");
+        let bytes = codec::encode(4, 4, &[codec::Component { precision: 8, signed: false, data: vec![7; 16] }]).unwrap();
+        std::fs::write(&source, bytes).unwrap();
+        let reader = crate::LazyRaster::open(source.to_str().unwrap()).unwrap();
+        assert!(!reader.geotransform_present());
+        crate::ops::pipeline::Pipeline::parse(&format!("read '{}' ! write '{}'", source.display(), output.display()))
+            .unwrap()
+            .run()
+            .unwrap();
+        let tags = crate::geotiff::read_geo_tags(&output).unwrap();
+        assert!(tags.geo_transform.is_none());
+        assert_eq!(crate::open_raster(output.to_str().unwrap()).unwrap().raster.data.to_f64_vec(), vec![7.; 16]);
+    }
     #[test]
     fn round_trips_signed_samples() {
         let data: Vec<i16> = (0..40 * 30).map(|i: i32| ((i * 37) % 3000 - 1500) as i16).collect();

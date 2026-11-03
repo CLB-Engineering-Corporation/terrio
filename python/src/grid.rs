@@ -4,7 +4,7 @@
 use crate::ops::{data_type, srs, vector_write_options};
 use crate::raster::{PyRaster, write_options};
 use crate::vector::{PyLayer, PyVectorDataset, layers_from_object};
-use crate::{PyResultExt, invalid};
+use crate::{Detach, PyResultExt, invalid};
 use pyo3::prelude::*;
 use terrio::ops::lineref::LineRefOptions;
 use terrio::ops::vector_filter::WriteMode;
@@ -26,7 +26,7 @@ fn input_layers(py: Python<'_>, src: &Bound<'_, PyAny>, layers: Option<Vec<Strin
     match src.extract::<String>() {
         Ok(path) => {
             let options = terrio::VectorOpenOptions { layers: layers.unwrap_or_default(), ..Default::default() };
-            py.detach(|| terrio::ops::vector_filter::open_layers(&path, &options)).py()
+            py.detach_result(|| terrio::ops::vector_filter::open_layers(&path, &options)).py()
         }
         Err(_) => {
             let all = layers_from_object(src, None, None)?;
@@ -192,7 +192,8 @@ fn with_one_layer<T>(
 fn write_layer(py: Python<'_>, layer: &terrio::Layer, dst: Option<&str>, format: Option<&str>) -> PyResult<()> {
     if let Some(path) = dst {
         let o = vector_write_options(format)?;
-        py.detach(|| terrio::ops::vector_filter::write_vector_with_mode(std::slice::from_ref(layer), path, &o, WriteMode::Create)).py()?;
+        py.detach_result(|| terrio::ops::vector_filter::write_vector_with_mode(std::slice::from_ref(layer), path, &o, WriteMode::Create))
+            .py()?;
     }
     Ok(())
 }
@@ -254,7 +255,7 @@ fn lineref_create(
     };
     let inner = crate::with_warnings(py, || terrio::ops::lineref::create_reference(&lines, &points, &options))?;
     write_layer(py, &inner, dst, format)?;
-    Ok(PyLayer { inner })
+    Ok(PyLayer::from(inner))
 }
 
 /// The position of a point on linear reference parts, like `terrio lineref get-pos` (GDAL's
@@ -323,5 +324,5 @@ fn lineref_subline(
         terrio::ops::lineref::subline(parts, begin, end, &layer_name.unwrap_or(stem)).py()
     })?;
     write_layer(py, &inner, dst, format)?;
-    Ok(PyLayer { inner })
+    Ok(PyLayer::from(inner))
 }

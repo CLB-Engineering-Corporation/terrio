@@ -24,6 +24,8 @@ function build(args, before = () => {}) {
     calls.push(argv);
     const out = argv[argv.indexOf("--out-dir") + 1];
     fs.mkdirSync(out, { recursive: true });
+    fs.mkdirSync(join(out, "snippets"));
+    fs.writeFileSync(join(out, "snippets", "helper.js"), "export {};\n");
     const files = ["terrio.js", "terrio.d.ts", "terrio_bg.wasm", "terrio_bg.wasm.d.ts"];
     for (const file of files) fs.writeFileSync(join(out, file), file);
     // wasm-pack generates WASM declarations but omits them from its npm files list.
@@ -50,6 +52,7 @@ for (const target of ["web", "nodejs", "bundler"]) {
       assert.ok(pkg.files.includes(file), file);
       assert.ok(files.includes(file), file);
     }
+    assert.ok(pkg.files.includes("snippets/"));
     assert.ok(!files.includes("load.js"));
     assert.ok(!files.includes("core"));
   });
@@ -69,5 +72,13 @@ test("feature selection cannot silently retain full defaults", () => {
 });
 test("selective threading and invalid targets fail before tools run", () => {
   assert.throws(() => build(["--no-default-features", "--features", "netcdf-hdf5,threads"]), /single-threaded/);
+  assert.throws(() => build(["--no-default-features", "--features", "terrio-js/threads"]), /single-threaded/);
   assert.throws(() => build(["--target", "typo"]), /target must be/);
+});
+
+test("selective build without optional features remains locked", () => {
+  const { calls, pkg } = build(["--no-default-features"]);
+  assert.equal(calls.length, 1);
+  assert.deepEqual(Array.from(calls[0].slice(calls[0].indexOf("--") + 1)), ["--no-default-features", "--locked"]);
+  assert.ok(!pkg.exports["./core"]);
 });

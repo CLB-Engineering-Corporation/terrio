@@ -1,3 +1,14 @@
+// SPDX-FileCopyrightText: Copyright (c) 2006, MapShots Inc (www.mapshots.com)
+// SPDX-FileCopyrightText: Copyright (c) 2007-2013, Even Rouault <even dot rouault at spatialys.com>
+// SPDX-FileCopyrightText: Copyright (c) 2023, Even Rouault <even dot rouault at spatialys.com>
+// SPDX-FileCopyrightText: Copyright (c) 2026 Qiusheng Wu and Terrio contributors
+// SPDX-License-Identifier: MIT
+//
+// Derived from (translated to Rust and modified):
+//   GDAL v3.12.2 (checked against v3.13.3):
+//     apps/nearblack_lib.cpp
+//     apps/nearblack_lib_floodfill.cpp
+
 //! Collar cleaning: an equivalent of `nearblack` and `gdal raster clean-collar` (GDAL 3.12).
 //!
 //! Nearly black (or white, or another color) pixels along the edges of an image, such as the
@@ -769,8 +780,9 @@ mod tests {
         assert!(o.set_mask);
     }
 
+    /// Reference: GDAL 3.13.
     #[test]
-    fn rgba_mask_processing_retains_alpha_only_in_place_like_gdal_313() {
+    fn rgba_mask_processing_retains_alpha_only_in_place_like_gdal() {
         let grid = Grid { width: 3, height: 1, geo_transform: [0., 1., 0., 1., 0., -1.] };
         let pixels = vec![0, 120, 0, 0, 120, 0, 0, 120, 0, 64, 64, 64];
         let mut ds = super::super::build_raster_data(grid, RasterData::U8(pixels), 4, None, &Default::default()).unwrap();

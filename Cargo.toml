@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/*", "python", "js"]
 
 [workspace.package]
-version = "0.5.0"
+version = "0.6.1"
 edition = "2024"
 license = "MIT"
 rust-version = "1.90"
@@ -14,8 +14,8 @@ authors = ["Qiusheng Wu <giswqs@gmail.com>"]
 [workspace.dependencies]
 # Memory-mapped reads of SQLite files (GeoPackage, MBTiles), native builds only.
 memmap2 = "0.9"
-terrio = { path = "crates/terrio", version = "0.5.0" }
-terrio-crs = { path = "crates/terrio-crs", version = "0.1.0", default-features = false }
+terrio = { path = "crates/terrio", version = "0.6.1" }
+terrio-crs = { path = "crates/terrio-crs", version = "0.2.1", default-features = false }
 # For the Python package (not published to crates.io), so without a version to keep in step.
 terrio-cli = { path = "crates/terrio-cli" }
 
@@ -39,8 +39,10 @@ acadrust = { version = "=0.6.7", default-features = false }
 flatgeobuf = { version = "6", default-features = false }
 # The version flatgeobuf's generated code is built with.
 flatbuffers = "=24.12.23"
-# GeoParquet writing; the same versions wbvector reads GeoParquet with.
-parquet = { version = "58", default-features = false, features = ["arrow", "snap"] }
+# GeoParquet reading and writing (drivers/vector/geoparquet.rs).
+# Without its Zstandard (the zstd C library): terrio reads Zstandard pages itself
+# (drivers/vector/geoparquet_zstd.rs).
+parquet = { version = "58", default-features = false, features = ["arrow", "snap", "brotli", "flate2-zlib-rs", "lz4", "base64", "simdutf8"] }
 arrow-array = "58"
 arrow-schema = "58"
 # Arrow IPC streams of vector layers; already built for parquet.
@@ -48,10 +50,13 @@ arrow-ipc = { version = "58", default-features = false }
 arrow-buffer = "58"
 bytes = "1"
 quick-xml = "0.42"
+# Multi-byte DBF code pages (CP932, CP936, CP949, CP950) of shapefiles, with the differences of
+# GDAL's iconv recoding applied on top (drivers/vector/shapefile_cjk.rs).
+encoding_rs = "0.8.35"
 # OpenStreetMap PBF decoding, the version wbvector uses.
 osmpbfreader = "0.19"
-# Its Zstandard (a C library) is enabled by the `libzstd` features of terrio and terrio-crs only:
-# otherwise terrio decodes Zstandard with `ruzstd`.
+# Its Zstandard (zstd 0.13, a C library) is enabled by terrio-crs's `libzstd` feature only, for
+# terrio-crs built on its own: terrio decodes GeoTIFF Zstandard itself (zstd 0.14 or `ruzstd`).
 tiff = { version = "0.11", features = ["webp"] }
 half = "2"
 flate2 = "1"
@@ -59,8 +64,15 @@ weezl = "0.2"
 png = "0.18"
 lz4_flex = { version = "0.14", default-features = false, features = ["alloc", "safe-decode", "checked-decode"] }
 ruzstd = "0.9"
-netcdf-reader = { version = "0.9", default-features = false, features = ["netcdf4"] }
-hdf5-reader = { version = "0.9", default-features = false }
+# 0.10 reads HDF5 files written in the earliest format with version 1/2 compound datatypes
+# (every HEC-RAS geometry and plan file, among others) and old fill value messages
+# (roteiro-gis/netcdf-rust#95). The HEC-RAS engine uses the same hdf5-reader 0.10.1, so a build
+# compiles one HDF5 reader.
+netcdf-reader = { version = "0.10.1", default-features = false, features = ["netcdf4"] }
+hdf5-reader = { version = "0.10.1", default-features = false }
+# HEC-RAS geometry and plan HDF files (the `hecras` feature): the read-only engine behind
+# ras-commander. It owns every HEC-RAS rule; terrio's driver only translates its values.
+ras-commander-fast-hdf = { version = "0.2.4", default-features = false, features = ["hdf", "mesh", "results"] }
 # The portable decoder: the same pixels on every platform, closer to libjpeg's than its SIMD paths.
 jpeg-decoder = { version = "0.3", default-features = false, features = ["platform_independent"] }
 # GeoPackage JPEG tiles; the version wbraster already uses.
@@ -70,11 +82,6 @@ image-webp = "0.2"
 # Pure-Rust WebP encoder for GeoTIFF/COG; already used transitively by wbgeotiff.
 webp-rust = "0.3.2"
 openjp2 = { version = "0.6", default-features = false, features = ["std"] }
-# GRIB2 CCSDS packing (its pure-Rust decoder); without its C features (OpenJPEG, libaec): terrio
-# decodes the other packings itself (JPEG 2000 with openjp2).
-gribberish = { version = "1.9", default-features = false }
-# The bit slices gribberish's decoders take.
-bitvec = "1"
 # GeoTIFF compressions GDAL writes and the tiff crate does not read: LERC, JPEG XL and LZMA (XZ).
 lerc-reader = { version = "0.5", default-features = false }
 lerc-core = "0.5"
@@ -85,17 +92,21 @@ zune-core = "0.5"
 jxl-oxide = { version = "0.12", default-features = false }
 # AVIF tiles: a pure-Rust port of dav1d, without its assembly so that it builds for WebAssembly.
 rusty_av1d = { version = "1.2", default-features = false, features = ["bitdepth_8"] }
-lzma-rust2 = { version = "0.23", default-features = false, features = ["std", "xz"] }
+lzma-rust2 = { version = "0.24", default-features = false, features = ["std", "xz"] }
 zstd = "0.14"
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+shlex = "2.0.1"
 tempfile = "3"
+same-file = "1.0.6"
 tar = { version = "0.4", default-features = false }
 # POSIX file locks for in-place SQLite updates (Unix).
 libc = "0.2"
 zip = { version = "9", default-features = false, features = ["deflate"] }
-ureq = "3"
+# No TLS provider of its own: terrio supplies `rustls-graviola`, which needs no C compiler.
+ureq = { version = "3", default-features = false, features = ["gzip", "rustls-no-provider", "rustls-webpki-roots"] }
+rustls-graviola = "0.4"
 hmac = "0.13"
 sha2 = "0.11"
 clap = { version = "4", features = ["derive"] }
@@ -168,14 +179,3 @@ laz = { opt-level = 3 }
 rusty_av1d = { opt-level = 3 }
 image-webp = { opt-level = 3 }
 lz4_flex = { opt-level = 3 }
-
-# HDF5 files written in the earliest format with version 1/2 compound datatypes (every HEC-RAS
-# geometry and plan file, among others) fail in hdf5-reader 0.9.1, and old fill value messages
-# read wrong. Fixed in roteiro-gis/netcdf-rust#95; until a release carries it, build against that
-# branch. All four crates come from the same commit so their shared types agree. (`cargo publish`
-# ignores this section: a published terrio uses the crates.io release.)
-[patch.crates-io]
-hdf5-core = { git = "https://github.com/gpt-cmdr/netcdf-rust", rev = "24ff6fcfcc79a35c30aa5d8cb3028ab4d9d00564" }
-hdf5-reader = { git = "https://github.com/gpt-cmdr/netcdf-rust", rev = "24ff6fcfcc79a35c30aa5d8cb3028ab4d9d00564" }
-netcdf-core = { git = "https://github.com/gpt-cmdr/netcdf-rust", rev = "24ff6fcfcc79a35c30aa5d8cb3028ab4d9d00564" }
-netcdf-reader = { git = "https://github.com/gpt-cmdr/netcdf-rust", rev = "24ff6fcfcc79a35c30aa5d8cb3028ab4d9d00564" }

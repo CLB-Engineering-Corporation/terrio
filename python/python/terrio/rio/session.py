@@ -1,8 +1,15 @@
+# SPDX-FileCopyrightText: Copyright (c) 2013-2021, Mapbox
+# SPDX-FileCopyrightText: Copyright (c) 2026 Qiusheng Wu and Terrio contributors
+# SPDX-License-Identifier: MIT AND BSD-3-Clause
+#
+# Derived from (adapted and modified):
+#   rasterio 1.5.2:
+#     rasterio/session.py
+
 """Cloud sessions: credentials for remote datasets, given to terrio as environment variables."""
 
 from __future__ import annotations
 
-import os
 from typing import Any
 
 
@@ -133,7 +140,9 @@ class AWSSession(Session):
             requester_pays: Accept requester-pays charges.
         """
         if aws_unsigned is None:
-            aws_unsigned = os.environ.get("AWS_NO_SIGN_REQUEST", "").upper() in ("YES", "TRUE")
+            from terrio import _terrio
+
+            aws_unsigned = (_terrio.config_get("AWS_NO_SIGN_REQUEST") or "").upper() in ("YES", "TRUE")
         self.unsigned = bool(aws_unsigned)
         self.endpoint_url = endpoint_url
         self.requester_pays = requester_pays
