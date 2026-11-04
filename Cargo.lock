@@ -2810,6 +2810,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "terrio-filegdb"
+version = "0.1.0"
+dependencies = [
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "terrio-js"
 version = "0.6.1"
 dependencies = [

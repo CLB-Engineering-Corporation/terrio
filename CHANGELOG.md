@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- New crate `terrio-filegdb`: a pure-Rust reader and writer for Esri File Geodatabases, ported from
+  GDAL's OpenFileGDB driver. It is a library for now, not yet a driver of `terrio::open`.
 - LERC tiles are GDAL's by default: the `LERC_ENCODER` creation option (GeoTIFF and COG) selects
   `lerc-writer`'s encoder profile, `GDAL` (default; the blobs GDAL writes, byte for byte for
   floating-point and 16-bit data) or `COMPACT` (the smallest blobs, within the same

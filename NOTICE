@@ -20,6 +20,13 @@ GDAL (https://github.com/OSGeo/gdal)
 
 Terrio files derived from GDAL source files (each file's header names them):
   crates/terrio-crs/src/lib.rs
+  crates/terrio-filegdb/src/geometry.rs
+  crates/terrio-filegdb/src/lib.rs
+  crates/terrio-filegdb/src/shape.rs
+  crates/terrio-filegdb/src/spatial_index.rs
+  crates/terrio-filegdb/src/table.rs
+  crates/terrio-filegdb/src/varint.rs
+  crates/terrio-filegdb/src/writer.rs
   crates/terrio/src/cog_validate.rs
   crates/terrio/src/dataset.rs
   crates/terrio/src/drivers/gdal_overview.rs
