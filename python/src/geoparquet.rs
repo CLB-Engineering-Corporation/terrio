@@ -1,7 +1,7 @@
 //! `write_geoparquet_layers`: Arrow tables to one GeoParquet file with the layout options of
 //! `terrio::geoparquet`.
 
-use crate::{PyResultExt, invalid};
+use crate::{Detach, PyResultExt, invalid};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyTuple};
 use std::time::Instant;
@@ -182,7 +182,7 @@ pub(crate) fn write_geoparquet_layers<'py>(
     } else {
         let (schema, batches) = arrow_of(layers)?;
         match options.layer_column.as_deref().filter(|c| schema.index_of(c).is_ok()) {
-            Some(column) => inputs = py.detach(|| split_by_column(&schema, &batches, column)).py()?,
+            Some(column) => inputs = py.detach_result(|| split_by_column(&schema, &batches, column)).py()?,
             None => inputs.push(ArrowLayer::new(None, schema, batches.into_iter().map(Ok).collect())),
         }
     }

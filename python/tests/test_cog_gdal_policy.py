@@ -1,4 +1,4 @@
-"""GDAL overview kernel conformance under the explicit GDAL_3_13 policy."""
+"""GDAL overview kernel conformance: the default COG policy, and its explicit GDAL_3_13 name."""
 
 import numpy as np
 import pytest
@@ -123,33 +123,26 @@ def test_overviews_are_gdals(tmp_path, case, method):
 
 @pytest.mark.parametrize("path", ["convert", "rio_copy", "rio_open", "raster_write"])
 def test_default_resampling_is_gdals_cubic(tmp_path, path):
-    """No resampling asked for, as in ingestion: GDAL's default (CUBIC), on every path."""
+    """No resampling and no policy asked for, as in ingestion: GDAL's default (CUBIC), on every
+    path."""
     src = _source(tmp_path / "src.tif", 1001, 999, 3, "uint16", 0)
     gdal = _gdal_cog(src, tmp_path / "gdal.tif")
     ours = str(tmp_path / "terrio.tif")
     if path == "convert":
-        terrio.convert(
-            src,
-            ours,
-            format="COG",
-            compress="DEFLATE",
-            options={"COG_OVERVIEW_POLICY": "GDAL_3_13"},
-        )
+        terrio.convert(src, ours, format="COG", compress="DEFLATE")
     elif path == "rio_copy":
         with trio.open(src) as ds:
             profile = ds.profile.copy()
-        profile.update(driver="COG", compress="deflate", COG_OVERVIEW_POLICY="GDAL_3_13")
+        profile.update(driver="COG", compress="deflate")
         trio.shutil.copy(src, ours, **profile)
     elif path == "rio_open":
         with trio.open(src) as ds:
             profile, data = ds.profile.copy(), ds.read()
-        profile.update(driver="COG", compress="deflate", COG_OVERVIEW_POLICY="GDAL_3_13")
+        profile.update(driver="COG", compress="deflate")
         with trio.open(ours, "w", **profile) as dst:
             dst.write(data)
     else:
-        terrio.open(src).write(
-            ours, driver="COG", compress="DEFLATE", options={"COG_OVERVIEW_POLICY": "GDAL_3_13"}
-        )
+        terrio.open(src).write(ours, driver="COG", compress="DEFLATE")
     _assert_same(gdal, ours, path)
 
 
@@ -190,7 +183,7 @@ def test_paletted_default_is_nearest(tmp_path):
         dst.write_colormap(1, {i: (i * 30, 255 - i * 30, i * 10, 255) for i in range(8)})
     gdal = _gdal_cog(src, tmp_path / "gdal.tif")
     ours = str(tmp_path / "terrio.tif")
-    trio.shutil.copy(src, ours, driver="COG", compress="deflate", COG_OVERVIEW_POLICY="GDAL_3_13")
+    trio.shutil.copy(src, ours, driver="COG", compress="deflate")
     _assert_same(gdal, ours, "paletted")
 
 

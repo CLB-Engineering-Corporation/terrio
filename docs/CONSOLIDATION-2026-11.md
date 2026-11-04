@@ -99,11 +99,58 @@ feat/streaming-raster-tiles, feat/windowed-dem, fix/edge-tile-nodata-padding.
 ## Validation (Windows 11, Rust 1.99.1 x86_64-pc-windows-gnu)
 
 `cargo test --workspace --no-fail-fast` (debug info and incremental compilation off, to fit
-the disk): 2,832 passed, 0 failed, 43 ignored. Linux CI and `cargo clippy` were not run for
-this consolidation.
+the disk): 2,832 passed, 0 failed, 43 ignored. That first validation covered the Rust crates
+only: pytest, the wheel and packaging checks, Linux CI and `cargo clippy` were not part of it, and
+CI on `main` then failed in those (see "CI failures after the consolidation").
 
 The first run had 2 failures. `open_sniffs_geoparquet_without_its_extension` came from the
 branch and assumed its dropped `PAR1` sniff; it now turns on `TERRIO_WBVECTOR_FALLBACK`, as
 main's detection requires. `another_origin_gets_no_header_a_document_supplies` failed on a
 Windows socket error (10055, no buffer space) while the machine was heavily loaded, and passed
 on the rerun without a change.
+
+## CI failures after the consolidation
+
+The first CI runs on the consolidated `main` failed in pytest and packaging. Only the GIL rule and
+the licence list came from the consolidation itself. The overview and metadata failures were
+already on the old `main`: "CI (macOS and Windows)" failed on 72133fb (run 41665704880) with them,
+and "CI" had last passed on d1e1484, before the upstream merge in f88347f.
+
+- **COG overviews differed from GDAL's (a policy conflict).** f88347f made `SOURCE` (`average` from
+  the source blocks, ceil-sized levels) the default `COG_OVERVIEW_POLICY` and moved upstream's
+  comparisons with GDAL to an explicit `GDAL_3_13`; `test_convert_alpha_cog.py`,
+  `test_png_colorinterp.py` and `test_png_palette.py` kept comparing the default with GDAL. None of
+  the branches suspected at first (the default-domain report, sidecar overviews, streamed blend)
+  touches the overview pixels. Resolution: GDAL parity is the default again (`GDAL_3_13`).
+  `COG_OVERVIEW_POLICY=SOURCE` stays available, and `min`, `max`, `area_matched`,
+  `area_matched_mode` and supplied overviews select it when no policy is given, since GDAL has
+  none of them. Callers relying on the `average` default must now ask for `SOURCE`.
+- **Metadata domains.** An early return in `gdal_metadata_xml`'s `item` (from 70ef191, kept through
+  f88347f) wrote an item with a domain without its `sample`, so a band's domain was read back as the
+  dataset's. Not the effective-options resolution of `plan_with`. The early return is gone; the
+  general path writes `sample`, `role` and `domain`.
+- **GIL rule.** `python/src/pixel.rs` (the path-to-path `blend`, eb69ec3) and
+  `python/src/geoparquet.rs` (`split_by_column`, be35cca) called `py.detach` directly. They now use
+  `detach_result`, so a panic there is an `InternalError`. The HECRAS archive bindings were not
+  involved.
+- **Licence list.** 2019f8f regenerated the list on Windows with `core.autocrlf=true`. Git stripped
+  the CRLF line endings of the licence texts that have them (939 lines), and terrio's own `LICENSE`,
+  read with CRLF from the working tree, sorted into a group of its own. The list is regenerated with
+  cargo-about 0.9.2 from an LF checkout, as CI runs it, and `.gitattributes` keeps Git from changing
+  its line endings.
+- **Docs.** `docs.yml` downloads the Pyodide wheel of the latest GitHub release and the fork has no
+  releases ("release not found"). Not a code failure, and nothing was changed for it: the workflow
+  stays red on the fork until a release with that wheel exists.
+- **macOS.** `test_overviews_are_gdals[3001x2999x1-uint16-nd0-AVERAGE]`,
+  `test_masked_overviews_are_gdals[mask-f32-BILINEAR]` and
+  `test_masked_build_overviews_are_gdals[mask-rgb-AVERAGE]` differ from GDAL by rounding in a few
+  pixels on macOS only. `BIT_EXACT_ON_LINUX` in `python/tests/conftest.py` lists these tests under
+  their old file, `test_cog_overviews.py`; f88347f moved them to `test_cog_gdal_policy.py`, so the
+  entry no longer matches and they became required off Linux. They were left as they are: registering
+  the new names marks them xfail off Linux, which is a decision for the repository's owner.
+
+Tests changed: the Rust tests of the `SOURCE` reductions and `test_cog_options_not_acted_on_are_refused`
+now ask for `SOURCE`, the old default; `overview_policies_select_distinct_defaults_and_filter_scopes`,
+`overviews_none_writes_the_full_resolution_only` and `cog_options_are_acted_on_or_refused` assert the
+new default; `test_default_resampling_is_gdals_cubic` and `test_paletted_default_is_nearest` no longer
+name a policy, as upstream's. No comparison with GDAL was weakened, skipped or marked xfail.
