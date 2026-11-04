@@ -561,11 +561,10 @@ impl PyRaster {
     ///     overview_resampling: `"nearest"`, `"average"`, `"min"`, `"max"` or `"mode"`; or
     ///         `"area_matched"` (`"area_matched_mode"` for categorical rasters), whose levels keep
     ///         the full-resolution valid area instead of growing it, with the mean (or mode) of the
-    ///         valid pixels (needs a nodata value). Defaults to `"nearest"` for GeoTIFF and, for
-    ///         COG, to GDAL's default and kernels (`"cubic"`, `"nearest"` for palettes; also
-    ///         `bilinear`, `cubicspline`, `lanczos`, `rms`). The creation option
-    ///         `COG_OVERVIEW_POLICY=SOURCE` selects the source-block policy, `"average"` by
-    ///         default; `"min"`, `"max"`, area-matched and supplied overviews imply it.
+    ///         valid pixels (needs a nodata value). Defaults to `"nearest"` for GeoTIFF and
+    ///         `"average"` for COG under its default `COG_OVERVIEW_POLICY=SOURCE`. Explicit
+    ///         `COG_OVERVIEW_POLICY=GDAL_3_13` selects GDAL cubic defaults and filter kernels
+    ///         (`bilinear`, `cubic`, `cubicspline`, `lanczos`, `rms`), as creation options.
     ///     metadata: Dataset metadata items (GDAL's default domain) to set over the raster's
     ///         own: a mapping or `(key, value)` pairs.
     ///     gcps: GeoTIFF ground control points, in the raster's CRS: `(pixel, line, x, y, z)`

@@ -121,10 +121,8 @@ and "CI" had last passed on d1e1484, before the upstream merge in f88347f.
   comparisons with GDAL to an explicit `GDAL_3_13`; `test_convert_alpha_cog.py`,
   `test_png_colorinterp.py` and `test_png_palette.py` kept comparing the default with GDAL. None of
   the branches suspected at first (the default-domain report, sidecar overviews, streamed blend)
-  touches the overview pixels. Resolution: GDAL parity is the default again (`GDAL_3_13`).
-  `COG_OVERVIEW_POLICY=SOURCE` stays available, and `min`, `max`, `area_matched`,
-  `area_matched_mode` and supplied overviews select it when no policy is given, since GDAL has
-  none of them. Callers relying on the `average` default must now ask for `SOURCE`.
+  touches the overview pixels. Resolution: `SOURCE` stays the fork's default, as chosen in f88347f,
+  and those three test files now name `GDAL_3_13`, as upstream's other comparisons already do.
 - **Metadata domains.** An early return in `gdal_metadata_xml`'s `item` (from 70ef191, kept through
   f88347f) wrote an item with a domain without its `sample`, so a band's domain was read back as the
   dataset's. Not the effective-options resolution of `plan_with`. The early return is gone; the
@@ -149,11 +147,7 @@ and "CI" had last passed on d1e1484, before the upstream merge in f88347f.
   entry no longer matches and they became required off Linux. They were left as they are: registering
   the new names marks them xfail off Linux, which is a decision for the repository's owner.
 
-Tests changed: the Rust tests of the `SOURCE` reductions and `test_cog_options_not_acted_on_are_refused`
-now ask for `SOURCE`, the old default; `overview_policies_select_distinct_defaults_and_filter_scopes`,
-`overviews_none_writes_the_full_resolution_only` and `cog_options_are_acted_on_or_refused` assert the
-new default; `test_default_resampling_is_gdals_cubic` and `test_paletted_default_is_nearest` no longer
-name a policy, as upstream's. No comparison with GDAL was weakened, skipped or marked xfail.
+Tests changed: the three COG comparison files above name `GDAL_3_13`; their GDAL expectations are unchanged. Two test servers now count bytes before sending them.
 
 Two test servers counted what they sent after writing it, so the client could return first:
 `test_palette_destination_reuses_the_remote_source` and

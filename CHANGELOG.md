@@ -2,11 +2,6 @@
 
 ## Unreleased
 
-- COG overviews are GDAL's by default again: `COG_OVERVIEW_POLICY` now defaults to `GDAL_3_13`
-  (`cubic`, `nearest` for palettes; recursive, floor-sized levels) instead of `SOURCE` (`average`
-  from the source blocks, ceil-sized levels). Set `COG_OVERVIEW_POLICY=SOURCE` for the previous
-  behaviour; `min`, `max`, `area_matched`, `area_matched_mode` and supplied overviews select it
-  when no policy is given.
 - GeoTIFF: a band's item in a named metadata domain keeps its `sample` attribute, as GDAL writes
   it. It was written as a dataset item.
 - New crate `terrio-filegdb`: a pure-Rust reader and writer for Esri File Geodatabases, ported from

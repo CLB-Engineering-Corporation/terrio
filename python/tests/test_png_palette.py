@@ -96,6 +96,8 @@ def test_the_cog_of_a_paletted_png_is_gdals(tmp_path, case):
         with mod.open(src) as s:
             profile = dict(s.profile)
             profile.update(driver="COG", compress="deflate")
+            if mod is terrio.rio:
+                profile["COG_OVERVIEW_POLICY"] = "GDAL_3_13"
             shutil.copy(s, path, **profile)
     _assert_same_cog(gdal, ours)
 
@@ -105,5 +107,7 @@ def test_a_converted_paletted_png_is_gdals_cog(tmp_path, case):
     src = _source(tmp_path / "src.png", ALPHAS[case])
     gdal, ours = str(tmp_path / "gdal.tif"), str(tmp_path / "terrio.tif")
     rasterio.shutil.copy(src, gdal, driver="COG", compress="DEFLATE")
-    terrio.convert(src, ours, format="COG", compress="DEFLATE")
+    terrio.convert(
+        src, ours, format="COG", compress="DEFLATE", options={"COG_OVERVIEW_POLICY": "GDAL_3_13"}
+    )
     _assert_same_cog(gdal, ours)

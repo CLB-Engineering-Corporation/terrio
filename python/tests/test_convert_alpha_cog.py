@@ -88,7 +88,9 @@ def test_a_converted_cog_is_gdals(tmp_path, kind):
     src = _source(tmp_path / "src.tif", kind)
     gdal, ours = str(tmp_path / "gdal.tif"), str(tmp_path / "terrio.tif")
     rasterio.shutil.copy(src, gdal, driver="COG", compress="DEFLATE")
-    terrio.convert(src, ours, format="COG", compress="DEFLATE")
+    terrio.convert(
+        src, ours, format="COG", compress="DEFLATE", options={"COG_OVERVIEW_POLICY": "GDAL_3_13"}
+    )
     (g_about, g_levels), (t_about, t_levels) = _levels(gdal), _levels(ours)
     assert t_about == g_about
     assert len(t_levels) == len(g_levels) > 2

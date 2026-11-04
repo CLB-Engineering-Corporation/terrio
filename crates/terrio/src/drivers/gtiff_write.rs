@@ -769,6 +769,13 @@ impl TiffOptions {
         let size = |key: &str| -> Result<Option<u32>> {
             co(key).map(|v| v.trim().parse::<u32>().map_err(|_| Error::InvalidArgument(format!("invalid {key} '{v}'")))).transpose()
         };
+        let gdal_overviews = match co("COG_OVERVIEW_POLICY").map(str::to_ascii_uppercase).as_deref() {
+            None | Some("SOURCE") => false,
+            Some("GDAL_3_13") if cog => true,
+            Some(value) => {
+                return Err(Error::InvalidArgument(format!("invalid COG_OVERVIEW_POLICY '{value}' (SOURCE or GDAL_3_13 for COG)")));
+            }
+        };
         if cog {
             check_cog_creation_options(&options.creation_options)?;
         }
@@ -776,18 +783,6 @@ impl TiffOptions {
         // COG driver does; a GeoTIFF's overviews have no creation option.
         let method =
             if cog { co("OVERVIEW_RESAMPLING").or_else(|| co("RESAMPLING")) } else { None }.or(options.overview_resampling.as_deref());
-        // A COG's overviews are GDAL's by default. What only `SOURCE` builds (methods GDAL does not
-        // have, and overviews supplied at its sizes) selects it when no policy is given.
-        let source_only = !options.overview_data.is_empty()
-            || method.is_some_and(|m| ["area_matched", "area_matched_mode", "min", "max"].iter().any(|name| m.eq_ignore_ascii_case(name)));
-        let gdal_overviews = match co("COG_OVERVIEW_POLICY").map(str::to_ascii_uppercase).as_deref() {
-            None => cog && !source_only,
-            Some("SOURCE") => false,
-            Some("GDAL_3_13") if cog => true,
-            Some(value) => {
-                return Err(Error::InvalidArgument(format!("invalid COG_OVERVIEW_POLICY '{value}' (SOURCE or GDAL_3_13 for COG)")));
-            }
-        };
         let area_matched = method.and_then(|m| match m.to_ascii_lowercase().as_str() {
             "area_matched" => Some(false),
             "area_matched_mode" => Some(true),
@@ -4949,8 +4944,6 @@ mod tests {
     }
 
     fn stored_cog_overviews(raster: &Raster, mut options: crate::RasterWriteOptions, nodata: Option<f64>) -> Vec<(usize, RasterData)> {
-        // These tests check the reductions of the SOURCE policy.
-        options.creation_options.push(("COG_OVERVIEW_POLICY".into(), "SOURCE".into()));
         options.tile_size = Some(16);
         options.compression = Some("NONE".into());
         let opts = TiffOptions::from_write_options(&options, true, nodata).unwrap().unwrap();
@@ -5626,25 +5619,9 @@ mod cog_option_tests {
     /// GDAL 3.13's COG defaults are opt-in; scientific SOURCE remains the fork default.
     #[test]
     fn overview_policies_select_distinct_defaults_and_filter_scopes() {
-        // GDAL's by default.
-        let default = TiffOptions::from_write_options(&crate::RasterWriteOptions::default(), true, None).unwrap().unwrap();
-        assert!(default.gdal_overviews);
-        assert_eq!(cog_method(&default), Method::Cubic);
-        // SOURCE on request, or for what only it builds.
-        let policy = |name: &str| vec![("COG_OVERVIEW_POLICY".to_string(), name.to_string())];
-        let source = crate::RasterWriteOptions { creation_options: policy("SOURCE"), ..Default::default() };
-        let source = TiffOptions::from_write_options(&source, true, None).unwrap().unwrap();
+        let source = TiffOptions::from_write_options(&crate::RasterWriteOptions::default(), true, None).unwrap().unwrap();
         assert!(!source.gdal_overviews);
         assert_eq!(source.overview_resampling, OverviewResampling::Average);
-        for method in ["min", "MAX", "area_matched", "area_matched_mode"] {
-            let implied = crate::RasterWriteOptions { overview_resampling: Some(method.into()), ..Default::default() };
-            assert!(!TiffOptions::from_write_options(&implied, true, None).unwrap().unwrap().gdal_overviews, "{method}");
-            let explicit = crate::RasterWriteOptions { creation_options: policy("GDAL_3_13"), ..implied };
-            assert!(TiffOptions::from_write_options(&explicit, true, None).is_err(), "{method}");
-        }
-        let supplied =
-            crate::RasterWriteOptions { overview_data: vec![Arc::new(grid(8, 8, DataType::U8, |_, _| 1.0))], ..Default::default() };
-        assert!(!TiffOptions::from_write_options(&supplied, true, None).unwrap().unwrap().gdal_overviews);
         for policy in ["SOURCE", "GDAL_3_13"] {
             let palette = crate::RasterWriteOptions {
                 color_table: vec![[0, 0, 0, 255], [255, 255, 255, 255]],
@@ -5664,8 +5641,6 @@ mod cog_option_tests {
         cubic.overview_resampling = Some("cubic".into());
         assert!(TiffOptions::from_write_options(&cubic, true, None).is_ok());
         cubic.creation_options.clear();
-        assert!(TiffOptions::from_write_options(&cubic, true, None).is_ok());
-        cubic.creation_options = policy("SOURCE");
         assert!(TiffOptions::from_write_options(&cubic, true, None).is_err());
         assert_eq!(source_sizes(65, 35, 16, None), [(33, 18), (17, 9), (9, 5)]);
         assert_eq!(source_sizes(2, 2, 16, Some(usize::MAX)), [(1, 1)]);
@@ -5680,8 +5655,8 @@ mod cog_option_tests {
             &[("BLOCKXSIZE", "256")],
             &[("OVERVIEWS", "FORCE_USE_EXISTING")],
             &[("OVERVIEWS", "SOMETIMES")],
-            &[("RESAMPLING", "CUBIC"), ("COG_OVERVIEW_POLICY", "SOURCE")],
-            &[("OVERVIEW_RESAMPLING", "BILINEAR"), ("COG_OVERVIEW_POLICY", "SOURCE")],
+            &[("RESAMPLING", "CUBIC")],
+            &[("OVERVIEW_RESAMPLING", "BILINEAR")],
             &[("COMPRESS", "DEFLATE"), ("OVERVIEW_COMPRESS", "LZW")],
             &[("COMPRESS", "DEFLATE"), ("PREDICTOR", "YES"), ("OVERVIEW_PREDICTOR", "2")],
             &[("COMPRESS", "LERC"), ("MAX_Z_ERROR", "0.01"), ("MAX_Z_ERROR_OVERVIEW", "0.1")],
@@ -5696,8 +5671,6 @@ mod cog_option_tests {
         }
         let accepted: &[&[(&str, &str)]] = &[
             &[("OVERVIEWS", "AUTO")],
-            &[("RESAMPLING", "CUBIC")],
-            &[("OVERVIEW_RESAMPLING", "BILINEAR")],
             &[("OVERVIEWS", "IGNORE_EXISTING"), ("OVERVIEW_RESAMPLING", "nearest")],
             &[("COMPRESS", "DEFLATE"), ("OVERVIEW_COMPRESS", "deflate"), ("LEVEL", "9"), ("SPARSE_OK", "YES")],
             &[("COMPRESS", "DEFLATE"), ("PREDICTOR", "YES"), ("OVERVIEW_PREDICTOR", "YES"), ("NUM_THREADS", "ALL_CPUS")],
@@ -5726,7 +5699,7 @@ mod cog_option_tests {
         let r = grid(1100, 600, DataType::F32, |x, _| x as f64);
         let (_d, p) = write_cog(&r, &cog_options(&[])).unwrap();
         assert_eq!(images(&p).len(), 3);
-        assert!(gdal_metadata(&p).contains(r#"<Item name="OVERVIEW_RESAMPLING" domain="IMAGE_STRUCTURE">CUBIC</Item>"#));
+        assert!(gdal_metadata(&p).contains(r#"<Item name="OVERVIEW_RESAMPLING" domain="IMAGE_STRUCTURE">AVERAGE</Item>"#));
         let (_d, p) = write_cog(&r, &cog_options(&[("OVERVIEWS", "NONE")])).unwrap();
         assert_eq!(images(&p).len(), 1);
         assert!(!gdal_metadata(&p).contains("OVERVIEW_RESAMPLING"));
@@ -5791,7 +5764,7 @@ mod cog_option_tests {
                 _ => unreachable!(),
             }
         };
-        let (_d, avg) = write_cog(&r, &cog_options(&[("COG_OVERVIEW_POLICY", "SOURCE")])).unwrap();
+        let (_d, avg) = write_cog(&r, &cog_options(&[])).unwrap();
         let (_d2, am) = write_cog(&r, &cog_options(&[("OVERVIEW_RESAMPLING", "AREA_MATCHED")])).unwrap();
         assert!(gdal_metadata(&am).contains(r#"<Item name="OVERVIEW_RESAMPLING" domain="IMAGE_STRUCTURE">AREA_MATCHED</Item>"#));
         for i in 0..2 {

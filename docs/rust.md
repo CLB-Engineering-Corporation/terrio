@@ -51,18 +51,14 @@ terrio::write_raster_dataset(&ds, "dem_cog.tif", &options)?;
 ```
 
 `RasterWriteOptions::overview_resampling` accepts `nearest`, `average`, `min`, `max` or
-`mode` for GeoTIFF and COG. The defaults are `nearest` for GeoTIFF and palette COGs, and GDAL's
-`cubic` for other COGs. `COG_OVERVIEW_POLICY` selects how a COG's levels are built: `GDAL_3_13`,
-the default, or `SOURCE`, the opt-in source-block policy with `average` as its default for continuous
-rasters. `min`, `max`, `area_matched`, `area_matched_mode` and `overview_data` select `SOURCE` when
-no policy is given.
+`mode` for GeoTIFF and COG. The defaults are `nearest` for GeoTIFF and palette COGs, and `average` for continuous COGs.
 COGs build factors 2, 4, 8, … until the image fits in one tile, unless
 `RasterWriteOptions::overviews` gives the factors: those levels are then built as for a GeoTIFF
 (each from the previous one, `ceil(cols / f) x ceil(rows / f)`) and written as the COG's, as
 GDAL's COG driver reuses overviews built on its source by `gdaladdo` (`OVERVIEWS=AUTO` or
 `FORCE_USE_EXISTING`; `NONE` or `IGNORE_EXISTING` with factors is refused rather than ignored).
 
-With `COG_OVERVIEW_POLICY=SOURCE` and without explicit factors, the unmasked policy reduces each automatic
+Without explicit factors, the unmasked `SOURCE` policy reduces each automatic
 overview level from the original source blocks independently: `nearest` samples the block center (clamped at image edges), and
 `average` skips nodata and rounds only the final result. Categorical methods retain native
 sample precision, including UInt64 values above 2⁵³. With `ALPHA=YES`, color averages are
@@ -162,11 +158,11 @@ terrio::write_raster_dataset(&ds, "depth_cog.tif", &options)?;
 # Ok::<(), terrio::Error>(())
 ```
 
-The default `COG_OVERVIEW_POLICY=GDAL_3_13` is the upstream recursive GDAL
-overview implementation with floor-sized levels, including alpha and dataset masks. It
+Set `COG_OVERVIEW_POLICY=GDAL_3_13` to select the upstream recursive GDAL
+overview implementation with floor-sized levels, including alpha and dataset masks. This opt-in policy
 also supports `rms`, `bilinear`, `cubic`, `cubicspline`, `lanczos` and `gauss`.
-`COG_OVERVIEW_POLICY=SOURCE` is opt-in and keeps the source-block reductions; the area-matched and
-supplied-array extensions described above use it. Neither policy implies a performance advantage.
+The fork keeps its `SOURCE` default and scientific area-matched/supplied-array
+extensions described above. Neither policy implies a performance advantage.
 
 For `SOURCE` rasters carrying a dataset mask, nearest/average/mode use the
 upstream recursive mask-weighted kernels at SOURCE's ceil dimensions. Masked

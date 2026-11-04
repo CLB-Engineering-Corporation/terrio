@@ -124,7 +124,7 @@ def test_predictor_yes_follows_gdal_cog(tmp_path, dtype, expected):
         {"TILED": "YES"},
         {"BLOCKXSIZE": "256"},
         {"OVERVIEWS": "FORCE_USE_EXISTING"},
-        {"RESAMPLING": "CUBIC", "COG_OVERVIEW_POLICY": "SOURCE"},
+        {"RESAMPLING": "CUBIC"},
         {"COMPRESS": "DEFLATE", "OVERVIEW_COMPRESS": "LZW"},
     ],
 )
