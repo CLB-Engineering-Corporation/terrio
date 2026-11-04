@@ -48,11 +48,11 @@
 //!     Arc::new(Int64Array::from(vec![1, 2])),
 //!     Arc::new(BinaryArray::from_vec(vec![&point(0.0, 0.0), &point(5.0, 5.0)])),
 //! ]).map_err(|e| terrio::Error::InvalidData(e.to_string()))?;
+//! // The archive profile writes ZSTD, which needs the `parquet-zstd` feature.
+//! # #[cfg(feature = "parquet-zstd")] {
 //! let layers = vec![ArrowLayer::new(Some("points".into()), schema, vec![Ok(batch)])];
 //! let mut options = GeoParquetWriteOptions::archive();
 //! options.crs = Some(serde_json::json!("EPSG:32633"));
-//! // The archive profile writes ZSTD, which needs the `parquet-zstd` feature.
-//! # #[cfg(feature = "parquet-zstd")] {
 //! let mut out = Vec::new();
 //! let report = write_arrow_layers(layers, &mut out, &options)?;
 //! assert_eq!((report.rows, report.row_groups), (2, 1));
