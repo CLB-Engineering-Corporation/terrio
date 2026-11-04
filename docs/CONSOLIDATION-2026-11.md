@@ -135,7 +135,7 @@ and "CI" had last passed on d1e1484, before the upstream merge in f88347f.
   involved.
 - **Licence list.** 2019f8f regenerated the list on Windows with `core.autocrlf=true`. Git stripped
   the CRLF line endings of the licence texts that have them (939 lines), and terrio's own `LICENSE`,
-  read with CRLF from the working tree, sorted into a group of its own. The list is regenerated with
+  read with CRLF from the working tree, moved to another place in the list. The list is regenerated with
   cargo-about 0.9.2 from an LF checkout, as CI runs it, and `.gitattributes` keeps Git from changing
   its line endings.
 - **Docs.** `docs.yml` downloads the Pyodide wheel of the latest GitHub release and the fork has no
