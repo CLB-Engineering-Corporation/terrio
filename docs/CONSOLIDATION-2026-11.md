@@ -154,3 +154,8 @@ now ask for `SOURCE`, the old default; `overview_policies_select_distinct_defaul
 `overviews_none_writes_the_full_resolution_only` and `cog_options_are_acted_on_or_refused` assert the
 new default; `test_default_resampling_is_gdals_cubic` and `test_paletted_default_is_nearest` no longer
 name a policy, as upstream's. No comparison with GDAL was weakened, skipped or marked xfail.
+
+Two test servers counted what they sent after writing it, so the client could return first:
+`test_palette_destination_reuses_the_remote_source` and
+`test_network_stats_report_gdals_counters_per_host` failed now and then (`assert 0 == 1794`,
+`assert 0 > 0`). They now count first; their assertions are unchanged.
