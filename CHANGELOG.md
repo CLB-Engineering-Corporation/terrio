@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- GeoTIFF: a band's item in a named metadata domain keeps its `sample` attribute, as GDAL writes
+  it. It was written as a dataset item.
 - New crate `terrio-filegdb`: a pure-Rust reader and writer for Esri File Geodatabases, ported from
   GDAL's OpenFileGDB driver.
 - The `OpenFileGDB` driver (the `filegdb` feature, on by default, native builds only) reads `.gdb`

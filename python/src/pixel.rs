@@ -225,12 +225,12 @@ fn blend(
         let same = |p: &str| std::fs::canonicalize(p).ok().zip(std::fs::canonicalize(dst).ok()).is_some_and(|(a, b)| a == b);
         if !same(&c) && !same(&v) {
             let options = write_options(format, compress, tile_size, bigtiff)?;
-            py.detach(|| {
+            py.detach_result(|| {
                 let (mut c, mut v) = (terrio::open_raster_lazy(&c)?, terrio::open_raster_lazy(&v)?);
                 terrio::ops::blend::blend_to_path(&mut c, &mut v, &o, dst, &options)
             })
             .py()?;
-            return Ok(PyRaster { inner: py.detach(|| terrio::open_raster_lazy(dst)).py()? });
+            return Ok(PyRaster { inner: py.detach_result(|| terrio::open_raster_lazy(dst)).py()? });
         }
     }
     let base = input_raster(py, src)?;

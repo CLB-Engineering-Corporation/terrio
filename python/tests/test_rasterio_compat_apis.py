@@ -334,8 +334,9 @@ def server(tmp_path):
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Content-Range", f"bytes {start}-{end}/{len(data)}")
             self.end_headers()
-            self.wfile.write(body)
+            # Recorded first: the client can return before this thread runs again after the write.
             sent.append(len(body))
+            self.wfile.write(body)
 
     httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     threading.Thread(target=httpd.serve_forever, daemon=True).start()

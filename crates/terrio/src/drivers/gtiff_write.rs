@@ -2746,12 +2746,6 @@ fn gdal_metadata_xml(
     let mut any = false;
     let mut item = |name: &str, value: &str, sample: Option<usize>, role: Option<&str>, domain: Option<&str>| {
         let mut attrs = format!("name=\"{}\"", xml_escape(name));
-        if let Some(domain) = domain {
-            attrs.push_str(&format!(" domain=\"{}\"", xml_escape(domain)));
-            xml.push_str(&format!("  <Item {attrs}>{}</Item>\n", xml_escape(&xml_escape(value))));
-            any = true;
-            return;
-        }
         if let Some(s) = sample {
             attrs.push_str(&format!(" sample=\"{s}\""));
         }
