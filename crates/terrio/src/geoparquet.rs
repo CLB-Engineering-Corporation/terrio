@@ -51,9 +51,12 @@
 //! let layers = vec![ArrowLayer::new(Some("points".into()), schema, vec![Ok(batch)])];
 //! let mut options = GeoParquetWriteOptions::archive();
 //! options.crs = Some(serde_json::json!("EPSG:32633"));
+//! // The archive profile writes ZSTD, which needs the `parquet-zstd` feature.
+//! # #[cfg(feature = "parquet-zstd")] {
 //! let mut out = Vec::new();
 //! let report = write_arrow_layers(layers, &mut out, &options)?;
 //! assert_eq!((report.rows, report.row_groups), (2, 1));
+//! # }
 //! # Ok::<(), terrio::Error>(())
 //! ```
 
