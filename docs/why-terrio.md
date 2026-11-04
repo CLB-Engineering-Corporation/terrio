@@ -91,7 +91,7 @@ another library and not in terrio, use it.
 
 ## When to use something else
 
-- **You need many formats terrio doesn't have** (File Geodatabase, MrSID, HDF4, databases):
+- **You need many formats terrio doesn't have** (writing File Geodatabases, MrSID, HDF4, databases):
   use GDAL, directly, through the `gdal` crate, or through terrio's `gdal` feature.
 - **You need the fastest conversion or warping today:** GDAL. terrio is faster for some tasks and
   slower for others; see [Benchmarks](benchmarks.md).

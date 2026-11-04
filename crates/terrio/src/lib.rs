@@ -142,6 +142,7 @@
 //! - `tiles`: MBTiles, PMTiles and MVT ([`tiles`]); `avif`: their AVIF tiles;
 //! - `zarr`, `jp2` (JPEG 2000), `flatgeobuf`, `osm` (OpenStreetMap);
 //! - `xlsx`: XLSX and XLSM workbooks, in pure Rust;
+//! - `filegdb`: Esri File Geodatabases, read only, in pure Rust (native builds only);
 //! - `pointcloud`: LAS, LAZ, COPC, EPT, PLY and E57 ([`pointcloud`]);
 //! - `lerc` and `lzma`: GeoTIFFs with those compressions.
 //!

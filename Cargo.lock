@@ -2766,6 +2766,7 @@ dependencies = [
  "tar",
  "tempfile",
  "terrio-crs",
+ "terrio-filegdb",
  "thiserror 2.0.21",
  "tiff",
  "ureq",

@@ -10,7 +10,6 @@ repository.workspace = true
 authors = ["CLB Engineering Corporation"]
 keywords = ["gis", "geospatial", "filegdb", "geodatabase", "esri"]
 categories = ["science::geo", "parser-implementations"]
-publish = false
 
 [dependencies]
 thiserror.workspace = true

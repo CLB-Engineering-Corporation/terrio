@@ -434,7 +434,7 @@ fn polygon_or_multi(mut polygons: Vec<(Ring, Vec<Ring>)>) -> Geometry {
 
 /// Groups rings into polygons: clockwise rings are exteriors, and each counter-clockwise ring is
 /// a hole of the smallest exterior containing it.
-fn organize_rings(parts: Vec<Vec<Coord>>) -> Geometry {
+pub(super) fn organize_rings(parts: Vec<Vec<Coord>>) -> Geometry {
     // GDAL organizes, and since 3.13 splits self-touching rings, only in records of several parts.
     let several = parts.len() > 1;
     let mut rings: Vec<Ring> = Vec::with_capacity(parts.len());

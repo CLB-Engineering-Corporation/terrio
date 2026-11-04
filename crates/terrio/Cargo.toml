@@ -95,7 +95,7 @@ ndarray = { workspace = true, optional = true }
 # Disabled drivers stay in the API (`RasterDriver`, `VectorDriver`) and fail with "built without
 # the `...` feature".
 [features]
-default = ["cad", "geotiff", "parquet", "remote", "avif", "netcdf-hdf5", "osm", "lzma", "flatgeobuf", "jp2", "lerc", "pointcloud", "tiles", "zarr", "sqlite", "grib", "hecras", "xlsx"]
+default = ["cad", "geotiff", "parquet", "remote", "avif", "netcdf-hdf5", "osm", "lzma", "flatgeobuf", "jp2", "lerc", "pointcloud", "tiles", "zarr", "sqlite", "grib", "hecras", "xlsx", "filegdb"]
 ## GeoTIFF and COG reading and writing. Always built (it is the core): the feature exists so that
 ## `features = ["geotiff"]` states what a build needs.
 geotiff = []
@@ -122,6 +122,10 @@ netcdf-hdf5 = ["dep:netcdf-reader", "dep:hdf5-reader"]
 hecras = ["netcdf-hdf5", "dep:ras-commander-fast-hdf", "ras-commander-fast-hdf/arrow", "dep:arrow-array", "dep:arrow-schema"]
 ## XLSX and XLSM workbooks as vector layers (pure Rust).
 xlsx = []
+## Esri File Geodatabases (`.gdb` directories) as vector layers, read only, through the pure-Rust
+## `terrio-filegdb` crate. Native builds only: a geodatabase is a directory, and WebAssembly has no
+## file system to hold one, so there the feature builds nothing.
+filegdb = ["dep:terrio-filegdb"]
 ## OpenStreetMap PBF and XML.
 osm = ["dep:osmpbfreader", "wbvector/osmpbf"]
 ## LZMA-compressed GeoTIFFs.
@@ -158,6 +162,7 @@ gdal = ["dep:gdal", "dep:gdal-sys"]
 ndarray = ["dep:ndarray"]
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
+terrio-filegdb = { workspace = true, optional = true }
 # `libzstd`: EPT tiles' Zstandard, natively (without it, and in WebAssembly, `ruzstd`).
 memmap2.workspace = true
 zstd = { workspace = true, optional = true }

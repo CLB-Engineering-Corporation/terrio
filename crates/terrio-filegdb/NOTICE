@@ -1,0 +1,42 @@
+terrio-filegdb
+Licensed under the MIT License (see LICENSE).
+
+This crate is a port of the relevant parts of GDAL's OpenFileGDB driver. The copyright in the code
+it translates remains with its authors, whose notices follow. Each source file derived from GDAL's
+source files starts with SPDX headers: the copyright lines of those source files, copied verbatim,
+the license that applies, and the files it was translated from.
+
+-------------------------------------------------------------------------------
+GDAL (https://github.com/OSGeo/gdal)
+-------------------------------------------------------------------------------
+
+Files derived from GDAL source files (ogr/ogrsf_frmts/openfilegdb/):
+  crates/terrio-filegdb/src/geometry.rs
+  crates/terrio-filegdb/src/lib.rs
+  crates/terrio-filegdb/src/shape.rs
+  crates/terrio-filegdb/src/spatial_index.rs
+  crates/terrio-filegdb/src/table.rs
+  crates/terrio-filegdb/src/varint.rs
+  crates/terrio-filegdb/src/writer.rs
+
+The copyright notices of those source files:
+  Copyright (c) 2014, Even Rouault <even dot rouault at spatialys.com>
+  Copyright (c) 2022, Even Rouault <even dot rouault at spatialys.com>
+
+Permission is hereby granted, free of charge, to any person obtaining a
+copy of this software and associated documentation files (the "Software"),
+to deal in the Software without restriction, including without limitation
+the rights to use, copy, modify, merge, publish, distribute, sublicense,
+and/or sell copies of the Software, and to permit persons to whom the
+Software is furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included
+in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.

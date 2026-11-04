@@ -867,6 +867,10 @@ fn list_layers_native(path: &str) -> Result<Vec<String>> {
         #[cfg(not(feature = "sqlite"))]
         return Err(Error::disabled("sqlite"));
     }
+    #[cfg(all(feature = "filegdb", not(target_family = "wasm")))]
+    if VectorDriver::for_extension(local.as_str()) == Some(VectorDriver::FileGDB) {
+        return crate::drivers::vector::filegdb::list_layers(local.as_str());
+    }
     Ok(open_vector_native(local.as_str(), &VectorOpenOptions::default())?.layers.into_iter().map(|l| l.name).collect())
 }
 
@@ -1162,8 +1166,8 @@ fn read_vector_local(path: &str, driver: VectorDriver, options: &VectorOpenOptio
         }
         vec![layer]
     };
-    // The Shapefile driver reads only the range; the others read every feature.
-    if driver != VectorDriver::Shapefile {
+    // The Shapefile and File Geodatabase drivers keep only the range; the others read every feature.
+    if !matches!(driver, VectorDriver::Shapefile | VectorDriver::FileGDB) {
         layers.iter_mut().for_each(|l| options.keep_range(l));
     }
     Ok(finish_vector(layers, path, driver))
@@ -1195,8 +1199,11 @@ fn select_layers(layers: Vec<Layer>, path: &str, options: &VectorOpenOptions) ->
 /// WGS 84 by definition.
 pub(crate) fn fix_layer(mut layer: Layer, path: &str, driver: VectorDriver) -> Layer {
     let stem = Path::new(path).file_stem().and_then(|s| s.to_str()).unwrap_or("layer");
-    // A GeoPackage table or a worksheet may be named "layer"; other drivers use it as a placeholder.
-    if layer.name.is_empty() || (layer.name == "layer" && !matches!(driver, VectorDriver::GPKG | VectorDriver::XLSX)) {
+    // A GeoPackage or geodatabase table or a worksheet may be named "layer"; other drivers use it as
+    // a placeholder.
+    if layer.name.is_empty()
+        || (layer.name == "layer" && !matches!(driver, VectorDriver::GPKG | VectorDriver::XLSX | VectorDriver::FileGDB))
+    {
         layer.name = stem.to_string();
     }
     // Re-identify the EPSG code of stored WKT (such as a shapefile's ESRI .prj) the way GDAL does,
@@ -1665,7 +1672,8 @@ pub struct VectorWriteOptions {
 /// for the other formats, write one layer at a time.
 ///
 /// With the `gdal` feature, an extension terrio has no driver for is written by the GDAL driver
-/// that claims it (`.dxf`, `.gdb`; see `gdal_backend::write_vector`).
+/// that claims it (`.dxf`; see `gdal_backend::write_vector`), and so is `.gdb`, which terrio's own
+/// driver only reads.
 ///
 /// ```no_run
 /// let ds = terrio::open_vector("countries.shp", &Default::default())?;
@@ -1677,12 +1685,13 @@ pub struct VectorWriteOptions {
 /// ```
 pub fn write_vector(layers: &[Layer], path: &str, options: &VectorWriteOptions) -> Result<()> {
     ensure_writable_location(path)?;
-    let driver = match options.driver.or_else(|| VectorDriver::for_extension(path)) {
-        Some(d) => d,
-        None => {
-            // With the GDAL backend, the GDAL driver of the extension (`.gdb`...).
+    let requested = options.driver.or_else(|| VectorDriver::for_extension(path));
+    let driver = match requested {
+        Some(d) if !d.written_through_gdal() => d,
+        _ => {
+            // With the GDAL backend, the GDAL driver of the extension (`.dxf`...), or of `.gdb`.
             #[cfg(feature = "gdal")]
-            if let Some(d) = crate::gdal_backend::driver_for_path(path, true) {
+            if let Some(d) = requested.map(|d| d.name().to_string()).or_else(|| crate::gdal_backend::driver_for_path(path, true)) {
                 ensure_vector_options_apply(options, None)?;
                 return crate::gdal_backend::write_vector(layers, path, &d, &[], &[]);
             }

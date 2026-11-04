@@ -117,9 +117,10 @@ With the feature enabled:
   included; a layer of unknown type gets the type its features share, single geometries promoted
   to multi ones as `-nlt PROMOTE_TO_MULTI` does) and CRSs are kept; an existing output is
   replaced.
-- An output extension terrio has no driver for goes to the GDAL driver that claims it (`.gdb`,
-  `.ntf`...), in `terrio convert` and in `terrio::write_vector` and
-  `write_raster_dataset`.
+- An output extension terrio has no driver for goes to the GDAL driver that claims it (`.ntf`...),
+  in `terrio convert` and in `terrio::write_vector` and `write_raster_dataset`. So does `.gdb`:
+  terrio's own `OpenFileGDB` driver reads geodatabases, without GDAL, but doesn't write them. With
+  this backend it still reads them first, GDAL being the fallback; `GDAL:x.gdb` asks for GDAL.
 - Bytes in memory: `terrio::memory::open_bytes` (and `open_raster_bytes`, `open_vector_bytes`)
   hands what terrio cannot read to GDAL through its `/vsimem/` file system, zip archives through
   `/vsizip/`; `memory::write_raster_bytes` and `write_vector_bytes` write the formats only GDAL

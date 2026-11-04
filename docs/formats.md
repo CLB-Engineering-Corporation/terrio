@@ -380,6 +380,7 @@ terrio convert 'STACTA:"https://example.com/pyramid/stacta.json":bands' preview.
 | MapInfo File | MapInfo TAB and interchange format | ✓ | ✓ | tab, mif |
 | OSM | OpenStreetMap PBF and XML | ✓ | | osm.pbf, osm |
 | HECRAS | HEC-RAS geometry and plan HDF5 (the `hecras` feature) | ✓ | | g##.hdf, p##.hdf (by content) |
+| OpenFileGDB | Esri File Geodatabase directories (the `filegdb` feature, native builds) | ✓ | | gdb |
 | PMTiles | PMTiles v3 vector tiles (MVT) | ✓ | ✓ | pmtiles |
 | MBTiles | MBTiles vector tiles (MVT) | ✓ | ✓ | mbtiles |
 | MVT | Mapbox Vector Tiles: a tile, or a directory of tiles | ✓ | ✓ | mvt, pbf |
@@ -778,6 +779,32 @@ HEC-RAS geometry and plan files (`HECRAS`, which GDAL does not have) are recogni
 an HDF5 signature and the root `File Type` HEC-RAS writes, and give the mesh, 1D and 2D feature
 layers with the results HEC-RAS stored; `open_raster` still reads them as HDF5. See
 [HEC-RAS](hecras.md).
+
+Esri File Geodatabases (`OpenFileGDB`, GDAL's name; `FileGDB` is accepted too) are read in pure Rust
+by the `terrio-filegdb` crate, a port of GDAL's driver, without GDAL. A `.gdb` directory opens by its
+name: every table except the system `GDB_*` ones is a layer, including empty ones and tables without
+geometry, with the layer, feature range and spatial filter options (the filter compares envelopes,
+and drops null shapes). OBJECTID is the feature id, and `Shape_Length` and `Shape_Area` are
+ordinary fields. Polyline features are always multilinestrings and polygon features multipolygons,
+as GDAL gives them. A row with a null shape is a feature without geometry. Dates are read as text to
+the millisecond. What terrio's vector model cannot hold is lost:
+
+- True curves are densified with a step of 1 degree of arc (GDAL's default is 4): a circle gets about
+  360 vertices and an area 0.005% too small. Exact curve parameters are lost; so is the Z or M along
+  a curve, each new vertex taking those of the segment's start. Elliptic arcs become their chords.
+  `Shape_Length` and `Shape_Area` stay what the geodatabase stores.
+- Multipatch features keep their attributes but have no geometry, and raster fields are left out,
+  both with a warning. Tables the reader does not support are left out with a warning too, unless
+  named.
+- Times of day have no type in the model and are `HH:MM:SS` text. Date-times with a UTC offset are
+  read in UTC, marked `Z`, their offset lost.
+- Aliases, coded-value and range domains, subtypes, relationship classes and attribute indexes are
+  not read. File Geodatabase rasters are not read either: their `fras_*` tables are plain layers.
+
+A table is read into memory whole, and the driver takes directories only: no `.gdb.zip`, no remote
+geodatabases and, as WebAssembly has no directories, no WebAssembly builds. It only reads:
+to write a geodatabase, use [the GDAL backend](gdal.md#the-optional-gdal-backend) or the
+`terrio-filegdb` crate. Without the `gdal` feature, writing `.gdb` is refused.
 
 Layer and field models follow GDAL's: GPX has GDAL's five layers, KML has the LIBKML driver's
 fields, OSM has the `points`, `lines`, `multilinestrings`, `multipolygons` and `other_relations`

@@ -14,6 +14,8 @@ pub(crate) mod datetime;
 pub mod esrijson;
 pub mod esripbf;
 pub(crate) mod featureservice;
+#[cfg(all(feature = "filegdb", not(target_family = "wasm")))]
+pub(crate) mod filegdb;
 #[cfg(feature = "flatgeobuf")]
 pub mod flatgeobuf;
 pub mod geojson;
@@ -122,6 +124,8 @@ pub(crate) fn read(path: &str, driver: VectorDriver, options: &VectorOpenOptions
         VectorDriver::OSM => osm::read(path)?,
         #[cfg(feature = "hecras")]
         VectorDriver::HECRAS => crate::drivers::hecras::driver::read(path, options)?,
+        #[cfg(all(feature = "filegdb", not(target_family = "wasm")))]
+        VectorDriver::FileGDB => filegdb::read(path, options)?,
         _ => return Ok(None),
     }))
 }
@@ -203,6 +207,9 @@ pub(crate) fn read_bytes(bytes: Vec<u8>, name: &str, driver: VectorDriver, optio
         VectorDriver::GPKG => gpkg_read::parse(bytes, &[])?,
         #[cfg(feature = "hecras")]
         VectorDriver::HECRAS => crate::drivers::hecras::driver::read_bytes(bytes, name, options)?,
+        VectorDriver::FileGDB => {
+            return Err(crate::Error::Unsupported(format!("'{name}': a File Geodatabase is a directory: open it by its path")));
+        }
         _ => return Ok(None),
     }))
 }

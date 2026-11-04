@@ -199,13 +199,14 @@ pub fn write_raster_bytes(ds: &RasterDataset, name: &str, options: &RasterWriteO
 /// Bare `.shp` names are refused: use [`crate::write_vector`] for filesystem members.
 /// See [`write_shapefile_zip_bytes`] for supported data and refusals.
 pub fn write_vector_bytes(layers: &[Layer], name: &str, options: &VectorWriteOptions) -> Result<Vec<u8>> {
-    let driver = match options.driver.or_else(|| {
+    let requested = options.driver.or_else(|| {
         if name.to_ascii_lowercase().ends_with(".shp.zip") { Some(VectorDriver::Shapefile) } else { VectorDriver::for_extension(name) }
-    }) {
-        Some(d) => d,
-        None => {
+    });
+    let driver = match requested {
+        Some(d) if !d.written_through_gdal() => d,
+        _ => {
             #[cfg(feature = "gdal")]
-            if let Some(d) = crate::gdal_backend::driver_for_path(name, true) {
+            if let Some(d) = requested.map(|d| d.name().to_string()).or_else(|| crate::gdal_backend::driver_for_path(name, true)) {
                 crate::dataset::ensure_vector_options_apply(options, None)?;
                 return crate::gdal_backend::write_vector_bytes(layers, name, &d, &[], &[]);
             }

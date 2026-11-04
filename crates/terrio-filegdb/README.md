@@ -13,6 +13,9 @@ produces follow what ArcGIS Pro 3.x writes, as read from geodatabases ArcGIS cre
 
 Written by CLB Engineering Corporation. MIT licence.
 
+terrio reads geodatabases with this crate, as the `OpenFileGDB` vector driver (its `filegdb`
+feature); use the crate directly to write them or to keep true curves.
+
 ## API
 
 ```rust,ignore

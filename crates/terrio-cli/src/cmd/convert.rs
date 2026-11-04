@@ -397,8 +397,15 @@ pub fn run(mut a: Args) -> terrio::Result<()> {
             #[cfg(feature = "gdal")]
             {
                 let gdal_driver = match a.format.as_deref() {
-                    Some(f) if VectorDriver::from_name(f).is_none() && terrio::gdal_backend::has_driver(f) => Some(f.to_string()),
-                    None if VectorDriver::for_extension(&a.output).is_none() => terrio::gdal_backend::driver_for_path(&a.output, true),
+                    Some(f)
+                        if VectorDriver::from_name(f).is_none_or(VectorDriver::written_through_gdal)
+                            && terrio::gdal_backend::has_driver(f) =>
+                    {
+                        Some(f.to_string())
+                    }
+                    None if VectorDriver::for_extension(&a.output).is_none_or(VectorDriver::written_through_gdal) => {
+                        terrio::gdal_backend::driver_for_path(&a.output, true)
+                    }
                     _ => None,
                 };
                 if let Some(d) = gdal_driver {

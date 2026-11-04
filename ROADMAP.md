@@ -569,6 +569,9 @@ WebAssembly (the `terrio-js` npm package):
       in memory). Tested on HEC-RAS 7.0.1 files against h5py, bit for bit
       (`scripts/compare_hecras_with_h5py.py`, the `hecras` conformance suite); older versions best
       effort.
+- [x] Esri File Geodatabases read without GDAL (the `OpenFileGDB` driver, `filegdb` feature, through
+      the `terrio-filegdb` crate). Writing through `terrio::write_vector` is not done: the crate's
+      `GdbWriter` is not wired in, and `.gdb` outputs still go through the GDAL backend.
 - [ ] HEC-RAS files read in place over HTTP and S3 by range requests: needs an engine byte-source
       interface (plan the ranges from the HDF5 metadata, fetch them, then decode, as
       `sparse::SparseFile` reads).

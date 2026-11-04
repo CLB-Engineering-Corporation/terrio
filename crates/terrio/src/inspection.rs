@@ -379,6 +379,10 @@ pub(crate) fn identify_unjudged(path: &str, deep: bool) -> Result<Option<Identif
         crate::vfs::Location::Local(path) if path.is_dir() => {
             let mut found =
                 if path.join("hdr.adf").is_file() && path.join("w001001.adf").is_file() { raster(RasterDriver::AIG) } else { None };
+            // A File Geodatabase: `open` knows it by its name, its catalog tells it from other directories.
+            if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("gdb")) && path.join("a00000001.gdbtable").is_file() {
+                found = vector(VectorDriver::FileGDB);
+            }
             for marker in ["zarr.json", ".zgroup", ".zarray"] {
                 let marker = path.join(marker);
                 if marker.is_file() {

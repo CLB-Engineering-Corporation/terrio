@@ -148,6 +148,9 @@ pub enum VectorDriver {
     /// feature and its `terrio::hecras` module). Recognized by content: an HDF5 signature and the
     /// root `File Type` HEC-RAS writes, so that other HDF5 files stay rasters.
     HECRAS,
+    /// Esri File Geodatabases (`.gdb` directories), read only: every table is a layer (the
+    /// `filegdb` feature, native builds only). Written through the GDAL backend, when built with it.
+    FileGDB,
     /// Comma-separated values with X/Y or WKT geometry columns.
     CSV,
     /// Office Open XML spreadsheets: each worksheet is a layer (the `xlsx` feature).
@@ -404,6 +407,7 @@ impl VectorDriver {
         // After OSM, so that `.pbf` names OSM by its extension: ESRIPBF is told by content.
         Self::ESRIPBF,
         Self::HECRAS,
+        Self::FileGDB,
         Self::CSV,
         Self::XLSX,
         Self::MBTiles,
@@ -438,6 +442,8 @@ impl VectorDriver {
             Self::OSM => ("OSM", "OpenStreetMap PBF and XML", &["pbf", "osm"], true, false),
             // No extension of its own: HEC-RAS files share `.hdf` and `.h5` with other HDF5 files.
             Self::HECRAS => ("HECRAS", "HEC-RAS geometry and plan HDF5", &[], true, false),
+            // GDAL's name: terrio's reader is a port of that driver.
+            Self::FileGDB => ("OpenFileGDB", "Esri File Geodatabase", &["gdb"], true, false),
             Self::CSV => ("CSV", "Comma Separated Value", &["csv", "tsv"], true, true),
             Self::XLSX => ("XLSX", "MS Office Open XML spreadsheet", &["xlsx", "xlsm"], true, true),
             Self::MBTiles => ("MBTiles", "MBTiles", &["mbtiles"], true, true),
@@ -458,6 +464,8 @@ impl VectorDriver {
             Self::DXF | Self::DWG => ("cad", cfg!(feature = "cad")),
             Self::OSM => ("osm", cfg!(feature = "osm")),
             Self::HECRAS => ("hecras", cfg!(feature = "hecras")),
+            // A directory of files: there is none to read in WebAssembly.
+            Self::FileGDB => ("filegdb", cfg!(all(feature = "filegdb", not(target_family = "wasm")))),
             Self::XLSX => ("xlsx", cfg!(feature = "xlsx")),
             Self::WFS => ("remote", cfg!(remote)),
             Self::MBTiles | Self::PMTiles | Self::MVT => ("tiles", cfg!(feature = "tiles")),
@@ -488,6 +496,7 @@ impl VectorDriver {
             "mapinfo" | "mif" => Some(Self::MapInfo),
             "json" => Some(Self::GeoJSON),
             "hec-ras" | "hec_ras" | "hecras_hdf" => Some(Self::HECRAS),
+            "filegdb" | "gdb" => Some(Self::FileGDB),
             _ => None,
         };
         alias.or_else(|| Self::ALL.iter().copied().find(|d| d.name().eq_ignore_ascii_case(name)))
@@ -539,8 +548,15 @@ impl VectorDriver {
             | Self::PMTiles
             | Self::MVT
             | Self::HECRAS
+            | Self::FileGDB
             | Self::Gdal => return None,
         })
+    }
+
+    /// Whether this build writes the format with GDAL's driver of the same name: terrio's own
+    /// driver of it only reads, and the `gdal` feature keeps `.gdb` outputs working.
+    pub fn written_through_gdal(self) -> bool {
+        cfg!(feature = "gdal") && self == Self::FileGDB
     }
 }
 
@@ -613,6 +629,7 @@ pub fn canonical_driver_name(name: &str) -> String {
     let upper = name.trim().to_ascii_uppercase();
     match upper.as_str() {
         "JP2OPENJPEG" | "JPEG2000" | "JP2KAK" | "JP2ECW" | "JP2MRSID" => "JP2".to_string(),
+        "FILEGDB" => "OPENFILEGDB".to_string(),
         _ => upper,
     }
 }
