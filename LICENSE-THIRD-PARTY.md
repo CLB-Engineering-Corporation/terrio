@@ -10,8 +10,8 @@ LICENSE-THIRD-PARTY.md`, from `about.toml`.
 
 ## Overview
 
-- Apache License 2.0 (263)
-- MIT License (72)
+- Apache License 2.0 (262)
+- MIT License (70)
 - ISC License (20)
 - BSD 3-Clause "New" or "Revised" License (14)
 - BSD 2-Clause "Simplified" License (8)
@@ -262,17 +262,16 @@ Used by:
 
 Used by:
 
-- [arrow-array 58.4.1](https://github.com/apache/arrow-rs)
-- [arrow-buffer 58.4.1](https://github.com/apache/arrow-rs)
-- [arrow-data 58.4.1](https://github.com/apache/arrow-rs)
-- [arrow-ipc 58.4.1](https://github.com/apache/arrow-rs)
-- [arrow-schema 58.4.1](https://github.com/apache/arrow-rs)
-- [arrow-select 58.4.1](https://github.com/apache/arrow-rs)
+- [arrow-array 59.0.0](https://github.com/apache/arrow-rs)
+- [arrow-data 59.0.0](https://github.com/apache/arrow-rs)
+- [arrow-ipc 59.0.0](https://github.com/apache/arrow-rs)
+- [arrow-schema 59.0.0](https://github.com/apache/arrow-rs)
+- [arrow-select 59.0.0](https://github.com/apache/arrow-rs)
 - [cmov 0.5.4](https://github.com/RustCrypto/utils)
 - [ctutils 0.4.3](https://github.com/RustCrypto/utils)
 - [encoding_rs 0.8.42](https://github.com/hsivonen/encoding_rs)
 - [multiversion_no_op 1.0.0](https://github.com/hsivonen/multiversion_no_op)
-- [parquet 58.4.1](https://github.com/apache/arrow-rs)
+- [parquet 59.0.0](https://github.com/apache/arrow-rs)
 - [siphasher 1.0.4](https://github.com/jedisct1/rust-siphash)
 - [spade 2.15.1](https://github.com/Stoeoef/spade)
 - [static_assertions 1.1.0](https://github.com/nvzqz/static-assertions-rs)
@@ -1005,7 +1004,7 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 Used by:
 
-- [thrift 0.23.0](https://github.com/apache/thrift/tree/master/lib/rs)
+- [arrow-buffer 59.3.2](https://github.com/apache/arrow-rs)
 
 ```text
 
@@ -1211,118 +1210,12 @@ Used by:
    See the License for the specific language governing permissions and
    limitations under the License.
 
---------------------------------------------------
-SOFTWARE DISTRIBUTED WITH THRIFT:
+--------------------------------------------------------------------------------
 
-The Apache Thrift software includes a number of subcomponents with
-separate copyright notices and license terms. Your use of the source
-code for the these subcomponents is subject to the terms and
-conditions of the following licenses.
+arrow-array/src/delta.rs: MIT
 
---------------------------------------------------
-Portions of the following files are licensed under the MIT License:
-
-  lib/erl/src/Makefile.am
-
-Please see doc/otp-base-license.txt for the full terms of this license.
-
---------------------------------------------------
-For the aclocal/ax_boost_base.m4 and contrib/fb303/aclocal/ax_boost_base.m4 components:
-
-#   Copyright (c) 2007 Thomas Porschberg <thomas@randspringer.de>
-#
-#   Copying and distribution of this file, with or without
-#   modification, are permitted in any medium without royalty provided
-#   the copyright notice and this notice are preserved.
-
---------------------------------------------------
-For the lib/nodejs/lib/thrift/json_parse.js:
-
-/*
-    json_parse.js
-    2015-05-02
-    Public Domain.
-    NO WARRANTY EXPRESSED OR IMPLIED. USE AT YOUR OWN RISK.
-
-*/
-(By Douglas Crockford <douglas@crockford.com>)
-
---------------------------------------------------
-For lib/cpp/src/thrift/windows/SocketPair.cpp
-
-/* socketpair.c
- * Copyright 2007 by Nathan C. Myers <ncm@cantrip.org>; some rights reserved.
- * This code is Free Software.  It may be copied freely, in original or
- * modified form, subject only to the restrictions that (1) the author is
- * relieved from all responsibilities for any use for any purpose, and (2)
- * this copyright notice must be retained, unchanged, in its entirety.  If
- * for any reason the author might be held responsible for any consequences
- * of copying or use, license is withheld.
- */
-
-
---------------------------------------------------
-For lib/py/compat/win32/stdint.h
-
-// ISO C9x  compliant stdint.h for Microsoft Visual Studio
-// Based on ISO/IEC 9899:TC2 Committee draft (May 6, 2005) WG14/N1124
-//
-//  Copyright (c) 2006-2008 Alexander Chemeris
-//
-// Redistribution and use in source and binary forms, with or without
-// modification, are permitted provided that the following conditions are met:
-//
-//   1. Redistributions of source code must retain the above copyright notice,
-//      this list of conditions and the following disclaimer.
-//
-//   2. Redistributions in binary form must reproduce the above copyright
-//      notice, this list of conditions and the following disclaimer in the
-//      documentation and/or other materials provided with the distribution.
-//
-//   3. The name of the author may be used to endorse or promote products
-//      derived from this software without specific prior written permission.
-//
-// THIS SOFTWARE IS PROVIDED BY THE AUTHOR ``AS IS'' AND ANY EXPRESS OR IMPLIED
-// WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF
-// MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO
-// EVENT SHALL THE AUTHOR BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
-// SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
-// PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS;
-// OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY,
-// WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR
-// OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF
-// ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-//
-///////////////////////////////////////////////////////////////////////////////
-
-
---------------------------------------------------
-Codegen template in t_html_generator.h
-
-* Bootstrap v2.0.3
-*
-* Copyright 2012 Twitter, Inc
-* Licensed under the Apache License v2.0
-* http://www.apache.org/licenses/LICENSE-2.0
-*
-* Designed and built with all the love in the world @twitter by @mdo and @fat.
-
----------------------------------------------------
-For t_cl_generator.cc
-
- * Copyright (c) 2008- Patrick Collison <patrick@collison.ie>
- * Copyright (c) 2006- Facebook
-
----------------------------------------------------
-
----------------------------------------------------
-For compiler/cpp/src/thrift/generate/sha256.h
-
-SHA-256 implementation by Brad Conte (brad AT bradconte.com).
-Source: https://github.com/B-Con/crypto-algorithms
-The author has placed this code in the public domain (no copyright claimed).
-No algorithmic changes were made; the file was adapted to a C++ header-only
-form for inclusion in the Thrift compiler.
+This file is derived from the chronoutil crate. The full MIT license
+text is in arrow-array/LICENSE-MIT.
 
 ```
 
@@ -4999,6 +4892,7 @@ Used by:
 - [matrixmultiply 0.3.11](https://github.com/bluss/matrixmultiply/)
 - [ndarray 0.17.2](https://github.com/rust-ndarray/ndarray)
 - [num-bigint 0.4.8](https://github.com/rust-num/num-bigint)
+- [num-bigint 0.5.1](https://github.com/rust-num/num-bigint)
 - [num-complex 0.4.6](https://github.com/rust-num/num-complex)
 - [num-derive 0.4.2](https://github.com/rust-num/num-derive)
 - [num-integer 0.1.47](https://github.com/rust-num/num-integer)
@@ -5024,7 +4918,6 @@ Used by:
 - [stable_deref_trait 1.2.1](https://github.com/storyyeller/stable_deref_trait)
 - [tar 0.4.46](https://github.com/composefs/tar-rs)
 - [tempfile 3.27.0](https://github.com/Stebalien/tempfile)
-- [uuid 1.29.0](https://github.com/uuid-rs/uuid)
 - [wasi 0.11.1+wasi-snapshot-preview1](https://github.com/bytecodealliance/wasi)
 - [wasip2 1.0.4+wasi-0.2.12](https://github.com/bytecodealliance/wasi-rs)
 - [wasm-bindgen-futures 0.4.79](https://github.com/wasm-bindgen/wasm-bindgen/tree/master/crates/futures)
@@ -6612,9 +6505,9 @@ Used by:
 - [jxl-threadpool 1.0.0](https://github.com/tirr-c/jxl-oxide.git)
 - [jxl-vardct 0.11.1](https://github.com/tirr-c/jxl-oxide.git)
 - [laz 0.13.0](https://github.com/tmontaigu/laz-rs)
-- [lerc-core 0.5.0](https://github.com/i-norden/lerc-rust)
-- [lerc-reader 0.5.0](https://github.com/i-norden/lerc-rust)
-- [lerc-writer 0.5.0](https://github.com/i-norden/lerc-rust)
+- [lerc-core 0.5.2](https://github.com/i-norden/lerc-rust)
+- [lerc-reader 0.5.2](https://github.com/i-norden/lerc-rust)
+- [lerc-writer 0.5.2](https://github.com/i-norden/lerc-rust)
 - [libc 0.2.191](https://github.com/rust-lang/libc)
 - [miniz_oxide 0.8.9](https://github.com/Frommi/miniz_oxide/tree/master/miniz_oxide)
 - [miniz_oxide 0.9.1](https://github.com/Frommi/miniz_oxide/tree/master/miniz_oxide)
@@ -8538,7 +8431,7 @@ THIS SOFTWARE.
 
 Used by:
 
-- [ras-commander-fast-hdf 0.2.4](https://github.com/gpt-cmdr/ras-commander-fast-hdf)
+- [ras-commander-fast-hdf 0.3.0](https://github.com/gpt-cmdr/ras-commander-fast-hdf)
 
 ```text
 Supercluster 8.0.1: ISC License
@@ -8567,7 +8460,7 @@ THIS SOFTWARE.
 
 Used by:
 
-- [ras-commander-fast-hdf 0.2.4](https://github.com/gpt-cmdr/ras-commander-fast-hdf)
+- [ras-commander-fast-hdf 0.3.0](https://github.com/gpt-cmdr/ras-commander-fast-hdf)
 
 ```text
 # MIT License
@@ -8679,41 +8572,6 @@ NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
 LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
 OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-
-```
-
-## MIT License
-
-Used by:
-
-- [ordered-float 3.9.2](https://github.com/reem/rust-ordered-float)
-
-```text
-Copyright (c) 2015 Jonathan Reem
-
-Permission is hereby granted, free of charge, to any
-person obtaining a copy of this software and associated
-documentation files (the "Software"), to deal in the
-Software without restriction, including without
-limitation the rights to use, copy, modify, merge,
-publish, distribute, sublicense, and/or sell copies of
-the Software, and to permit persons to whom the Software
-is furnished to do so, subject to the following
-conditions:
-
-The above copyright notice and this permission notice
-shall be included in all copies or substantial portions
-of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
-ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
-TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
-PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
-SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
-CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
-OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
-IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
-DEALINGS IN THE SOFTWARE.
 
 ```
 
@@ -9257,7 +9115,7 @@ SOFTWARE.
 
 Used by:
 
-- [arrow-array 58.4.1](https://github.com/apache/arrow-rs)
+- [arrow-array 59.0.0](https://github.com/apache/arrow-rs)
 
 ```text
 MIT License
@@ -9320,7 +9178,7 @@ SOFTWARE.
 
 Used by:
 
-- [ras-commander-fast-hdf 0.2.4](https://github.com/gpt-cmdr/ras-commander-fast-hdf)
+- [ras-commander-fast-hdf 0.3.0](https://github.com/gpt-cmdr/ras-commander-fast-hdf)
 
 ```text
 MIT License
@@ -9375,47 +9233,6 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
-
-```
-
-## MIT License
-
-Used by:
-
-- terrio (terrio's own crate)
-- terrio-cli (terrio's own crate)
-- terrio-crs (terrio's own crate)
-- terrio-py (terrio's own crate)
-
-```text
-MIT License
-
-Copyright (c) 2026 Qiusheng Wu and Terrio contributors
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
-
----
-
-terrio ports and adapts code and data from other projects, among them GDAL,
-PROJ and PDAL. The copyright in that code and data remains with its authors.
-NOTICE lists them with their licenses, and LICENSE-THIRD-PARTY.md lists the
-licenses of the Rust crates terrio is built with.
 
 ```
 
@@ -9554,7 +9371,7 @@ DEALINGS IN THE SOFTWARE.
 
 Used by:
 
-- [ras-commander-fast-hdf 0.2.4](https://github.com/gpt-cmdr/ras-commander-fast-hdf)
+- [ras-commander-fast-hdf 0.3.0](https://github.com/gpt-cmdr/ras-commander-fast-hdf)
 
 ```text
 MIT License
@@ -9647,6 +9464,47 @@ CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
 OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
 IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
+```
+
+## MIT License
+
+Used by:
+
+- terrio (terrio's own crate)
+- terrio-cli (terrio's own crate)
+- terrio-crs (terrio's own crate)
+- terrio-py (terrio's own crate)
+
+```text
+MIT License
+
+Copyright (c) 2026 Qiusheng Wu and Terrio contributors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+---
+
+terrio ports and adapts code and data from other projects, among them GDAL,
+PROJ and PDAL. The copyright in that code and data remains with its authors.
+NOTICE lists them with their licenses, and LICENSE-THIRD-PARTY.md lists the
+licenses of the Rust crates terrio is built with.
+
 ```
 
 ## MIT License
@@ -9931,39 +9789,6 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
-
-```
-
-## MIT License
-
-Used by:
-
-- [integer-encoding 3.0.4](https://github.com/dermesser/integer-encoding-rs)
-
-```text
-The MIT License (MIT)
-
-Copyright (c) 2016 Google Inc. (lewinb@google.com) -- though not an official
-Google product or in any way related!
-Copyright (c) 2018-2020 Lewin Bormann (lbo@spheniscida.de)
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to
-deal in the Software without restriction, including without limitation the
-rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
-sell copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in
-all copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
-FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
-IN THE SOFTWARE.
 
 ```
 

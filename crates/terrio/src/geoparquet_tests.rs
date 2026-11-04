@@ -340,7 +340,11 @@ fn open_sniffs_geoparquet_without_its_extension() {
     let options =
         GeoParquetWriteOptions { crs: Some(json!({"id": {"authority": "EPSG", "code": 26918}})), ..GeoParquetWriteOptions::default() };
     write_arrow_layers_to_path(vec![cells], path.to_str().unwrap(), &options).unwrap();
-    let crate::Dataset::Vector(ds) = crate::open(path.to_str().unwrap()).unwrap() else { panic!("not a vector dataset") };
+    // Detection by content goes through the fallback, which is off by default (#444).
+    crate::config::push_scope([("TERRIO_WBVECTOR_FALLBACK".to_string(), Some("YES".to_string()))].into());
+    let opened = crate::open(path.to_str().unwrap());
+    crate::config::pop_scope();
+    let crate::Dataset::Vector(ds) = opened.unwrap() else { panic!("not a vector dataset") };
     assert_eq!(ds.layers[0].len(), 1);
     assert_eq!(ds.layers[0].features[0].geometry, Some(wbvector::Geometry::point(1., 2.)));
 }
