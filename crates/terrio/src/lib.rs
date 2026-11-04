@@ -142,7 +142,8 @@
 //! - `tiles`: MBTiles, PMTiles and MVT ([`tiles`]); `avif`: their AVIF tiles;
 //! - `zarr`, `jp2` (JPEG 2000), `flatgeobuf`, `osm` (OpenStreetMap);
 //! - `xlsx`: XLSX and XLSM workbooks, in pure Rust;
-//! - `filegdb`: Esri File Geodatabases, read only, in pure Rust (native builds only);
+//! - `filegdb`: Esri File Geodatabases, in pure Rust (native builds only): the read-only
+//!   `OpenFileGDB` vector driver and the [`filegdb`] module, which writes them too;
 //! - `pointcloud`: LAS, LAZ, COPC, EPT, PLY and E57 ([`pointcloud`]);
 //! - `lerc` and `lzma`: GeoTIFFs with those compressions.
 //!
@@ -205,6 +206,9 @@ mod drivers;
 #[cfg(test)]
 mod entry_allow_list_tests;
 mod error;
+#[cfg(all(feature = "filegdb", not(target_family = "wasm")))]
+#[cfg_attr(docsrs, doc(cfg(feature = "filegdb")))]
+pub mod filegdb;
 mod float_read;
 pub mod formats;
 #[cfg(feature = "hecras")]

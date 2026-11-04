@@ -16,7 +16,6 @@ authors = ["Qiusheng Wu <giswqs@gmail.com>"]
 memmap2 = "0.9"
 terrio = { path = "crates/terrio", version = "0.6.1" }
 terrio-crs = { path = "crates/terrio-crs", version = "0.2.1", default-features = false }
-terrio-filegdb = { path = "crates/terrio-filegdb", version = "0.1.0" }
 # For the Python package (not published to crates.io), so without a version to keep in step.
 terrio-cli = { path = "crates/terrio-cli" }
 

@@ -13,8 +13,8 @@
 //! same arithmetic as GDAL (`integer / scale + origin`), so values are
 //! bit-identical to what GDAL (and ArcGIS) report.
 
-use crate::varint::{Cursor, write_varint, write_varuint};
-use crate::{Coord, CurveSegment, Error, GeometryFieldInfo, Result, Shape, ShapeType};
+use crate::filegdb::varint::{Cursor, write_varint, write_varuint};
+use crate::filegdb::{Coord, CurveSegment, Error, GeometryFieldInfo, Result, Shape, ShapeType};
 
 const SEGMENT_ARC: u32 = 1;
 const SEGMENT_BEZIER: u32 = 4;

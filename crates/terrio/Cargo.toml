@@ -122,10 +122,10 @@ netcdf-hdf5 = ["dep:netcdf-reader", "dep:hdf5-reader"]
 hecras = ["netcdf-hdf5", "dep:ras-commander-fast-hdf", "ras-commander-fast-hdf/arrow", "dep:arrow-array", "dep:arrow-schema"]
 ## XLSX and XLSM workbooks as vector layers (pure Rust).
 xlsx = []
-## Esri File Geodatabases (`.gdb` directories) as vector layers, read only, through the pure-Rust
-## `terrio-filegdb` crate. Native builds only: a geodatabase is a directory, and WebAssembly has no
-## file system to hold one, so there the feature builds nothing.
-filegdb = ["dep:terrio-filegdb"]
+## Esri File Geodatabases (`.gdb` directories), in pure Rust: the read-only `OpenFileGDB` vector
+## driver and the `filegdb` module, which writes them too. Native builds only: a geodatabase is a
+## directory, and WebAssembly has no file system to hold one, so there the feature builds nothing.
+filegdb = []
 ## OpenStreetMap PBF and XML.
 osm = ["dep:osmpbfreader", "wbvector/osmpbf"]
 ## LZMA-compressed GeoTIFFs.
@@ -162,7 +162,6 @@ gdal = ["dep:gdal", "dep:gdal-sys"]
 ndarray = ["dep:ndarray"]
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
-terrio-filegdb = { workspace = true, optional = true }
 # `libzstd`: EPT tiles' Zstandard, natively (without it, and in WebAssembly, `ruzstd`).
 memmap2.workspace = true
 zstd = { workspace = true, optional = true }
@@ -191,3 +190,23 @@ same-file.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+
+[[example]]
+name = "bench"
+required-features = ["filegdb"]
+
+[[example]]
+name = "gdbcopy"
+required-features = ["filegdb"]
+
+[[example]]
+name = "gdbdump"
+required-features = ["filegdb"]
+
+[[example]]
+name = "items"
+required-features = ["filegdb"]
+
+[[example]]
+name = "rawgeom"
+required-features = ["filegdb"]

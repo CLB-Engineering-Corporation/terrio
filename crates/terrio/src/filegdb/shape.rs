@@ -16,7 +16,7 @@
 //! Bezier and elliptic segments are approximated by densification (Bezier with
 //! GDAL's heuristic; ellipses as straight chords, which are rare in practice).
 
-use crate::{Coord, CurveSegment, Shape, ShapeType};
+use crate::filegdb::{Coord, CurveSegment, Shape, ShapeType};
 use std::f64::consts::PI;
 
 /// A circular arc in normalised form.

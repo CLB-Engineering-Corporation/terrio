@@ -1,5 +1,5 @@
 //! Prints raw geometry blob bytes of the first N rows: `rawgeom <gdb> <table> [n]`.
-use terrio_filegdb::{Geodatabase, RowFilter, Value};
+use terrio::filegdb::{Geodatabase, RowFilter, Value};
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let a: Vec<String> = std::env::args().collect();
     let gdb = Geodatabase::open(&a[1])?;

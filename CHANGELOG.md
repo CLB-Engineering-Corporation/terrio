@@ -4,8 +4,8 @@
 
 - GeoTIFF: a band's item in a named metadata domain keeps its `sample` attribute, as GDAL writes
   it. It was written as a dataset item.
-- New crate `terrio-filegdb`: a pure-Rust reader and writer for Esri File Geodatabases, ported from
-  GDAL's OpenFileGDB driver.
+- New module `terrio::filegdb` (the `filegdb` feature, native builds only): a pure-Rust reader and
+  writer for Esri File Geodatabases, ported from GDAL's OpenFileGDB driver.
 - The `OpenFileGDB` driver (the `filegdb` feature, on by default, native builds only) reads `.gdb`
   directories without GDAL: `terrio::open("x.gdb")`, `terrio info`, `terrio convert` and the
   bindings. Every table is a layer, those that are empty or have no geometry too, with the layer,

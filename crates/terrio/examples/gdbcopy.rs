@@ -1,7 +1,7 @@
 //! Copies the user tables, coded-value domains and field-domain links of a
 //! File Geodatabase into a new one written by [`GdbWriter`]:
 //! `gdbcopy <src.gdb> <dst.gdb>`. Used to validate the writer against ArcGIS.
-use terrio_filegdb::{FieldDef, FieldType, GdbWriter, Geodatabase, GeometryDef, TableDef, Value};
+use terrio::filegdb::{FieldDef, FieldType, GdbWriter, Geodatabase, GeometryDef, TableDef, Value};
 
 /// Text between `<tag>` and `</tag>` occurrences (crude, enough for Esri XML).
 fn tags<'a>(xml: &'a str, tag: &str) -> Vec<&'a str> {

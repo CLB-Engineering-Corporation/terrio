@@ -14,8 +14,8 @@
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-use crate::varint::{Cursor, utf16};
-use crate::{Error, FieldInfo, FieldType, GeometryFieldInfo, Result, Row, ShapeType, Value, geometry};
+use crate::filegdb::varint::{Cursor, utf16};
+use crate::filegdb::{Error, FieldInfo, FieldType, GeometryFieldInfo, Result, Row, ShapeType, Value, geometry};
 
 /// Raster field storage kind (needed only to skip raster values).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

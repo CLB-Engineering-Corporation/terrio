@@ -1,5 +1,5 @@
 //! Dumps a File Geodatabase: `gdbdump <path.gdb> [table] [n_rows]`.
-use terrio_filegdb::{Geodatabase, Value};
+use terrio::filegdb::{Geodatabase, Value};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();

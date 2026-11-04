@@ -1,5 +1,5 @@
 //! The `OpenFileGDB` vector driver: Esri File Geodatabases (`.gdb` directories), read only, through
-//! the pure-Rust `terrio-filegdb` crate.
+//! the pure-Rust `crate::filegdb` module.
 //!
 //! Every user table is a layer (the system `GDB_*` tables are not), empty ones and those without
 //! geometry included. As in GDAL's driver, OBJECTID is the feature id and no field; `Shape_Length`
@@ -12,13 +12,13 @@
 // Written to match the layers of:
 //   GDAL v3.13.3:
 //     ogr/ogrsf_frmts/openfilegdb/ogropenfilegdblayer.cpp
-// No code is translated from this source: the format's code is in the terrio-filegdb crate.
+// No code is translated from this source: the format's code is in `crate::filegdb`.
 
 use super::datetime::{format_date, format_datetime};
 use crate::dataset::{VectorOpenOptions, fallible};
+use crate::filegdb::{FieldInfo, FieldType as GdbType, Geodatabase, RowFilter, Shape, ShapeType, Table, Value};
 use crate::formats::{Kind, VectorDriver};
 use crate::{Error, Result};
-use terrio_filegdb::{FieldInfo, FieldType as GdbType, Geodatabase, RowFilter, Shape, ShapeType, Table, Value};
 use wbvector::{Coord, Feature, FieldDef, FieldType, FieldValue, Geometry, GeometryType, Layer};
 
 /// The largest angle, in degrees, a straight segment replaces along a true curve: circular arcs
@@ -64,14 +64,14 @@ fn usable(bytes: usize) -> std::result::Result<usize, String> {
     fallible::check_usable(Some(bytes), || "OpenFileGDB: the layers are too large to hold in memory".to_string())
 }
 
-fn error(e: terrio_filegdb::Error) -> Error {
+fn error(e: crate::filegdb::Error) -> Error {
     match e {
-        terrio_filegdb::Error::Io { path, source } => {
+        crate::filegdb::Error::Io { path, source } => {
             Error::Io(std::io::Error::new(source.kind(), format!("{}: {source}", path.display())))
         }
-        terrio_filegdb::Error::Format(m) => Error::InvalidData(format!("OpenFileGDB: {m}")),
-        terrio_filegdb::Error::Unsupported(m) => Error::Unsupported(format!("OpenFileGDB: {m}")),
-        e @ (terrio_filegdb::Error::NotFound(_) | terrio_filegdb::Error::InvalidArgument(_)) => Error::InvalidArgument(e.to_string()),
+        crate::filegdb::Error::Format(m) => Error::InvalidData(format!("OpenFileGDB: {m}")),
+        crate::filegdb::Error::Unsupported(m) => Error::Unsupported(format!("OpenFileGDB: {m}")),
+        e @ (crate::filegdb::Error::NotFound(_) | crate::filegdb::Error::InvalidArgument(_)) => Error::InvalidArgument(e.to_string()),
     }
 }
 
@@ -261,7 +261,7 @@ fn to_geometry(shape: &Shape) -> Option<Geometry> {
     } else {
         shape
     };
-    let coord = |c: &terrio_filegdb::Coord| Coord { x: c.x, y: c.y, z: c.z, m: c.m.filter(|m| !m.is_nan()) };
+    let coord = |c: &crate::filegdb::Coord| Coord { x: c.x, y: c.y, z: c.z, m: c.m.filter(|m| !m.is_nan()) };
     let mut parts = shape.parts.iter().filter(|p| !p.is_empty()).map(|p| p.iter().map(coord).collect::<Vec<Coord>>()).peekable();
     parts.peek()?;
     match shape.shape_type {
@@ -285,9 +285,9 @@ fn to_geometry(shape: &Shape) -> Option<Geometry> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::filegdb::{Coord as C, CurveSegment, FieldDef as F, GdbWriter, GeometryDef, TableDef};
     use crate::{Dataset, VectorDataset};
     use std::collections::HashMap;
-    use terrio_filegdb::{Coord as C, CurveSegment, FieldDef as F, GdbWriter, GeometryDef, TableDef};
 
     /// 2021-03-04 05:06:07 in days since 1899-12-30.
     const DATETIME: f64 = 44_259.0 + (5.0 * 3600.0 + 6.0 * 60.0 + 7.0) / 86_400.0;
@@ -550,7 +550,7 @@ mod tests {
         let areas = layer(&ds, "Areas");
         assert_eq!(areas.geom_type, Some(GeometryType::MultiPolygon));
         assert_eq!(areas.crs_epsg(), Some(2278));
-        assert_eq!(areas.crs_wkt(), Some(terrio_filegdb::ESRI_WKT_2278));
+        assert_eq!(areas.crs_wkt(), Some(crate::filegdb::ESRI_WKT_2278));
         let Some(Geometry::MultiPolygon(polygons)) = &areas.features[0].geometry else { panic!("{:?}", areas.features[0].geometry) };
         let [(exterior, interiors)] = polygons.as_slice() else { panic!("{polygons:?}") };
         assert_xy(exterior.coords(), &[(1000.0, 2000.0), (1000.0, 2100.0), (1100.0, 2100.0), (1100.0, 2000.0)]);

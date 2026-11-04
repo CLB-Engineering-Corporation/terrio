@@ -1,5 +1,5 @@
 //! Times a full read and a bbox-filtered read: `bench <gdb> <table> xmin ymin xmax ymax`.
-use terrio_filegdb::{Geodatabase, RowFilter};
+use terrio::filegdb::{Geodatabase, RowFilter};
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let a: Vec<String> = std::env::args().collect();
     let t = Geodatabase::open(&a[1])?.open_table(&a[2])?;

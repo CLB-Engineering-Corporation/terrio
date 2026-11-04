@@ -1,5 +1,5 @@
 //! Writes the GDB_Items definitions of a geodatabase to <out_dir>: `items <gdb> <out_dir>`.
-use terrio_filegdb::{Geodatabase, Value};
+use terrio::filegdb::{Geodatabase, Value};
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let a: Vec<String> = std::env::args().collect();
     let gdb = Geodatabase::open(&a[1])?;

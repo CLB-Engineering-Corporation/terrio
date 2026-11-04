@@ -23,10 +23,10 @@ use std::collections::BTreeSet;
 use std::hash::{BuildHasher, Hasher};
 use std::path::{Path, PathBuf};
 
-use crate::geometry::{self, EXT_SHAPE_CURVE_FLAG, EXT_SHAPE_M_FLAG, EXT_SHAPE_Z_FLAG};
-use crate::spatial_index;
-use crate::varint::{to_utf16, write_varint, write_varuint};
-use crate::{CurveSegment, Error, FieldType, GeometryFieldInfo, Result, Shape, ShapeType, Value};
+use crate::filegdb::geometry::{self, EXT_SHAPE_CURVE_FLAG, EXT_SHAPE_M_FLAG, EXT_SHAPE_Z_FLAG};
+use crate::filegdb::spatial_index;
+use crate::filegdb::varint::{to_utf16, write_varint, write_varuint};
+use crate::filegdb::{CurveSegment, Error, FieldType, GeometryFieldInfo, Result, Shape, ShapeType, Value};
 
 const FOLDER_TYPE: &str = "{f3783e6f-65ca-4514-8315-ce3985dad3b1}";
 const WORKSPACE_TYPE: &str = "{c673fe0f-7280-404f-8532-20755dd8fc06}";
@@ -459,7 +459,7 @@ fn encode_shape(s: &Shape, g: &GeometryFieldInfo) -> Result<Vec<u8>> {
     let mf = if g.has_m { EXT_SHAPE_M_FLAG } else { 0 };
     let mut out = Vec::new();
     write_varuint(&mut out, u64::from(base | EXT_SHAPE_CURVE_FLAG | zf | mf));
-    let parts: Vec<&Vec<crate::Coord>> = s.parts.iter().collect();
+    let parts: Vec<&Vec<crate::filegdb::Coord>> = s.parts.iter().collect();
     let n_points: usize = parts.iter().map(|p| p.len()).sum();
     write_varuint(&mut out, n_points as u64);
     write_varuint(&mut out, parts.len() as u64);
@@ -659,7 +659,7 @@ struct UserTable {
 /// Writer of a new File Geodatabase.
 ///
 /// ```no_run
-/// use terrio_filegdb::*;
+/// use terrio::filegdb::*;
 /// let mut w = GdbWriter::create("out.gdb")?;
 /// w.add_coded_domain("STATUS", "STATUS", FieldType::String, &[("A", "A"), ("B", "B")])?;
 /// let mut f = FieldDef::new("STATUS", FieldType::String);
@@ -669,7 +669,7 @@ struct UserTable {
 /// let square = Shape::new(ShapeType::Polygon, vec![vec![Coord::xy(0.0, 0.0), Coord::xy(0.0, 1.0), Coord::xy(1.0, 1.0), Coord::xy(1.0, 0.0), Coord::xy(0.0, 0.0)]]);
 /// w.insert("Areas", Some(&square), vec![Value::String("A".into())])?;
 /// w.finish()?;
-/// # Ok::<(), terrio_filegdb::Error>(())
+/// # Ok::<(), terrio::filegdb::Error>(())
 /// ```
 pub struct GdbWriter {
     dir: PathBuf,
@@ -1369,7 +1369,7 @@ const REL_TYPES: &[(&str, &str, &str, &str, &str, &str, i64)] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Coord, Geodatabase};
+    use crate::filegdb::{Coord, Geodatabase};
 
     #[test]
     fn guid_roundtrip_bytes() {
@@ -1379,7 +1379,7 @@ mod tests {
 
     #[test]
     fn write_and_read_back() {
-        let dir = std::env::temp_dir().join(format!("terrio_filegdb_test_{}.gdb", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("terrio_gdb_writer_test_{}.gdb", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let mut w = GdbWriter::create(&dir).unwrap();
         w.add_coded_domain("STATUS", "STATUS", FieldType::String, &[("A", "Alpha"), ("B", "Beta")]).unwrap();
@@ -1469,7 +1469,7 @@ mod tests {
 
     #[test]
     fn empty_feature_class_gets_empty_spatial_index() {
-        let dir = std::env::temp_dir().join(format!("terrio_filegdb_empty_{}.gdb", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("terrio_gdb_writer_empty_{}.gdb", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let mut w = GdbWriter::create(&dir).unwrap();
         w.create_table(&TableDef {

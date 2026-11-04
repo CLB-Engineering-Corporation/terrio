@@ -12,7 +12,7 @@ SPDX-License-Identifier = "MIT"
 
 # The notices reproduce other projects' copyright lines and licence texts.
 [[annotations]]
-path = ["NOTICE", "crates/terrio/NOTICE", "crates/terrio-crs/NOTICE", "crates/terrio-filegdb/NOTICE", "LICENSE-THIRD-PARTY.md"]
+path = ["NOTICE", "crates/terrio/NOTICE", "crates/terrio-crs/NOTICE", "LICENSE-THIRD-PARTY.md"]
 precedence = "override"
 SPDX-FileCopyrightText = "Copyright (c) 2026 Qiusheng Wu and Terrio contributors"
 SPDX-License-Identifier = "MIT"

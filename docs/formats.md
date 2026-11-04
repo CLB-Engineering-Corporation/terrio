@@ -781,8 +781,8 @@ layers with the results HEC-RAS stored; `open_raster` still reads them as HDF5. 
 [HEC-RAS](hecras.md).
 
 Esri File Geodatabases (`OpenFileGDB`, GDAL's name; `FileGDB` is accepted too) are read in pure Rust
-by the `terrio-filegdb` crate, a port of GDAL's driver, without GDAL. A `.gdb` directory opens by its
-name: every table except the system `GDB_*` ones is a layer, including empty ones and tables without
+by the `terrio::filegdb` module, a port of GDAL's driver, without GDAL. A `.gdb` directory opens by
+its name: every table except the system `GDB_*` ones is a layer, including empty ones and tables without
 geometry, with the layer, feature range and spatial filter options (the filter compares envelopes,
 and drops null shapes). OBJECTID is the feature id, and `Shape_Length` and `Shape_Area` are
 ordinary fields. Polyline features are always multilinestrings and polygon features multipolygons,
@@ -804,7 +804,7 @@ the millisecond. What terrio's vector model cannot hold is lost:
 A table is read into memory whole, and the driver takes directories only: no `.gdb.zip`, no remote
 geodatabases and, as WebAssembly has no directories, no WebAssembly builds. It only reads:
 to write a geodatabase, use [the GDAL backend](gdal.md#the-optional-gdal-backend) or the
-`terrio-filegdb` crate. Without the `gdal` feature, writing `.gdb` is refused.
+`terrio::filegdb` module. Without the `gdal` feature, writing `.gdb` is refused.
 
 Layer and field models follow GDAL's: GPX has GDAL's five layers, KML has the LIBKML driver's
 fields, OSM has the `points`, `lines`, `multilinestrings`, `multipolygons` and `other_relations`

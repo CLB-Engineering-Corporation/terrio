@@ -10,7 +10,7 @@
 //! Ported from GDAL's `ReadVarUInt`, `ReadVarIntAndAddNoCheck` and the
 //! corresponding writers in `filegdbtable_priv.h`.
 
-use crate::{Error, Result};
+use crate::filegdb::{Error, Result};
 
 /// A forward-only cursor over a byte slice with bounds-checked reads.
 #[derive(Debug, Clone)]

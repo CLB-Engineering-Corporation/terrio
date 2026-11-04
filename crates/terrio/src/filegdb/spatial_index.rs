@@ -19,7 +19,7 @@
 //! feature class without a `.spx`, so the writer always creates one (an empty
 //! one, with grid size 0, for an empty feature class, as ArcGIS does).
 
-use crate::{Shape, ShapeType};
+use crate::filegdb::{Shape, ShapeType};
 
 const PAGE: usize = 4096;
 /// Features per page for 8-byte values: (4096 - 12) / (4 + 8).
@@ -397,7 +397,7 @@ fn write_index(values: &[(i64, i64)]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Coord;
+    use crate::filegdb::Coord;
 
     #[test]
     fn empty_index_matches_arcgis() {

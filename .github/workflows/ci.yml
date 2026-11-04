@@ -175,7 +175,7 @@ jobs:
           cargo test -p terrio -p terrio-crs --doc
           cargo test -p terrio --doc --features ndarray
       - name: The crate packages and verifies
-        run: cargo publish -p terrio-crs -p terrio-filegdb -p terrio -p terrio-cli --dry-run --locked
+        run: cargo publish -p terrio-crs -p terrio -p terrio-cli --dry-run --locked
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-about@0.9.2
@@ -185,7 +185,7 @@ jobs:
           git diff --exit-code LICENSE-THIRD-PARTY.md
       - name: The copies of LICENSE and NOTICE in the packages match the originals
         run: |
-          for f in python/LICENSE crates/terrio/LICENSE crates/terrio-cli/LICENSE crates/terrio-crs/LICENSE crates/terrio-filegdb/LICENSE; do cmp LICENSE "$f"; done
+          for f in python/LICENSE crates/terrio/LICENSE crates/terrio-cli/LICENSE crates/terrio-crs/LICENSE; do cmp LICENSE "$f"; done
           cmp NOTICE crates/terrio/NOTICE
       - name: The Python sdist carries the license
         working-directory: python
@@ -205,14 +205,11 @@ jobs:
           cargo package --list -p terrio > terrio.list
           cargo package --list -p terrio-cli > terrio-cli.list
           cargo package --list -p terrio-crs > terrio-crs.list
-          cargo package --list -p terrio-filegdb > terrio-filegdb.list
           grep -qx NOTICE terrio.list
           grep -qx LICENSE terrio.list
           grep -qx LICENSE terrio-cli.list
           grep -qx LICENSE terrio-crs.list
           grep -qx NOTICE terrio-crs.list
-          grep -qx LICENSE terrio-filegdb.list
-          grep -qx NOTICE terrio-filegdb.list
           grep -qx data/epsg.tsv.zst terrio-crs.list
           grep -qx data/esri.tsv.zst terrio-crs.list
 

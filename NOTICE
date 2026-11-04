@@ -20,13 +20,6 @@ GDAL (https://github.com/OSGeo/gdal)
 
 Terrio files derived from GDAL source files (each file's header names them):
   crates/terrio-crs/src/lib.rs
-  crates/terrio-filegdb/src/geometry.rs
-  crates/terrio-filegdb/src/lib.rs
-  crates/terrio-filegdb/src/shape.rs
-  crates/terrio-filegdb/src/spatial_index.rs
-  crates/terrio-filegdb/src/table.rs
-  crates/terrio-filegdb/src/varint.rs
-  crates/terrio-filegdb/src/writer.rs
   crates/terrio/src/cog_validate.rs
   crates/terrio/src/dataset.rs
   crates/terrio/src/drivers/gdal_overview.rs
@@ -44,6 +37,13 @@ Terrio files derived from GDAL source files (each file's header names them):
   crates/terrio/src/drivers/vector/mapinfo.rs
   crates/terrio/src/drivers/vector/osm.rs
   crates/terrio/src/drivers/vector/tab.rs
+  crates/terrio/src/filegdb/geometry.rs
+  crates/terrio/src/filegdb/mod.rs
+  crates/terrio/src/filegdb/shape.rs
+  crates/terrio/src/filegdb/spatial_index.rs
+  crates/terrio/src/filegdb/table.rs
+  crates/terrio/src/filegdb/varint.rs
+  crates/terrio/src/filegdb/writer.rs
   crates/terrio/src/gpkg_validation/content.rs
   crates/terrio/src/gpkg_validation/extensions.rs
   crates/terrio/src/gpkg_validation/features.rs
@@ -221,6 +221,8 @@ The copyright notices of those source files:
   Copyright 2007, Mateusz Loskot
   Copyright 2008-2024, Even Rouault <even.rouault at spatialys.com>
   Copyright (c) 2007, Mateusz Loskot
+  Copyright (c) 2014, Even Rouault <even dot rouault at spatialys.com>
+  Copyright (c) 2022, Even Rouault <even dot rouault at spatialys.com>
 
 In general GDAL/OGR is licensed under an MIT style license with the
 following terms:

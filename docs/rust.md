@@ -725,7 +725,7 @@ the operations and the streams. The other drivers are features:
 | `lerc` | on | LERC-compressed GeoTIFFs, read and written. |
 | `lzma` | on | LZMA-compressed GeoTIFFs. |
 | `hecras` | on | HEC-RAS geometry and plan HDF files as vector layers, read only (the `HECRAS` driver and the `hecras` module, through the `ras-commander-fast-hdf` engine; needs `netcdf-hdf5`). See [HEC-RAS](hecras.md). |
-| `filegdb` | on | Esri File Geodatabases as vector layers, read only, in pure Rust (the `OpenFileGDB` driver, through `terrio-filegdb`; native builds only, as a geodatabase is a directory). See [Formats](formats.md#other-vector-formats). |
+| `filegdb` | on | Esri File Geodatabases as vector layers, read only, in pure Rust (the `OpenFileGDB` driver, through the `filegdb` module, which writes them too; native builds only, as a geodatabase is a directory). See [Formats](formats.md#other-vector-formats). |
 | `gdal` | off | The optional GDAL backend: formats terrio has no driver for, through GDAL (needs GDAL installed). See [the GDAL backend](gdal.md#the-optional-gdal-backend). |
 | `ndarray` | off | Raster pixels as `ndarray` arrays, without copying them: views, owned transfers and the masks of lazy reads, with the crate re-exported as `terrio::ndarray`; floating-point windows as owned arrays, bands first or last. See [ndarray](#ndarray). |
 | `cad` | on | DWG and DXF, read and written, through acadrust. See [CAD drawings](formats.md#cad-drawings-dwg-and-dxf). |
