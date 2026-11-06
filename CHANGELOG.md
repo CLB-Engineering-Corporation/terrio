@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- Remote files read over HTTP(S) share one connection pool per process (up to 64 idle connections;
+  the /vsi file operations keep one pool per operation, as before), so files opened one after
+  another or from many threads reuse warm connections rather than each opening its own. The pool
+  is rebuilt when the timeout, connect timeout, user agent or proxy variables change, and in a
+  forked child, which never uses or closes the parent's connections. Opening a STAC item set of 10
+  Sentinel-2 dates x 4 bands over https on 32 threads took 18.6 s instead of 27.2 s (one run).
+- GeoTIFF: Deflate tiles and strips are decoded by terrio with `fdeflate` (pure Rust) when the file
+  and the host are little-endian and the samples are 8-, 16-, 32- or 64-bit integers (with or
+  without the horizontal predictor) or Float32 or Float64 without a predictor. YCbCr and WhiteIsZero
+  images, Float16 and complex samples, and RGB or CMYK images whose extra samples the `tiff` crate
+  misreads keep their previous decoders. A stream ending before the chunk's samples, or with a wrong
+  Adler-32 right after them, is an error; one cut in its trailer after the samples is read, as
+  libtiff with zlib reads it. All 121 tiles of a Sentinel-2 L2A band decode as the `tiff` crate
+  decodes them.
+
 - GeoTIFF: a band's item in a named metadata domain keeps its `sample` attribute, as GDAL writes
   it. It was written as a dataset item.
 - New module `terrio::filegdb` (the `filegdb` feature, native builds only): a pure-Rust reader and
