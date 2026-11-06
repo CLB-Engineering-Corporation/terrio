@@ -288,7 +288,7 @@ pub(super) fn open(name: &str) -> Result<Dataset> {
 pub(super) fn open_bytes(bytes: &[u8]) -> Result<Dataset> {
     // Bytes have no name: a classic file is netCDF's, any other is read as HDF5 (netCDF-4 too), as
     // a file named for neither driver is. Judged before either reader runs.
-    let driver = if bytes.starts_with(b"CDF") { "netCDF" } else { "HDF5" };
+    let driver = if bytes.starts_with(b"CDF") && crate::drivers::hdf5::signature_offset_in(bytes).is_none() { "netCDF" } else { "HDF5" };
     crate::formats::check_driver_allowed(driver, "a file in memory", crate::formats::Kind::Raster)?;
     let body = crate::drivers::hdf5::signature_offset_in(bytes).map(|offset| &bytes[offset..]).unwrap_or(bytes);
     open_bytes_owned(body.to_vec())
@@ -299,7 +299,7 @@ fn owned_storage(bytes: Vec<u8>) -> hdf5_reader::storage::DynStorage {
     if offset == 0 { storage } else { Arc::new(OffsetStorage { inner: storage, offset: offset as u64 }) }
 }
 pub(super) fn open_bytes_owned(bytes: Vec<u8>) -> Result<Dataset> {
-    let classic = bytes.starts_with(b"CDF");
+    let classic = bytes.starts_with(b"CDF") && crate::drivers::hdf5::signature_offset_in(&bytes).is_none();
     let driver = if classic { "netCDF" } else { "HDF5" };
     crate::formats::check_driver_allowed(driver, "a file in memory", crate::formats::Kind::Raster)?;
     // Both metadata readers share retained storage, including any userblock.
@@ -311,7 +311,7 @@ pub(super) fn open_bytes_owned(bytes: Vec<u8>) -> Result<Dataset> {
     )
     .map_err(error)?;
     let hdf = (!classic).then(|| hdf5_reader::Hdf5File::from_storage(storage).ok()).flatten();
-    dataset(file, hdf, if classic { "netCDF" } else { "netCDF/HDF5" })
+    dataset(file, hdf, driver)
 }
 pub(super) fn read(file: &NcFile, name: &str, t: DataType, selections: &[Selection]) -> Result<Vec<u8>> {
     let variable = file.variable(name.trim_start_matches('/')).map_err(error)?;
@@ -370,6 +370,7 @@ mod tests {
         let bytes = classic_fixture();
         let borrowed = super::open_bytes(&bytes).unwrap();
         let owned = crate::multidim::open_bytes_owned(bytes).unwrap();
+        assert_eq!(owned.driver, "netCDF");
         let array = owned.array("v").unwrap();
         assert_eq!(serde_json::to_value(&array.info).unwrap(), serde_json::to_value(&borrowed.array("v").unwrap().info).unwrap());
         let view = array.view();
@@ -409,6 +410,7 @@ mod tests {
             bytes.extend_from_slice(&raw);
             let borrowed = super::open_bytes(&bytes).unwrap();
             let owned = crate::multidim::open_bytes_owned(bytes).unwrap();
+            assert_eq!(owned.driver, "HDF5");
             let array = owned.array("sample").unwrap();
             assert_eq!(serde_json::to_value(&array.info).unwrap(), serde_json::to_value(&borrowed.array("sample").unwrap().info).unwrap());
             let view = array.view();
