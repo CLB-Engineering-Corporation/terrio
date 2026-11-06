@@ -6,6 +6,7 @@ crates/terrio        the library
   formats.rs         the driver registry, with GDAL's short names
   drivers/           terrio's own raster drivers; drivers/vector/ its vector drivers
   geotiff.rs, cog.rs GeoTIFF tags and decoding, lazy window and overview reads
+  block_cache.rs     process-wide LRU cache of decoded GeoTIFF tiles and strips
   tiles/             PMTiles, MBTiles and MVT: archives, tile pyramids, vector tile clipping
   vfs.rs             locations: paths, URLs, s3://, gs://, az://, zip archives, /vsi prefixes
   http.rs, s3.rs     range requests with a block cache; AWS Signature Version 4
