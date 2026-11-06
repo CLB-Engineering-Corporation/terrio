@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- HTTP prefetches larger than half the compressed block cache are fetched in bounded
+  batches, preserving planned blocks until read. File-order decoding avoids fetching
+  evicted prefetched ranges again (upstream #602).
+
 - Remote files read over HTTP(S) share one connection pool per process (up to 64 idle connections;
   the /vsi file operations keep one pool per operation, as before), so files opened one after
   another or from many threads reuse warm connections rather than each opening its own. The pool
