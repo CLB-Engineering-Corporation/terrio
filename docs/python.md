@@ -686,3 +686,14 @@ Returns a dictionary with `valid`, `complete`, `version`, `errors`, `warnings` a
 `unsupported_checks`. Paths accept native or `/vsimem/` files; uploaded bytes are
 also supported. The [CLI reference](cli.md#geopackage-validation) documents the
 supported rules, SQL subset, case options, memory use and checkpoint requirement.
+
+## Decoded raster cache
+
+The process-wide GeoTIFF chunk cache defaults to 64 MiB. `TERRIO_CACHEMAX`,
+then `GDAL_CACHEMAX`, selects the budget; zero disables it.
+
+```python
+terrio.block_cache_max()
+terrio.set_block_cache_max(256 << 20)
+terrio.clear_block_cache()
+```

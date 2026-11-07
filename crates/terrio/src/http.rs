@@ -31,7 +31,7 @@
 //! | `TERRIO_HTTP_BLOCK_SIZE` (bytes) | `CPL_VSIL_CURL_CHUNK_SIZE` | 65536 |
 //! | `TERRIO_HTTP_CACHE_SIZE` (bytes): the block cache of each open file, and the process-wide cache | `CPL_VSIL_CURL_CACHE_SIZE` | 67108864 |
 //! | `TERRIO_HTTP_USERAGENT` | `GDAL_HTTP_USERAGENT` | `terrio/VERSION` |
-//! | `TERRIO_HTTP_LOG=YES`: print each request to standard error | `CPL_CURL_VERBOSE` | off |
+//! | `TERRIO_HTTP_LOG=YES`: print each request, and each new process-wide connection pool, to standard error | `CPL_CURL_VERBOSE` | off |
 //! | `TERRIO_JSON_MAX_SIZE` (bytes, `K`, `M` or `G` suffixes): the largest JSON document fetched whole | `CPL_JSON_MAX_SIZE` | 100 MB |
 //!
 //! Bodies fetched whole are capped: JSON documents (STAC, a search page) at `CPL_JSON_MAX_SIZE`,
@@ -402,6 +402,8 @@ struct Fetched {
 /// Makes requests for one remote file: signing, redirects, region discovery and retries.
 struct Client {
     agent: ureq::Agent,
+    /// The process `agent` was made in (see [`agent_in`]).
+    pid: u32,
     options: HttpOptions,
     remote: Remote,
     /// The URL requests go to (after S3 region discovery or a redirect).
@@ -506,6 +508,7 @@ impl Client {
         };
         let mut client = Self {
             agent,
+            pid: std::process::id(),
             options,
             remote: remote.clone(),
             url,
@@ -637,7 +640,7 @@ impl Client {
         let mut redirects = 0;
         let mut attempt = 0;
         loop {
-            let mut req = self.agent.get(&url);
+            let mut req = agent_in(self.pid, &self.agent, || own_agent(&self.options)).get(&url);
             if let Some(r) = &range_header {
                 req = req.header("Range", r);
             }
@@ -891,16 +894,29 @@ pub(crate) fn over_cap(url: &str, cap: u64) -> Error {
 
 thread_local! {
     /// The agent shared by the requests of the operation in progress on this thread (see
-    /// [`AgentScope`]), with the settings it was built with.
-    static SHARED_AGENT: std::cell::RefCell<(u32, Option<(AgentSettings, ureq::Agent)>)> = const { std::cell::RefCell::new((0, None)) };
+    /// [`AgentScope`]), with the settings it was built with and the process it was built in.
+    static SHARED_AGENT: std::cell::RefCell<(u32, Option<ScopeAgent>)> = const { std::cell::RefCell::new((0, None)) };
 }
 
 /// The settings an agent is built with.
 type AgentSettings = (Option<Duration>, Duration, String);
 
+/// An [`AgentScope`]'s agent, its settings and the id of the process it was built in.
+type ScopeAgent = (AgentSettings, ureq::Agent, u32);
+
+/// Ends the life of a scope's agent: dropped in the process it was built in, leaked in a forked
+/// child, where its idle connections are the parent's sockets, which the child must neither use
+/// nor close.
+fn release(agent: Option<ScopeAgent>) {
+    if let Some(a) = agent.filter(|a| a.2 != std::process::id()) {
+        std::mem::forget(a);
+    }
+}
+
 /// While alive, the requests made on this thread share one agent, and so its connections (and
 /// TLS sessions): a recursive upload, deletion or listing opens one connection per host rather
-/// than one per request. Scopes nest; the agent is dropped when the outermost one ends.
+/// than one per request. Scopes nest; the agent is dropped when the outermost one ends (leaked in
+/// a forked child that inherited the scope: see [`release`]).
 pub(crate) struct AgentScope(());
 
 impl AgentScope {
@@ -916,27 +932,96 @@ impl Drop for AgentScope {
             let mut shared = shared.borrow_mut();
             shared.0 = shared.0.saturating_sub(1);
             if shared.0 == 0 {
-                shared.1 = None;
+                release(shared.1.take());
             }
         });
     }
 }
 
+/// Outside any [`AgentScope`], the agent of the whole process: opening and reading remote files
+/// from many threads reuses connections (and TLS sessions) rather than opening one per file.
+static PROCESS_AGENT: std::sync::Mutex<Option<ProcessAgent>> = std::sync::Mutex::new(None);
+
+/// [`PROCESS_AGENT`]: the agent, the settings and proxy variables it was built with (`ureq`
+/// reads `ALL_PROXY`, `HTTPS_PROXY`, `HTTP_PROXY` and `NO_PROXY` when an agent is built), and
+/// the process it was built in.
+struct ProcessAgent {
+    pid: u32,
+    settings: AgentSettings,
+    proxy: Vec<Option<std::ffi::OsString>>,
+    agent: ureq::Agent,
+}
+
+/// The proxy variables `ureq` reads, in both cases.
+fn proxy_env() -> Vec<Option<std::ffi::OsString>> {
+    ["ALL_PROXY", "all_proxy", "HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "NO_PROXY", "no_proxy"]
+        .iter()
+        .map(std::env::var_os)
+        .collect()
+}
+
+/// The process's agent for `settings`, rebuilt when they or the proxy variables change. In a
+/// forked child (another process id), the parent's agent is leaked, not dropped: its idle
+/// connections are the parent's sockets, which the child must neither use nor close.
+fn process_agent(settings: AgentSettings, options: &HttpOptions) -> ureq::Agent {
+    crate::par::fork_safe();
+    cached_agent(&PROCESS_AGENT, std::process::id(), proxy_env(), settings, || {
+        if options.log {
+            eprintln!("terrio: new HTTP connection pool (first use, or settings, proxy variables or process changed)");
+        }
+        new_agent(options)
+    })
+}
+
+/// [`process_agent`] with its cache, process id, proxy variables and agent builder given.
+fn cached_agent(
+    slot: &std::sync::Mutex<Option<ProcessAgent>>,
+    pid: u32,
+    proxy: Vec<Option<std::ffi::OsString>>,
+    settings: AgentSettings,
+    build: impl FnOnce() -> ureq::Agent,
+) -> ureq::Agent {
+    let mut cached = slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    match &*cached {
+        Some(p) if p.pid == pid && p.settings == settings && p.proxy == proxy => return p.agent.clone(),
+        Some(p) if p.pid != pid => std::mem::forget(cached.take()),
+        _ => {}
+    }
+    cached.insert(ProcessAgent { pid, settings, proxy, agent: build() }).agent.clone()
+}
+
+/// `agent`, made in process `pid`, in this process: in a forked child, `here` (the child's own
+/// agent, [`own_agent`]) instead, since `agent`'s idle connections are the parent's sockets, which
+/// the parent and every client sharing its pool may still use.
+fn agent_in(pid: u32, agent: &ureq::Agent, here: impl FnOnce() -> ureq::Agent) -> ureq::Agent {
+    if pid == std::process::id() { agent.clone() } else { here() }
+}
+
+/// The process's agent for `options`, whatever [`AgentScope`] the thread is in: the agent a client
+/// made before a fork sends its requests with in the child.
+fn own_agent(options: &HttpOptions) -> ureq::Agent {
+    process_agent((options.timeout, options.connect_timeout, options.user_agent.clone()), options)
+}
+
 /// The agent requests are sent with: no automatic redirects (followed by [`Client`], which
 /// signs only the first request), no compression. Within an [`AgentScope`], the scope's agent
-/// when its settings are the same.
+/// when its settings and process are the same, otherwise a new one the scope keeps (in a child
+/// forked inside a scope, the parent's agent is leaked: see [`release`]); outside any scope, the
+/// process's ([`process_agent`]).
 fn agent(options: &HttpOptions) -> ureq::Agent {
     let settings: AgentSettings = (options.timeout, options.connect_timeout, options.user_agent.clone());
     SHARED_AGENT.with(|shared| {
         let mut shared = shared.borrow_mut();
         if shared.0 == 0 {
-            return new_agent(options);
+            return process_agent(settings, options);
         }
+        let pid = std::process::id();
         match &shared.1 {
-            Some((s, agent)) if *s == settings => agent.clone(),
+            Some((s, agent, made_in)) if *s == settings && *made_in == pid => agent.clone(),
             _ => {
+                release(shared.1.take());
                 let agent = new_agent(options);
-                shared.1 = Some((settings, agent.clone()));
+                shared.1 = Some((settings, agent.clone(), pid));
                 agent
             }
         }
@@ -966,6 +1051,10 @@ fn new_agent(options: &HttpOptions) -> ureq::Agent {
         .user_agent(options.user_agent.as_str())
         .timeout_global(options.timeout)
         .timeout_connect(Some(options.connect_timeout))
+        // A fixed idle pool sized for parallel reads (ureq keeps 3 per host by default); it could
+        // follow the thread count if 64 proves too few or too many.
+        .max_idle_connections(64)
+        .max_idle_connections_per_host(64)
         .build()
         .into()
 }
@@ -985,6 +1074,8 @@ pub(crate) enum ByteRange {
 /// connections, from any number of threads. An S3 bucket's region, once learned, is reused.
 pub(crate) struct ObjectFetcher {
     agent: ureq::Agent,
+    /// The process `agent` was made in (see [`agent_in`]).
+    pid: u32,
     options: HttpOptions,
     region: Mutex<Option<String>>,
     /// S3 credentials and region from the environment, read once rather than for every object.
@@ -998,7 +1089,14 @@ impl ObjectFetcher {
     pub(crate) fn new() -> Self {
         let options = HttpOptions::from_env();
         let auth = (Credentials::from_env(), s3::region_from_env());
-        Self { agent: agent(&options), options, region: Mutex::new(None), auth, config: crate::config::thread_options() }
+        Self {
+            agent: agent(&options),
+            pid: std::process::id(),
+            options,
+            region: Mutex::new(None),
+            auth,
+            config: crate::config::thread_options(),
+        }
     }
 
     /// Fetches an object, or part of it. `None` when the object does not exist (status 404, or
@@ -1007,7 +1105,8 @@ impl ObjectFetcher {
         // A region already learned is the client's from the start (its URL is the regional one).
         let known = self.region.lock().ok().and_then(|r| r.clone());
         let auth = (self.auth.0.clone(), known.clone().or_else(|| self.auth.1.clone()));
-        let mut client = Client::with_auth(remote, self.options.clone(), self.agent.clone(), Some(auth), self.config.clone());
+        let agent = agent_in(self.pid, &self.agent, || own_agent(&self.options));
+        let mut client = Client::with_auth(remote, self.options.clone(), agent, Some(auth), self.config.clone());
         client.missing_ok = true;
         if let (Remote::S3(_), Some(auth), Some(_)) = (remote, client.s3.as_mut(), known) {
             auth.discovered = true;
@@ -1517,9 +1616,9 @@ impl Drop for CacheTestGuard {
 }
 
 /// Holds this module's process-wide locks (the cache of remote files, the request statistics,
-/// the path-specific options and the retry warnings) across a fork, for [`crate::par`]: the
-/// forking thread takes them before the process is copied and lets them go after, so that the
-/// child never starts with one held by a thread it does not have.
+/// the path-specific options, the retry warnings and the process's agent) across a fork, for
+/// [`crate::par`]: the forking thread takes them before the process is copied and lets them go
+/// after, so that the child never starts with one held by a thread it does not have.
 #[cfg(unix)]
 pub(crate) fn hold_for_fork(held: &mut Vec<Box<dyn std::any::Any>>) {
     held.push(Box::new(file_cache()));
@@ -1527,6 +1626,7 @@ pub(crate) fn hold_for_fork(held: &mut Vec<Box<dyn std::any::Any>>) {
     held.push(Box::new(stats(&FILE_STATS)));
     held.push(Box::new(path_options_write()));
     held.push(Box::new(retry_warnings()));
+    held.push(Box::new(PROCESS_AGENT.lock().unwrap_or_else(std::sync::PoisonError::into_inner)));
 }
 
 /// [`PATH_OPTIONS`] to change, also after a panic elsewhere poisoned its lock.
@@ -1653,6 +1753,10 @@ struct Shared {
     whole: Option<Arc<[u8]>>,
     /// The file's first bytes, when the first request was shorter than a block.
     prefix: Option<Arc<[u8]>>,
+    /// The blocks the last prefetch asked for, sorted: fetched a batch at a time
+    /// ([`Shared::fetch_planned`]), the next batch when a read reaches one not cached. A deque, so
+    /// that taking batches from its front does not shift the rest.
+    plan: VecDeque<u64>,
 }
 
 impl RangeReader {
@@ -1690,6 +1794,7 @@ impl RangeReader {
             order: VecDeque::new(),
             whole: None,
             prefix: None,
+            plan: VecDeque::new(),
         };
         if !shared.load_cached(first_len) {
             let first = shared.client.fetch(Some((0, first_len - 1)))?;
@@ -1732,7 +1837,9 @@ impl RangeReader {
 
     /// Fetches the blocks covering the byte ranges `(offset, length)` that are not cached yet, in as
     /// few requests as it can: runs of missing blocks separated by at most two cached blocks are
-    /// fetched together.
+    /// fetched together. Ranges larger than half the cache are fetched a batch at a time, the
+    /// first now and the next ones as reads reach them, so that no block is evicted before it is
+    /// read and then fetched again.
     pub fn prefetch(&self, ranges: &[(u64, u64)]) -> io::Result<()> {
         let mut s = self.lock()?;
         if s.whole.is_some() {
@@ -1749,7 +1856,12 @@ impl RangeReader {
             .collect();
         wanted.sort_unstable();
         wanted.dedup();
-        s.fetch_blocks(&wanted, 2)
+        // A prefetch of cached blocks keeps the plan of an earlier one that is still being read.
+        if wanted.is_empty() {
+            return Ok(());
+        }
+        s.plan = wanted.into();
+        s.fetch_planned(0)
     }
 
     fn lock(&self) -> io::Result<std::sync::MutexGuard<'_, Shared>> {
@@ -1810,6 +1922,26 @@ impl Shared {
         {
             self.blocks.remove(&old);
         }
+    }
+
+    /// Fetches the next batch of the prefetch's blocks from its `from`th: those not cached within
+    /// half the cache's blocks of the first (the gaps the batch's requests span included), so that
+    /// the batch being read stays while the next one is fetched. They leave the plan, so that a
+    /// block read again once evicted is fetched alone.
+    fn fetch_planned(&mut self, from: usize) -> io::Result<()> {
+        let batch = (self.max_blocks / 2).max(1) as u64;
+        let (mut next, mut to) = (Vec::<u64>::new(), from);
+        while let Some(&b) = self.plan.get(to) {
+            if next.first().is_some_and(|&first| b >= first + batch) {
+                break;
+            }
+            if !self.blocks.contains_key(&b) {
+                next.push(b);
+            }
+            to += 1;
+        }
+        self.plan.drain(from..to);
+        self.fetch_blocks(&next, 2)
     }
 
     fn store(&mut self, first_block: u64, data: Vec<u8>) {
@@ -1887,8 +2019,26 @@ impl Shared {
         if self.whole.is_none() {
             self.evict();
             let bs = self.block_size;
-            let missing: Vec<u64> = (pos / bs..=(end - 1) / bs).filter(|b| !self.blocks.contains_key(b)).collect();
-            self.fetch_blocks(&missing, 0)?;
+            let mut missing: Vec<u64> = (pos / bs..=(end - 1) / bs).filter(|b| !self.blocks.contains_key(b)).collect();
+            // A block the prefetch asked for: its next batch, from there.
+            if let Some(at) = missing.iter().find_map(|b| self.plan.binary_search(b).ok()) {
+                self.fetch_planned(at)?;
+                missing.retain(|b| !self.blocks.contains_key(b));
+            }
+            if self.whole.is_none() && !missing.is_empty() {
+                // Requests of at most half the cache's blocks, as a prefetch's batches are.
+                let batch = (self.max_blocks / 2).max(1);
+                for chunk in missing.chunks(batch) {
+                    self.fetch_blocks(chunk, 0)?;
+                    if self.whole.is_some() {
+                        break;
+                    }
+                }
+                // Planned blocks past the batch, fetched with the read, leave the plan too.
+                if !self.plan.is_empty() && missing.iter().any(|b| self.plan.binary_search(b).is_ok()) {
+                    self.plan.retain(|b| missing.binary_search(b).is_err());
+                }
+            }
         }
         if let Some(whole) = &self.whole {
             let n = (end - pos) as usize;
@@ -2340,6 +2490,106 @@ mod tests {
         assert_eq!(count.load(Ordering::SeqCst), 3);
     }
 
+    /// The inclusive byte ranges of the requests a [`test_server`] saw.
+    fn requested(seen: &[Option<String>]) -> Vec<(u64, u64)> {
+        seen.iter()
+            .filter_map(|r| r.as_deref()?.strip_prefix("bytes=")?.split_once('-').map(|(a, b)| (a.parse().unwrap(), b.parse().unwrap())))
+            .collect()
+    }
+
+    // A prefetch larger than the cache (a whole COG's tiles read as one window) is fetched in
+    // batches as it is read, each byte once: fetched whole, it was evicted before it was read and
+    // fetched again a block per request.
+    #[test]
+    fn a_prefetch_larger_than_the_cache_is_fetched_once_in_batches() {
+        let data = test_data();
+        let (url, seen) = test_server(data.clone());
+        let opts = HttpOptions { cache_size: 16 * 4096, ..options() };
+        let mut r = RangeReader::open_with(&Remote::Url(format!("{url}/big.bin")), opts).unwrap();
+        r.prefetch(&[(0, data.len() as u64)]).unwrap();
+        let mut read = Vec::new();
+        r.read_to_end(&mut read).unwrap();
+        assert!(read == data);
+        let ranges = requested(&seen.lock().unwrap());
+        let bytes: u64 = ranges.iter().map(|(a, b)| b - a + 1).sum();
+        // The first read, then batches of half the cache (8 blocks), merged across the prefix.
+        assert!(bytes <= data.len() as u64 + 2 * 4096, "{bytes} bytes in {ranges:?}");
+        assert!(ranges.len() <= 2 + data.len().div_ceil(8 * 4096), "{ranges:?}");
+        // A block of the prefetch read again once evicted is fetched alone, not with a batch.
+        let before = seen.lock().unwrap().len();
+        assert_eq!(read_range(&mut r, 5 * 4096 + 100, 50), data[5 * 4096 + 100..5 * 4096 + 150]);
+        let again: Vec<Option<String>> = seen.lock().unwrap()[before..].to_vec();
+        assert!(again.len() <= 1 && again.iter().flatten().all(|r| r == "bytes=20480-24575"), "{again:?}");
+    }
+
+    // A read longer than a batch of a prefetch: the blocks past its batch are fetched with the read,
+    // and leave the plan too, so that one of them read again once evicted is fetched alone.
+    #[test]
+    fn blocks_a_read_fetched_past_its_batch_leave_the_plan() {
+        let data = test_data();
+        let (url, seen) = test_server(data.clone());
+        let opts = HttpOptions { cache_size: 16 * 4096, ..options() };
+        let mut r = RangeReader::open_with(&Remote::Url(format!("{url}/long.bin")), opts).unwrap();
+        r.prefetch(&[(0, data.len() as u64)]).unwrap();
+        // Blocks 0-19: 1-8 fetched by the prefetch, 9-16 a batch, 17-19 with the read.
+        assert_eq!(read_range(&mut r, 0, 20 * 4096), data[..20 * 4096]);
+        let mut rest = Vec::new();
+        r.read_to_end(&mut rest).unwrap();
+        assert!(rest == data[20 * 4096..]);
+        // Another request-counting test can hold the process-wide cache's eviction.
+        // Pin the plan invariant directly, then allow a shared-cache hit on the reread.
+        assert!(!r.shared.lock().unwrap().plan.contains(&18));
+        let before = seen.lock().unwrap().len();
+        assert_eq!(read_range(&mut r, 18 * 4096, 100), data[18 * 4096..18 * 4096 + 100]);
+        let again = requested(&seen.lock().unwrap()[before..]);
+        assert!(again.len() <= 1 && again.iter().all(|r| *r == (18 * 4096, 19 * 4096 - 1)), "{again:?}");
+    }
+
+    // A read longer than half the cache, with nothing prefetched, is fetched in requests of at
+    // most half the cache's blocks, not in one request for the whole read.
+    #[test]
+    fn a_read_longer_than_half_the_cache_is_fetched_in_bounded_requests() {
+        let data = test_data();
+        let (url, seen) = test_server(data.clone());
+        let opts = HttpOptions { cache_size: 16 * 4096, ..options() };
+        let mut r = RangeReader::open_with(&Remote::Url(format!("{url}/read.bin")), opts).unwrap();
+        let before = seen.lock().unwrap().len();
+        assert_eq!(read_range(&mut r, 0, 20 * 4096), data[..20 * 4096]);
+        let ranges = requested(&seen.lock().unwrap()[before..]);
+        assert!(!ranges.is_empty() && ranges.iter().all(|(a, b)| b - a < 8 * 4096), "{ranges:?}");
+    }
+
+    // A sparse prefetch larger than the cache (every third block: batches merge across two-block
+    // gaps) read in file order and in reverse: each request spans at most half the cache, gaps
+    // included. In file order no block is fetched twice; in reverse, only the first batch, which
+    // the prefetch fetched before the reads began at the other end.
+    #[test]
+    fn a_sparse_prefetch_larger_than_the_cache_is_fetched_in_bounded_batches() {
+        let data = test_data();
+        let (url, seen) = test_server(data.clone());
+        let opts = HttpOptions { cache_size: 16 * 4096, ..options() };
+        let blocks: Vec<u64> = (1..70).step_by(3).collect();
+        for (name, reverse) in [("forward.bin", false), ("reverse.bin", true)] {
+            let before = seen.lock().unwrap().len();
+            let mut r = RangeReader::open_with(&Remote::Url(format!("{url}/{name}")), opts.clone()).unwrap();
+            r.prefetch(&blocks.iter().map(|b| (b * 4096, 4096)).collect::<Vec<_>>()).unwrap();
+            let mut order = blocks.clone();
+            if reverse {
+                order.reverse();
+            }
+            for b in order {
+                let at = (b * 4096) as usize;
+                assert_eq!(read_range(&mut r, b * 4096, 4096), data[at..at + 4096], "{name} block {b}");
+            }
+            let ranges = requested(&seen.lock().unwrap()[before..]);
+            assert!(ranges.iter().all(|(a, b)| b - a < 8 * 4096), "{name}: {ranges:?}");
+            let refetched: u64 =
+                blocks.iter().filter(|&&b| ranges.iter().filter(|(s, e)| *s <= b * 4096 && b * 4096 <= *e).count() > 1).count() as u64;
+            // The first batch: blocks 1, 4 and 7, within half the cache (8 blocks) of block 1.
+            assert!(refetched <= if reverse { 3 } else { 0 }, "{name}: {refetched} blocks fetched twice in {ranges:?}");
+        }
+    }
+
     /// A child forked while other threads read remote files reads remote files too: the locks of
     /// remote reads that every thread shares (the cache of remote files, the request statistics,
     /// the path-specific options) are held by the forking thread across the fork, never left held
@@ -2430,6 +2680,168 @@ mod tests {
                 released.load(Ordering::Acquire) && take_retry_warnings().iter().any(|w| w.contains("forked-child.bin"))
             });
             holder.join().is_ok() && exit == Some(0)
+        });
+    }
+
+    /// A child forked while another thread holds the process agent's lock gets an agent of its
+    /// own: the lock is held by the forking thread across the fork, as the module's other locks
+    /// are, never left held in the child by a thread it does not have.
+    #[test]
+    #[cfg(unix)]
+    fn a_child_forked_while_the_process_agent_lock_is_held_gets_its_own() {
+        use std::sync::atomic::AtomicBool;
+        crate::par::alone(60, || {
+            let (holding, released) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
+            let (h, r) = (holding.clone(), released.clone());
+            let holder = std::thread::spawn(move || {
+                crate::par::fork_safe();
+                let agent = PROCESS_AGENT.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                h.store(true, Ordering::Release);
+                std::thread::sleep(Duration::from_millis(300));
+                r.store(true, Ordering::Release);
+                drop(agent);
+            });
+            while !holding.load(Ordering::Acquire) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let exit = crate::par::in_child(10, move || {
+                let options = HttpOptions::default();
+                process_agent((options.timeout, options.connect_timeout, options.user_agent.clone()), &options);
+                released.load(Ordering::Acquire)
+            });
+            holder.join().is_ok() && exit == Some(0)
+        });
+    }
+
+    /// A server keeping its connections open (HTTP/1.1 keep-alive) answering any range of
+    /// `data` at any path, and the number of connections it has accepted.
+    fn serve_keep_alive(data: Vec<u8>) -> (String, Arc<AtomicU64>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let connections = Arc::new(AtomicU64::new(0));
+        let accepted = connections.clone();
+        let data = Arc::new(data);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                accepted.fetch_add(1, Ordering::SeqCst);
+                let data = data.clone();
+                std::thread::spawn(move || {
+                    let mut reader = BufReader::new(stream.try_clone().unwrap());
+                    loop {
+                        let head = read_head(&mut reader);
+                        if head.is_empty() {
+                            return;
+                        }
+                        let range = head.iter().find_map(|l| {
+                            let l = l.to_ascii_lowercase();
+                            let (a, b) = l.strip_prefix("range: bytes=")?.split_once('-')?;
+                            Some((a.parse::<usize>().ok()?, b.parse::<usize>().ok()?.min(data.len() - 1)))
+                        });
+                        let (a, b) = range.unwrap_or((0, data.len() - 1));
+                        let status = if range.is_some() { "206 Partial Content" } else { "200 OK" };
+                        let head = format!(
+                            "HTTP/1.1 {status}\r\nContent-Length: {}\r\nContent-Range: bytes {a}-{b}/{}\r\n\r\n",
+                            b - a + 1,
+                            data.len()
+                        );
+                        if stream.write_all(&[head.as_bytes(), &data[a..=b]].concat()).is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        (url, connections)
+    }
+
+    /// Remote files opened one after another, each with a client of its own, send their requests
+    /// over one connection, and files opened from 4 threads at once over at most 4: the clients
+    /// share the process's agent. In a process of its own (`par::alone`), where no other test
+    /// rebuilds that agent with other settings.
+    #[test]
+    #[cfg(unix)]
+    fn remote_files_opened_one_after_another_share_one_connection() {
+        crate::par::alone(60, || {
+            let (url, connections) = serve_keep_alive(test_data());
+            let open_and_read = |name: String| {
+                let mut r = RangeReader::open_with(&Remote::Url(name), options()).unwrap();
+                assert_eq!(read_range(&mut r, 100_000, 1000), test_data()[100_000..101_000]);
+            };
+            for i in 0..8 {
+                open_and_read(format!("{url}one-{i}.bin"));
+            }
+            let one = connections.load(Ordering::SeqCst);
+            std::thread::scope(|s| {
+                for t in 0..4 {
+                    let (open_and_read, url) = (&open_and_read, &url);
+                    s.spawn(move || (0..8).for_each(|i| open_and_read(format!("{url}many-{t}-{i}.bin"))));
+                }
+            });
+            let many = connections.load(Ordering::SeqCst);
+            assert!(one == 1 && many <= 4, "{one} connections for 8 files one after another, {many} after 32 more from 4 threads");
+            true
+        });
+    }
+
+    /// A child forked inside an [`AgentScope`] sends the requests it makes itself through an
+    /// agent of its own, over connections of its own: the scope's agent, built in the parent,
+    /// holds the parent's sockets, which the child must neither use nor close (ending the
+    /// inherited scope in the child leaks that agent). The parent's agent keeps its connection.
+    #[test]
+    #[cfg(unix)]
+    fn a_child_forked_inside_an_agent_scope_uses_connections_of_its_own() {
+        crate::par::alone(60, || {
+            let (url, connections) = serve_keep_alive(test_data());
+            let get = move |agent: &ureq::Agent| {
+                agent
+                    .get(url.as_str())
+                    .header("Range", "bytes=0-99")
+                    .call()
+                    .is_ok_and(|mut r| r.body_mut().read_to_vec().is_ok_and(|body| body == test_data()[..100]))
+            };
+            let scope = AgentScope::new();
+            let parent = agent(&options());
+            assert!(get(&parent));
+            assert_eq!(connections.load(Ordering::SeqCst), 1);
+            let in_child = get.clone();
+            let exit = crate::par::in_child(10, move || {
+                let own = in_child(&agent(&options()));
+                drop(scope);
+                own
+            });
+            assert_eq!(exit, Some(0), "the child hung (None) or failed (1)");
+            assert_eq!(connections.load(Ordering::SeqCst), 2, "the child's request opened a connection of its own");
+            get(&parent) && connections.load(Ordering::SeqCst) == 2
+        });
+    }
+
+    /// A remote file's reader and an object fetcher made before a fork send the child's requests
+    /// over a connection of the child's own, not over the warm one they hold from the parent; the
+    /// parent's requests keep that one.
+    #[test]
+    #[cfg(unix)]
+    fn clients_made_before_a_fork_use_connections_of_the_childs_own() {
+        crate::par::alone(60, || {
+            let (url, connections) = serve_keep_alive(test_data());
+            let count = || connections.load(Ordering::SeqCst);
+            let mut reader = RangeReader::open_with(&Remote::Url(format!("{url}reader.bin")), options()).unwrap();
+            let fetcher = ObjectFetcher::new();
+            let object = Remote::Url(format!("{url}object.bin"));
+            let fetch = |at: usize| {
+                fetcher.get(&object, ByteRange::At(at as u64, 100)).ok().flatten().as_deref() == Some(&test_data()[at..at + 100])
+            };
+            assert!(fetch(0));
+            assert_eq!(read_range(&mut reader, 0, 100), test_data()[..100]);
+            let warm = count();
+            // Each child makes one request through one of the two; the parent then makes one more.
+            assert_eq!(crate::par::in_child(10, || read_range(&mut reader, 100_000, 100) == test_data()[100_000..100_100]), Some(0));
+            assert_eq!(count(), warm + 1, "the reader's request in the child opened a connection of its own");
+            assert_eq!(read_range(&mut reader, 200_000, 100), test_data()[200_000..200_100]);
+            assert_eq!(count(), warm + 1, "the parent's request kept its connection");
+            assert_eq!(crate::par::in_child(10, || fetch(1000)), Some(0));
+            assert_eq!(count(), warm + 2, "the fetcher's request in the child opened a connection of its own");
+            fetch(2000) && count() == warm + 2
         });
     }
 
@@ -2730,6 +3142,45 @@ mod tests {
             }
             lines.push(line.trim().to_string());
         }
+    }
+
+    /// The process's agent is reused while its settings, the proxy variables and the process
+    /// stay the same, and rebuilt when one of them changes (a forked child has another id).
+    #[test]
+    fn process_agent_is_rebuilt_when_settings_proxy_or_process_change() {
+        let slot = std::sync::Mutex::new(None);
+        let builds = std::cell::Cell::new(0);
+        let options = HttpOptions::default();
+        let settings = |timeout: Option<Duration>| -> AgentSettings { (timeout, options.connect_timeout, options.user_agent.clone()) };
+        let get = |pid: u32, proxy: Option<&str>, timeout: Option<Duration>| {
+            let proxy = vec![proxy.map(std::ffi::OsString::from)];
+            cached_agent(&slot, pid, proxy, settings(timeout), || {
+                builds.set(builds.get() + 1);
+                new_agent(&options)
+            });
+            builds.get()
+        };
+        assert_eq!(get(1, None, None), 1);
+        assert_eq!(get(1, None, None), 1);
+        assert_eq!(get(1, None, Some(Duration::from_secs(5))), 2);
+        assert_eq!(get(1, Some("http://proxy:3128"), Some(Duration::from_secs(5))), 3);
+        assert_eq!(get(2, Some("http://proxy:3128"), Some(Duration::from_secs(5))), 4);
+        assert_eq!(get(2, Some("http://proxy:3128"), Some(Duration::from_secs(5))), 4);
+    }
+
+    /// `agent_in` keeps an agent made in this process and replaces one from another (a fork).
+    #[test]
+    fn an_agent_from_another_process_is_replaced() {
+        let made = new_agent(&HttpOptions::default());
+        let here = std::cell::Cell::new(0);
+        let child = || {
+            here.set(here.get() + 1);
+            new_agent(&HttpOptions::default())
+        };
+        agent_in(std::process::id(), &made, child);
+        assert_eq!(here.get(), 0);
+        agent_in(std::process::id().wrapping_add(1), &made, child);
+        assert_eq!(here.get(), 1);
     }
 
     /// A loopback HTTP proxy standing in for every host: it records the target (`host:port`) of

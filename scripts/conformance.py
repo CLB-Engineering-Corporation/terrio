@@ -2499,14 +2499,16 @@ def suite_sample(ctx):
     if missing_modules("osgeo"):
         suite.skipped = "needs osgeo"
         return suite
+    columns_example = Path(ctx.terrio).resolve().parent / "examples" / "sample_columns"
+    extra = ["--sample-columns", str(columns_example)] if columns_example.exists() and not missing_modules("pyarrow") else []
     code, out, err = run([
         sys.executable, str(SCRIPTS / "compare_processing_with_gdal.py"), ctx.data,
-        "--terrio", ctx.terrio, "--only-sample",
+        "--terrio", ctx.terrio, "--only-sample", *extra,
     ])
     for line in out.splitlines():
         if line.startswith("PASS "):
             suite.cases.append(Case("sample", line[5:].split(":", 1)[0], IDENTICAL, line.split(":", 1)[1].strip()))
-    if code != 0 or len(suite.cases) != 4:
+    if code != 0 or len(suite.cases) != (9 if extra else 4):
         suite.error = tail(err or out)
     return suite
 

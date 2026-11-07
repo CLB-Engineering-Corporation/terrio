@@ -2214,3 +2214,22 @@ contains nine independent GDAL 3.13 MEM overview references (odd/even dimensions
 opaque/binary/partial alpha). AVERAGE weights fractional source-pixel overlap and
 uses nonzero alpha as validity, rather than alpha magnitude as density. This is
 overview behavior; source-alpha density during reprojection is a separate concern.
+
+### Native point sample columns
+
+Build the `sample_columns` example to compare the coordinate-only Rust API and
+bounded Arrow output with GDAL, in addition to the existing lazy CLI comparisons:
+
+```sh
+cargo build --release -p terrio-cli --bin terrio
+cargo build --release -p terrio --example sample_columns
+python scripts/conformance.py ../terrio-data --terrio target/release/terrio --only sample --strict
+```
+
+With `pyarrow` installed and the example beside that CLI under `examples/`, the
+sample suite adds five native column checks on the public COG and derived rotated
+internal/external masks. It checks every ordered value/status, ID, original field
+and geometry coordinate, and caps Arrow batches at 37 rows. Without the example or
+PyArrow it runs the original four CLI comparisons only. The corpus is limited to
+the supplied public fixture; frozen mechanics regressions cover valid zero, exact
+grid edges, Float32 nodata precision, finite checks and transform/read failures.

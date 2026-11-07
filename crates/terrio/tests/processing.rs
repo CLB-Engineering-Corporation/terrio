@@ -477,5 +477,68 @@ fn lazy_sampling_reads_internal_and_external_dataset_masks() {
         let out = sample_lazy(&p, &mut [LazySampleInput { field_name: "v".into(), raster: &mut lazy, band: 1 }], &options).unwrap();
         assert_eq!(out.features[0].attributes[1..], [V::Float(0.), V::Text("valid".into())]);
         assert_eq!(out.features[1].attributes[1..], [V::Null, V::Text("nodata".into())]);
+        let column = terrio::ops::sample::sample_points(
+            &mut lazy,
+            1,
+            &lazy_crs_unknown(),
+            &[Some((0.5, 0.5)), Some((1.5, 0.5))],
+            &terrio::ops::sample::PointSampleOptions {
+                nodata_comparison: terrio::ops::sample::NodataComparison::Exact,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(column.values, [Some(0.), None]);
+        assert_eq!(column.statuses, [terrio::ops::sample::SampleStatus::Valid, terrio::ops::sample::SampleStatus::Nodata]);
     }
+}
+
+#[test]
+fn coordinate_columns_keep_half_open_rotated_grids_and_null_positions() {
+    use terrio::ops::sample::{PointSampleOptions, SampleStatus as S, sample_points};
+    // Binary-exact affine coordinates make the edge oracle independent of CRS roundoff.
+    for gt in [[0., 1., 0., 2., 0., -1.], [8., 2., 0.5, -4., 0.5, 2.]] {
+        let mut ds = raster(2, 2, 1, &[0., 2., 3., 4.], None);
+        ds.set_geo_transform(gt);
+        let xy: Vec<_> = [(1.5, 0.5), (0., 0.), (0.5, 1.5), (2., 0.), (0., 2.), (-0.25, 0.), (1.5, 0.5)]
+            .into_iter()
+            .map(|(c, r)| Some((gt[0] + gt[1] * c + gt[2] * r, gt[3] + gt[4] * c + gt[5] * r)))
+            .chain([None])
+            .collect();
+        let mut lazy = terrio::LazyRaster::from(ds);
+        let out = sample_points(&mut lazy, 1, &lazy_crs_unknown(), &xy, &PointSampleOptions::default()).unwrap();
+        assert_eq!(out.values, [Some(2.), Some(0.), Some(3.), None, None, None, Some(2.), None]);
+        assert_eq!(out.statuses, [S::Valid, S::Valid, S::Valid, S::Outside, S::Outside, S::Outside, S::Valid, S::NoGeometry]);
+        assert!(sample_points(&mut lazy, 1, &lazy_crs_unknown(), &[Some((f64::NAN, 0.))], &Default::default()).is_err());
+        assert!(sample_points(&mut lazy, 0, &lazy_crs_unknown(), &[], &Default::default()).is_err());
+        assert!(
+            sample_points(&mut lazy, 1, &lazy_crs_unknown(), &[], &PointSampleOptions { window_size: 0, ..Default::default() }).is_err()
+        );
+        assert!(sample_points(&mut lazy, 1, &lazy_crs_unknown(), &[], &Default::default()).unwrap().values.is_empty());
+    }
+}
+
+fn lazy_crs_unknown() -> terrio::crs::SpatialRef {
+    terrio::crs::SpatialRef::from_layer(&Layer::new("unknown"))
+}
+
+#[test]
+fn coordinate_columns_use_gis_axis_order_and_strict_transform_policy() {
+    use terrio::ops::sample::{PointSampleOptions, SampleStatus as S, sample_points};
+    let mut ds = raster(1, 1, 1, &[42.], None);
+    ds.raster.crs = terrio::crs::SpatialRef::parse("+proj=ortho +lat_0=0 +lon_0=0 +datum=WGS84 +units=m").unwrap().to_crs_info();
+    ds.set_geo_transform([-1., 2., 0., 1., 0., -2.]);
+    let mut lazy = terrio::LazyRaster::from(ds);
+    let src = terrio::crs::SpatialRef::from_epsg(4326).unwrap();
+    let xy = [Some((180., 0.)), Some((0., 0.))];
+    let out = sample_points(&mut lazy, 1, &src, &xy, &Default::default()).unwrap();
+    assert_eq!(out.values, [None, Some(42.)]);
+    assert_eq!(out.statuses, [S::TransformError, S::Valid]);
+    assert!(sample_points(&mut lazy, 1, &src, &xy, &PointSampleOptions { strict_transform_errors: true, ..Default::default() }).is_err());
+    // Longitude=10, latitude=40 in EPSG:3857, independently pinned to PROJ/GDAL GIS XY.
+    let mut ds = raster(1, 1, 1, &[7.], None);
+    ds.raster.crs.epsg = Some(3857);
+    ds.set_geo_transform([1113194., 2., 0., 4865943., 0., -2.]);
+    let mut lazy = terrio::LazyRaster::from(ds);
+    assert_eq!(sample_points(&mut lazy, 1, &src, &[Some((10., 40.))], &Default::default()).unwrap().values, [Some(7.)]);
 }

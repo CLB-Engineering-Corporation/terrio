@@ -228,7 +228,7 @@ def traditional(srs):
     return srs
 
 
-def compare_sample(terrio: Path, sources: list[Path], work: Path, lazy: bool = False) -> None:
+def compare_sample(terrio: Path, sources: list[Path], work: Path, lazy: bool = False, columns_example: Path | None = None) -> None:
     rasters = [gdal.Open(str(p)) for p in sources]
     wgs84 = osr.SpatialReference()
     wgs84.ImportFromEPSG(4326)
@@ -276,6 +276,17 @@ def compare_sample(terrio: Path, sources: list[Path], work: Path, lazy: bool = F
         ct = osr.CoordinateTransformation(wgs84, traditional(raster.GetSpatialRef()))
         inverse = gdal.InvGeoTransform(raster.GetGeoTransform())
         band = raster.GetRasterBand(1)
+        native = None
+        if lazy and columns_example:
+            import pyarrow.ipc as ipc
+            arrow_path = work / f"samples_{i}.arrow"
+            arrow_path.unlink(missing_ok=True)
+            subprocess.run([str(columns_example), str(source), str(sources[i]), str(arrow_path), "37"], check=True, capture_output=True)
+            with ipc.open_file(arrow_path) as reader:
+                batches = [reader.get_batch(k) for k in range(reader.num_record_batches)]
+                assert all(batch.num_rows <= 37 for batch in batches)
+                native = reader.read_all().to_pylist()
+            assert len(native) == len(points)
         for j, (lon, lat) in enumerate(points):
             x, y, _ = ct.TransformPoint(lon, lat)
             col, row = gdal.ApplyGeoTransform(inverse, x, y)
@@ -293,12 +304,22 @@ def compare_sample(terrio: Path, sources: list[Path], work: Path, lazy: bool = F
                     status = "valid"
             if lazy:
                 assert result[j][f"r{i}_b1_status"] == status
+            if native is not None:
+                row = native[j]
+                assert row["sample_value"] == expected, (i, j, row, expected)
+                assert row["sample_status"] == status
+                assert row["site"] == j
+                assert row["sample_fid"] == j
+                geom = ogr.CreateGeometryFromWkb(row["geometry"])
+                assert (geom.GetX(), geom.GetY()) == (lon, lat)
             got = result[j][f"r{i}_b1"]
             assert got == expected, (i, j, got, expected)
             assert result[j]["site"] == j
             g = result[j].GetGeometryRef()
             assert (g.GetX(), g.GetY()) == (lon, lat)
             valid_count += expected is not None
+        if native is not None:
+            print(f"PASS native sample columns {i}: {len(native)} ordered rows, bounded Arrow batches, exact GDAL masks/values/XY/IDs")
     assert valid_count > 0
     print(
         f"PASS {'lazy' if lazy else 'eager'} multi-raster sampling: {len(points)} points, {len(rasters)} rasters, {valid_count} valid samples; values/nulls identical"
@@ -311,6 +332,7 @@ def main() -> None:
     parser.add_argument("--terrio", type=Path, default=Path("target/debug/terrio"))
     parser.add_argument("--only-footprint", action="store_true")
     parser.add_argument("--only-sample", action="store_true")
+    parser.add_argument("--sample-columns", type=Path, help="built sample_columns Rust example; requires pyarrow")
     args = parser.parse_args()
     terrio, data = args.terrio.resolve(), args.data.resolve()
     print(f"GDAL {gdal.VersionInfo('--version')}")
@@ -320,7 +342,7 @@ def main() -> None:
             # Public COG fixture and derived rotated/masked copies. No private inputs.
             source = data / "cog.tif"
             compare_sample(terrio, [source], work)
-            compare_sample(terrio, [source], work, lazy=True)
+            compare_sample(terrio, [source], work, lazy=True, columns_example=args.sample_columns)
             for external in (False, True):
                 path = work / f"masked_{external}.tif"
                 with gdal.config_option("GDAL_TIFF_INTERNAL_MASK", "NO" if external else "YES"):
@@ -336,7 +358,7 @@ def main() -> None:
                     ds.FlushCache()
                     ds.Close()
                     ds = None
-                compare_sample(terrio, [source, path], work, lazy=True)
+                compare_sample(terrio, [source, path], work, lazy=True, columns_example=args.sample_columns)
             return
         if args.only_footprint:
             for name in ("dem.tif", "landsat.tif"):
