@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- Douglas-Peucker simplification, ported from JTS 1.20.0's `DouglasPeuckerSimplifier` without its
+  repair step: `terrio simplify --method douglas-peucker` (Python `simplify(..., method=)`,
+  JavaScript `simplify(src, tolerance, { method })`; `preserve-topology` stays the default), and
+  `terrio.simplify_wkb` (JavaScript `simplifyWkb`, Rust `ops::simplify_dp::simplify_wkb_many`),
+  which simplifies WKB directly (pyarrow `binary`, `large_binary` or `binary_view` arrays, or
+  sequences of `bytes`) in parallel over features, keeping each geometry's byte order, type code,
+  Z and M. Rings left with fewer than four points keep their vertices unless `collapse="drop"`.
+  With `collapse="drop"`, every feature whose result is valid has the vertices of OGR's
+  `Simplify` (GDAL 3.12.2, GEOS 3.14.1) on the Tennessee counties, world countries and Las Vegas
+  roads of the test data. 200,000 polygons of 64 vertices (13 M vertices) simplified at 0.5:
+  0.31 s against 2.89 s for shapely 2.2's `to_wkb(simplify(from_wkb(...),
+  preserve_topology=False))`, with the same vertices (median of three, 8 shared cores, Windows).
 - KMZ archives are read within limits (#579). Their main document and the layer documents it
   links to may take 512 MiB of decompressed text together (`TERRIO_KMZ_MAX_SIZE` changes it),
   and the archive is checked against `TERRIO_ZIP_MAX_ENTRIES`, `TERRIO_ZIP_MAX_RATIO` and
