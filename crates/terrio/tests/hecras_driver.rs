@@ -357,3 +357,54 @@ fn invalid_requests_fail_a_default_open() {
     assert_eq!(ds.layers.len(), 9);
     assert!(ds.layers[0].schema.fields().iter().any(|f| f.name == "water_surface"));
 }
+
+/// Every layer of a plan, with joined summaries and JSON cross-section tables, written as one
+/// GeoParquet file with a layer column, Hilbert order and Zstandard, reads back with each layer's
+/// rows and values.
+#[cfg(feature = "parquet")]
+#[test]
+fn a_plan_writes_to_one_geoparquet_file_with_a_layer_column() {
+    let o = options(&[("CELL_SUMMARIES", "Maximum Water Surface"), ("XS_GEOMETRY", "STATION_ELEVATION")], &[]);
+    let ds = terrio::open_vector(&data("results_mesh_xs.h5"), &o).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("plan.parquet");
+    let path = path.to_str().unwrap();
+    let mut write = terrio::VectorWriteOptions::default();
+    // One file holds one layer unless a layer column tells them apart.
+    assert!(terrio::write_vector(&ds.layers, path, &write).is_err());
+    for (k, v) in [("LAYER_COLUMN", "layer"), ("COMPRESSION", "ZSTD"), ("SPATIAL_ORDER", "HILBERT"), ("HILBERT_COLUMN", "hilbert_index")] {
+        assert!(write.parquet.set(k, v).unwrap(), "{k}");
+    }
+    terrio::write_vector(&ds.layers, path, &write).unwrap();
+    let back = terrio::open_vector(path, &VectorOpenOptions::default()).unwrap();
+    assert_eq!(back.layers.len(), 1);
+    let file = &back.layers[0];
+    assert_eq!(file.len(), ds.layers.iter().map(Layer::len).sum::<usize>());
+    assert!(file.crs.is_some());
+    let names = field(file, "layer");
+    for layer in &ds.layers {
+        // The layer's rows, in Hilbert order: compare them as sorted rows of their own fields.
+        let rows: Vec<usize> = (0..file.len()).filter(|&i| names[i] == &FieldValue::Text(layer.name.clone())).collect();
+        assert_eq!(rows.len(), layer.len(), "{}", layer.name);
+        let key = |values: Vec<String>| values.join("|");
+        let mut expected: Vec<String> = layer
+            .features
+            .iter()
+            .map(|f| key(f.attributes.iter().map(|v| format!("{v:?}")).chain([format!("{:?}", f.geometry)]).collect()))
+            .collect();
+        let mut got: Vec<String> = rows
+            .iter()
+            .map(|&i| {
+                let f = &file.features[i];
+                let values = layer.schema.fields().iter().map(|d| {
+                    let at = file.schema.fields().iter().position(|a| a.name == d.name).unwrap();
+                    format!("{:?}", f.attributes[at])
+                });
+                key(values.chain([format!("{:?}", f.geometry)]).collect())
+            })
+            .collect();
+        expected.sort();
+        got.sort();
+        assert_eq!(got, expected, "{}", layer.name);
+    }
+}

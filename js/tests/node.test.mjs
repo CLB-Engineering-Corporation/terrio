@@ -189,6 +189,18 @@ test("vector layers as Arrow IPC streams, and back", { skip: needs("parquet") },
   assert.throws(() => ds.toArrowIPC(0, { geometryEncoding: "nope" }), /unknown geometry encoding/);
 });
 
+test("GeoParquet layer creation options of vector writes", { skip: needs("parquet") }, () => {
+  const ds = terrio.fromGeoJSON(SQUARES, "squares");
+  // String, number and boolean values, as Python's string mapping and `--lco` take them.
+  const creationOptions = { COMPRESSION: "ZSTD", COMPRESSION_LEVEL: 3, SPATIAL_ORDER: "HILBERT", HILBERT_COLUMN: "hilbert_index", ROW_GROUP_PER_LAYER: true };
+  const back = terrio.open(ds.toBytes("squares.parquet", { creationOptions }), "squares.parquet").toGeoJSON();
+  assert.equal(back.features.length, 2);
+  assert.ok(back.features.every((f) => Number.isInteger(f.properties.hilbert_index)));
+  assert.deepEqual(back.features.map((f) => f.properties.name).sort(), ["east", "west"].sort());
+  assert.throws(() => ds.toBytes("squares.parquet", { creationOptions: { NO_SUCH: "1" } }), /unknown layer creation option/);
+  assert.throws(() => ds.toBytes("squares.geojson", { creationOptions: { COMPRESSION: "ZSTD" } }), /apply to GeoParquet output/);
+});
+
 test("CityJSON late root type retains vertical XYZ and unknown CRS", () => {
   const doc = {
     vertices: [[10, 20, 30], [10, 21, 30], [10, 21, 31]],

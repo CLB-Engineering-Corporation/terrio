@@ -57,6 +57,21 @@ pub(crate) fn vector_write_options(driver: Option<&str>) -> PyResult<VectorWrite
     Ok(VectorWriteOptions { driver, ..Default::default() })
 }
 
+/// Applies layer creation options (`-lco`, as the command line's `--lco`) for output to `path`.
+pub(crate) fn apply_layer_options(
+    options: &mut VectorWriteOptions,
+    path: &str,
+    given: Option<std::collections::BTreeMap<String, String>>,
+) -> PyResult<()> {
+    let output = options.driver.or_else(|| VectorDriver::for_extension(path));
+    for (k, v) in given.into_iter().flatten() {
+        if !options.set_layer_option(output, &k, &v).py()? {
+            return Err(invalid(format!("unknown layer creation option '{k}'")));
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn parse_cityjson_version(value: Option<&str>) -> PyResult<Option<terrio::CityJsonVersion>> {
     value.map(str::parse).transpose().py()
 }

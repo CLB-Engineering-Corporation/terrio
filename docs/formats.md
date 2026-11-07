@@ -899,6 +899,36 @@ reads it.
   65536 rows with statistics. Reading with a bounding box (`terrio convert --spat` on a Parquet
   input, or `VectorOpenOptions::spatial_filter`) skips the row groups and rows whose covering
   bounding box is outside it.
+- **GeoParquet layer creation options** (`--lco`, `options=` in Python, `creationOptions` in
+  JavaScript, `GeoParquetWriteOptions` in Rust) lay the file out. GDAL's Parquet driver (3.13)
+  names `COMPRESSION` (`SNAPPY`, the default, `ZSTD`, `GZIP`, `BROTLI`, `LZ4_RAW`, `NONE`),
+  `COMPRESSION_LEVEL`, `ROW_GROUP_SIZE`, `GEOMETRY_NAME`, `WRITE_COVERING_BBOX` and
+  `COVERING_BBOX_NAME`, with its meanings. The others are terrio's:
+  - `LAYER_COLUMN=<name>` writes several layers into one file, told apart by a string column of
+    that name after the attributes. The schema is the union of the layers' fields in
+    first-appearance order (null where a layer lacks a field; a field typed differently in two
+    layers is refused). `ROW_GROUP_PER_LAYER=YES` (the default) also ends a row group at every
+    layer boundary, so that a filter on the layer column skips whole row groups.
+  - `SPATIAL_ORDER=HILBERT` sorts each layer's rows by the Hilbert index of their bounding-box
+    centre over the layer's extent, the key of DuckDB spatial's `ST_Hilbert(x, y, box)` (equal to
+    DuckDB 1.4.4's and 2.0.0's), so that row groups and their covering statistics hold nearby
+    features. The curve is the one `terrio sort --method hilbert` and GDAL's `gdal vector sort`
+    use; the grid differs (DuckDB scales by 65535 and truncates, GDAL by 65534 and rounds), so
+    the two orders can differ between neighbouring features. Ties keep the input order; null and
+    empty geometries go last. `HILBERT_COLUMN=<name>` stores the key as a `UInt64` column. GDAL's
+    `SORT_BY_BBOX=YES` (an R-tree order through a temporary GeoPackage) is a different order and is
+    refused.
+  - `DICTIONARY=ALL|STRING|NONE` and `STATISTICS=PAGE|CHUNK`: dictionaries on every column (the
+    default) or on string columns only, and page statistics with a page index (the default) or
+    untruncated chunk statistics without one, as pyarrow writes them.
+
+  Zstandard is written without the zstd C library: the pages are encoded by the `parquet` crate
+  uncompressed and compressed with `ruzstd`, at its only level (about zstd's 1) whatever
+  `COMPRESSION_LEVEL` asks, so files are larger than zstd's at level 3 (by 30-75% on the HEC-RAS
+  files measured); with the `libzstd` feature, in native builds, at the level asked for.
+  `terrio.write_geoparquet_layers` (Python) writes Arrow tables (pyarrow, GeoPandas' `to_arrow()`,
+  any `__arrow_c_stream__` object) with these options, keeping their column types (`float32`,
+  lists, structs); `terrio::geoparquet::write_arrow_layers` is the Rust function.
 - **MapInfo TAB** native tables (`.tab` with its `.dat`, `.map` and `.id`) are read with every
   object type and field type, in their charset, and seamless tables; they are written with their
   spatial index, which GDAL uses for spatial filters. Views and DBF-backed tables are not read.

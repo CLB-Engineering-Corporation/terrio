@@ -226,6 +226,9 @@ mod gpkg_validate;
 #[cfg(feature = "sqlite")]
 mod gpkg_validation;
 pub use gpkg_validate::{GpkgRequirement, GpkgValidation, GpkgValidationOptions, GpkgViolation, validate_gpkg, validate_gpkg_bytes};
+#[cfg(feature = "parquet")]
+#[cfg_attr(docsrs, doc(cfg(feature = "parquet")))]
+pub mod geoparquet;
 mod histogram;
 #[cfg(remote)]
 #[cfg_attr(docsrs, doc(cfg(feature = "remote")))]
@@ -295,6 +298,7 @@ pub use drivers::vector::citygml_write::{CityGmlLod0Surface, CityGmlVersion};
 pub use drivers::vector::cityjson_write::CityJsonVersion;
 pub use drivers::vector::csv::{CsvGeometry, CsvOptions};
 pub use drivers::vector::geojson::{GeoJsonIdType, GeoJsonOptions};
+pub use drivers::vector::geoparquet_options::GeoParquetWriteOptions;
 pub use drivers::vector::hecras_options::HecRasOpenOptions;
 pub use drivers::vector::kml::KmzOptions;
 pub use drivers::vector::shapefile::{OrganizePolygons, ShapefileOptions};

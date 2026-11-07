@@ -1640,6 +1640,10 @@ pub struct VectorWriteOptions {
     pub kmz: crate::drivers::vector::kml::KmzOptions,
     /// How to write XLSX workbooks: the geometry columns, a macro-enabled workbook.
     pub xlsx: crate::drivers::vector::xlsx_options::XlsxOptions,
+    /// How to write GeoParquet files: compression, row groups, the bounding-box covering, Hilbert
+    /// order, and several layers in one file with a layer column (see
+    /// [`GeoParquetWriteOptions`](crate::GeoParquetWriteOptions)).
+    pub parquet: crate::GeoParquetWriteOptions,
     /// KML and KMZ: shared styles to write as `<Style id>` elements, each id with its OGR style
     /// string, for the features whose `OGR_STYLE` is `@id`. See [`VectorDataset::style_table`].
     /// Layers do not hold the table: without it, `@id` is written as it is, as a `styleUrl` with no
@@ -1647,8 +1651,30 @@ pub struct VectorWriteOptions {
     pub style_table: Vec<(String, String)>,
 }
 
-/// Writes vector layers. GeoPackage, GPX, KML, KMZ, TopoJSON and XLSX hold several layers in one file;
-/// for the other formats, write one layer at a time.
+impl VectorWriteOptions {
+    /// Sets a layer creation option (GDAL's `-lco`) for output in the `output` format: the vector
+    /// tile options for PMTiles, MBTiles and MVT, the XLSX options for XLSX, otherwise the CSV,
+    /// GeoJSON and GeoParquet options. Returns `false` for a name none of them knows.
+    ///
+    /// ```
+    /// use terrio::formats::VectorDriver;
+    /// let mut options = terrio::VectorWriteOptions::default();
+    /// assert!(options.set_layer_option(Some(VectorDriver::Parquet), "COMPRESSION", "ZSTD")?);
+    /// assert!(!options.set_layer_option(Some(VectorDriver::Parquet), "NO_SUCH_OPTION", "1")?);
+    /// # Ok::<(), terrio::Error>(())
+    /// ```
+    pub fn set_layer_option(&mut self, output: Option<VectorDriver>, key: &str, value: &str) -> Result<bool> {
+        match output {
+            Some(VectorDriver::MBTiles | VectorDriver::PMTiles | VectorDriver::MVT) => self.tiles.set(key, value),
+            Some(VectorDriver::XLSX) => self.xlsx.set_creation(key, value),
+            _ => Ok(self.csv.set(key, value)? || self.geojson.set(key, value)? || self.parquet.set(key, value)?),
+        }
+    }
+}
+
+/// Writes vector layers. GeoPackage, GPX, KML, KMZ, TopoJSON and XLSX hold several layers in one file,
+/// and so does GeoParquet with a `LAYER_COLUMN` ([`crate::GeoParquetWriteOptions`]); for the other
+/// formats, write one layer at a time.
 ///
 /// With the `gdal` feature, an extension terrio has no driver for is written by the GDAL driver
 /// that claims it (`.dxf`, `.gdb`; see `gdal_backend::write_vector`).
@@ -1733,6 +1759,10 @@ pub fn write_vector(layers: &[Layer], path: &str, options: &VectorWriteOptions) 
         (VectorDriver::MBTiles | VectorDriver::PMTiles | VectorDriver::MVT, _) => {
             crate::tiles::write_vector(layers, path, driver, &options.tiles)
         }
+        #[cfg(feature = "parquet")]
+        (VectorDriver::Parquet, _) if options.parquet.applies() => {
+            crate::geoparquet::write_vector_layers_to_path(layers, path, &options.parquet).map(|_| ())
+        }
         (d, [layer]) => {
             if !crate::drivers::vector::write(layer, path, d, options)? {
                 let format = d.to_wb().ok_or_else(|| Error::Unsupported(format!("the {} driver cannot write", d.name())))?;
@@ -1758,6 +1788,9 @@ pub(crate) fn ensure_vector_options_apply(options: &VectorWriteOptions, driver: 
     let xlsx = &options.xlsx;
     if (xlsx.geometry != crate::CsvGeometry::None || xlsx.macro_enabled || xlsx.has_layout()) && driver != Some(VectorDriver::XLSX) {
         return Err(Error::InvalidArgument("the XLSX write options apply to XLSX output".into()));
+    }
+    if options.parquet != crate::GeoParquetWriteOptions::default() && driver != Some(VectorDriver::Parquet) {
+        return Err(Error::InvalidArgument("the GeoParquet write options apply to GeoParquet output".into()));
     }
     if !options.style_table.is_empty() && !driver.is_some_and(|d| d.holds_style_table()) {
         return Err(Error::InvalidArgument("style_table applies to KML and KMZ output".into()));

@@ -916,8 +916,8 @@ impl SortMethod {
 }
 
 /// GDAL's `GDALHilbertCode` of a point on a 16-bit grid (public domain code by
-/// rawrunprotected, as GDAL uses it).
-fn hilbert(x: u32, y: u32) -> u32 {
+/// rawrunprotected, as GDAL uses it). `x` and `y` are below 65,536.
+pub(crate) fn hilbert(x: u32, y: u32) -> u32 {
     let mut a = x ^ y;
     let mut b = 0xFFFF ^ a;
     let mut c = 0xFFFF ^ (x | y);

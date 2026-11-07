@@ -232,6 +232,27 @@ println!("{} cells, {} omitted, units {:?}", cells.layer.len(), cells.omitted.le
 # Ok::<(), terrio::Error>(())
 ```
 
+A whole plan, every layer the driver reads with the summaries joined, fits in one GeoParquet
+file with the GeoParquet layer creation options (see [formats](formats.md)): a layer column
+tells the layers apart, each layer's rows are in Hilbert order and get their own row groups, and
+Zstandard compresses the pages, so DuckDB, GDAL or pyarrow can read one layer and one area with
+row-group and covering pushdown (`WHERE layer = 'mesh_cells'`).
+
+```sh
+terrio convert BaldEagleDamBrk.p18.all2d.hdf plan.parquet --oo "CELL_SUMMARIES=Maximum Water Surface" \
+  --lco LAYER_COLUMN=layer --lco SPATIAL_ORDER=HILBERT --lco HILBERT_COLUMN=hilbert_index \
+  --lco COMPRESSION=ZSTD --lco COVERING_BBOX_NAME=bbox
+```
+
+```python
+ds = terrio.open_vector("BaldEagleDamBrk.p18.all2d.hdf", options={"CELL_SUMMARIES": "Maximum Water Surface"})
+ds.write("plan.parquet", options={"LAYER_COLUMN": "layer", "SPATIAL_ORDER": "HILBERT", "COMPRESSION": "ZSTD"})
+```
+
+The values are the driver's, unchanged: its field types (stored `f32` values widened to `f64`, as
+in every terrio output), its JSON cross-section tables as text, and its refusals, which fail the
+write rather than leave a layer out.
+
 ```js
 const ds = terrio.openVector(bytes, "BaldEagleDamBrk.p18.all2d.hdf", {
   layers: ["mesh_cells"],

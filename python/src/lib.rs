@@ -9,6 +9,7 @@ mod cog_writer;
 mod config;
 mod dataset_files;
 mod focal;
+mod geoparquet;
 mod gpkg_maintenance;
 mod grid;
 #[cfg(target_os = "linux")]
@@ -260,6 +261,7 @@ fn _terrio(m: &Bound<'_, PyModule>) -> PyResult<()> {
     pipeline::register(m)?;
     palette::register(m)?;
     focal::register(m)?;
+    geoparquet::register(m)?;
     pointcloud::register(m)?;
     pyogrio::register(m)?;
     rio::register(m)?;

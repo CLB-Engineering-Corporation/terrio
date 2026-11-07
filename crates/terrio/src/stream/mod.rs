@@ -818,7 +818,11 @@ impl FeatureWriter {
         };
         crate::dataset::ensure_vector_options_apply(options, Some(driver))?;
         let schema = schema_of(layer);
-        let streamed = can_write_stream(driver) && (profile.is_some() || !needs_profile(driver, &schema));
+        // GeoParquet layer creation options (Hilbert order, a layer column...) are applied by the
+        // whole-layer writer: with any of them set, the features are written when it finishes.
+        let streamed = can_write_stream(driver)
+            && (profile.is_some() || !needs_profile(driver, &schema))
+            && !(driver == VectorDriver::Parquet && options.parquet.applies());
         let sink: Box<dyn FeatureSink> = match (streamed, driver, profile) {
             (false, ..) => Box::new(WholeSink {
                 layer: schema,
@@ -1731,6 +1735,8 @@ pub fn can_convert_stream(src: &str, dst: &str, options: &ConvertOptions) -> boo
     let pbf = || input == Some(VectorDriver::OSM) && ext.as_deref() == Some("pbf") && osm_sorted(src);
     options.translate.sql.is_none()
         && out.is_some_and(can_write_stream)
+        // GeoParquet layer creation options are applied by the whole-layer writer.
+        && !(out == Some(VectorDriver::Parquet) && options.write.parquet.applies())
         && (input.is_some_and(can_read_stream) || pbf())
         && crate::vfs::Location::parse(src).is_local()
         && !same_dataset(src, dst)

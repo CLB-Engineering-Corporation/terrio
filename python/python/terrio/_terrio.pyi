@@ -88,6 +88,7 @@ __all__ = [
     "neighbors",
     "nearblack",
     "clean_collar",
+    "write_geoparquet_layers",
     "enhance",
     "enhance_luts",
     "unscale",
@@ -443,6 +444,7 @@ class Layer:
         cityjson_version: Literal["1.1", "2.0"] | None = None,
         citygml_version: Literal["2.0", "3.0"] | None = None,
         citygml_lod0_surface: Literal["footprint", "roof-edge"] | None = None,
+        options: Mapping[str, str] | None = None,
     ) -> None: ...
     def to_bytes(
         self,
@@ -455,6 +457,7 @@ class Layer:
         cityjson_version: Literal["1.1", "2.0"] | None = None,
         citygml_version: Literal["2.0", "3.0"] | None = None,
         citygml_lod0_surface: Literal["footprint", "roof-edge"] | None = None,
+        options: Mapping[str, str] | None = None,
     ) -> bytes: ...
 
 @final
@@ -482,6 +485,7 @@ class VectorDataset:
         cityjson_version: Literal["1.1", "2.0"] | None = None,
         citygml_version: Literal["2.0", "3.0"] | None = None,
         citygml_lod0_surface: Literal["footprint", "roof-edge"] | None = None,
+        options: Mapping[str, str] | None = None,
     ) -> None: ...
 
 @final
@@ -2251,6 +2255,14 @@ def dataset_rename(
 def dataset_delete(
     sources: str | os.PathLike[str] | Iterable[str | os.PathLike[str]], *, format: str | None = None
 ) -> list[dict[str, Any]]: ...
+def write_geoparquet_layers(
+    layers: Any | Sequence[tuple[str | None, Any]],
+    path: str | os.PathLike[str],
+    *,
+    options: Mapping[str, str] | None = None,
+    crs: str | Mapping[str, Any] | None = None,
+    identity: Sequence[str] | Mapping[str, Sequence[str]] | None = None,
+) -> dict[str, Any]: ...
 def parquet_create_metadata(
     inputs: Sequence[str | os.PathLike[str]],
     output: str | os.PathLike[str],

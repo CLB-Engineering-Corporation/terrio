@@ -939,6 +939,26 @@ impl ParquetEncoder {
         features.chunks(BATCH).map(|chunk| self.batch(chunk)).collect()
     }
 
+    /// The schema and record batches of `features` without the covering column, the geometry
+    /// column named `geometry` (for [`crate::geoparquet`], which writes its own covering).
+    pub(crate) fn attribute_batches(&self, features: &[Feature], geometry: &str) -> Result<(Arc<Schema>, Vec<RecordBatch>)> {
+        let n = self.schema.fields().len() - 1;
+        let mut fields: Vec<Field> = self.schema.fields().iter().take(n).map(|f| f.as_ref().clone()).collect();
+        if let Some(g) = fields.last_mut() {
+            *g = Field::new(geometry, DataType::Binary, true);
+        }
+        let schema = Arc::new(Schema::new(fields));
+        let chunks: Vec<&[Feature]> = if features.is_empty() { vec![&[]] } else { features.chunks(BATCH).collect() };
+        let batches = chunks
+            .into_iter()
+            .map(|c| {
+                let (batch, _) = self.batch(c)?;
+                RecordBatch::try_new(schema.clone(), batch.columns()[..n].to_vec()).map_err(|e| perr(&e))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok((schema, batches))
+    }
+
     fn batch(&self, chunk: &[Feature]) -> Result<EncodedBatch> {
         // The columns, built in parallel.
         let mut columns: Vec<ArrayRef> = crate::par::map_range(self.kinds.len(), |i| self.kinds[i].build(chunk, i));
@@ -1080,7 +1100,7 @@ fn geo_metadata(crs: Option<Value>, geo: &GeoStats) -> Value {
 }
 
 /// The `crs` of the `geo` metadata for a layer: `None` to leave it out.
-fn geo_crs(layer: &Layer) -> Option<Value> {
+pub(crate) fn geo_crs(layer: &Layer) -> Option<Value> {
     // A missing `crs` means OGC:CRS84 (longitude/latitude on WGS 84) and `null` an unknown CRS;
     // others are PROJJSON, as the specification asks (WKT, which GDAL and PROJ-based readers
     // also accept, for what cannot be converted).

@@ -19,6 +19,8 @@ Suites:
     ops               translate, warp, mosaic vs GDAL's tools (compare_ops_with_gdal.py)
     raster-masks      per-dataset masks in convert/warp, including COG overviews
     parquet-zstd      Zstandard GeoParquet pages read without the zstd C library vs GDAL
+    parquet-write     GeoParquet written with layout options (ZSTD, Hilbert order, layer column,
+                      covering name) and read back by GDAL
     catalogs          indexed real DEM mosaics and HTTP window I/O vs GDAL GTI
                       (compare_catalogs_with_gdal.py)
     vrt               serialized warped/derived/kernel VRTs, masks and lazy windows
@@ -1222,6 +1224,79 @@ def suite_parquet_zstd(ctx):
         status = IDENTICAL if got == reference else DIFFERS
         detail = "" if got == reference else f"{len(got)} features, GDAL {len(reference)}"
         suite.cases.append(Case("GeoParquet", path.name, status, detail))
+    return suite
+
+
+# Layer creation options of `terrio convert` for the GeoParquet layout suite, with the columns they
+# add (left out of the comparison).
+PARQUET_LAYOUTS = [
+    (["COMPRESSION=ZSTD", "COMPRESSION_LEVEL=3", "SPATIAL_ORDER=HILBERT", "HILBERT_COLUMN=hilbert_index",
+      "LAYER_COLUMN=layer", "COVERING_BBOX_NAME=bbox", "DICTIONARY=STRING", "STATISTICS=CHUNK"], {"hilbert_index", "layer"}),
+    (["COMPRESSION=GZIP", "ROW_GROUP_SIZE=50", "WRITE_COVERING_BBOX=NO"], set()),
+]
+
+
+def suite_parquet_write(ctx):
+    suite = Suite("parquet-write", "GeoParquet layout options", "GDAL 3.13.3 / Arrow",
+                  "Natural Earth layers written by `terrio convert --lco` with Zstandard (pure Rust), Hilbert "
+                  "order, a layer column and a covering name, then read by GDAL: the same features (attributes "
+                  "exactly, geometries by Equals, as multisets) as GDAL reads from the source, rows in "
+                  "nondecreasing Hilbert key order, and the covering GDAL finds.")
+    if missing_modules("osgeo"):
+        suite.skipped = "needs osgeo"
+        return suite
+    from osgeo import gdal, ogr
+
+    ogr.UseExceptions()
+
+    def features(layer, skip):
+        out = {}
+        for f in layer:
+            items = {k: v for k, v in f.items().items() if k not in skip}
+            g = f.GetGeometryRef()
+            out.setdefault(json.dumps(items, sort_keys=True, default=str), []).append(g.Clone() if g else None)
+        return out
+
+    for src in ("countries.geojson", "cables.geojson"):
+        path = os.path.join(ctx.data, src)
+        if not os.path.exists(path):
+            continue
+        reference = features(ogr.Open(path).GetLayer(0), set())
+        for lcos, added in PARQUET_LAYOUTS:
+            name = f"{src} {' '.join(lcos)}"
+            with tempfile.TemporaryDirectory() as tmp:
+                out_path = Path(tmp) / "out.parquet"
+                code, out, err = run([ctx.terrio, "convert", path, str(out_path), *[a for o in lcos for a in ("--lco", o)]])
+                if code:
+                    suite.cases.append(Case("GeoParquet layout", name, DIFFERS, tail(err or out)))
+                    continue
+                ds = gdal.OpenEx(str(out_path), gdal.OF_VECTOR)
+                layer = ds.GetLayer(0)
+                problems = []
+                if "hilbert_index" in added:
+                    keys = [f.GetField("hilbert_index") for f in layer]
+                    layer.ResetReading()
+                    if any(b is not None and a is not None and b < a for a, b in zip(keys, keys[1:])):
+                        problems.append("rows are not in Hilbert key order")
+                covering = layer.GetMetadataItem("GEOMETRY_COLUMN_COVERING", "_GDAL_") if hasattr(layer, "GetMetadataItem") else None
+                got = features(layer, added | {"bbox", "geometry_bbox"})
+                if sorted(got) != sorted(reference):
+                    problems.append(f"{sum(map(len, got.values()))} features, GDAL {sum(map(len, reference.values()))}, "
+                                    f"{len(set(got) ^ set(reference))} attribute rows differ")
+                else:
+                    for key, geoms in reference.items():
+                        mine = got[key]
+                        if len(mine) != len(geoms) or not all(
+                            (a is None and b is None) or (a is not None and b is not None and a.Equals(b))
+                            for a, b in zip(sorted(geoms, key=lambda g: g.ExportToWkt() if g else ""),
+                                            sorted(mine, key=lambda g: g.ExportToWkt() if g else ""))
+                        ):
+                            problems.append(f"geometries differ for {key[:60]}")
+                            break
+                detail = "; ".join(problems) or (f"covering {covering}" if covering else "")
+                suite.cases.append(Case("GeoParquet layout", name, DIFFERS if problems else IDENTICAL, detail))
+    if not suite.cases:
+        suite.skipped = "needs countries.geojson or cables.geojson in the test data"
     return suite
 
 
@@ -3230,6 +3305,7 @@ SUITES = OrderedDict(
         ("dataset-files", suite_dataset_files),
         ("parquet-metadata", suite_parquet_metadata),
         ("parquet-zstd", suite_parquet_zstd),
+        ("parquet-write", suite_parquet_write),
         ("dataset-check", suite_dataset_check),
         ("focal", suite_focal),
         ("vector-ops", suite_vector_ops),

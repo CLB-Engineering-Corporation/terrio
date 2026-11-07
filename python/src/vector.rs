@@ -434,8 +434,10 @@ impl PyLayer {
     ///     style_table: KML and KMZ output: shared styles, by id, as OGR style strings, for the
     ///         features whose `OGR_STYLE` is `@id`. By default, the table of the dataset the layer
     ///         came from; other formats get each feature's style.
+    ///     options: Layer creation options, as `terrio convert --lco` takes them (CSV, GeoJSON,
+    ///         GeoParquet, XLSX and vector tiles), such as `{"COMPRESSION": "ZSTD"}`.
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (path, driver=None, *, kmz_resources=None, style_table=None, preserve_declared_geometry_type=false, cityjson_version=None, citygml_version=None, citygml_lod0_surface=None))]
+    #[pyo3(signature = (path, driver=None, *, kmz_resources=None, style_table=None, preserve_declared_geometry_type=false, cityjson_version=None, citygml_version=None, citygml_lod0_surface=None, options=None))]
     fn write(
         &self,
         py: Python<'_>,
@@ -447,13 +449,16 @@ impl PyLayer {
         cityjson_version: Option<&str>,
         citygml_version: Option<&str>,
         citygml_lod0_surface: Option<&str>,
+        options: Option<std::collections::BTreeMap<String, String>>,
     ) -> PyResult<()> {
+        let lco = options;
         let mut options = crate::ops::vector_write_options(driver)?;
         options.preserve_declared_geometry_type = preserve_declared_geometry_type;
         options.cityjson_version = crate::ops::parse_cityjson_version(cityjson_version)?;
         options.citygml_version = crate::ops::parse_citygml_version(citygml_version)?;
         options.citygml_lod0_surface = crate::ops::parse_citygml_lod0_surface(citygml_lod0_surface)?;
         options.kmz.resources = kmz_resources.into_iter().flatten().map(|(path, bytes)| (path, bytes.to_vec())).collect();
+        crate::ops::apply_layer_options(&mut options, path, lco)?;
         let layer = self.prepare_write(&mut options, style_table, path);
         py.detach_result(|| terrio::write_vector(std::slice::from_ref(layer.as_ref()), path, &options)).py()
     }
@@ -469,6 +474,8 @@ impl PyLayer {
     ///     citygml_lod0_surface: CityGML 2.0 LoD 0 fallback: "footprint" or "roof-edge".
     ///     kmz_resources: KMZ output: files packed into the archive, such as icon images, by the
     ///         relative path the styles refer to them with (`{"icons/pin.png": png_bytes}`).
+    ///     options: Layer creation options, as `terrio convert --lco` takes them (CSV, GeoJSON,
+    ///         GeoParquet, XLSX and vector tiles), such as `{"COMPRESSION": "ZSTD"}`.
     ///
     /// Returns:
     ///     bytes: The file's contents. Shapefiles require a `.shp.zip` filename and
@@ -476,7 +483,7 @@ impl PyLayer {
     ///     encoding and CRS members. Bare `.shp` names and unsupported DBF values
     ///     (including text over 254 UTF-8 bytes) raise an error.
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (filename="layer.geojson", driver=None, *, kmz_resources=None, style_table=None, preserve_declared_geometry_type=false, cityjson_version=None, citygml_version=None, citygml_lod0_surface=None))]
+    #[pyo3(signature = (filename="layer.geojson", driver=None, *, kmz_resources=None, style_table=None, preserve_declared_geometry_type=false, cityjson_version=None, citygml_version=None, citygml_lod0_surface=None, options=None))]
     fn to_bytes<'py>(
         &self,
         py: Python<'py>,
@@ -488,13 +495,16 @@ impl PyLayer {
         cityjson_version: Option<&str>,
         citygml_version: Option<&str>,
         citygml_lod0_surface: Option<&str>,
+        options: Option<std::collections::BTreeMap<String, String>>,
     ) -> PyResult<Bound<'py, PyBytes>> {
+        let lco = options;
         let mut options = crate::ops::vector_write_options(driver)?;
         options.preserve_declared_geometry_type = preserve_declared_geometry_type;
         options.cityjson_version = crate::ops::parse_cityjson_version(cityjson_version)?;
         options.citygml_version = crate::ops::parse_citygml_version(citygml_version)?;
         options.citygml_lod0_surface = crate::ops::parse_citygml_lod0_surface(citygml_lod0_surface)?;
         options.kmz.resources = kmz_resources.into_iter().flatten().map(|(path, bytes)| (path, bytes.to_vec())).collect();
+        crate::ops::apply_layer_options(&mut options, filename, lco)?;
         let layer = self.prepare_write(&mut options, style_table, filename);
         let bytes =
             py.detach_result(|| terrio::memory::write_vector_bytes(std::slice::from_ref(layer.as_ref()), filename, &options)).py()?;
@@ -558,7 +568,8 @@ impl PyVectorDataset {
         format!("<terrio.VectorDataset driver={} layers={:?}>", self.driver, self.layer_names(py))
     }
 
-    /// Writes the layers to a file. Only GeoPackage holds several layers.
+    /// Writes the layers to a file. GeoPackage, GPX, KML, KMZ, TopoJSON and XLSX hold several
+    /// layers, and so does GeoParquet with the `LAYER_COLUMN` option.
     ///
     /// Args:
     ///     path: The output path. Its extension tells the format unless `driver` is given.
@@ -568,8 +579,10 @@ impl PyVectorDataset {
     ///     citygml_lod0_surface: CityGML 2.0 LoD 0 fallback: "footprint" or "roof-edge".
     ///     kmz_resources: KMZ output: files packed into the archive, such as icon images, by the
     ///         relative path the styles refer to them with (`{"icons/pin.png": png_bytes}`).
+    ///     options: Layer creation options, as `terrio convert --lco` takes them, such as
+    ///         `{"LAYER_COLUMN": "layer", "COMPRESSION": "ZSTD"}` for one GeoParquet file.
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (path, driver=None, *, kmz_resources=None, preserve_declared_geometry_type=false, cityjson_version=None, citygml_version=None, citygml_lod0_surface=None))]
+    #[pyo3(signature = (path, driver=None, *, kmz_resources=None, preserve_declared_geometry_type=false, cityjson_version=None, citygml_version=None, citygml_lod0_surface=None, options=None))]
     fn write(
         &self,
         py: Python<'_>,
@@ -580,13 +593,16 @@ impl PyVectorDataset {
         cityjson_version: Option<&str>,
         citygml_version: Option<&str>,
         citygml_lod0_surface: Option<&str>,
+        options: Option<std::collections::BTreeMap<String, String>>,
     ) -> PyResult<()> {
+        let lco = options;
         let mut options = crate::ops::vector_write_options(driver)?;
         options.preserve_declared_geometry_type = preserve_declared_geometry_type;
         options.cityjson_version = crate::ops::parse_cityjson_version(cityjson_version)?;
         options.citygml_version = crate::ops::parse_citygml_version(citygml_version)?;
         options.citygml_lod0_surface = crate::ops::parse_citygml_lod0_surface(citygml_lod0_surface)?;
         options.kmz.resources = kmz_resources.into_iter().flatten().map(|(path, bytes)| (path, bytes.to_vec())).collect();
+        crate::ops::apply_layer_options(&mut options, path, lco)?;
         // A KML or KMZ output holds the shared styles; elsewhere each feature gets its style.
         let output = options.driver.or_else(|| terrio::formats::VectorDriver::for_extension(path));
         let layers = if output.is_some_and(|d| d.holds_style_table()) {

@@ -66,7 +66,10 @@ pub struct Args {
     /// XLSX: GEOMETRY=AS_XY|AS_WKT|NONE, HEADER_STYLE=BOLD, FREEZE_HEADER=YES, AUTOFILTER=YES,
     /// COLUMN_WIDTH=AUTO|<n>, DATE_FORMAT, DATETIME_FORMAT, CREATION_TIME; GeoJSON: RFC7946=YES,
     /// ID_FIELD, ID_TYPE; GeoJSONSeq:
-    /// ID_FIELD, ID_TYPE; vector tiles:
+    /// ID_FIELD, ID_TYPE; GeoParquet: COMPRESSION, COMPRESSION_LEVEL, ROW_GROUP_SIZE,
+    /// GEOMETRY_NAME, WRITE_COVERING_BBOX, COVERING_BBOX_NAME, and terrio's LAYER_COLUMN (several
+    /// layers in one file), ROW_GROUP_PER_LAYER, SPATIAL_ORDER=HILBERT, HILBERT_COLUMN,
+    /// DICTIONARY=ALL|STRING|NONE, STATISTICS=PAGE|CHUNK; vector tiles:
     /// MINZOOM, MAXZOOM, EXTENT, BUFFER, SIMPLIFICATION,
     /// SIMPLIFICATION_MAX_ZOOM, NAME, DESCRIPTION, TYPE).
     #[arg(long = "lco", value_name = "KEY=VALUE")]
@@ -456,20 +459,9 @@ pub fn run(mut a: Args) -> terrio::Result<()> {
                 }
                 options.kmz.resources = kmz_resources(&a.kmz_resources)?;
             }
-            let xlsx_out = matches!(driver.or_else(|| VectorDriver::for_extension(&a.output)), Some(VectorDriver::XLSX));
-            let tiles_out = matches!(
-                driver.or_else(|| VectorDriver::for_extension(&a.output)),
-                Some(VectorDriver::MBTiles | VectorDriver::PMTiles | VectorDriver::MVT)
-            );
+            let output = driver.or_else(|| VectorDriver::for_extension(&a.output));
             for (k, v) in key_values(&a.creation_options)? {
-                let known = if tiles_out {
-                    options.tiles.set(k, v)?
-                } else if xlsx_out {
-                    options.xlsx.set_creation(k, v)?
-                } else {
-                    options.csv.set(k, v)? || options.geojson.set(k, v)?
-                };
-                if !known {
+                if !options.set_layer_option(output, k, v)? {
                     return Err(terrio::Error::InvalidArgument(format!("unknown layer creation option '{k}'")));
                 }
             }

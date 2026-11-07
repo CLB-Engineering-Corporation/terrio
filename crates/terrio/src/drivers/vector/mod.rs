@@ -21,8 +21,9 @@ pub mod geojson;
 pub mod geopackage;
 #[cfg(feature = "parquet")]
 pub mod geoparquet;
+pub mod geoparquet_options;
 #[cfg(feature = "parquet")]
-mod geoparquet_zstd;
+pub(crate) mod geoparquet_zstd;
 pub mod gml;
 #[cfg(feature = "sqlite")]
 pub(crate) mod gpkg_edit;
@@ -153,6 +154,10 @@ pub(crate) fn write(layer: &Layer, path: &str, driver: VectorDriver, options: &V
         VectorDriver::GeoJSONSeq => std::fs::write(path, geojson::to_seq_string(layer, &options.geojson)?)?,
         VectorDriver::CSV => csv::write(layer, path, &options.csv)?,
         #[cfg(feature = "parquet")]
+        VectorDriver::Parquet if options.parquet.applies() => {
+            crate::geoparquet::write_vector_layers_to_path(std::slice::from_ref(layer), path, &options.parquet)?;
+        }
+        #[cfg(feature = "parquet")]
         VectorDriver::Parquet => geoparquet::write(layer, path)?,
         VectorDriver::Shapefile => shapefile::write(layer, path)?,
         VectorDriver::GML => gml::write(layer, path)?,
@@ -254,6 +259,12 @@ pub(crate) fn read_parts(
 pub(crate) fn write_bytes(layers: &[Layer], driver: VectorDriver, options: &VectorWriteOptions) -> Result<Option<Vec<u8>>> {
     let Some(first) = layers.first() else { return Err(crate::Error::InvalidArgument("no layers to write".into())) };
     driver.ensure_built()?;
+    #[cfg(feature = "parquet")]
+    if driver == VectorDriver::Parquet && options.parquet.applies() {
+        let mut out = Vec::new();
+        crate::geoparquet::write_vector_layers(layers, &mut out, &options.parquet)?;
+        return Ok(Some(out));
+    }
     if layers.len() > 1
         && matches!(
             driver,

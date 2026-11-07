@@ -271,6 +271,11 @@ Command-group progress:
 - [x] Vector: Shapefile (with `.prj`, `.cpg` and zipped), FlatGeobuf (with its spatial index),
       GeoParquet 1.1 (with bounding-box filtering), CSV with point or WKT columns, XLSX as GDAL's
       driver reads and writes it.
+- [x] GeoParquet layout options across Rust, CLI/MCP, Python and JavaScript/WASM: GDAL's
+      `COMPRESSION` (Zstandard without the C library), `COMPRESSION_LEVEL`, `ROW_GROUP_SIZE`,
+      `WRITE_COVERING_BBOX` and `COVERING_BBOX_NAME`, and terrio's `LAYER_COLUMN` (several layers
+      in one file), `SPATIAL_ORDER=HILBERT` (DuckDB's `ST_Hilbert` key), `DICTIONARY` and
+      `STATISTICS`; Arrow tables written with their column types (`write_geoparquet_layers`).
 - [ ] XLSX layer layout options across Rust, CLI/MCP, Python and JavaScript/WASM,
       and a Rust workbook model beyond GDAL; `Workbook::add_layer` still needs
       to apply layout options

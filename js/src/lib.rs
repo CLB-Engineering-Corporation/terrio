@@ -258,7 +258,8 @@ struct WriteOptions {
     minzoom: Option<u8>,
     /// PMTiles, MBTiles: the highest zoom level written.
     maxzoom: Option<u8>,
-    /// Raster creation options, as GDAL's (`{ FORMAT: "NC4", MAX_Z_ERROR: "0.01" }`).
+    /// Raster creation options, as GDAL's (`{ FORMAT: "NC4", MAX_Z_ERROR: "0.01" }`), or vector
+    /// layer creation options, as `terrio convert --lco` takes them (`{ COMPRESSION: "ZSTD" }`).
     creation_options: Option<std::collections::BTreeMap<String, serde_json::Value>>,
 }
 
@@ -871,14 +872,8 @@ impl Dataset {
                     .as_deref()
                     .map(|f| VectorDriver::from_name(f).ok_or_else(|| JsError::new(&format!("unknown vector format '{f}'"))))
                     .transpose()?;
-                if o.srcwin.is_some()
-                    || o.overview.is_some()
-                    || o.bands.is_some()
-                    || o.compress.is_some()
-                    || o.tile_size.is_some()
-                    || o.creation_options.is_some()
-                {
-                    return Err(JsError::new("srcwin, overview, bands, compress, tileSize and creationOptions apply to rasters"));
+                if o.srcwin.is_some() || o.overview.is_some() || o.bands.is_some() || o.compress.is_some() || o.tile_size.is_some() {
+                    return Err(JsError::new("srcwin, overview, bands, compress and tileSize apply to rasters"));
                 }
                 let chosen: Vec<Layer> = match &o.layers {
                     Some(names) => layers.iter().filter(|l| names.contains(&l.name)).cloned().collect(),
@@ -903,6 +898,12 @@ impl Dataset {
                 options.kmz.resources = resources;
                 // A KML or KMZ output holds the shared styles; elsewhere each feature gets its style.
                 let output = options.driver.or_else(|| VectorDriver::for_extension(filename));
+                for (k, v) in o.creation_options.unwrap_or_default() {
+                    let v = v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string());
+                    if !options.set_layer_option(output, &k, &v).map_err(js_err)? {
+                        return Err(JsError::new(&format!("unknown layer creation option '{k}'")));
+                    }
+                }
                 let out = if output.is_some_and(|d| d.holds_style_table()) {
                     options.style_table = self.style_table.as_ref().clone();
                     out

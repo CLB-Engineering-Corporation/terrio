@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+- GeoParquet output takes layer creation options (`terrio convert --lco`, `options=` of Python's
+  `Layer.write`, `Layer.to_bytes` and `VectorDataset.write`, `creationOptions` in JavaScript,
+  `GeoParquetWriteOptions` in Rust). GDAL 3.13's Parquet driver names `COMPRESSION` (`SNAPPY`,
+  the default, `ZSTD`, `GZIP`, `BROTLI`, `LZ4_RAW`, `NONE`), `COMPRESSION_LEVEL`,
+  `ROW_GROUP_SIZE`, `GEOMETRY_NAME`, `WRITE_COVERING_BBOX` and `COVERING_BBOX_NAME`, with its
+  meanings and defaults; `SORT_BY_BBOX=YES` is refused. terrio adds `LAYER_COLUMN` (several
+  layers in one file, told apart by a string column, the schema the union of theirs),
+  `ROW_GROUP_PER_LAYER`, `SPATIAL_ORDER=HILBERT` with `HILBERT_COLUMN` (DuckDB spatial's
+  `ST_Hilbert` key of the bounding-box centres, on the curve `terrio sort` uses), `DICTIONARY` and
+  `STATISTICS`. Python's `write_geoparquet_layers` writes Arrow tables with these options and
+  keeps their column types. Zstandard is written without the zstd C library unless the `libzstd`
+  feature is on: `ruzstd` compresses at its only level, about zstd's 1, whatever level is asked
+  for. Without options, files are written as before. Given the tables pyarrow 26.0.1 writes with
+  ZSTD level 3, string dictionaries and chunk statistics after a DuckDB `ST_Hilbert` sort (three
+  HEC-RAS models, 20 files, 6.8 M rows), terrio writes the same rows in the same order, the same
+  schema with field metadata, the same `geo` metadata and the same row groups; it also keeps
+  min/max statistics of the WKB column, which pyarrow drops. Bald Eagle p07 (789,797 rows): 3.96 s
+  and a 578 MB peak against pyarrow's 3.96 s and 1,202 MB. Files are 30-75% larger than
+  pyarrow's without `libzstd`, and -5.4% to +1.5% with it.
+
 - KMZ archives are read within limits (#579). Their main document and the layer documents it
   links to may take 512 MiB of decompressed text together (`TERRIO_KMZ_MAX_SIZE` changes it),
   and the archive is checked against `TERRIO_ZIP_MAX_ENTRIES`, `TERRIO_ZIP_MAX_RATIO` and
