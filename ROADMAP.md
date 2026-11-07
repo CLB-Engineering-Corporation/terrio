@@ -621,6 +621,11 @@ WebAssembly (the `terrio-js` npm package):
       interface (plan the ranges from the HDF5 metadata, fetch them, then decode, as
       `sparse::SparseFile` reads).
 - [x] One HDF5 reader for terrio and the HEC-RAS engine: both on crates.io `hdf5-reader` 0.10.1.
+- [x] Overviews that keep the valid area of a raster with nodata (`OVERVIEW_RESAMPLING`
+      `AREA_MATCHED`, `AREA_MATCHED_MODE`; GDAL has no equivalent), for COG overviews and GeoTIFF
+      overviews at factors, with the area each level keeps in the band metadata. Read, validated
+      and copied by GDAL 3.12.2 on real rasters (the `cog-area-matched` conformance suite).
+      Streamed and bounded-memory writing of these overviews is not done.
 - [x] CRS: datum shift grids (NTv2, GeoTIFF grids), vertical datums, time-dependent transformations
       between dynamic datums (coordinate epochs). Done: PROJ's GeoTIFF grids (PROJ-data), NTv2 and GTX
       read in pure Rust and interpolated as PROJ does (`hgridshift`, `vgridshift`, NADCON5's

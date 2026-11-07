@@ -147,6 +147,13 @@ terrio's GeoTIFF and COG writers compress Deflate chunks with a Rust port of
 (`crates/terrio/src/deflate_compress.rs`, copyright 2016 Eric Biggers, MIT): the chunks are
 libdeflate's, byte for byte, as GDAL writes them when built with libdeflate (GDAL 3.12).
 
+## ras2cng
+
+terrio's area-matched overviews (`OVERVIEW_RESAMPLING=AREA_MATCHED`,
+`crates/terrio/src/drivers/area_matched.rs`) are translated from
+[ras2cng](https://github.com/gpt-cmdr/ras2cng)'s `build_area_matched_overviews`
+(copyright 2024 William Katzenmeyer / CLB Engineering Corporation, MIT).
+
 ## fdlibm
 
 terrio's vectorized aspect, and with the default (GDAL 3.12) kernel its slope in degrees and its

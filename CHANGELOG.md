@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+- COG overviews, and GeoTIFF overviews at factors, can keep the valid area of a raster with
+  nodata: `OVERVIEW_RESAMPLING=AREA_MATCHED` (`overview_resampling="area_matched"` in Rust, Python
+  and JavaScript), and `AREA_MATCHED_MODE` for class rasters, which GDAL 3.12.2 does not have.
+  GDAL's `average` makes a coarse pixel valid when any of its pixels is, so a HEC-RAS maximum depth
+  grid of 6705 x 4852 pixels written as a COG grows its valid area by 2.4%, 5.3%, 13.5% and 23.1%
+  over its four levels, with GDAL 3.12.2 as with terrio. Area-matched levels have GDAL's sizes and
+  keep `round(valid * w * h / (cols * rows))` cells, the most covered first, holding the mean (or
+  the most frequent class) of their valid pixels; on that grid every level keeps the area to within
+  0.01%. Each band records `OVERVIEW_AREA_RATIOS` and `OVERVIEW_BASE_VALID_PIXELS` in its
+  default-domain metadata, which GDAL's COG driver copies when it converts the file again. Such a
+  COG is written whole, not a strip at a time: on a 15777 x 12599 Float32 terrain on 8 CPUs,
+  `terrio convert -f COG` takes 6.5 s and 2,169 MiB at peak, against 6.7 s and 716 MiB for the
+  streamed `average` COG (GDAL 3.12.2: 10.1 s, 1,181 MiB). Other overview methods write the same
+  bytes as before. Real rasters are checked against GDAL in the `cog-area-matched` conformance
+  suite.
+
 - KMZ archives are read within limits (#579). Their main document and the layer documents it
   links to may take 512 MiB of decompressed text together (`TERRIO_KMZ_MAX_SIZE` changes it),
   and the archive is checked against `TERRIO_ZIP_MAX_ENTRIES`, `TERRIO_ZIP_MAX_RATIO` and
