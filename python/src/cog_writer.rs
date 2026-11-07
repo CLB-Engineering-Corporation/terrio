@@ -14,8 +14,8 @@ use wbraster::raster::RasterData;
 /// each level's rows of tiles are compressed as they are complete (into temporary files), its
 /// overviews computed from the rows they need as GDAL's COG driver computes them, and the file
 /// laid out at the end, the same, byte for byte, as `Raster.write(..., driver="COG")` writes it.
-/// Masks, overview factors, a source's overviews to copy and compressions only the whole raster
-/// is encoded with are not written this way.
+/// Masks, overview factors, a source's overviews to copy, area-matched overviews and compressions
+/// only the whole raster is encoded with are not written this way.
 ///
 /// Args:
 ///     path: The output path.

@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+- A COG's `PREDICTOR=YES` (or `ON`, `TRUE`) follows the data type as GDAL's COG driver does:
+  the floating-point predictor (3) for Float32 and Float64, horizontal differencing (2) for
+  integers. It was always 2. `STANDARD` (2) and `FLOATING_POINT` (3) are accepted too. A GeoTIFF's
+  `YES` still means 2 (GDAL 3.12's GTiff driver refuses `YES`).
+- COG overviews, and GeoTIFF overviews at factors, can keep the valid area of a raster with
+  nodata: `OVERVIEW_RESAMPLING=AREA_MATCHED` (`overview_resampling="area_matched"` in Rust, Python
+  and JavaScript), and `AREA_MATCHED_MODE` for class rasters, which GDAL 3.12.2 does not have.
+  GDAL's `average` makes a coarse pixel valid when any of its pixels is, so a HEC-RAS maximum depth
+  grid of 6705 x 4852 pixels written as a COG grows its valid area by 2.4%, 5.3%, 13.5% and 23.1%
+  over its four levels, with GDAL 3.12.2 as with terrio. Area-matched levels have GDAL's sizes and
+  keep `round(valid * w * h / (cols * rows))` cells, the most covered first, holding the mean (or
+  the most frequent class) of their valid pixels; on that grid every level keeps the area to within
+  0.01%. Each band records `OVERVIEW_AREA_RATIOS` and `OVERVIEW_BASE_VALID_PIXELS` in its
+  default-domain metadata, which GDAL's COG driver copies when it converts the file again. Such a
+  COG is written whole, not a strip at a time: on a 15777 x 12599 Float32 terrain on 8 CPUs,
+  `terrio convert -f COG` takes 6.5 s and 2,169 MiB at peak, against 6.7 s and 716 MiB for the
+  streamed `average` COG (GDAL 3.12.2: 10.1 s, 1,181 MiB). Other overview methods write the same
+  bytes as before. Real rasters are checked against GDAL in the `cog-area-matched` conformance
+  suite.
+
 - `warp` of a `Raster` in memory releases the GIL for the whole warp: it takes the raster's
   shared pixels (no copy) and warps them after releasing it, so warps from Python threads
   (rioxarray-style `reproject` of xarray arrays on a thread pool) overlap. 96 nearest-neighbour
