@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+- `terrio warp --wm`, Python `terrio.warp(..., wm=)` and JavaScript `warp(src, { wm })` set the
+  working memory of a warp chunk as `gdalwarp -wm` reads it (GDAL 3.13.3's
+  `CPLParseMemorySize()`): a number is megabytes below 10000 and bytes from 10000, or it takes a
+  `K`, `M`, `G` or `%` unit (`512MB`, `10%`); 0 keeps the default of 64 MB. At each value the
+  chunks are GDAL's: the ECOSTRESS LST scene warped to EPSG:4326 at `-wm` 1, 500000 and 64MB
+  equals `gdalwarp` 3.12.2 with nearest and is within 3.1e-5 with bilinear (one pixel), while
+  changing `-wm` alone moves 2.37 M of its 2.57 M pixels by up to 0.34, as it does in GDAL. A
+  JavaScript `wm` number below 10000 is now megabytes; it was bytes.
+- Python `terrio.warp` and `terrio.mosaic` given source paths and a `dst` path write it as the
+  command line does (`ops::warp::warp_to_path`, `ops::mosaic::mosaic_to_path`) and return it
+  opened lazily from `dst`: a single source without a cutline is read a chunk's window at a time
+  and written as its rows are done, and sources on the output's grid are mosaicked a strip at a
+  time. A 15,777 x 12,599 Float32 DEM warped to EPSG:3857 at 6 m (`tap`, bilinear), one process
+  per run on a shared 8-core Windows host, median of three: 9.7 s and 2,877 MiB peak -> 7.8 s and
+  714 MiB (392 MiB with `wm=16`), pixels identical; `gdal.Warp` 3.12.2 took 24.9 s and 2,259 MiB.
+  Its four quarters mosaicked back: 2.5 s and 2,314 MiB -> 1.7 s and 394 MiB. Rasters in memory
+  among the sources, `init` and `geolocation` keep the in-memory operation.
 - KMZ archives are read within limits (#579). Their main document and the layer documents it
   links to may take 512 MiB of decompressed text together (`TERRIO_KMZ_MAX_SIZE` changes it),
   and the archive is checked against `TERRIO_ZIP_MAX_ENTRIES`, `TERRIO_ZIP_MAX_RATIO` and

@@ -287,8 +287,8 @@ terrio.info("dem.tif", stats=True)  # the same dict as `terrio info --json`
 terrio.convert("countries.shp", "europe.gpkg", where="CONTINENT = 'Europe'", select=["NAME"])
 terrio.convert("https://example.com/cog.tif", "window.tif", srcwin=(0, 0, 512, 512))
 terrio.translate("dem.tif", "small.tif", outsize=("25%", "25%"), resampling="average")
-terrio.warp("dem.tif", "dem_4326.tif", t_srs="EPSG:4326", resampling="bilinear")
-terrio.mosaic(["n40w106.tif", "n40w107.tif"], "mosaic.tif")
+terrio.warp("dem.tif", "dem_4326.tif", t_srs="EPSG:4326", resampling="bilinear", wm=16)  # by chunks, lazy result
+terrio.mosaic(["n40w106.tif", "n40w107.tif"], "mosaic.tif")  # by strips, lazy result
 terrio.rasterize("counties.gpkg", "pop.tif", attribute="POPULATION", tr=(0.01, 0.01), ot="Int32")
 polygons = terrio.polygonize("landcover.tif", connectedness=8)
 shade = terrio.dem("dem.tif", "hillshade", z=2, multidirectional=True)  # like gdaldem
@@ -318,6 +318,13 @@ kept by `clean_collar`) needs `dst`, which holds it, and the returned `Raster` i
 (`terrio clean-collar --update`). See [neighbors](cli.md#neighbors),
 [clean-collar](cli.md#clean-collar-and-nearblack) and [enhance](cli.md#enhance) for the
 options, GDAL's arithmetic and the known differences.
+
+`warp` and `mosaic` given source paths and a `dst` path write it as the command line does: a
+single source warped without a cutline is read a chunk's window at a time and written as its rows
+are done (`wm`, as `gdalwarp -wm`, sets a chunk's working memory: see [warp](cli.md#warp)), and
+sources on the output's grid are mosaicked a strip at a time. The result is then returned opened
+lazily from `dst`, with the values of the operation in memory at the same `wm`. Rasters in memory
+among the sources, `init` and `geolocation` keep the in-memory operation.
 
 ### Warp source overviews
 

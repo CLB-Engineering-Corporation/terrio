@@ -759,8 +759,9 @@ Windows read as `f32` or `f64` values, NaN where GDAL's mask band marks pixels i
   overview level, decoding only the tiles needed and fetching them with HTTP range requests.
   Terrain analysis, warping and mosaics read their inputs that way and write GeoTIFF outputs a
   strip of rows at a time (`ops::dem::dem_to_path`, `ops::warp::warp_to_path`,
-  `ops::mosaic::mosaic_to_path`, which the command line uses), with the values of the in-memory
-  operations.
+  `ops::mosaic::mosaic_to_path`, which the command line and Python's `dem`, `warp` and `mosaic`
+  given a destination path use), with the values of the in-memory operations. A warp chunk's
+  working memory is set as `gdalwarp -wm` sets it (`--wm`, `wm=`).
 - HTTP goes through `ureq` (with rustls) and S3 requests are signed by terrio itself, rather than
   through `object_store`, to keep the API synchronous and the dependencies small.
 - GeoPackage is read and written by terrio's own SQLite file reader and writer (pure Rust): no

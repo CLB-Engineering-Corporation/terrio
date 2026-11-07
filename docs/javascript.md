@@ -172,7 +172,8 @@ and is given one (`crypto.getRandomValues`).
 camelCase options. So do `zonalStats`, `makeValid`, `checkGeometry`, `clipVector`, `layerAlgebra`,
 `checkCoverage`, `simplifyCoverage`, `cleanCoverage`, `blend`, `identify`, `checkDataset`,
 `pipeline`, `retile`, `planRetile`, `rasterIndex`, `vectorIndex`, `rpftocCreate` and `vsiStat`.
-`takeWarnings` returns the warnings collected so far.
+`takeWarnings` returns the warnings collected so far. `warp`'s `wm` is the working memory of a
+chunk, a number or a string read as [`--wm`](cli.md#warp) (`gdalwarp -wm`) reads it.
 
 ### Raster management
 

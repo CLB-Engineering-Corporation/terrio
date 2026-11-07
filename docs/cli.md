@@ -1022,7 +1022,20 @@ The target grid is always planned from full-resolution metadata before choosing 
 overviews. Downsampling remote COGs therefore fetches coarse tiles instead of full-resolution
 pixels. An unavailable explicit level falls back to the last available level, as GDAL does.
 
+The output is warped in chunks, as `gdalwarp` splits it, each from the window of the source it
+needs; a single input without a cutline is read a chunk's window at a time and a GeoTIFF or COG
+output written as its rows are done, so that neither is held whole. `--wm` sets the working memory
+of a chunk as `gdalwarp -wm` (GDAL 3.13.3) reads it: megabytes below 10000 and bytes from 10000
+(`--wm 64` and `--wm 67108864` are both the default, 64 MB), or with a `K`, `M` or `G` unit or a
+`%` of the memory the process can use (`--wm 512MB`, `--wm 10%`; a percentage needs Linux's
+`/proc`); 0 keeps the default. A smaller chunk lowers the peak memory of a path-to-path warp. As
+with gdalwarp, another chunk size can change some pixels, by a small amount, since each chunk has
+its own source window and its own approximate transformer (`--et`); the same `--wm` gives the
+same pixels in memory and path to path. Python's `terrio.warp(..., wm=)` and JavaScript's
+`warp(src, { wm })` take the same values, as a number or a string.
+
 ```sh
+terrio warp dem.tif dem_3857.tif --t-srs EPSG:3857 -r bilinear --wm 16
 terrio warp scene.tif scene_4326.tif --rpc --to RPC_HEIGHT=120
 terrio warp scene.tif scene_utm.tif --rpc --to RPC_DEM=dem.tif --t-srs EPSG:32720 -r bilinear
 ```
