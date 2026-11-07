@@ -2354,6 +2354,10 @@ Text status fields distinguish `valid`, `nodata` (including masks and non-finite
 `outside`, `transform-error` and `no-geometry`. Their names append the suffix to the final
 sample field name and resolve collisions in the same way. `--strict-transform-errors` fails
 on a per-point projection error; invalid CRS construction and pixel/mask I/O always fail.
+The lazy CLI adds fields to the owned layer without cloning it for each raster band.
+Rust callers can avoid Layers entirely with `ops::sample::sample_points`; see
+[Native point sample columns](rust.md#native-point-sample-columns) for bounded Arrow batches.
+
 `--sample-window-size N` caps returned window width and height (default 512); native block
 sizes are used when smaller. Indexing/output memory grows with point count. Decoder chunks
 and caches have separate limits; large blocks can be decoded repeatedly and formats without

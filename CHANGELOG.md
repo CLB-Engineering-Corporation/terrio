@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Native point sampling: `ops::sample::sample_points` returns ordered nullable values
+  and typed validity statuses without a Layer or GeoJSON transport. Callers control
+  batch size and output schema. `sample_lazy_owned` and the lazy CLI avoid sampling
+  Layer clones; existing borrowed APIs, options and eager defaults remain available.
+  The `sample_columns` example writes bounded Arrow IPC batches.
+
 - HTTP prefetches larger than half the compressed block cache are fetched in bounded
   batches, preserving planned blocks until read. File-order decoding avoids fetching
   evicted prefetched ranges again (upstream #602).

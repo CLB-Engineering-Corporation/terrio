@@ -811,3 +811,71 @@ assert!(report.is_complete && from_bytes.is_complete);
 errors, warnings and unsupported checks. It serializes validity/completeness as
 `valid`/`complete`. The `sqlite` feature is required. See the
 [supported checks and limitations](cli.md#geopackage-validation).
+
+## Native point sample columns
+
+`ops::sample::sample_points` samples a coordinate slice into nullable Float64 values
+and `SampleStatus` columns. It does not construct features, copy attributes or
+convert through GeoJSON. Retain the input IDs and XY columns and append the results
+in their original order. `sample_lazy_owned` adds sample fields to an owned layer;
+`sample_lazy` remains the compatible borrowed wrapper.
+
+```rust
+# fn example() -> terrio::Result<()> {
+use terrio::ops::sample::{PointSampleOptions, sample_points};
+let mut raster = terrio::open_raster_lazy("terrain.tif")?;
+let src = terrio::crs::SpatialRef::parse("EPSG:4326")?;
+let options = PointSampleOptions { strict_transform_errors: true, ..Default::default() };
+let xy = [Some((-91.0, 40.0)), None];
+let result = sample_points(&mut raster, 1, &src, &xy, &options)?;
+assert_eq!(result.statuses.len(), xy.len());
+# Ok(())
+# }
+```
+
+The containing full-resolution pixel is selected by the inverse affine transform
+and floor, with traditional GIS XY axis order. Right and bottom grid edges are
+outside. A valid sample is finite, differs from nodata in the band's own type,
+and has a nonzero explicit internal/external mask where present. Zero is valid.
+Statuses also distinguish outside, failed transforms and absent coordinates.
+Read errors are fatal; strict mode also makes each transform error fatal.
+The default `NodataComparison::GdalMask` preserves the lazy API's GDAL mask-band
+relative tolerance. Select `NodataComparison::Exact` when a consumer requires exact
+sentinel equality (Float32 metadata is cast to Float32 first). This can retain
+finite values adjacent to the sentinel that GDAL's tolerance invalidates, including
+its extreme-Float32 overflow cases. Both policies combine nodata with explicit
+masks and finite checks; an explicit mask does not override a nodata sentinel.
+Values are unscaled raster values: applications choose their own units and policy.
+Integers above 2^53 can lose precision in the Float64 sample representation.
+
+Pass bounded slices (for example 8192 points) and retain the open raster between
+calls. The sample index and result are O(batch rows); one returned window is held
+at a time, up to `window_size` in each dimension. Codecs can decode larger native
+chunks, and input inventories and driver caches have separate budgets. The decoded
+GeoTIFF cache (`terrio::block_cache`) can reuse tiles across batches; zero disables
+it. A batch grouped once per native tile may gain little from caching. The Deflate
+fast path excludes floating-point predictor 3. Neither HTTP connection pooling nor
+HTTP prefetch batching speeds up a local file by itself.
+
+A runnable Arrow IPC example retains normal attributes and WKB geometry, adds
+UInt64 `sample_fid`, nullable Float64 `sample_value` and text `sample_status`, and
+writes bounded record batches:
+
+```sh
+cargo run --release -p terrio --example sample_columns -- sites.fgb terrain.tif sampled.arrow 8192
+```
+
+The example still opens the complete vector inventory in memory, requires one
+layer, refuses field collisions/overwrites, and leaves a partial file on error.
+Production consumers should stage output and publish only after successful close
+and their identity checks. A streaming inventory can call `sample_points` directly
+on each batch without retaining a Layer.
+
+For direct Parquet, construct Arrow arrays from `values` and the status labels,
+append the caller's original ID/XY arrays, then write bounded record batches with
+`parquet::arrow::ArrowWriter`. The caller owns the schema, footer metadata, source
+identity, unit conversion and publication contract. Generic vector/GeoParquet
+output is not a substitute for an application's geometryless analytical table.
+No event identity, valuation, or application-specific row schema belongs in the
+sampling API. Existing `terrio sample --lazy` also writes normal vector formats,
+including GeoParquet, and retains its options and eager default.

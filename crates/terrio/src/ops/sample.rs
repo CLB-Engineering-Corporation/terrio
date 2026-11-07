@@ -202,120 +202,251 @@ impl Default for LazySampleOptions {
 /// # Ok::<(), terrio::Error>(())
 /// ```
 pub fn sample_lazy(points: &Layer, inputs: &mut [LazySampleInput<'_>], options: &LazySampleOptions) -> Result<Layer> {
-    use crate::{Window, WindowOptions};
-    use std::collections::BTreeMap;
+    sample_lazy_owned(points.clone(), inputs, options)
+}
 
+/// [`sample_lazy`] taking ownership of the layer, avoiding a copy of all features and attributes.
+/// Output reprojection and rounding have the same semantics as the borrowed wrapper.
+pub fn sample_lazy_owned(mut points: Layer, inputs: &mut [LazySampleInput<'_>], options: &LazySampleOptions) -> Result<Layer> {
     validate_decimal_places(options.output.decimal_places)?;
     if inputs.is_empty() || options.window_size == 0 {
         return Err(Error::InvalidArgument("sampling needs a raster band and a positive window size".into()));
     }
-    for f in &points.features {
-        match &f.geometry {
-            Some(Geometry::Point(c)) if c.x.is_finite() && c.y.is_finite() => {}
-            None => {}
-            _ => return Err(Error::InvalidArgument(format!("feature {} needs a point with finite XY coordinates", f.fid))),
-        }
-    }
-    let src = SpatialRef::from_layer(points);
-    let mut out = points.clone();
+    let xy = points
+        .features
+        .iter()
+        .map(|f| match &f.geometry {
+            Some(Geometry::Point(c)) => Ok(Some((c.x, c.y))),
+            None => Ok(None),
+            _ => Err(Error::InvalidArgument(format!("feature {} needs a point with finite XY coordinates", f.fid))),
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let src = SpatialRef::from_layer(&points);
+    let first_field = points.schema.len();
     for input in inputs {
-        let ds = &mut *input.raster;
-        let header = ds.header();
-        check_raster(&header)?;
-        check_band(&header, input.band)?;
         if input.field_name.trim().is_empty() {
             return Err(Error::InvalidArgument("sample field names cannot be empty".into()));
         }
-        let dst = ds.crs();
-        let ct = match (src.is_unknown(), dst.is_unknown()) {
-            (true, true) => None,
-            (true, false) | (false, true) => {
-                return Err(Error::Crs("points and raster must both declare a CRS, or both have no CRS".into()));
-            }
-            _ if src.same_as(&dst) => None,
-            _ => Some(Transformer::new(&src, &dst)?),
-        };
-        let name = super::geometry::unique_field(&out, &input.field_name);
-        let index = out.schema.len();
-        out.schema.add_field(FieldDef::new(name.clone(), FieldType::Float));
-        let status_index = options.status_suffix.as_ref().map(|suffix| {
-            let status_name = super::geometry::unique_field(&out, &format!("{name}{suffix}"));
-            let i = out.schema.len();
-            out.schema.add_field(FieldDef::new(status_name, FieldType::Text));
-            i
-        });
-        for f in &mut out.features {
+        let column = sample_points(
+            input.raster,
+            input.band,
+            &src,
+            &xy,
+            &PointSampleOptions {
+                strict_transform_errors: options.strict_transform_errors,
+                window_size: options.window_size,
+                ..Default::default()
+            },
+        )?;
+        let name = super::geometry::unique_field(&points, &input.field_name);
+        let index = points.schema.len();
+        points.schema.add_field(FieldDef::new(name.clone(), FieldType::Float));
+        if let Some(suffix) = &options.status_suffix {
+            let status_name = super::geometry::unique_field(&points, &format!("{name}{suffix}"));
+            points.schema.add_field(FieldDef::new(status_name, FieldType::Text));
+        }
+        for (i, f) in points.features.iter_mut().enumerate() {
             f.attributes.resize(index, FieldValue::Null);
-            f.attributes.push(FieldValue::Null);
-            if status_index.is_some() {
-                f.attributes.push(FieldValue::Text("no-geometry".into()));
+            f.attributes.push(column.values[i].map_or(FieldValue::Null, FieldValue::Float));
+            if options.status_suffix.is_some() {
+                f.attributes.push(FieldValue::Text(column.statuses[i].as_str().into()));
             }
-        }
-        let gt = ds.geo_transform();
-        let det = gt[1] * gt[5] - gt[2] * gt[4];
-        let (bw, bh) = ds.block_size().unwrap_or((options.window_size, options.window_size));
-        let width = bw.max(1).min(options.window_size);
-        let height = bh.max(1).min(options.window_size);
-        let mut windows = BTreeMap::<(usize, usize), Vec<(usize, usize, usize)>>::new();
-        let mut failures = 0usize;
-        for (i, f) in points.features.iter().enumerate() {
-            let Some(Geometry::Point(c)) = &f.geometry else { continue };
-            let xy = ct.as_ref().map_or(Ok((c.x, c.y)), |t| t.transform(c.x, c.y));
-            let (x, y) = match xy {
-                Ok((x, y)) if x.is_finite() && y.is_finite() => (x, y),
-                other => {
-                    if options.strict_transform_errors {
-                        let detail = other.err().map_or_else(|| "non-finite transformed coordinates".into(), |e| e.to_string());
-                        return Err(Error::Crs(format!("sample field '{name}', feature {}: {detail}", f.fid)));
-                    }
-                    failures += 1;
-                    if let Some(j) = status_index {
-                        out.features[i].attributes[j] = FieldValue::Text("transform-error".into());
-                    }
-                    continue;
-                }
-            };
-            let (dx, dy) = (x - gt[0], y - gt[3]);
-            let col = ((gt[5] * dx - gt[2] * dy) / det).floor();
-            let row = ((gt[1] * dy - gt[4] * dx) / det).floor();
-            if col >= 0.0 && row >= 0.0 && col < ds.width() as f64 && row < ds.height() as f64 {
-                let (col, row) = (col as usize, row as usize);
-                windows.entry((row / height, col / width)).or_default().push((i, col, row));
-            } else if let Some(j) = status_index {
-                out.features[i].attributes[j] = FieldValue::Text("outside".into());
-            }
-        }
-        for ((by, bx), entries) in windows {
-            let (x, y) = (bx * width, by * height);
-            let window = Window::new(x, y, width.min(ds.width() - x), height.min(ds.height() - y));
-            let pixels = ds.read_window(window, &WindowOptions { bands: vec![input.band], overview: None })?;
-            let mask = ds.read_mask(window, None)?;
-            let expected = window.width * window.height;
-            if pixels.raster.data.len() != expected || mask.as_ref().is_some_and(|m| m.len() != expected) {
-                return Err(Error::InvalidArgument("sample reader returned an unexpected window size".into()));
-            }
-            for (i, col, row) in entries {
-                let offset = (row - y) * window.width + col - x;
-                let v = pixels.raster.data.get_f64(offset);
-                let valid = v.is_finite()
-                    && crate::histogram::is_valid(v, ds.band_nodata(input.band), ds.band_data_type(input.band))
-                    && mask.as_ref().is_none_or(|m| m[offset] != 0);
-                if valid {
-                    out.features[i].attributes[index] = FieldValue::Float(v);
-                }
-                if let Some(j) = status_index {
-                    out.features[i].attributes[j] = FieldValue::Text(if valid { "valid" } else { "nodata" }.into());
-                }
-            }
-        }
-        if failures > 0 {
-            crate::warnings::warn(format!(
-                "sample field '{name}' in layer '{}': could not transform {failures} points into the raster CRS; samples set to null",
-                points.name
-            ));
         }
     }
-    finish_output(out, points.schema.len(), options.output.dst_srs.as_ref(), options.output.decimal_places)
+    finish_output(points, first_field, options.output.dst_srs.as_ref(), options.output.decimal_places)
+}
+
+/// Validity of a full-resolution containing-pixel sample.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SampleStatus {
+    /// Finite, unmasked pixel, including zero.
+    Valid,
+    /// Explicitly masked, typed nodata, or non-finite pixel.
+    Nodata,
+    /// Coordinate falls outside the half-open raster grid.
+    Outside,
+    /// Per-point CRS transformation failed (only returned in non-strict mode).
+    TransformError,
+    /// Input coordinate was absent.
+    NoGeometry,
+}
+
+impl SampleStatus {
+    /// Stable labels used by the lazy CLI status fields.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Valid => "valid",
+            Self::Nodata => "nodata",
+            Self::Outside => "outside",
+            Self::TransformError => "transform-error",
+            Self::NoGeometry => "no-geometry",
+        }
+    }
+}
+
+/// Ordered sample columns, independent of vector attributes, IDs, and output formats.
+/// A value is present exactly when its corresponding status is [`SampleStatus::Valid`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct SampleColumn {
+    /// Unscaled full-precision pixel values, represented as Float64; missing samples are null.
+    pub values: Vec<Option<f64>>,
+    /// One status per input coordinate, in exactly the same order.
+    pub statuses: Vec<SampleStatus>,
+}
+
+/// How floating-point nodata metadata is compared with a pixel.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum NodataComparison {
+    /// GDAL mask-band relative tolerance in the band's type, as existing [`sample_lazy`] uses.
+    #[default]
+    GdalMask,
+    /// Exact equality, with Float32 nodata rounded to Float32 before comparison.
+    /// Other types compare their Float64 representation with the nodata metadata.
+    /// Explicit masks and finite checks still apply. Useful for analytical consumers whose
+    /// contract distinguishes a finite value adjacent to nodata from the sentinel itself.
+    Exact,
+}
+
+/// Controls for [`sample_points`]. Output coordinates and numeric values are never rounded.
+#[derive(Debug, Clone)]
+pub struct PointSampleOptions {
+    /// Nodata comparison policy. Default: GDAL mask tolerance, preserving [`sample_lazy`].
+    pub nodata_comparison: NodataComparison,
+    /// Return an error on a failed per-point CRS transform. Default: false.
+    pub strict_transform_errors: bool,
+    /// Maximum returned raster window width/height, positive. Default: 512.
+    /// Native chunks, compressed/decoded caches and input/output columns have separate budgets.
+    pub window_size: usize,
+}
+
+impl Default for PointSampleOptions {
+    fn default() -> Self {
+        Self { strict_transform_errors: false, window_size: 512, nodata_comparison: NodataComparison::GdalMask }
+    }
+}
+
+/// Sample a coordinate batch without constructing or cloning a [`Layer`].
+///
+/// Coordinates use traditional GIS XY order in `src`. None produces `no-geometry`;
+/// non-finite input XY is an error. Values, statuses and duplicate positions retain input order;
+/// callers retain their IDs, coordinates and attributes unchanged. Full-resolution inverse-affine
+/// containing-pixel selection, typed nodata, finite checks and internal/external masks match
+/// [`sample_lazy`] by default. [`NodataComparison::Exact`] instead uses exact typed equality;
+/// it never replaces explicit masks or finite checks. Pixel/mask read errors and
+/// transform-construction errors are always fatal.
+///
+/// The index and result use O(N) memory for this batch. Windows are grouped and read once per
+/// occupied subdivision; the underlying codec can decode whole chunks. Call with bounded slices
+/// (for example 8192 rows), retaining the raster handle across calls to reuse its decoded cache.
+/// Batching may reread chunks across batches; disabling the cache can make that slower.
+/// No application identity, unit conversion, Parquet metadata or row schema is imposed.
+///
+/// ```no_run
+/// use terrio::ops::sample::{sample_points, PointSampleOptions};
+/// let mut raster = terrio::open_raster_lazy("terrain.tif")?;
+/// let src = terrio::crs::SpatialRef::parse("EPSG:4326")?;
+/// let xy = [Some((-91.0, 40.0)), None];
+/// let columns = sample_points(&mut raster, 1, &src, &xy, &PointSampleOptions::default())?;
+/// assert_eq!(columns.values.len(), xy.len());
+/// # Ok::<(), terrio::Error>(())
+/// ```
+pub fn sample_points(
+    ds: &mut crate::LazyRaster,
+    band: usize,
+    src: &SpatialRef,
+    points: &[Option<(f64, f64)>],
+    options: &PointSampleOptions,
+) -> Result<SampleColumn> {
+    use crate::{Window, WindowOptions};
+    use std::collections::BTreeMap;
+
+    if options.window_size == 0 {
+        return Err(Error::InvalidArgument("sample window size must be positive".into()));
+    }
+    for (i, xy) in points.iter().enumerate() {
+        if xy.is_some_and(|(x, y)| !x.is_finite() || !y.is_finite()) {
+            return Err(Error::InvalidArgument(format!("sample point {i} has non-finite XY coordinates")));
+        }
+    }
+    let header = ds.header();
+    check_raster(&header)?;
+    check_band(&header, band)?;
+    let dst = ds.crs();
+    let ct = match (src.is_unknown(), dst.is_unknown()) {
+        (true, true) => None,
+        (true, false) | (false, true) => {
+            return Err(Error::Crs("points and raster must both declare a CRS, or both have no CRS".into()));
+        }
+        _ if src.same_as(&dst) => None,
+        _ => Some(Transformer::new(src, &dst)?),
+    };
+    let mut values = vec![None; points.len()];
+    let mut statuses = vec![SampleStatus::NoGeometry; points.len()];
+    let gt = ds.geo_transform();
+    let det = gt[1] * gt[5] - gt[2] * gt[4];
+    let (bw, bh) = ds.block_size().unwrap_or((options.window_size, options.window_size));
+    let width = bw.max(1).min(options.window_size);
+    let height = bh.max(1).min(options.window_size);
+    let mut windows = BTreeMap::<(usize, usize), Vec<(usize, usize, usize)>>::new();
+    let mut failures = 0usize;
+    for (i, point) in points.iter().enumerate() {
+        let Some((px, py)) = *point else { continue };
+        let xy = ct.as_ref().map_or(Ok((px, py)), |t| t.transform(px, py));
+        let (x, y) = match xy {
+            Ok((x, y)) if x.is_finite() && y.is_finite() => (x, y),
+            other => {
+                if options.strict_transform_errors {
+                    let detail = other.err().map_or_else(|| "non-finite transformed coordinates".into(), |e| e.to_string());
+                    return Err(Error::Crs(format!("sample point {i}: {detail}")));
+                }
+                failures += 1;
+                statuses[i] = SampleStatus::TransformError;
+                continue;
+            }
+        };
+        let (dx, dy) = (x - gt[0], y - gt[3]);
+        let col = ((gt[5] * dx - gt[2] * dy) / det).floor();
+        let row = ((gt[1] * dy - gt[4] * dx) / det).floor();
+        if col >= 0.0 && row >= 0.0 && col < ds.width() as f64 && row < ds.height() as f64 {
+            let (col, row) = (col as usize, row as usize);
+            windows.entry((row / height, col / width)).or_default().push((i, col, row));
+        } else {
+            statuses[i] = SampleStatus::Outside;
+        }
+    }
+    let nodata = ds.band_nodata(band);
+    let data_type = ds.band_data_type(band);
+    for ((by, bx), entries) in windows {
+        let (x, y) = (bx * width, by * height);
+        let window = Window::new(x, y, width.min(ds.width() - x), height.min(ds.height() - y));
+        let pixels = ds.read_window(window, &WindowOptions { bands: vec![band], overview: None })?;
+        let mask = ds.read_mask(window, None)?;
+        let expected = window.width * window.height;
+        if pixels.raster.data.len() != expected || mask.as_ref().is_some_and(|m| m.len() != expected) {
+            return Err(Error::InvalidArgument("sample reader returned an unexpected window size".into()));
+        }
+        for (i, col, row) in entries {
+            let offset = (row - y) * window.width + col - x;
+            let v = pixels.raster.data.get_f64(offset);
+            let valid = v.is_finite()
+                && match options.nodata_comparison {
+                    NodataComparison::GdalMask => crate::histogram::is_valid(v, nodata, data_type),
+                    NodataComparison::Exact => {
+                        nodata.is_none_or(|nd| v != if data_type == crate::DataType::F32 { nd as f32 as f64 } else { nd })
+                    }
+                }
+                && mask.as_ref().is_none_or(|m| m[offset] != 0);
+            if valid {
+                values[i] = Some(v);
+            }
+            statuses[i] = if valid { SampleStatus::Valid } else { SampleStatus::Nodata };
+        }
+    }
+
+    if failures > 0 {
+        crate::warnings::warn(format!("sample: could not transform {failures} points into the raster CRS; samples set to null"));
+    }
+    Ok(SampleColumn { values, statuses })
 }
 
 pub(crate) fn validate_decimal_places(decimal_places: Option<u8>) -> Result<()> {
@@ -392,6 +523,7 @@ mod lazy_tests {
     struct Source {
         reads: Reads,
         fail: bool,
+        fail_mask: bool,
     }
     impl WindowSource for Source {
         fn overviews(&self) -> Vec<(usize, usize)> {
@@ -412,6 +544,9 @@ mod lazy_tests {
             true
         }
         fn read_mask(&mut self, level: usize, w: Window) -> Result<Option<Vec<u8>>> {
+            if self.fail_mask {
+                return Err(Error::InvalidArgument("mask read failed".into()));
+            }
             assert_eq!(level, 0);
             assert!(w.width <= 4 && w.height <= 2);
             let mut mask = vec![255; w.width * w.height];
@@ -437,7 +572,7 @@ mod lazy_tests {
         header.raster.cols = 10000;
         header.raster.rows = 10000;
         header.set_geo_transform([0., 1., 0., 0., 0., 1.]);
-        let mut ds = LazyRaster::from_source(header.clone(), Box::new(Source { reads: reads.clone(), fail: false }));
+        let mut ds = LazyRaster::from_source(header.clone(), Box::new(Source { reads: reads.clone(), fail: false, fail_mask: false }));
         let mut p = points(&[(9., 3.), (0., 0.), (1., 0.), (9., 3.), (-0.1, 0.), (10000., 0.)]);
         p.features.push(Feature { fid: 999, geometry: None, attributes: vec![] });
         let options = LazySampleOptions { status_suffix: Some("_status".into()), ..Default::default() };
@@ -461,7 +596,7 @@ mod lazy_tests {
         assert_eq!(reads.len(), 2, "one read per occupied native block, including repeated points");
         assert_eq!(reads.iter().map(|r| r.1.width * r.1.height).sum::<usize>(), 16);
         assert!(reads.iter().all(|(level, w, bands)| *level == 0 && w.width <= 4 && w.height <= 2 && bands == &[1]));
-        let mut ds = LazyRaster::from_source(header, Box::new(Source { reads: Arc::default(), fail: true }));
+        let mut ds = LazyRaster::from_source(header, Box::new(Source { reads: Arc::default(), fail: true, fail_mask: false }));
         assert!(
             sample_lazy(&p, &mut [LazySampleInput { field_name: "v".into(), raster: &mut ds, band: 1 }], &options)
                 .unwrap_err()
@@ -469,6 +604,38 @@ mod lazy_tests {
                 .contains("decoder failed")
         );
     }
+    #[test]
+    fn native_columns_propagate_mask_errors_and_bound_reads() {
+        let reads = Arc::default();
+        let config = RasterConfig { cols: 4, rows: 2, ..Default::default() };
+        let mut header = RasterDataset::new(Raster::from_data(config, vec![0.; 8]).unwrap(), false);
+        header.set_geo_transform([0., 1., 0., 0., 0., 1.]);
+        let src = SpatialRef::from_layer(&Layer::new("points"));
+        let xy = [Some((0., 0.)), Some((1., 0.)), None];
+        let mut ds = LazyRaster::from_source(header.clone(), Box::new(Source { reads, fail: false, fail_mask: false }));
+        let out = sample_points(&mut ds, 1, &src, &xy, &Default::default()).unwrap();
+        assert_eq!(out.values, [Some(0.), None, None]);
+        assert_eq!(out.statuses, [SampleStatus::Valid, SampleStatus::Nodata, SampleStatus::NoGeometry]);
+        let mut ds = LazyRaster::from_source(header, Box::new(Source { reads: Arc::default(), fail: false, fail_mask: true }));
+        assert!(sample_points(&mut ds, 1, &src, &xy, &Default::default()).unwrap_err().to_string().contains("mask read failed"));
+    }
+
+    #[test]
+    fn exact_typed_nodata_keeps_adjacent_float32_values_and_avoids_tolerance_overflow() {
+        let src = SpatialRef::from_layer(&Layer::new("points"));
+        for (nd, other) in [(-9999.1, f32::from_bits((-9999.1f32).to_bits() + 1)), (f32::MIN as f64, -3.0e38f32)] {
+            let config = RasterConfig { cols: 2, rows: 1, data_type: DataType::F32, nodata: nd, ..Default::default() };
+            let mut ds = RasterDataset::new(Raster::from_data(config, vec![nd, other as f64]).unwrap(), true);
+            ds.set_geo_transform([0., 1., 0., 0., 0., 1.]);
+            let mut ds = LazyRaster::from(ds);
+            let xy = [Some((0., 0.)), Some((1., 0.))];
+            let exact = PointSampleOptions { nodata_comparison: NodataComparison::Exact, ..Default::default() };
+            assert_eq!(sample_points(&mut ds, 1, &src, &xy, &exact).unwrap().values, [None, Some(other as f64)]);
+            // Legacy lazy behavior is deliberately retained, including GDAL's overflow behavior.
+            assert_eq!(sample_points(&mut ds, 1, &src, &xy, &Default::default()).unwrap().values, [None, None]);
+        }
+    }
+
     #[test]
     fn float32_nodata_precision_and_per_band_metadata() {
         let nodata = -3.4028234663852886e38;

@@ -2536,9 +2536,13 @@ mod tests {
         let mut rest = Vec::new();
         r.read_to_end(&mut rest).unwrap();
         assert!(rest == data[20 * 4096..]);
+        // Another request-counting test can hold the process-wide cache's eviction.
+        // Pin the plan invariant directly, then allow a shared-cache hit on the reread.
+        assert!(!r.shared.lock().unwrap().plan.contains(&18));
         let before = seen.lock().unwrap().len();
         assert_eq!(read_range(&mut r, 18 * 4096, 100), data[18 * 4096..18 * 4096 + 100]);
-        assert_eq!(requested(&seen.lock().unwrap()[before..]), [(18 * 4096, 19 * 4096 - 1)]);
+        let again = requested(&seen.lock().unwrap()[before..]);
+        assert!(again.len() <= 1 && again.iter().all(|r| *r == (18 * 4096, 19 * 4096 - 1)), "{again:?}");
     }
 
     // A read longer than half the cache, with nothing prefetched, is fetched in requests of at

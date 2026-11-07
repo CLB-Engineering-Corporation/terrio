@@ -211,3 +211,7 @@ required-features = ["filegdb"]
 [[example]]
 name = "rawgeom"
 required-features = ["filegdb"]
+
+[[example]]
+name = "sample_columns"
+required-features = ["parquet"]

@@ -590,6 +590,26 @@ pub struct ArrowEncoder {
 }
 
 impl ArrowEncoder {
+    /// Build an encoder for borrowed chunks of a complete layer, without copying its features.
+    /// Profiles the layer only when column types depend on its values. Each [`Self::encode`]
+    /// call can then produce a bounded record batch with the same schema.
+    ///
+    /// ```no_run
+    /// use terrio::arrow::{ArrowEncoder, ArrowWriteOptions};
+    /// let data = terrio::open_vector("sites.fgb", &Default::default())?;
+    /// let layer = &data.layers[0];
+    /// let encoder = ArrowEncoder::for_layer(layer, &ArrowWriteOptions::default())?;
+    /// for chunk in layer.features.chunks(8192) {
+    ///     let batch = encoder.encode(chunk)?;
+    ///     assert!(batch.num_rows() <= 8192);
+    /// }
+    /// # Ok::<(), terrio::Error>(())
+    /// ```
+    pub fn for_layer(layer: &Layer, options: &ArrowWriteOptions) -> Result<Self> {
+        let profile = if Self::needs_profile(layer, options) { LayerProfile::of(layer) } else { LayerProfile::new(layer) };
+        Self::new(layer, &profile, options)
+    }
+
     /// An encoder for the features of `layer` (its fields and CRS; its features are not read),
     /// which `profile` describes.
     pub fn new(layer: &Layer, profile: &LayerProfile, options: &ArrowWriteOptions) -> Result<Self> {
@@ -1050,6 +1070,27 @@ mod tests {
             });
         }
         l
+    }
+
+    #[test]
+    fn borrowed_chunk_encoder_preserves_profile_dependent_types_and_order() {
+        for layer in [sample(), {
+            let mut layer = Layer::new("points").with_epsg(4326);
+            layer.add_field(FieldDef::new("id", FieldType::Text));
+            layer.add_feature(Some(Geometry::point(10., 40.)), &[("id", FieldValue::Text("a".into()))]).unwrap();
+            layer
+        }] {
+            let options = ArrowWriteOptions::default();
+            let enc = ArrowEncoder::for_layer(&layer, &options).unwrap();
+            let batches: Vec<_> = layer.features.chunks(2).map(|c| enc.encode(c).unwrap()).collect();
+            assert!(batches.iter().all(|b| b.num_rows() <= 2));
+            let back = layer_from_arrow(&enc.schema(), &batches, &layer.name).unwrap();
+            assert_eq!(back.features.len(), layer.features.len());
+            for (a, b) in back.features.iter().zip(&layer.features) {
+                assert_eq!(a.geometry, b.geometry);
+                assert_eq!(a.attributes, b.attributes);
+            }
+        }
     }
 
     fn round_trip(options: &ArrowWriteOptions) -> Layer {

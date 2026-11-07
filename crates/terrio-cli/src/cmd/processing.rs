@@ -339,18 +339,19 @@ fn sample_lazy(args: PointSampleArgs) -> Result<()> {
         strict_transform_errors: args.strict_transform_errors,
         window_size: args.sample_window_size,
     };
-    let mut layers = a.input.open()?;
-    for layer in &mut layers {
+    let mut layers = Vec::new();
+    for mut layer in a.input.open()? {
         for (raster, prefix) in rasters.iter_mut().zip(&prefixes) {
             for &band in &a.bands {
                 let mut inputs = [LazySampleInput { field_name: format!("{prefix}_b{band}"), raster, band }];
-                *layer = terrio::ops::sample::sample_lazy(layer, &mut inputs, &options)?;
+                layer = terrio::ops::sample::sample_lazy_owned(layer, &mut inputs, &options)?;
             }
         }
         // Output reprojection must not change the pixels selected in later rasters.
         if let Some(crs) = &a.t_srs {
-            *layer = terrio::vector::reproject_layer(layer, &terrio::crs::SpatialRef::parse(crs)?)?;
+            layer = terrio::vector::reproject_layer_with_options(layer, &terrio::crs::SpatialRef::parse(crs)?, &Default::default())?;
         }
+        layers.push(layer);
     }
     a.output.write(layers)
 }
