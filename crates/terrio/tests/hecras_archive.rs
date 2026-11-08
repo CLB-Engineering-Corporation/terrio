@@ -2,8 +2,8 @@
 //! plan fixture `results_mesh_xs.h5`: layer names and fields from the engine catalog's ras2cng
 //! aliases, summary geometry joined by identity, the lossless additions, refusals listed instead
 //! of failing the file, and the written file read back.
-// The archive profile writes ZSTD GeoParquet (`parquet-zstd`).
-#![cfg(all(feature = "hecras", feature = "parquet-zstd"))]
+// The archive profile writes ZSTD GeoParquet (in pure Rust unless `parquet-zstd` or `libzstd`).
+#![cfg(all(feature = "hecras", feature = "parquet"))]
 
 use arrow_array::RecordBatch;
 use arrow_array::cast::AsArray;
@@ -176,26 +176,31 @@ fn the_file_has_every_layer_and_extra_layers() {
     assert_eq!(report.layers, expected.len() + 1);
     assert_eq!(report.rows, expected.iter().map(|(_, n)| n).sum::<usize>() + 1);
 
+    // The metadata, without decompressing a page.
     let file = std::fs::File::open(&out).unwrap();
-    let reader = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
-    let geo = reader.metadata().file_metadata().key_value_metadata().unwrap().iter().find(|kv| kv.key == "geo").unwrap().value.clone();
+    let meta = parquet::file::reader::FileReader::metadata(&parquet::file::reader::SerializedFileReader::new(file).unwrap()).clone();
+    let geo = meta.file_metadata().key_value_metadata().unwrap().iter().find(|kv| kv.key == "geo").unwrap().value.clone();
     let geo: serde_json::Value = serde_json::from_str(geo.as_deref().unwrap()).unwrap();
     assert!(!geo["columns"]["geometry"]["crs"].is_null(), "the stored projection is the file's CRS");
-    let batches: Vec<RecordBatch> = reader.build().unwrap().collect::<Result<_, _>>().unwrap();
-    let table = one(&batches);
-    let layer = table.column_by_name("layer").unwrap();
-    let layer = arrow_array::cast::AsArray::as_string_opt::<i32>(layer.as_ref())
-        .map(|a| a.iter().map(|v| v.unwrap().to_string()).collect::<Vec<_>>())
-        .unwrap_or_else(|| {
-            let d = layer.as_dictionary::<arrow_array::types::Int32Type>();
-            let values = d.values().as_string::<i32>();
-            d.keys().iter().map(|k| values.value(k.unwrap() as usize).to_string()).collect()
-        });
+    let columns: Vec<String> = meta.file_metadata().schema_descr().columns().iter().map(|c| c.path().string()).collect();
+    assert!(columns.iter().any(|c| c == "hilbert_index") && columns.iter().any(|c| c == "bbox.xmin"), "{columns:?}");
+    assert!(meta.row_groups().iter().all(|g| g.columns().iter().all(|c| matches!(c.compression(), parquet::basic::Compression::ZSTD(_)))));
+    // The rows, Zstandard pages decoded by terrio's GeoParquet reader.
+    let terrio::Dataset::Vector(ds) = terrio::open(out.to_str().unwrap()).unwrap() else { panic!("not a vector dataset") };
+    let file_layer = &ds.layers[0];
+    let k = file_layer.schema.field_index("layer").unwrap();
+    let layer: Vec<String> = file_layer
+        .features
+        .iter()
+        .map(|f| match &f.attributes[k] {
+            wbvector::FieldValue::Text(t) => t.clone(),
+            other => panic!("layer {other:?}"),
+        })
+        .collect();
     for (name, rows) in &expected {
         assert_eq!(layer.iter().filter(|l| l == &name).count(), *rows, "{name}");
     }
     assert_eq!(layer.iter().filter(|l| *l == "storage_areas_text").count(), 1);
-    assert!(table.column_by_name("hilbert_index").is_some() && table.column_by_name("bbox").is_some());
 
     // `order` puts the extra layer first; a missing or unknown name is refused.
     let archive = hdf.archive_layers(&ArchiveOptions::default()).unwrap();

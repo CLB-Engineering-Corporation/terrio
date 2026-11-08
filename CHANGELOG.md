@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+- Pure-Rust Zstandard by default, everywhere it writes (CLB fork). terrio's pure-Rust Zstandard
+  is now `zstd-rust`, CLB's fork of `ruzstd` with the `Default`, `Better` and `Best` levels, from
+  git (gpt-cmdr/zstd-rs at `6678927`, the 0.1.0 release merge; not on crates.io) under the
+  `ruzstd` name. zstd's level maps to the nearest of its four: 2 and below `Fastest`, 0 and 3 to 5
+  `Default`, 6 to 9 `Better`, 10 and up `Best` (it was `Fastest` whatever the level). GeoTIFF/COG
+  ZSTD without `LEVEL` is GDAL's 9, now `Better`: smaller, and slower than `LEVEL=3`. Zarr ZSTD
+  stays at level 1 (`Fastest`) and pure Rust in every build. The zstd C library stays opt-in
+  (`libzstd`).
+- ZSTD GeoParquet writing (`terrio::geoparquet`, Python `write_geoparquet_layers`, the ras2cng
+  archive profile) no longer needs the zstd C library: the `parquet` crate writes the pages
+  uncompressed and terrio compresses each one (with `libzstd`, with the C library), keeping the
+  crate's pages, encodings, dictionaries, statistics and page index. It was refused without the
+  `parquet-zstd` feature, which stays as the opt-in for the crate's own codec. The native Python
+  wheels no longer enable `parquet-zstd`, so no default build or wheel links C. Files written
+  with `libzstd` are byte-identical to `parquet-zstd`'s.
+- Repository only: CI checks the crates' package file lists and builds them instead of
+  `cargo publish --dry-run`, which refuses a git dependency; this fork publishes no crates.
+
 - Native point sampling: `ops::sample::sample_points` returns ordered nullable values
   and typed validity statuses without a Layer or GeoJSON transport. Callers control
   batch size and output schema. `sample_lazy_owned` and the lazy CLI avoid sampling

@@ -1,6 +1,5 @@
 use super::*;
 use arrow_array::{BooleanArray, Float32Array, Int64Array, ListArray, types::Float64Type};
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::file::reader::{FileReader, SerializedFileReader};
 
 fn point(x: f64, y: f64) -> Vec<u8> {
@@ -60,11 +59,19 @@ fn layer(name: &str, extra: (&str, ArrayRef), geometries: Vec<Option<Vec<u8>>>) 
     ArrowLayer::new(Some(name.into()), schema, vec![Ok(batch)]).with_identity(["mesh_name", "cell_id"])
 }
 
+/// The schema, rows, `geo` metadata and row-group sizes of a file, read as terrio's GeoParquet
+/// reader reads it (Zstandard pages with `crate::zstandard`, the `parquet` crate's codec unused).
 fn read(bytes: &[u8]) -> (SchemaRef, RecordBatch, Value, Vec<usize>) {
+    use parquet::arrow::ProjectionMask;
+    use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
     let bytes = bytes::Bytes::copy_from_slice(bytes);
-    let builder = ParquetRecordBatchReaderBuilder::try_new(bytes.clone()).unwrap();
-    let schema = builder.schema().clone();
-    let batches: Vec<RecordBatch> = builder.build().unwrap().map(|b| b.unwrap()).collect();
+    let meta = ArrowReaderMetadata::load(&bytes, ArrowReaderOptions::new()).unwrap();
+    let schema = meta.schema().clone();
+    let groups: Vec<usize> = (0..meta.metadata().num_row_groups()).collect();
+    let reader =
+        crate::drivers::vector::geoparquet_zstd::reader(bytes.clone(), meta.metadata(), &schema, ProjectionMask::all(), groups, None, 1024)
+            .unwrap();
+    let batches: Vec<RecordBatch> = reader.map(|b| b.unwrap()).collect();
     let batch = arrow_select::concat::concat_batches(&schema, &batches).unwrap();
     let reader = SerializedFileReader::new(bytes).unwrap();
     let meta = reader.metadata();
@@ -347,4 +354,135 @@ fn open_sniffs_geoparquet_without_its_extension() {
     let crate::Dataset::Vector(ds) = opened.unwrap() else { panic!("not a vector dataset") };
     assert_eq!(ds.layers[0].len(), 1);
     assert_eq!(ds.layers[0].features[0].geometry, Some(wbvector::Geometry::point(1., 2.)));
+}
+
+/// A layer of 70,000 polygons with a repetitive string column: two row groups of the archive's
+/// 65,536 rows.
+fn many_cells() -> MemoryLayer {
+    let n = 70_000;
+    let wkb: Vec<Option<Vec<u8>>> = (0..n).map(|i| Some(square(f64::from(i % 300), f64::from(i / 300), 1.0))).collect();
+    let notes = StringArray::from_iter_values((0..n).map(|i| format!("note {}", i % 7)));
+    layer("cells", ("note", Arc::new(notes)), wkb)
+}
+
+#[test]
+fn zstd_pages_decompress_to_the_uncompressed_files_columns() {
+    use parquet::file::serialized_reader::ReadOptionsBuilder;
+    let write = |compression, statistics| {
+        let options = GeoParquetWriteOptions { compression, statistics, ..GeoParquetWriteOptions::archive() };
+        let mut out = Vec::new();
+        write_arrow_layers(vec![many_cells()], &mut out, &options).unwrap();
+        out
+    };
+    let plain = write(ParquetCompression::Uncompressed, ColumnStatistics::Page);
+    let (schema_a, a, geo_a, groups_a) = read(&plain);
+    assert_eq!(groups_a, [65536, 4464]);
+    for statistics in [ColumnStatistics::Page, ColumnStatistics::Chunk] {
+        for level in [1, 3, 9, 19] {
+            let zstd = write(ParquetCompression::Zstd(level), statistics);
+            assert!(zstd.len() * 3 < plain.len(), "level {level}: {} vs {}", zstd.len(), plain.len());
+            let (schema_b, b, geo_b, groups_b) = read(&zstd);
+            assert_eq!((&schema_a, &geo_a, &groups_a), (&schema_b, &geo_b, &groups_b));
+            assert_eq!(a, b);
+            // Every chunk says ZSTD, and the page index points at the pages actually written.
+            let options = ReadOptionsBuilder::new().with_page_index().build();
+            let reader = SerializedFileReader::new_with_options(bytes::Bytes::from(zstd.clone()), options).unwrap();
+            let meta = reader.metadata();
+            for group in meta.row_groups() {
+                assert!(group.columns().iter().all(|c| matches!(c.compression(), Compression::ZSTD(_))));
+            }
+            match (statistics, meta.offset_index()) {
+                (ColumnStatistics::Page, Some(index)) => {
+                    for (g, group) in index.iter().enumerate() {
+                        for (c, chunk) in group.iter().enumerate() {
+                            let column = meta.row_group(g).column(c);
+                            let first = chunk.page_locations()[0].offset;
+                            assert_eq!(first, column.data_page_offset());
+                            let end = column.dictionary_page_offset().unwrap_or(first) + column.compressed_size();
+                            let last = chunk.page_locations().last().unwrap();
+                            assert_eq!(last.offset + i64::from(last.compressed_page_size), end);
+                        }
+                    }
+                }
+                (ColumnStatistics::Chunk, None) => {}
+                (s, i) => panic!("{s:?}: page index {}", i.is_some()),
+            }
+        }
+    }
+}
+
+/// terrio's Zstandard pages (`ruzstd`, or the C library with `libzstd`) and the `parquet` crate's
+/// (the zstd C library): the same file but for the compressed bytes. Each decodes with the other
+/// implementation to the same rows; pages, encodings, dictionaries, statistics and page index
+/// entries are identical.
+#[cfg(feature = "parquet-zstd")]
+#[test]
+fn terrio_zstd_pages_match_the_zstd_c_librarys_but_for_their_bytes() {
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    use parquet::file::serialized_reader::ReadOptionsBuilder;
+    let crate_read = |bytes: &[u8]| {
+        let builder = ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::copy_from_slice(bytes)).unwrap();
+        let schema = builder.schema().clone();
+        let batches: Vec<RecordBatch> = builder.build().unwrap().map(|b| b.unwrap()).collect();
+        arrow_select::concat::concat_batches(&schema, &batches).unwrap()
+    };
+    let chunks = |bytes: &[u8]| {
+        let options = ReadOptionsBuilder::new().with_page_index().build();
+        let reader = SerializedFileReader::new_with_options(bytes::Bytes::copy_from_slice(bytes), options).unwrap();
+        let meta = reader.metadata().clone();
+        let mut out = Vec::new();
+        for (g, group) in meta.row_groups().iter().enumerate() {
+            for (i, column) in group.columns().iter().enumerate() {
+                let pages =
+                    meta.offset_index().map(|index| index[g][i].page_locations().iter().map(|p| p.first_row_index).collect::<Vec<_>>());
+                out.push((
+                    column.column_path().string(),
+                    column.compression(),
+                    format!("{:?}", column.encodings().collect::<Vec<_>>()),
+                    column.dictionary_page_offset().is_some(),
+                    format!("{:?}", column.statistics()),
+                    column.num_values(),
+                    pages,
+                ));
+            }
+        }
+        (out, meta.column_index().map(|c| format!("{c:?}")))
+    };
+    // Every page, decompressed by the parquet crate (the C library): type, values, encoding,
+    // statistics and bytes. (A chunk's uncompressed size can still differ by a byte or so: it
+    // counts the page headers, which hold the compressed page size.)
+    let pages = |bytes: &[u8]| {
+        let reader = SerializedFileReader::new(bytes::Bytes::copy_from_slice(bytes)).unwrap();
+        let mut out = Vec::new();
+        for g in 0..reader.num_row_groups() {
+            let group = reader.get_row_group(g).unwrap();
+            for c in 0..group.num_columns() {
+                let mut pages = group.get_column_page_reader(c).unwrap();
+                while let Some(p) = pages.get_next_page().unwrap() {
+                    out.push((g, c, p.page_type(), p.num_values(), p.encoding(), format!("{:?}", p.statistics()), p.buffer().to_vec()));
+                }
+            }
+        }
+        out
+    };
+    for statistics in [ColumnStatistics::Page, ColumnStatistics::Chunk] {
+        let options = GeoParquetWriteOptions { statistics, ..GeoParquetWriteOptions::archive() };
+        let write = |terrio_zstd| {
+            let codec = options.compression.codec(terrio_zstd).unwrap();
+            write_layers_with(vec![many_cells()], Vec::new(), &options, codec).unwrap().1
+        };
+        let (ours, c) = (write(true), write(false));
+        // With `libzstd` terrio compresses with the same C library at the same level: the same
+        // file, byte for byte. Without it (`ruzstd`), only the compressed bytes differ.
+        assert_eq!(ours == c, cfg!(feature = "libzstd"));
+        // Decoded by terrio and by the parquet crate (the C library): the same rows.
+        let (a, b) = (read(&ours), read(&c));
+        assert_eq!(a, b);
+        assert_eq!(crate_read(&ours), a.1);
+        assert_eq!(crate_read(&c), a.1);
+        assert_eq!(chunks(&ours), chunks(&c), "{statistics:?}");
+        let ours_pages = pages(&ours);
+        assert!(ours_pages.len() > 20, "{} pages", ours_pages.len());
+        assert!(ours_pages == pages(&c), "{statistics:?}: pages differ");
+    }
 }

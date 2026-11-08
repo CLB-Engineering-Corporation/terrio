@@ -67,16 +67,23 @@ and parallel iterators everywhere else.
 The default builds have no C dependencies, and CI builds them without a C compiler. Three choices
 keep it so:
 
-- Zstandard is decoded and written with `ruzstd`, GeoParquet's pages included. The optional
-  `libzstd` feature uses the zstd C library natively instead, which decodes faster and compresses
-  better: `ruzstd` writes at its fastest level, about zstd's level 1, whatever level is asked for.
+- Zstandard is decoded and written with `ruzstd`, GeoParquet's pages included. terrio uses
+  `zstd-rust`, CLB's fork of `ruzstd` with the `Default`, `Better` and `Best` levels, from git
+  (gpt-cmdr/zstd-rs; not on crates.io) under the `ruzstd` name. zstd's levels map to its four:
+  2 and below `Fastest`, 0 and 3 to 5 `Default`, 6 to 9 `Better`, 10 and up `Best`. Its output
+  decodes to the same bytes as the zstd C library's and each reads the other's. The optional
+  `libzstd` feature uses the C library natively instead, which is faster.
 - HTTPS uses `rustls` with `rustls-graviola`, whose cryptography is Rust and assembly and needs no
   C compiler. It requires `aes`, `pclmulqdq`, `ssse3`, `avx`, `avx2`, `adx`, `bmi1` and `bmi2` on
   x86-64 (most CPUs since about 2014), and `aes`, `sha2`, `pmull` and `neon` on AArch64: without the
   ones it checks, an HTTPS request panics, naming the missing feature. Other
   architectures, for which no release is built, use `ring`, which needs a C compiler.
-- GeoParquet is written with Snappy, which needs no C. Reading also takes Zstandard, gzip, LZ4 and
-  Brotli.
+- GeoParquet is written with Snappy or Zstandard. The `parquet` crate's Zstandard is the C
+  library, so terrio has the crate write ZSTD pages uncompressed and compresses each page itself
+  (`drivers/vector/geoparquet_zstd.rs`): the pages, encodings, dictionaries, statistics and page
+  index are the crate's, and only the compressed bytes differ from the crate's own codec. The
+  opt-in `parquet-zstd` feature uses the crate's codec (the C library) instead. Reading also takes
+  gzip, LZ4 and Brotli.
 
 JPEG 2000 uses a Rust port of OpenJPEG, in WebAssembly too: terrio supplies the C allocator calls
 the port makes. JPEG is decoded by terrio's own decoder, which reproduces libjpeg's arithmetic;
