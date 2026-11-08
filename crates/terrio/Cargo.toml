@@ -152,7 +152,8 @@ sqlite = []
 ## `parquet-zstd`) with the zstd C library, natively. Opt-in: without it, and in WebAssembly,
 ## terrio uses the pure-Rust `ruzstd` (the `zstd-rust` crate), which decodes to the same bytes and
 ## maps zstd's levels to its four (`Fastest`, `Default`, `Better`, `Best`; see
-## `zstandard::pure::ruzstd_level`); the C library is faster at the same size. terrio decodes every ZSTD GeoTIFF
+## `zstandard::pure::ruzstd_level`); the C library writes 1.2 to 1.5 times faster, to
+## about the same size. terrio decodes every ZSTD GeoTIFF
 ## chunk itself, Float16, complex and WhiteIsZero samples included: the `tiff` crate is built
 ## without its Zstandard (zstd 0.13, whose streaming decoder has known advisories), so ZSTD datum
 ## grids, which terrio-crs reads with the crate, are not read (PROJ's are DEFLATE-compressed).
