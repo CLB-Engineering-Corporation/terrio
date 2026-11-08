@@ -304,14 +304,20 @@ jobs:
           CC_wasm32_unknown_unknown: "false"
         run: cargo build -p terrio --target wasm32-unknown-unknown
       # The CLB fork links the zstd C library for GeoTIFF/COG Zstandard by default
-      # (`libzstd-geotiff`): it must be the default build's only C dependency.
+      # (`libzstd-geotiff`): it must be the default build's only C dependency. zstd-sys always
+      # depends on pkg-config (used only with its `pkg-config` feature), so pkg-config is allowed
+      # when zstd-sys is its only dependent.
       - name: The default command-line build links no C but the zstd library
         run: |
           set -o pipefail
           crates=$(cargo tree -p terrio-cli -e normal,build --prefix none | cut -d' ' -f1 | sort -u)
-          found=$(echo "$crates" | grep -E '^(ring|cmake|bindgen|pkg-config|cxx-build)$|-sys$' | grep -vE '^(js|web|linux-raw|zstd)-sys$' || true)
+          found=$(echo "$crates" | grep -E '^(ring|cmake|bindgen|pkg-config|cxx-build)$|-sys$' | grep -vE '^((js|web|linux-raw|zstd)-sys|pkg-config)$' || true)
           if [ -n "$found" ]; then echo "C dependencies: $found"; exit 1; fi
           echo "$crates" | grep -qx zstd-sys || { echo "the default build no longer links libzstd: update this check"; exit 1; }
+          if echo "$crates" | grep -qx pkg-config; then
+            users=$(cargo tree -p terrio-cli -e normal,build -i pkg-config --depth 1 --prefix none | tail -n +2 | cut -d' ' -f1 | sort -u)
+            if [ "$users" != zstd-sys ]; then echo "pkg-config used by: $users"; exit 1; fi
+          fi
       - name: The command-line build without a C toolchain
         env:
           CC: "false"
