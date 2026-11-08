@@ -382,11 +382,12 @@ fn jpeg_encode(data: &[u8], c: &ChunkInfo, quality: u8, ycbcr: bool) -> Result<V
     Ok(out)
 }
 
-/// Zstandard at `level` (GDAL's default 9 when `None`). Without the zstd C library (the default) 9
-/// is `ruzstd`'s `Better`, smaller but slower than its `Default`, which the `LEVEL=3` creation
-/// option asks for (see `zstandard::pure::ruzstd_level`).
+/// Zstandard at `level` (GDAL's default 9 when `None`), of ZSTD and LERC_ZSTD chunks: the zstd C
+/// library with `libzstd-geotiff` (the default natively). Without it, and in WebAssembly, 9 is
+/// `ruzstd`'s `Better`, smaller but slower than its `Default`, which the `LEVEL=3` creation option
+/// asks for (see `zstandard::pure::ruzstd_level`).
 fn zstd_at(data: &[u8], level: Option<u8>) -> Result<Vec<u8>> {
-    Ok(crate::zstandard::compress(data, level.unwrap_or(9) as i32)?)
+    Ok(crate::zstandard::geotiff::compress(data, level.unwrap_or(9) as i32)?)
 }
 
 /// PackBits run-length encoding, as TIFF defines it.

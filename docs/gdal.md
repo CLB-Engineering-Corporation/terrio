@@ -180,7 +180,8 @@ curve linearization workspace are outside it. Raster reads have no equivalent bu
 
 ## Python wheels with GDAL
 
-The Python wheels on PyPI are pure Rust, without the backend. The `gdal` feature of the Python
+The Python wheels on PyPI are pure Rust, without the backend (the CLB fork's native wheels also
+link the zstd C library for GeoTIFF/COG Zstandard, statically). The `gdal` feature of the Python
 package builds it in from source (see [Installation](installation.md#with-the-gdal-backend)).
 No prebuilt wheels bundle GDAL: they would ship GDAL's whole native stack (PROJ, GEOS, curl,
 SQLite, HDF5 and the rest) under terrio's name, which works against terrio's purpose of reading

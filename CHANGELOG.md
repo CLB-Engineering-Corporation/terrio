@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- GeoTIFF/COG Zstandard uses the zstd C library by default again, natively (CLB fork, owner's
+  decision of 2026-11-08): the new `libzstd-geotiff` feature, a default feature of terrio,
+  terrio-cli and the Python package, writes ZSTD and LERC_ZSTD chunks and reads ZSTD chunks with
+  libzstd, byte-identical to the previous `libzstd` build. The pure-Rust path was 1.1 to 1.5 times
+  slower to write and about 2 times slower to decode. Zarr, EPT and GeoParquet stay pure Rust, as
+  does every format in WebAssembly. The C opt-in is split per format: `libzstd-geotiff`,
+  `libzstd-ept`, `libzstd-geoparquet`, and `libzstd` for all three. The new `drivers` feature is
+  every driver without C: a host with no C compiler builds terrio with
+  `default-features = false, features = ["drivers"]` and terrio-cli with `--no-default-features`.
+  The all-pure-Rust default is kept on `feat/pure-zstd-geotiff-default` for upstream, once it
+  reaches parity (ROADMAP.md).
+- Repository only: `release.yml` no longer runs `cargo publish` on a tag, which fails with the git
+  dependency `zstd-rust`; its `crates` job packages and builds the crates as the release dry run
+  does. Wheels, npm and the command-line binaries are released as before.
+  `docs/CONSOLIDATION-2026-11.md` lists the C dependencies to rewrite before upstreaming.
 - Pure-Rust Zstandard by default, everywhere it writes (CLB fork). terrio's pure-Rust Zstandard
   is now `zstd-rust`, CLB's fork of `ruzstd` with the `Default`, `Better` and `Best` levels, from
   git (gpt-cmdr/zstd-rs at `6678927`, the 0.1.0 release merge; not on crates.io) under the
@@ -15,7 +30,8 @@
   uncompressed and terrio compresses each one (with `libzstd`, with the C library), keeping the
   crate's pages, encodings, dictionaries, statistics and page index. It was refused without the
   `parquet-zstd` feature, which stays as the opt-in for the crate's own codec. The native Python
-  wheels no longer enable `parquet-zstd`, so no default build or wheel links C. Files written
+  wheels no longer enable `parquet-zstd`, so no default build or wheel linked C (until
+  `libzstd-geotiff`, above). Files written
   with `libzstd` are byte-identical to `parquet-zstd`'s.
 - Repository only: CI checks the crates' package file lists and builds them instead of
   `cargo publish --dry-run`, which refuses a git dependency; this fork publishes no crates.

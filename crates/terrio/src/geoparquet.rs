@@ -21,7 +21,7 @@
 //!   `ST_Hilbert(x, y, box)`. Ties keep input order; null and empty geometries go last. The key
 //!   can be stored in a nullable `UInt64` `hilbert_column`.
 //! - **Encoding**: Snappy, ZSTD at a chosen level or none (ZSTD pages are compressed by terrio in
-//!   pure Rust unless the `libzstd` feature or, for the `parquet` crate's own codec, the
+//!   pure Rust unless the `libzstd-geoparquet` feature or, for the `parquet` crate's own codec, the
 //!   `parquet-zstd` feature brings in the zstd C library); dictionary encoding on every column,
 //!   on top-level `Utf8` columns only, or none; chunk statistics without a page index (as pyarrow
 //!   writes them) or page statistics with one; geometry statistics on or off.
@@ -124,7 +124,7 @@ impl ParquetCompression {
             Self::Uncompressed => (Compression::UNCOMPRESSED, None),
             Self::Snappy => (Compression::SNAPPY, None),
             // By default the crate writes the pages uncompressed and terrio compresses each one:
-            // pure Rust (`ruzstd`), or the zstd C library with the `libzstd` feature. Pages,
+            // pure Rust (`ruzstd`), or the zstd C library with `libzstd-geoparquet`. Pages,
             // encodings, dictionaries and statistics are the crate's either way.
             Self::Zstd(level) if terrio_zstd => {
                 ZstdLevel::try_new(level).map_err(arg)?;

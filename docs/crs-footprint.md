@@ -117,8 +117,8 @@ Bundled EPSG/ESRI/datum tables use `ruzstd` on native and WASM targets. Removing
 the separate native table decoder removes the standalone crate's direct
 `zstd` 0.14 dependency. Zstandard TIFF grids use the Zstd 0.13 backend through the optional
 `libzstd` feature, off by default; without it the crate has no C dependency.
-Full Terrio retains its own Zstd dependency for its formats, behind its `libzstd` feature, and
-does not enable this crate's: within Terrio, Zstandard TIFF grids are not read.
+Full Terrio retains its own Zstd dependency for its formats, behind its `libzstd-*` features
+(`libzstd-geotiff` is on by default in the CLB fork), and does not enable this crate's: within Terrio, Zstandard TIFF grids are not read.
 
 TIFF grids support Float32/Float64 and Int16/UInt16/Int32/UInt32 samples. Dropping
 codecs based only on Float32 grids would narrow that contract; for example,

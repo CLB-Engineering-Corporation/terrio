@@ -150,7 +150,7 @@ impl<R: ChunkReader> ZstdPages<R> {
         if data.is_empty() {
             return Ok(Vec::new());
         }
-        crate::zstandard::decompress(data, self.limit).map_err(|e| ParquetError::External(Box::new(e)))
+        crate::zstandard::geoparquet::decompress(data, self.limit).map_err(|e| ParquetError::External(Box::new(e)))
     }
 
     fn page(&self, page: Page) -> Result<Page> {
@@ -226,7 +226,7 @@ impl<R: ChunkReader> PageReader for ZstdPages<R> {
 }
 
 /// Appends a row group's column chunks, encoded without compression, to `group`, every page
-/// compressed with Zstandard at `level` (see [`crate::zstandard::compress`]). `schema` and `props`
+/// compressed with Zstandard at `level` (see [`crate::zstandard::geoparquet::compress`]). `schema` and `props`
 /// are the file's.
 pub(crate) fn append_zstd<W: std::io::Write + Send>(
     chunks: Vec<parquet::arrow::arrow_writer::ArrowColumnChunk>,
@@ -285,7 +285,7 @@ fn compress_chunk(input: &Arc<Bytes>, chunk: &ColumnChunkMetaData, rows: usize, 
     use parquet::column::page::{CompressedPage, PageWriter};
     use parquet::file::writer::{SerializedPageWriter, TrackedWrite};
     let compress = |data: &[u8]| -> Result<Bytes> {
-        crate::zstandard::compress(data, level).map(Bytes::from).map_err(|e| ParquetError::External(Box::new(e)))
+        crate::zstandard::geoparquet::compress(data, level).map(Bytes::from).map_err(|e| ParquetError::External(Box::new(e)))
     };
     let mut sink = TrackedWrite::new(Vec::with_capacity(chunk.compressed_size().max(0) as usize / 2));
     let mut writer = SerializedPageWriter::new(&mut sink);

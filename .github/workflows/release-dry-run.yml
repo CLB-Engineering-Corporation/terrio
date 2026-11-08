@@ -2,8 +2,9 @@ name: Release dry run
 
 # Builds and checks everything a release publishes, without publishing: the wheels for every
 # platform, the source distribution, the Pyodide wheel and the command-line binaries
-# (release-build.yml, as the release builds them), the Docker image, the crates as `cargo publish`
-# packages and verifies them, the npm package, and that LICENSE-THIRD-PARTY.md is up to date.
+# (release-build.yml, as the release builds them), the Docker image, the crates' package file
+# lists and builds (as release.yml's `crates` job, which publishes nothing in the CLB fork), the npm
+# package, and that LICENSE-THIRD-PARTY.md is up to date.
 # Run by hand before tagging a release (Actions > Release dry run > Run workflow).
 # Pull requests use the normal CI build, API, Python and WASM packaging checks.
 on:
@@ -36,7 +37,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       # The CLB fork: the crates depend on `zstd-rust` from git, which `cargo publish` refuses, and
-      # the fork publishes no crates. Their file lists are checked, and the build verified.
+      # the fork publishes no crates. Their file lists are checked, and the build verified: the
+      # same commands as release.yml's `crates` job.
       - name: Package terrio-crs, terrio and terrio-cli (file lists) and build them
         run: |
           cargo package --list --locked -p terrio-crs -p terrio -p terrio-cli

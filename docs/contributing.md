@@ -13,7 +13,8 @@ issue to talk through what you have in mind before starting anything large.
 
 1. Install Rust with [rustup](https://rustup.rs), which also installs Cargo (Rust's build tool
    and package manager), `rustfmt` (the formatter) and Clippy (the linter). terrio's default build
-   compiles no C code, but Rust links with your system's linker:
+   compiles one C library, zstd (GeoTIFF/COG Zstandard, the `libzstd-geotiff` feature of the CLB
+   fork), and Rust links with your system's linker, so you need a C compiler:
 
     - Linux: a C compiler package, such as `build-essential` on Debian and Ubuntu
     - macOS: `xcode-select --install`

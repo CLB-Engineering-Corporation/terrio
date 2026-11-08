@@ -64,15 +64,23 @@ and parallel iterators everywhere else.
 
 ## Pure Rust
 
-The default builds have no C dependencies, and CI builds them without a C compiler. Three choices
-keep it so:
+Every driver builds without C dependencies, and CI builds them without a C compiler: the
+WebAssembly builds always, and natively with `default-features = false, features = ["drivers"]`
+(`terrio-cli --no-default-features`). One exception is on by default in the CLB fork: GeoTIFF/COG
+Zstandard uses the zstd C library natively (`libzstd-geotiff`, a default feature of terrio,
+terrio-cli and the Python package), because the pure-Rust path is not yet as fast (1.1 to 1.5 times
+slower to write, about 2 times slower to decode). The pure-Rust GeoTIFF default is kept on the branch
+`feat/pure-zstd-geotiff-default` until it reaches parity (see the ROADMAP). Three choices keep the
+rest pure Rust:
 
-- Zstandard is decoded and written with `ruzstd`, GeoParquet's pages included. terrio uses
+- Zstandard is decoded and written with `ruzstd` but for that exception: Zarr, EPT and GeoParquet's
+  pages, and GeoTIFF/COG in WebAssembly and in builds without `libzstd-geotiff`. terrio uses
   `zstd-rust`, CLB's fork of `ruzstd` with the `Default`, `Better` and `Best` levels, from git
   (gpt-cmdr/zstd-rs; not on crates.io) under the `ruzstd` name. zstd's levels map to its four:
   2 and below `Fastest`, 0 and 3 to 5 `Default`, 6 to 9 `Better`, 10 and up `Best`. Its output
-  decodes to the same bytes as the zstd C library's and each reads the other's. The optional
-  `libzstd` feature uses the C library natively instead, which is faster.
+  decodes to the same bytes as the zstd C library's and each reads the other's. The opt-in
+  `libzstd-ept` and `libzstd-geoparquet` features (or `libzstd`, all three) use the C library
+  natively for EPT and GeoParquet too.
 - HTTPS uses `rustls` with `rustls-graviola`, whose cryptography is Rust and assembly and needs no
   C compiler. It requires `aes`, `pclmulqdq`, `ssse3`, `avx`, `avx2`, `adx`, `bmi1` and `bmi2` on
   x86-64 (most CPUs since about 2014), and `aes`, `sha2`, `pmull` and `neon` on AArch64: without the
