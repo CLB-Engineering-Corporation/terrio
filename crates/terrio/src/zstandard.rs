@@ -1,28 +1,58 @@
-//! Zstandard: with the pure-Rust `ruzstd` (the `zstd-rust` crate, CLB's fork of `ruzstd` with the
-//! `Default`, `Better` and `Best` levels) by default and in WebAssembly; with the zstd C library
-//! with the opt-in `libzstd` feature, in native builds. Both read every frame of a stream
-//! (skippable frames skipped), and each reads what the other writes.
+//! Zstandard, with the pure-Rust `ruzstd` (the `zstd-rust` crate, CLB's fork of `ruzstd` with the
+//! `Default`, `Better` and `Best` levels) or, in native builds, the zstd C library. The choice is
+//! made per format, by feature: GeoTIFF/COG chunks use the C library with `libzstd-geotiff` (on by
+//! default in this fork), EPT tiles with `libzstd-ept` and GeoParquet pages with
+//! `libzstd-geoparquet` (both opt-in; `libzstd` turns on all three). WebAssembly is always
+//! `ruzstd`, and so is Zarr. Both read every frame of a stream (skippable frames skipped), and each
+//! reads what the other writes.
 
 use std::io::{Error, ErrorKind, Read, Result};
 
-// `decompress` reads EPT tiles (the `pointcloud` feature), `frames` ZSTD GeoTIFF chunks.
-#[cfg(all(feature = "libzstd", not(target_family = "wasm")))]
-pub(crate) use libzstd::frames;
-#[cfg(all(feature = "libzstd", not(target_family = "wasm")))]
-#[cfg_attr(not(feature = "pointcloud"), allow(unused_imports))]
-pub(crate) use libzstd::{compress, decompress};
-#[cfg(not(all(feature = "libzstd", not(target_family = "wasm"))))]
-pub(crate) use pure::frames;
-#[cfg(not(all(feature = "libzstd", not(target_family = "wasm"))))]
-#[cfg_attr(not(feature = "pointcloud"), allow(unused_imports))]
-pub(crate) use pure::{compress, decompress};
+/// The `cfg` of a format's Zstandard: the C library with `$feature` natively, `ruzstd` otherwise.
+macro_rules! zstd_for {
+    ($(#[$m:meta])* $name:ident, $feature:literal, $($item:ident),+) => {
+        $(#[$m])*
+        pub(crate) mod $name {
+            #[cfg(all(feature = $feature, not(target_family = "wasm")))]
+            #[allow(unused_imports)]
+            pub(crate) use super::libzstd::{$($item),+};
+            #[cfg(not(all(feature = $feature, not(target_family = "wasm"))))]
+            #[allow(unused_imports)]
+            pub(crate) use super::pure::{$($item),+};
+        }
+    };
+}
+
+zstd_for!(
+    /// GeoTIFF/COG chunks: `frames` reads ZSTD chunks, `compress` writes ZSTD and LERC_ZSTD ones.
+    geotiff,
+    "libzstd-geotiff",
+    compress,
+    frames
+);
+zstd_for!(
+    /// EPT tiles.
+    ept,
+    "libzstd-ept",
+    compress,
+    decompress
+);
+zstd_for!(
+    /// The GeoParquet pages terrio compresses and decompresses itself.
+    geoparquet,
+    "libzstd-geoparquet",
+    compress,
+    decompress
+);
 
 /// The error of a stream decompressing to more than `limit` bytes.
 fn too_long(limit: usize) -> Error {
     Error::new(ErrorKind::InvalidData, format!("Zstandard: decompresses to more than {limit} bytes"))
 }
 
-#[cfg(all(feature = "libzstd", not(target_family = "wasm")))]
+#[cfg(all(any(feature = "libzstd-geotiff", feature = "libzstd-ept", feature = "libzstd-geoparquet"), not(target_family = "wasm")))]
+// Each item is used by the formats whose feature is on.
+#[allow(dead_code)]
 mod libzstd {
     use super::*;
 
@@ -33,7 +63,6 @@ mod libzstd {
 
     /// Decompresses every frame of `data`, to at most `limit` bytes (more is an error, rather
     /// than an allocation of whatever a small stream expands to).
-    #[cfg_attr(not(feature = "pointcloud"), allow(dead_code))]
     pub(crate) fn decompress(data: &[u8], limit: usize) -> Result<Vec<u8>> {
         let mut out = Vec::new();
         zstd::stream::read::Decoder::with_buffer(data)?.take((limit as u64).saturating_add(1)).read_to_end(&mut out)?;
@@ -52,8 +81,10 @@ mod libzstd {
     }
 }
 
-/// `ruzstd`, used without `libzstd`, and in WebAssembly.
-#[cfg_attr(all(feature = "libzstd", not(target_family = "wasm")), allow(dead_code))]
+/// `ruzstd`: Zarr's, the other formats' without their `libzstd-*` feature, and every format's in
+/// WebAssembly.
+// Each item is used by the formats without their feature.
+#[allow(dead_code)]
 pub(crate) mod pure {
     use super::*;
     use ruzstd::decoding::errors::{FrameDecoderError, ReadFrameHeaderError};
@@ -76,7 +107,6 @@ pub(crate) mod pure {
     }
 
     /// Decompresses every frame of `data`, to at most `limit` bytes (more is an error).
-    #[cfg_attr(not(feature = "pointcloud"), allow(dead_code))]
     pub(crate) fn decompress(data: &[u8], limit: usize) -> Result<Vec<u8>> {
         let out = frames(data, limit.saturating_add(1))?;
         if out.len() > limit {
@@ -128,7 +158,9 @@ mod tests {
         let stream = [pure::compress(&a, 3).unwrap(), skippable(9), pure::compress(&b, 3).unwrap()].concat();
         let both = [a.clone(), b.clone()].concat();
         assert_eq!(pure::decompress(&stream, both.len()).unwrap(), both);
-        assert_eq!(decompress(&stream, both.len()).unwrap(), both);
+        assert_eq!(ept::decompress(&stream, both.len()).unwrap(), both);
+        assert_eq!(geoparquet::decompress(&stream, both.len()).unwrap(), both);
+        assert_eq!(geotiff::frames(&stream, usize::MAX).unwrap(), both);
         // At most `max` bytes, the rest not decoded.
         assert_eq!(pure::frames(&stream, 120_000).unwrap(), both[..120_000]);
         // A truncated skippable frame is an error.
@@ -140,7 +172,7 @@ mod tests {
     fn unlimited_output_limit_does_not_overflow() {
         let input = b"a finite frame with an unlimited caller policy";
         let compressed = pure::compress(input, 1).unwrap();
-        assert_eq!(decompress(&compressed, usize::MAX).unwrap(), input);
+        assert_eq!(geoparquet::decompress(&compressed, usize::MAX).unwrap(), input);
         assert_eq!(pure::decompress(&compressed, usize::MAX).unwrap(), input);
     }
 
@@ -149,10 +181,10 @@ mod tests {
         // 64 MiB of zeros in a few kilobytes.
         let bomb = pure::compress(&vec![0; 64 << 20], 3).unwrap();
         assert!(bomb.len() < 1 << 20);
-        for e in [pure::decompress(&bomb, 1 << 20).unwrap_err(), decompress(&bomb, 1 << 20).unwrap_err()] {
+        for e in [pure::decompress(&bomb, 1 << 20).unwrap_err(), geoparquet::decompress(&bomb, 1 << 20).unwrap_err()] {
             assert!(e.to_string().contains("more than 1048576 bytes"), "{e}");
         }
-        assert_eq!(decompress(&bomb, 64 << 20).unwrap().len(), 64 << 20);
+        assert_eq!(geoparquet::decompress(&bomb, 64 << 20).unwrap().len(), 64 << 20);
     }
 
     /// The bound of ZSTD GeoTIFF chunks (`frames`, given the chunk's size): a stream expanding far
@@ -164,12 +196,12 @@ mod tests {
         let bomb = [pure::compress(&vec![0; 64 << 20], 3).unwrap(), pure::compress(&[1; 100], 3).unwrap()].concat();
         assert!(bomb.len() < 1 << 20);
         for max in [0, 1, 4096, 1 << 20] {
-            for (decoder, out) in [("in use", frames(&bomb, max).unwrap()), ("ruzstd", pure::frames(&bomb, max).unwrap())] {
+            for (decoder, out) in [("in use", geotiff::frames(&bomb, max).unwrap()), ("ruzstd", pure::frames(&bomb, max).unwrap())] {
                 assert_eq!(out.len(), max, "{decoder}");
                 assert!(out.iter().all(|&b| b == 0), "{decoder}");
             }
         }
-        assert_eq!(frames(&bomb, usize::MAX).unwrap().len(), (64 << 20) + 100);
+        assert_eq!(geotiff::frames(&bomb, usize::MAX).unwrap().len(), (64 << 20) + 100);
     }
 
     #[test]
@@ -201,8 +233,26 @@ mod tests {
         }
     }
 
+    /// Each format's Zstandard is the C library exactly when its feature is on (natively), as its
+    /// output shows: `ruzstd`'s `Better` and the C library's level 9 write different bytes.
+    #[test]
+    fn each_format_uses_the_library_its_feature_names() {
+        let a = data(200_000, 13);
+        let ruzstd = pure::compress(&a, 9).unwrap();
+        let native = cfg!(not(target_family = "wasm"));
+        for (format, compress, c) in [
+            ("GeoTIFF", geotiff::compress as fn(&[u8], i32) -> Result<Vec<u8>>, cfg!(feature = "libzstd-geotiff")),
+            ("EPT", ept::compress, cfg!(feature = "libzstd-ept")),
+            ("GeoParquet", geoparquet::compress, cfg!(feature = "libzstd-geoparquet")),
+        ] {
+            let out = compress(&a, 9).unwrap();
+            assert_eq!(out != ruzstd, c && native, "{format}");
+            assert_eq!(pure::decompress(&out, a.len()).unwrap(), a, "{format}");
+        }
+    }
+
     /// Each implementation reads what the other writes, frames concatenated across them too.
-    #[cfg(all(feature = "libzstd", not(target_family = "wasm")))]
+    #[cfg(all(any(feature = "libzstd-geotiff", feature = "libzstd-ept", feature = "libzstd-geoparquet"), not(target_family = "wasm")))]
     #[test]
     fn ruzstd_and_libzstd_read_each_other() {
         let (a, b) = (data(200_000, 13), data(50_000, 7));

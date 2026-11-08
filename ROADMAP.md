@@ -707,6 +707,29 @@ Windows read as `f32` or `f64` values, NaN where GDAL's mask band marks pixels i
 - Out of scope: alpha bands as masks (GDAL's `GMF_ALPHA`), the Python and JavaScript bindings
   (Python's `terrio.rio` reads masked arrays already), and writing NaN back as nodata values.
 
+## Pure-Rust GeoTIFF/COG Zstandard by default (CLB fork, for upstream contribution)
+
+The CLB fork's default build compiles the zstd C library for GeoTIFF/COG Zstandard
+(`libzstd-geotiff`, owner's decision of 2026-11-08), which this roadmap's first principle does not
+allow upstream. The all-pure-Rust default (fork PR #35: `zstd-rust` for every Zstandard path, C
+opt-in) is kept on the branch
+[`feat/pure-zstd-geotiff-default`](https://github.com/CLB-Engineering-Corporation/terrio/tree/feat/pure-zstd-geotiff-default)
+(c913ad7) for a later upstream contribution. It is ready when:
+
+- [ ] `zstd-rust` writes GeoTIFF/COG chunks at the speed of the zstd C library at the same level.
+      Measured for #35 (Windows x86-64, release, Bald Eagle Depth (Max) and Terrain50 1x float32
+      COGs, `PREDICTOR=3`): 1.16x to 1.51x the C library's write time at levels 1, 3 and 9, to
+      within -11% to +0.3% of its size.
+- [ ] `zstd-rust` decodes ZSTD chunks at the C library's speed (about 2x slower for the decoder; a whole COG read takes 1.3x as long, fork PR #36).
+- [ ] `zstd-rust` is on crates.io (it is a git dependency, gpt-cmdr/zstd-rs, which `cargo publish`
+      refuses and upstream cannot take), or the encoder is contributed to `ruzstd` itself.
+- [ ] Then the branch is rebased on the fork's `main`, `libzstd-geotiff` leaves the defaults, and
+      the equivalence checks of #35 (decoded pixels bit-identical by terrio and GDAL, overviews
+      identical) are re-run.
+
+The rest of the fork's C dependencies that upstream would refuse are listed with this one in
+docs/CONSOLIDATION-2026-11.md ("Upstream migration: C dependencies").
+
 ## Decisions
 
 - The core API is synchronous and reads datasets into memory; remote files are downloaded first.

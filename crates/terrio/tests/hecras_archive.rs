@@ -2,7 +2,7 @@
 //! plan fixture `results_mesh_xs.h5`: layer names and fields from the engine catalog's ras2cng
 //! aliases, summary geometry joined by identity, the lossless additions, refusals listed instead
 //! of failing the file, and the written file read back.
-// The archive profile writes ZSTD GeoParquet (in pure Rust unless `parquet-zstd` or `libzstd`).
+// The archive profile writes ZSTD GeoParquet (in pure Rust unless `parquet-zstd` or `libzstd-geoparquet`).
 #![cfg(all(feature = "hecras", feature = "parquet"))]
 
 use arrow_array::RecordBatch;

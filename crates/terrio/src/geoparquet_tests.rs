@@ -411,7 +411,7 @@ fn zstd_pages_decompress_to_the_uncompressed_files_columns() {
     }
 }
 
-/// terrio's Zstandard pages (`ruzstd`, or the C library with `libzstd`) and the `parquet` crate's
+/// terrio's Zstandard pages (`ruzstd`, or the C library with `libzstd-geoparquet`) and the `parquet` crate's
 /// (the zstd C library): the same file but for the compressed bytes. Each decodes with the other
 /// implementation to the same rows; pages, encodings, dictionaries, statistics and page index
 /// entries are identical.
@@ -472,9 +472,9 @@ fn terrio_zstd_pages_match_the_zstd_c_librarys_but_for_their_bytes() {
             write_layers_with(vec![many_cells()], Vec::new(), &options, codec).unwrap().1
         };
         let (ours, c) = (write(true), write(false));
-        // With `libzstd` terrio compresses with the same C library at the same level: the same
+        // With `libzstd-geoparquet` terrio compresses with the same C library at the same level: the same
         // file, byte for byte. Without it (`ruzstd`), only the compressed bytes differ.
-        assert_eq!(ours == c, cfg!(feature = "libzstd"));
+        assert_eq!(ours == c, cfg!(feature = "libzstd-geoparquet"));
         // Decoded by terrio and by the parquet crate (the C library): the same rows.
         let (a, b) = (read(&ours), read(&c));
         assert_eq!(a, b);

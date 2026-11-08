@@ -13,7 +13,10 @@ homepage.workspace = true
 authors.workspace = true
 
 [features]
-default = []
+default = ["libzstd-geotiff"]
+## GeoTIFF/COG Zstandard with the zstd C library (`terrio/libzstd-geotiff`), on by default in this
+## fork. `--no-default-features` builds the command without C.
+libzstd-geotiff = ["terrio/libzstd-geotiff"]
 ## The optional GDAL backend: open anything GDAL can (`GDAL:` paths, `--driver gdal`), write
 ## rasters with GDAL's drivers (`-f NITF`). Needs GDAL installed.
 gdal = ["terrio/gdal"]

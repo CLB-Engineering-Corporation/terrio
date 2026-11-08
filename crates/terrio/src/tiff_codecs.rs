@@ -46,8 +46,8 @@ enum Codec {
     Lerc,
     Jxl,
     Lzma,
-    /// Zstandard, with the zstd C library natively with the `libzstd` feature, with `ruzstd`
-    /// otherwise ([`crate::zstandard::frames`]).
+    /// Zstandard, with the zstd C library natively with the `libzstd-geotiff` feature (a default
+    /// one), with `ruzstd` otherwise ([`crate::zstandard::geotiff::frames`]).
     Zstd,
     /// LZW of 8 to 64-bit samples, decoded whole: the `tiff` crate's reader fails on some chunks
     /// it reads row by row (edge tiles narrower than the tile).
@@ -179,7 +179,7 @@ fn decompress(compression: u16, raw: Vec<u8>, limit: usize) -> TiffResult<Vec<u8
         LZMA => bounded(&mut lzma_rust2::XzReader::new(&raw[..], true), &mut out).map_err(|e| invalid(format!("LZMA: {e}")))?,
         #[cfg(not(feature = "lzma"))]
         LZMA => return Err(disabled("lzma")),
-        ZSTD => out = crate::zstandard::frames(&raw, limit)?,
+        ZSTD => out = crate::zstandard::geotiff::frames(&raw, limit)?,
         32773 => {
             // PackBits: a count byte n, then n + 1 literal bytes (n >= 0) or one byte repeated
             // 1 - n times (n < 0, -128 skipped): at most 64 bytes out per byte in.
@@ -1125,8 +1125,8 @@ mod tests {
         }
     }
 
-    /// Zstandard chunks decode (with the zstd C library natively with the `libzstd` feature, with
-    /// `ruzstd` otherwise), whichever encoder wrote them.
+    /// Zstandard chunks decode (with the zstd C library natively with the `libzstd-geotiff`
+    /// feature, with `ruzstd` otherwise), whichever encoder wrote them.
     #[test]
     fn zstandard_chunks_decode_in_pure_rust() {
         let c = ChunkCodec { codec: Codec::Zstd, ..lzw(Sample::U16, 1, 2, false) };
@@ -1134,13 +1134,13 @@ mod tests {
         let rows: Vec<u8> =
             (0..4u16).flat_map(|r| (0..4u16).map(move |i| if i == 0 { r * 100 } else { 3 })).flat_map(u16::to_ne_bytes).collect();
         let want: Vec<u8> = (0..4u16).flat_map(|r| (0..4u16).map(move |i| r * 100 + 3 * i)).flat_map(u16::to_ne_bytes).collect();
-        assert_eq!(c.lossless(crate::zstandard::compress(&rows, 9).unwrap(), 4, 4).unwrap(), want);
+        assert_eq!(c.lossless(crate::zstandard::geotiff::compress(&rows, 9).unwrap(), 4, 4).unwrap(), want);
         assert_eq!(
             c.lossless(ruzstd::encoding::compress_to_vec(&rows[..], ruzstd::encoding::CompressionLevel::Fastest), 4, 4).unwrap(),
             want
         );
         // A short stream is an error.
-        assert!(c.lossless(crate::zstandard::compress(&rows[..8], 9).unwrap(), 4, 4).is_err());
+        assert!(c.lossless(crate::zstandard::geotiff::compress(&rows[..8], 9).unwrap(), 4, 4).is_err());
     }
 
     /// A truncated LZW chunk is an error, and a header's chunk size overflowing is refused.

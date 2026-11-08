@@ -27,9 +27,12 @@ hecras = ["terrio/hecras"]
 ## (`terrio/parquet-zstd`), opt-in; without it (the wheels), terrio compresses the same pages in
 ## pure Rust.
 parquet-zstd = ["terrio/parquet-zstd"]
+## GeoTIFF/COG Zstandard with the zstd C library (`terrio/libzstd-geotiff`), in the native wheels by
+## default (CLB fork); the Pyodide wheel is `ruzstd` whatever the features.
+libzstd-geotiff = ["terrio/libzstd-geotiff", "terrio-cli/libzstd-geotiff"]
 ## GeoTIFF, EPT and GeoParquet Zstandard with the zstd C library (`terrio/libzstd`).
-libzstd = ["terrio/libzstd"]
-default = ["hecras"]
+libzstd = ["terrio/libzstd", "libzstd-geotiff"]
+default = ["hecras", "libzstd-geotiff"]
 
 [dependencies]
 terrio.workspace = true

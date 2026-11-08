@@ -400,7 +400,8 @@ impl EptReader {
                 let bytes = if kind == "zstandard" {
                     // Every frame, to at most the records of the node's points in the hierarchy.
                     let limit = usize::try_from(points).ok().and_then(|n| n.checked_mul(rl)).unwrap_or(usize::MAX);
-                    crate::zstandard::decompress(&bytes, limit).map_err(|e| Error::InvalidData(format!("EPT node {}: {e}", key.name())))?
+                    crate::zstandard::ept::decompress(&bytes, limit)
+                        .map_err(|e| Error::InvalidData(format!("EPT node {}: {e}", key.name())))?
                 } else {
                     bytes
                 };
