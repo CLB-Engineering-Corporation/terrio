@@ -440,7 +440,6 @@ fn terrio_zstd_pages_match_the_zstd_c_librarys_but_for_their_bytes() {
                     column.compression(),
                     format!("{:?}", column.encodings().collect::<Vec<_>>()),
                     column.dictionary_page_offset().is_some(),
-                    column.uncompressed_size(),
                     format!("{:?}", column.statistics()),
                     column.num_values(),
                     pages,
@@ -448,6 +447,23 @@ fn terrio_zstd_pages_match_the_zstd_c_librarys_but_for_their_bytes() {
             }
         }
         (out, meta.column_index().map(|c| format!("{c:?}")))
+    };
+    // Every page, decompressed by the parquet crate (the C library): type, values, encoding,
+    // statistics and bytes. (A chunk's uncompressed size can still differ by a byte or so: it
+    // counts the page headers, which hold the compressed page size.)
+    let pages = |bytes: &[u8]| {
+        let reader = SerializedFileReader::new(bytes::Bytes::copy_from_slice(bytes)).unwrap();
+        let mut out = Vec::new();
+        for g in 0..reader.num_row_groups() {
+            let group = reader.get_row_group(g).unwrap();
+            for c in 0..group.num_columns() {
+                let mut pages = group.get_column_page_reader(c).unwrap();
+                while let Some(p) = pages.get_next_page().unwrap() {
+                    out.push((g, c, p.page_type(), p.num_values(), p.encoding(), format!("{:?}", p.statistics()), p.buffer().to_vec()));
+                }
+            }
+        }
+        out
     };
     for statistics in [ColumnStatistics::Page, ColumnStatistics::Chunk] {
         let options = GeoParquetWriteOptions { statistics, ..GeoParquetWriteOptions::archive() };
@@ -465,5 +481,8 @@ fn terrio_zstd_pages_match_the_zstd_c_librarys_but_for_their_bytes() {
         assert_eq!(crate_read(&ours), a.1);
         assert_eq!(crate_read(&c), a.1);
         assert_eq!(chunks(&ours), chunks(&c), "{statistics:?}");
+        let ours_pages = pages(&ours);
+        assert!(ours_pages.len() > 20, "{} pages", ours_pages.len());
+        assert!(ours_pages == pages(&c), "{statistics:?}: pages differ");
     }
 }
