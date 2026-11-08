@@ -720,7 +720,7 @@ opt-in) is kept on the branch
       Measured for #35 (Windows x86-64, release, Bald Eagle Depth (Max) and Terrain50 1x float32
       COGs, `PREDICTOR=3`): 1.16x to 1.51x the C library's write time at levels 1, 3 and 9, to
       within -11% to +0.3% of its size.
-- [ ] `zstd-rust` decodes ZSTD chunks at the C library's speed (about 2x slower today).
+- [ ] `zstd-rust` decodes ZSTD chunks at the C library's speed (about 2x slower for the decoder; a whole COG read takes 1.3x as long, fork PR #36).
 - [ ] `zstd-rust` is on crates.io (it is a git dependency, gpt-cmdr/zstd-rs, which `cargo publish`
       refuses and upstream cannot take), or the encoder is contributed to `ruzstd` itself.
 - [ ] Then the branch is rebased on the fork's `main`, `libzstd-geotiff` leaves the defaults, and

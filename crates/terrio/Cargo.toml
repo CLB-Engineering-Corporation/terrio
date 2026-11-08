@@ -156,7 +156,7 @@ sqlite = []
 ## Zstandard of GeoTIFF/COG chunks (ZSTD and LERC_ZSTD writing, ZSTD reading) with the zstd C
 ## library, in native builds. On by default in this fork (the CLB fork's decision of 2026-11-08):
 ## the pure-Rust `ruzstd` (the `zstd-rust` crate) writes these 1.1 to 1.5 times slower and decodes
-## them about 2 times slower. Without it, and always in WebAssembly, GeoTIFF/COG Zstandard is
+## them slower (a whole Terrain50 COG read takes 1.3 times as long). Without it, and always in WebAssembly, GeoTIFF/COG Zstandard is
 ## `ruzstd`, which decodes to the same pixels and maps zstd's levels to its four (`Fastest`,
 ## `Default`, `Better`, `Best`; see `zstandard::pure::ruzstd_level`). A host with no C compiler
 ## builds `default-features = false, features = ["drivers"]`. terrio decodes every ZSTD GeoTIFF

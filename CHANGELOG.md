@@ -6,7 +6,7 @@
   decision of 2026-11-08): the new `libzstd-geotiff` feature, a default feature of terrio,
   terrio-cli and the Python package, writes ZSTD and LERC_ZSTD chunks and reads ZSTD chunks with
   libzstd, byte-identical to the previous `libzstd` build. The pure-Rust path was 1.1 to 1.5 times
-  slower to write and about 2 times slower to decode. Zarr, EPT and GeoParquet stay pure Rust, as
+  slower to write and slower to read (a whole Terrain50 COG read took 1.3 times as long). Zarr, EPT and GeoParquet stay pure Rust, as
   does every format in WebAssembly. The C opt-in is split per format: `libzstd-geotiff`,
   `libzstd-ept`, `libzstd-geoparquet`, and `libzstd` for all three. The new `drivers` feature is
   every driver without C: a host with no C compiler builds terrio with

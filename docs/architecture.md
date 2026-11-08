@@ -69,7 +69,7 @@ WebAssembly builds always, and natively with `default-features = false, features
 (`terrio-cli --no-default-features`). One exception is on by default in the CLB fork: GeoTIFF/COG
 Zstandard uses the zstd C library natively (`libzstd-geotiff`, a default feature of terrio,
 terrio-cli and the Python package), because the pure-Rust path is not yet as fast (1.1 to 1.5 times
-slower to write, about 2 times slower to decode). The pure-Rust GeoTIFF default is kept on the branch
+slower to write; a whole ZSTD COG read takes 1.3 times as long). The pure-Rust GeoTIFF default is kept on the branch
 `feat/pure-zstd-geotiff-default` until it reaches parity (see the ROADMAP). Three choices keep the
 rest pure Rust:
 
