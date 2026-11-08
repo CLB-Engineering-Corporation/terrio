@@ -105,9 +105,10 @@ cad = ["dep:acadrust"]
 ## GeoParquet (the `geoparquet` module of Arrow layers included), the `arrow` module and Arrow
 ## streams of vector layers.
 parquet = ["dep:parquet", "dep:arrow-array", "dep:arrow-schema", "dep:arrow-ipc", "dep:arrow-buffer", "dep:arrow-select", "dep:bytes"]
-## ZSTD compression when writing GeoParquet (`terrio::geoparquet`, the ras2cng archive profile),
-## through the zstd C library that parquet's codec uses. Opt-in, so the default and WebAssembly
-## builds stay free of C; without it, ZSTD GeoParquet writing is refused (reading always works).
+## ZSTD GeoParquet pages written by the `parquet` crate's own codec, the zstd C library. Opt-in:
+## without it terrio has the crate write the pages uncompressed and compresses each one itself,
+## with `ruzstd` (or the C library with `libzstd`), so the default and WebAssembly builds write
+## ZSTD GeoParquet without C. Pages, encodings, dictionaries and statistics are the same either way.
 parquet-zstd = ["parquet", "parquet/zstd"]
 ## HTTP(S), S3, GCS and Azure inputs, range reads of remote COGs and STAC (native builds only).
 remote = ["dep:ureq", "dep:rustls-graviola", "dep:hmac", "dep:sha2", "terrio-crs/grid-transport"]
@@ -147,9 +148,11 @@ tiles = ["sqlite"]
 zarr = ["dep:lz4_flex"]
 ## GeoPackage (vector and raster tiles), SQLite/SpatiaLite and the SQLite store of MBTiles.
 sqlite = []
-## Zstandard (GeoTIFF chunks and EPT tiles) with the zstd C library, natively: it decodes faster
-## and compresses better than `ruzstd`, used without it and in WebAssembly, which writes at its
-## fastest level (about zstd's 1) whatever level is asked for. terrio decodes every ZSTD GeoTIFF
+## Zstandard (GeoTIFF chunks, EPT tiles and the pages of ZSTD GeoParquet written without
+## `parquet-zstd`) with the zstd C library, natively. Opt-in: without it, and in WebAssembly,
+## terrio uses the pure-Rust `ruzstd` (the `zstd-rust` crate), which decodes to the same bytes and
+## maps zstd's levels to its four (`Fastest`, `Default`, `Better`, `Best`; see
+## `zstandard::pure::ruzstd_level`); the C library is faster at the same size. terrio decodes every ZSTD GeoTIFF
 ## chunk itself, Float16, complex and WhiteIsZero samples included: the `tiff` crate is built
 ## without its Zstandard (zstd 0.13, whose streaming decoder has known advisories), so ZSTD datum
 ## grids, which terrio-crs reads with the crate, are not read (PROJ's are DEFLATE-compressed).

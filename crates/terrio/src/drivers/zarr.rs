@@ -2102,7 +2102,8 @@ fn compress(codec: &Option<Codec>, data: Vec<u8>) -> Result<Vec<u8>> {
             e.write_all(&data)?;
             e.finish()?
         }
-        Some(Codec::Zstd) => ruzstd::encoding::compress_to_vec(&data[..], ruzstd::encoding::CompressionLevel::Fastest),
+        // Pure Rust in every build, at zstd's level 1 (`ruzstd`'s `Fastest`).
+        Some(Codec::Zstd) => crate::zstandard::pure::compress(&data, 1)?,
         _ => data,
     })
 }

@@ -174,8 +174,13 @@ jobs:
         run: |
           cargo test -p terrio -p terrio-crs --doc
           cargo test -p terrio --doc --features ndarray
-      - name: The crate packages and verifies
-        run: cargo publish -p terrio-crs -p terrio -p terrio-cli --dry-run --locked
+      # The CLB fork: the crates depend on `zstd-rust` from git (gpt-cmdr/zstd-rs, not on crates.io),
+      # which `cargo publish` refuses, and the fork publishes no crates. The packages' file lists are
+      # checked and the crates built instead; the other jobs test the code.
+      - name: The crates package (file lists) and build
+        run: |
+          cargo package -p terrio-crs -p terrio -p terrio-cli --list --locked
+          cargo build -p terrio-crs -p terrio -p terrio-cli --locked
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-about@0.9.2

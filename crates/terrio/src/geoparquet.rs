@@ -20,7 +20,9 @@
 //!   a 16-bit-per-axis grid over the layer's extent, bit for bit DuckDB spatial's
 //!   `ST_Hilbert(x, y, box)`. Ties keep input order; null and empty geometries go last. The key
 //!   can be stored in a nullable `UInt64` `hilbert_column`.
-//! - **Encoding**: Snappy, ZSTD at a chosen level or none; dictionary encoding on every column,
+//! - **Encoding**: Snappy, ZSTD at a chosen level or none (ZSTD pages are compressed by terrio in
+//!   pure Rust unless the `libzstd` feature or, for the `parquet` crate's own codec, the
+//!   `parquet-zstd` feature brings in the zstd C library); dictionary encoding on every column,
 //!   on top-level `Utf8` columns only, or none; chunk statistics without a page index (as pyarrow
 //!   writes them) or page statistics with one; geometry statistics on or off.
 //!
@@ -48,15 +50,12 @@
 //!     Arc::new(Int64Array::from(vec![1, 2])),
 //!     Arc::new(BinaryArray::from_vec(vec![&point(0.0, 0.0), &point(5.0, 5.0)])),
 //! ]).map_err(|e| terrio::Error::InvalidData(e.to_string()))?;
-//! // The archive profile writes ZSTD, which needs the `parquet-zstd` feature.
-//! # #[cfg(feature = "parquet-zstd")] {
 //! let layers = vec![ArrowLayer::new(Some("points".into()), schema, vec![Ok(batch)])];
 //! let mut options = GeoParquetWriteOptions::archive();
 //! options.crs = Some(serde_json::json!("EPSG:32633"));
 //! let mut out = Vec::new();
 //! let report = write_arrow_layers(layers, &mut out, &options)?;
 //! assert_eq!((report.rows, report.row_groups), (2, 1));
-//! # }
 //! # Ok::<(), terrio::Error>(())
 //! ```
 
@@ -66,9 +65,7 @@ use arrow_array::{Array, ArrayRef, BinaryArray, Float64Array, RecordBatch, Strin
 use arrow_schema::{DataType, Field, Fields, Schema, SchemaRef};
 use parquet::arrow::ArrowSchemaConverter;
 use parquet::arrow::arrow_writer::{ArrowLeafColumn, ArrowRowGroupWriterFactory, ArrowWriter, ArrowWriterOptions, compute_leaves};
-#[cfg(feature = "parquet-zstd")]
-use parquet::basic::ZstdLevel;
-use parquet::basic::{Compression, LogicalType};
+use parquet::basic::{Compression, LogicalType, ZstdLevel};
 use parquet::file::metadata::KeyValue;
 use parquet::file::properties::{EnabledStatistics, WriterProperties};
 use parquet::file::writer::SerializedFileWriter;
@@ -114,19 +111,28 @@ impl ParquetCompression {
         }
     }
 
-    fn parquet(self) -> Result<Compression> {
+    /// The codec the `parquet` crate writes with, and the Zstandard level when the pages are
+    /// compressed by terrio instead (`geoparquet_zstd::append_zstd`).
+    fn parquet(self) -> Result<(Compression, Option<i32>)> {
+        self.codec(!cfg!(feature = "parquet-zstd"))
+    }
+
+    /// [`Self::parquet`]; ZSTD pages compressed by terrio when `terrio_zstd`, otherwise by the
+    /// `parquet` crate's codec (the zstd C library, with the `parquet-zstd` feature only).
+    fn codec(self, terrio_zstd: bool) -> Result<(Compression, Option<i32>)> {
         Ok(match self {
-            Self::Uncompressed => Compression::UNCOMPRESSED,
-            Self::Snappy => Compression::SNAPPY,
-            #[cfg(feature = "parquet-zstd")]
-            Self::Zstd(level) => Compression::ZSTD(ZstdLevel::try_new(level).map_err(arg)?),
-            // parquet's ZSTD codec is the zstd C library, kept out of the default builds.
-            #[cfg(not(feature = "parquet-zstd"))]
-            Self::Zstd(_) => {
-                return Err(Error::Unsupported(
-                    "ZSTD GeoParquet writing needs terrio's `parquet-zstd` feature (the zstd C library); use snappy or uncompressed".into(),
-                ));
+            Self::Uncompressed => (Compression::UNCOMPRESSED, None),
+            Self::Snappy => (Compression::SNAPPY, None),
+            // By default the crate writes the pages uncompressed and terrio compresses each one:
+            // pure Rust (`ruzstd`), or the zstd C library with the `libzstd` feature. Pages,
+            // encodings, dictionaries and statistics are the crate's either way.
+            Self::Zstd(level) if terrio_zstd => {
+                ZstdLevel::try_new(level).map_err(arg)?;
+                (Compression::UNCOMPRESSED, Some(level))
             }
+            // With `parquet-zstd`, parquet's own codec: the zstd C library (without the feature
+            // the crate refuses to write it).
+            Self::Zstd(level) => (Compression::ZSTD(ZstdLevel::try_new(level).map_err(arg)?), None),
         })
     }
 }
@@ -864,6 +870,8 @@ struct RowGroups<W: std::io::Write + Send> {
     pending: Vec<RecordBatch>,
     rows: usize,
     groups: usize,
+    /// The Zstandard level, when the pages are compressed by terrio (see `ParquetCompression::parquet`).
+    zstd: Option<i32>,
 }
 
 impl<W: std::io::Write + Send> RowGroups<W> {
@@ -908,9 +916,16 @@ impl<W: std::io::Write + Send> RowGroups<W> {
             }
             writer.close().map_err(err)
         });
+        let chunks = chunks.into_iter().collect::<Result<Vec<_>>>()?;
+        let (root, props) = (self.writer.schema_descr().root_schema_ptr(), self.writer.properties().clone());
         let mut group = self.writer.next_row_group().map_err(err)?;
-        for chunk in chunks {
-            chunk?.append_to_row_group(&mut group).map_err(err)?;
+        match self.zstd {
+            Some(level) => crate::drivers::vector::geoparquet_zstd::append_zstd(chunks, &mut group, root, props, level).map_err(err)?,
+            None => {
+                for chunk in chunks {
+                    chunk.append_to_row_group(&mut group).map_err(err)?;
+                }
+            }
         }
         group.close().map_err(err)?;
         self.groups += 1;
@@ -919,9 +934,9 @@ impl<W: std::io::Write + Send> RowGroups<W> {
     }
 }
 
-fn writer_properties(plan: &Plan, options: &GeoParquetWriteOptions) -> Result<WriterProperties> {
+fn writer_properties(plan: &Plan, options: &GeoParquetWriteOptions, compression: Compression) -> Result<WriterProperties> {
     let mut props = WriterProperties::builder()
-        .set_compression(options.compression.parquet()?)
+        .set_compression(compression)
         .set_max_row_group_row_count(Some(options.row_group_rows))
         // The specification's (and pyarrow's) list layout: three-level LIST, items `element`.
         .set_coerce_types(true);
@@ -992,8 +1007,22 @@ where
     I: IntoIterator<Item = Result<RecordBatch>>,
     W: std::io::Write + Send,
 {
+    write_layers_with(layers, out, options, options.compression.parquet()?)
+}
+
+/// [`write_layers`] with the codec given (see [`ParquetCompression::codec`]).
+fn write_layers_with<I, W>(
+    layers: Vec<ArrowLayer<I>>,
+    out: W,
+    options: &GeoParquetWriteOptions,
+    (compression, zstd): (Compression, Option<i32>),
+) -> Result<(GeoParquetWriteReport, W)>
+where
+    I: IntoIterator<Item = Result<RecordBatch>>,
+    W: std::io::Write + Send,
+{
     let plan = plan(&layers, options)?;
-    let props = writer_properties(&plan, options)?;
+    let props = writer_properties(&plan, options, compression)?;
     // pyarrow's root group name (`schema`); the Arrow schema is written at the end, so that it
     // carries the `geo` metadata as pyarrow writes it.
     let arrow = ArrowWriter::try_new_with_options(
@@ -1003,8 +1032,16 @@ where
     )
     .map_err(err)?;
     let (writer, factory) = arrow.into_serialized_writer().map_err(err)?;
-    let mut groups =
-        RowGroups { writer, factory, schema: plan.schema.clone(), limit: options.row_group_rows, pending: Vec::new(), rows: 0, groups: 0 };
+    let mut groups = RowGroups {
+        writer,
+        factory,
+        schema: plan.schema.clone(),
+        limit: options.row_group_rows,
+        pending: Vec::new(),
+        rows: 0,
+        groups: 0,
+        zstd,
+    };
     let mut report = GeoParquetWriteReport::default();
     let mut types: Vec<String> = Vec::new();
     let mut extent: Option<[f64; 4]> = None;
@@ -1120,19 +1157,6 @@ where
     }
 }
 
-// The archive profile and most layouts write ZSTD, which needs the `parquet-zstd` feature.
-#[cfg(all(test, feature = "parquet-zstd"))]
+#[cfg(test)]
 #[path = "geoparquet_tests.rs"]
 mod tests;
-
-#[cfg(all(test, not(feature = "parquet-zstd")))]
-mod tests_without_zstd {
-    use super::*;
-
-    #[test]
-    fn zstd_writing_is_refused_without_the_feature() {
-        assert_eq!(ParquetCompression::parse("zstd", Some(3)).unwrap(), ParquetCompression::Zstd(3));
-        assert!(matches!(ParquetCompression::Zstd(3).parquet(), Err(Error::Unsupported(_))));
-        assert!(ParquetCompression::Snappy.parquet().is_ok());
-    }
-}

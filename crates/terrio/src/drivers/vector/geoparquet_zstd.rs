@@ -1,6 +1,11 @@
 //! Zstandard column chunks of Parquet files, without the `parquet` crate's Zstandard, which is the
 //! zstd C library. A chunk's pages are read as if they were not compressed, and then decompressed
 //! here with `crate::zstandard`. Other compressions stay with the crate.
+//!
+//! Writing is the mirror image ([`append_zstd`]): a row group's chunks are encoded uncompressed by
+//! the crate, and each page is then compressed here and written again with its header, the chunk's
+//! metadata (codec, sizes, offsets and page locations) following. Page boundaries, encodings,
+//! dictionaries and statistics are the crate's, as they would be with its own Zstandard.
 
 use std::sync::Arc;
 
@@ -57,7 +62,7 @@ pub(super) fn has_zstd(meta: &ParquetMetaData, groups: &[usize], mask: &Projecti
 
 /// A reader of the rows of `groups`, like `ParquetRecordBatchReaderBuilder`'s, that also reads
 /// Zstandard chunks.
-pub(super) fn reader<R: ChunkReader + 'static>(
+pub(crate) fn reader<R: ChunkReader + 'static>(
     input: R,
     meta: &Arc<ParquetMetaData>,
     schema: &Schema,
@@ -218,6 +223,135 @@ impl<R: ChunkReader> PageReader for ZstdPages<R> {
     fn at_record_boundary(&mut self) -> Result<bool> {
         self.pages.at_record_boundary()
     }
+}
+
+/// Appends a row group's column chunks, encoded without compression, to `group`, every page
+/// compressed with Zstandard at `level` (see [`crate::zstandard::compress`]). `schema` and `props`
+/// are the file's.
+pub(crate) fn append_zstd<W: std::io::Write + Send>(
+    chunks: Vec<parquet::arrow::arrow_writer::ArrowColumnChunk>,
+    group: &mut parquet::file::writer::SerializedRowGroupWriter<'_, W>,
+    schema: parquet::schema::types::TypePtr,
+    props: parquet::file::properties::WriterPropertiesPtr,
+    level: i32,
+) -> Result<()> {
+    use parquet::file::writer::SerializedFileWriter;
+    // The chunks' bytes are reachable only through a row group: lay them out in a scratch file
+    // first, keeping what their metadata does not carry.
+    let kept: Vec<_> = chunks
+        .iter()
+        .map(|c| {
+            let close = c.close();
+            (close.rows_written, close.column_index.clone(), close.offset_index.clone())
+        })
+        .collect();
+    let mut scratch = SerializedFileWriter::new(Vec::new(), schema, props)?;
+    let mut raw = scratch.next_row_group()?;
+    for chunk in chunks {
+        chunk.append_to_row_group(&mut raw)?;
+    }
+    let meta = raw.close()?;
+    let bytes = Arc::new(Bytes::from(scratch.into_inner()?));
+    let rows = usize::try_from(meta.num_rows()).map_err(|e| ParquetError::External(Box::new(e)))?;
+    let compressed = crate::par::map_range(meta.num_columns(), |i| compress_chunk(&bytes, meta.column(i), rows, level));
+    for (chunk, (rows_written, column_index, offset_index)) in compressed.into_iter().zip(kept) {
+        let (data, metadata, locations) = chunk?;
+        let offset_index = offset_index.map(|mut index| {
+            for (location, (offset, size)) in index.page_locations.iter_mut().zip(&locations) {
+                location.offset = *offset;
+                location.compressed_page_size = *size;
+            }
+            index
+        });
+        let close = parquet::column::writer::ColumnCloseResult {
+            bytes_written: data.len() as u64,
+            rows_written,
+            metadata,
+            bloom_filter: None,
+            column_index,
+            offset_index,
+        };
+        group.append_column(&data, close)?;
+    }
+    Ok(())
+}
+
+/// A compressed chunk: its bytes (from offset 0), metadata, and each data page's offset and size
+/// (header included), for the page index.
+type CompressedChunk = (Bytes, ColumnChunkMetaData, Vec<(i64, i32)>);
+
+/// The pages of the uncompressed chunk `chunk` of `input`, compressed with Zstandard.
+fn compress_chunk(input: &Arc<Bytes>, chunk: &ColumnChunkMetaData, rows: usize, level: i32) -> Result<CompressedChunk> {
+    use parquet::column::page::{CompressedPage, PageWriter};
+    use parquet::file::writer::{SerializedPageWriter, TrackedWrite};
+    let compress = |data: &[u8]| -> Result<Bytes> {
+        crate::zstandard::compress(data, level).map(Bytes::from).map_err(|e| ParquetError::External(Box::new(e)))
+    };
+    let mut sink = TrackedWrite::new(Vec::with_capacity(chunk.compressed_size().max(0) as usize / 2));
+    let mut writer = SerializedPageWriter::new(&mut sink);
+    let (mut dictionary, mut first_data, mut locations) = (None, None, Vec::new());
+    let (mut compressed, mut uncompressed) = (0i64, 0i64);
+    for page in SerializedPageReader::new(input.clone(), chunk, rows, None)? {
+        let page = page?;
+        let size = page.buffer().len();
+        let page = match page {
+            Page::DataPage { buf, num_values, encoding, def_level_encoding, rep_level_encoding, statistics } => {
+                Page::DataPage { buf: compress(&buf)?, num_values, encoding, def_level_encoding, rep_level_encoding, statistics }
+            }
+            // The levels of a v2 page stay uncompressed, in front.
+            Page::DataPageV2 {
+                buf,
+                num_values,
+                encoding,
+                num_nulls,
+                num_rows,
+                def_levels_byte_len,
+                rep_levels_byte_len,
+                statistics,
+                ..
+            } => {
+                let levels = def_levels_byte_len as usize + rep_levels_byte_len as usize;
+                let (head, values) = buf.split_at_checked(levels).ok_or_else(|| ParquetError::General("Invalid page header".into()))?;
+                Page::DataPageV2 {
+                    buf: Bytes::from([head, &compress(values)?].concat()),
+                    num_values,
+                    encoding,
+                    num_nulls,
+                    num_rows,
+                    def_levels_byte_len,
+                    rep_levels_byte_len,
+                    is_compressed: true,
+                    statistics,
+                }
+            }
+            Page::DictionaryPage { buf, num_values, encoding, is_sorted } => {
+                Page::DictionaryPage { buf: compress(&buf)?, num_values, encoding, is_sorted }
+            }
+        };
+        let is_dictionary = page.is_dictionary_page();
+        let spec = writer.write_page(CompressedPage::new(page, size))?;
+        let offset = i64::try_from(spec.offset).map_err(|e| ParquetError::External(Box::new(e)))?;
+        let written = i32::try_from(spec.compressed_size).map_err(|e| ParquetError::External(Box::new(e)))?;
+        if is_dictionary {
+            dictionary = Some(offset);
+        } else {
+            first_data.get_or_insert(offset);
+            locations.push((offset, written));
+        }
+        compressed += i64::from(written);
+        uncompressed += spec.uncompressed_size as i64;
+    }
+    let data = Bytes::from(sink.into_inner()?);
+    let metadata = chunk
+        .clone()
+        .into_builder()
+        .set_compression(Compression::ZSTD(parquet::basic::ZstdLevel::try_new(level.clamp(1, 22))?))
+        .set_total_compressed_size(compressed)
+        .set_total_uncompressed_size(uncompressed)
+        .set_dictionary_page_offset(dictionary)
+        .set_data_page_offset(first_data.unwrap_or(0))
+        .build()?;
+    Ok((data, metadata, locations))
 }
 
 #[cfg(test)]
