@@ -416,7 +416,14 @@ fn report(args: &ReportArgs, r: &Report) -> terrio::Result<()> {
 }
 
 /// Prints the HTTP requests and bytes of this process.
+#[cfg(feature = "remote")]
 pub fn print_stats() {
     let s = terrio::http::fetch_stats();
     eprintln!("terrio: {} HTTP request(s), {} byte(s) received", s.requests, s.bytes);
+}
+
+/// Prints the HTTP requests and bytes of this process: none, without remote inputs.
+#[cfg(not(feature = "remote"))]
+pub fn print_stats() {
+    eprintln!("terrio: 0 HTTP request(s), 0 byte(s) received (built without remote inputs)");
 }
