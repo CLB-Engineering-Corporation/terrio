@@ -14,9 +14,9 @@ authors = ["Qiusheng Wu <giswqs@gmail.com>"]
 [workspace.dependencies]
 # Memory-mapped reads of SQLite files (GeoPackage, MBTiles), native builds only.
 memmap2 = "0.9"
-# Every driver, without the zstd C library: the members that link it say so (`libzstd-geotiff`, a
-# default feature of terrio, terrio-cli and the Python package), so `--no-default-features` builds
-# them without C.
+# Every driver, without the zstd C library or remote inputs (whose HTTPS is `ring`): the members
+# that link them say so (`libzstd-geotiff` and `remote`, default features of terrio, terrio-cli and
+# the Python package), so `--no-default-features` builds them without C.
 terrio = { path = "crates/terrio", version = "0.6.1", default-features = false, features = ["drivers"] }
 terrio-crs = { path = "crates/terrio-crs", version = "0.2.1", default-features = false }
 # For the Python package (not published to crates.io), so without a version to keep in step.
@@ -117,9 +117,9 @@ tar = { version = "0.4", default-features = false }
 # POSIX file locks for in-place SQLite updates (Unix).
 libc = "0.2"
 zip = { version = "9", default-features = false, features = ["deflate"] }
-# No TLS provider of its own: terrio supplies `rustls-graviola`, which needs no C compiler.
-ureq = { version = "3", default-features = false, features = ["gzip", "rustls-no-provider", "rustls-webpki-roots"] }
-rustls-graviola = "0.4"
+# HTTPS with `rustls` and `ring` (C and assembly) in every native build (CLB fork; see
+# docs/CONSOLIDATION-2026-11.md, "Upstream migration: C dependencies").
+ureq = { version = "3", default-features = false, features = ["gzip", "rustls", "rustls-webpki-roots"] }
 hmac = "0.13"
 sha2 = "0.11"
 clap = { version = "4", features = ["derive"] }

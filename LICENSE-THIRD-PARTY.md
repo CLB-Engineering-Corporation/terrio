@@ -10,7 +10,7 @@ LICENSE-THIRD-PARTY.md`, from `about.toml`.
 
 ## Overview
 
-- Apache License 2.0 (262)
+- Apache License 2.0 (260)
 - MIT License (70)
 - ISC License (20)
 - BSD 3-Clause "New" or "Revised" License (14)
@@ -6484,7 +6484,6 @@ Used by:
 - [geo-traits 0.3.0](https://github.com/georust/geo)
 - [geo 0.33.1](https://github.com/georust/geo)
 - [geozero 0.15.1](https://github.com/georust/geozero)
-- [graviola 0.4.2](https://github.com/ctz/graviola/)
 - [half 2.7.1](https://github.com/VoidStarKat/half-rs)
 - [hdf5-core 0.10.1](https://github.com/roteiro-gis/netcdf-rust)
 - [hdf5-reader 0.10.1](https://github.com/roteiro-gis/netcdf-rust)
@@ -6529,7 +6528,6 @@ Used by:
 - [rstar 0.12.2](https://github.com/georust/rstar)
 - [rstar 0.13.0](https://github.com/georust/rstar)
 - [rustc-hash 2.1.3](https://github.com/rust-lang/rustc-hash)
-- [rustls-graviola 0.4.0](https://github.com/ctz/graviola/)
 - [ryu 1.0.23](https://github.com/dtolnay/ryu)
 - [seq-macro 0.3.6](https://github.com/dtolnay/seq-macro)
 - [serde 1.0.229](https://github.com/serde-rs/serde)

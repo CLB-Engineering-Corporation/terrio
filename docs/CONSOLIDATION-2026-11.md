@@ -165,7 +165,7 @@ by default, every default feature building for WebAssembly without a C compiler.
 
 | # | Dependency | Builds | Before upstreaming |
 |---|---|---|---|
-| 1 | **TLS: `ring`** (C and assembly), through `ureq`'s `rustls` | `remote` (default), on architectures other than x86-64 and AArch64 (no release is built for them) | `ring` is C and assembly. The pure-Rust provider used on x86-64 and AArch64, `rustls-graviola` 0.4 (graviola 0.4.2, Rust and assembly), **panics** on x86-64 CPUs without AVX2, ADX or BMI2 (its `verify_cpu_features` asserts `aes`, `pclmulqdq`, `bmi1`, `adx`, `avx` and `avx2` on the first cryptographic call; its README also requires `bmi2` and `ssse3`), and on AArch64 without `aes`, `sha2`, `pmull` and `neon`. A rewrite or fallback must reach `ring`-like speed with no CPU-feature panic, for example a pure-Rust provider chosen at run time when graviola's features are missing. |
+| 1 | **TLS: `ring`** (C and assembly), through `ureq`'s `rustls` | `remote` (default), **every native build** since T26 (2026-11-09): the library, the command, the native wheels and the Docker image, on every architecture | The fork uses `ring`, as `terrio-clb` does: `rustls-graviola` 0.4 (graviola 0.4.2, Rust and assembly), which upstream uses on x86-64 and AArch64, **panics** on x86-64 CPUs without AVX2, ADX or BMI2 (its `verify_cpu_features` asserts `aes`, `pclmulqdq`, `bmi1`, `adx`, `avx` and `avx2` on the first cryptographic call; its README also requires `bmi2` and `ssse3`), and on AArch64 without `aes`, `sha2`, `pmull` and `neon`. Upstream still needs a pure-Rust provider with `ring`-like speed and no CPU-feature panic (for example graviola with a pure-Rust fallback chosen at run time when its features are missing) before this can go back. `remote` left `drivers`, so `default-features = false, features = ["drivers"]` (and `terrio-cli --no-default-features`) still builds without C, without remote inputs. CI fails if a default native build links graviola. |
 | 2 | **Zstandard of GeoTIFF/COG: `zstd` 0.14 / `zstd-sys`** (the zstd C library) | `libzstd-geotiff`, **on by default** in terrio, terrio-cli and the native Python wheels (owner's decision of 2026-11-08); never in WebAssembly | The pure-Rust path (`zstd-rust`) is 1.1 to 1.44x slower to write and about 2x slower to decode than libzstd (the owner's figures; measured in fork PR #35: 1.16x to 1.51x to write, and in PR #36: a whole COG read end to end, chunk decoding plus the rest, 1.29x to 1.33x). It needs speed parity before it becomes the upstream default. The all-pure default is kept on `feat/pure-zstd-geotiff-default` (c913ad7); see ROADMAP.md, "Pure-Rust GeoTIFF/COG Zstandard by default". |
 | 3 | **`zstd-rust` is a git dependency** (gpt-cmdr/zstd-rs at 6678927), not on crates.io | every build: it is `ruzstd` for every pure Zstandard path, terrio-crs's bundled tables included | The owner chose not to publish it, so it blocks upstream use: `cargo publish` refuses a dependency without a crates.io version, and upstream cannot depend on a git repository. Publish it, contribute its levels to `ruzstd`, or return to crates.io `ruzstd` first. It is also why `release.yml` publishes no crates. |
 | 4 | **ZSTD datum grids: the `tiff` crate's `zstd` 0.13 / `zstd-sys`** | terrio-crs's opt-in `libzstd` (terrio-crs built on its own; terrio does not enable it, so terrio reads no ZSTD TIFF grids) | ZSTD-compressed TIFF datum grids still need libzstd. A pure-Rust path (terrio-crs decoding the grid chunks with `ruzstd`, as terrio does for GeoTIFF) is needed for them. PROJ's CDN grids are DEFLATE-compressed, so no default path needs it today. |
@@ -174,18 +174,22 @@ by default, every default feature building for WebAssembly without a C compiler.
 | 7 | `gdal` (`gdal-sys`: GDAL's C and C++ libraries, found with `pkg-config`) | opt-in | Upstream's own opt-in backend: nothing to rewrite. |
 | 8 | `rusty_av1d`'s `cc` build dependency | `avif` (default) | Compiles no C or assembly with its assembly feature off, as upstream builds it: nothing to rewrite. |
 
-Audit (`cargo tree -e normal,build`, 2026-11-08): the default builds of terrio, terrio-cli and
-terrio-py on x86-64 have `zstd-sys` (item 2), `graviola` and `rustls-graviola` (Rust and assembly)
-and `cc` (item 8), and no other C crate; `--all-features` adds `gdal-sys` and `pkg-config`. On
-riscv64 the default build has `ring` (item 1) instead of graviola. terrio-js has no C dependency.
+Audit (`cargo tree -e normal,build`, 2026-11-08, updated 2026-11-09): the default builds of terrio,
+terrio-cli and terrio-py have `zstd-sys` (item 2), `ring` (item 1, on every architecture since
+2026-11-09; before, `graviola` and `rustls-graviola` on x86-64 and AArch64) and `cc` (items 1, 2
+and 8), and no other C crate; `--all-features` adds `gdal-sys` and `pkg-config`. terrio-js has no C
+dependency.
 
-**`rustls-graviola` in the default build and the wheels (reported, not changed).** The `remote`
-feature is a default feature, and on x86-64 and AArch64 `tls_config` in `crates/terrio/src/http.rs`
-installs `rustls_graviola::default_provider()` unconditionally, with no CPU check or fallback. So the
-default terrio library, the `terrio` command, the native Python wheels and the Docker image panic on
+**`rustls-graviola` in the default build and the wheels (fixed 2026-11-09, T26).** Until then the
+`remote` feature, a default feature, installed `rustls_graviola::default_provider()` in `tls_config`
+(`crates/terrio/src/http.rs`) on x86-64 and AArch64 with no CPU check or fallback, so the default
+terrio library, the `terrio` command, the native Python wheels and the Docker image panicked on
 their first HTTPS request on an x86-64 CPU without AVX2, ADX or BMI2 (about pre-2013 Intel and
-pre-2015 AMD CPUs, and virtual machines that hide those flags). Local files and plain HTTP are not
-affected. terrio-js and the Pyodide wheel do not build `remote`'s TLS.
+pre-2015 AMD CPUs, and virtual machines that hide those flags). They now use `ring`, which detects
+the CPU's features at run time and has portable code for each operation. CI's "No default native
+build links graviola" step checks terrio, terrio-cli and terrio-py on the eight release targets.
+HTTPS range reads of a public COG were as fast as before (network-bound; T26 measurements in the
+pull request). terrio-js and the Pyodide wheel build no TLS and are unchanged.
 
 **Known CI failure, not fixed (2026-11-08).** On `python (macos-latest)`,
 `test_cog_gdal_policy.py::test_overviews_are_gdals[3001x2999x1-uint16-nd0-AVERAGE]`,

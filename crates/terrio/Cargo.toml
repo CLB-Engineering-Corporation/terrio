@@ -89,19 +89,19 @@ gdal-sys = { workspace = true, optional = true }
 # feature), without copying the pixels.
 ndarray = { workspace = true, optional = true }
 
-# Every driver is on by default (`drivers`), and so is GeoTIFF/COG Zstandard with the zstd C
-# library in native builds (`libzstd-geotiff`, CLB fork). A build with `default-features = false`
+# Every driver is on by default (`drivers` and `remote`), and so is GeoTIFF/COG Zstandard with the
+# zstd C library in native builds (`libzstd-geotiff`, CLB fork). A build with `default-features = false`
 # keeps the core: GeoTIFF and COG (deflate, LZW, PackBits, ZSTD, WebP, JPEG, JPEG XL), the raw and
 # ASCII rasters (AAIGrid, EHdr, ENVI, ERS, HFA, RST, SAGA, GSBG, XYZ...), PNG, JPEG, VRT, GeoJSON,
 # Shapefile, KML/KMZ, GML, GPX, CSV, MapInfo, the CRS engine and the operations, without C
 # (Zstandard with `ruzstd`). `default-features = false, features = ["drivers"]` is every driver
-# without C, for hosts with no C toolchain. Disabled drivers stay in the API (`RasterDriver`,
+# without C, for hosts with no C toolchain: everything but remote inputs, whose HTTPS is `ring`. Disabled drivers stay in the API (`RasterDriver`,
 # `VectorDriver`) and fail with "built without the `...` feature".
 [features]
-default = ["drivers", "libzstd-geotiff"]
-## Every format driver: the default features but `libzstd-geotiff`, so pure Rust (no C compiler
-## needed) natively as in WebAssembly.
-drivers = ["cad", "geotiff", "parquet", "remote", "avif", "netcdf-hdf5", "osm", "lzma", "flatgeobuf", "jp2", "lerc", "pointcloud", "tiles", "zarr", "sqlite", "grib", "hecras", "xlsx", "filegdb"]
+default = ["drivers", "remote", "libzstd-geotiff"]
+## Every format driver: the default features but `remote` and `libzstd-geotiff`, so pure Rust (no C
+## compiler needed) natively as in WebAssembly.
+drivers = ["cad", "geotiff", "parquet", "avif", "netcdf-hdf5", "osm", "lzma", "flatgeobuf", "jp2", "lerc", "pointcloud", "tiles", "zarr", "sqlite", "grib", "hecras", "xlsx", "filegdb"]
 ## GeoTIFF and COG reading and writing. Always built (it is the core): the feature exists so that
 ## `features = ["geotiff"]` states what a build needs.
 geotiff = []
@@ -116,7 +116,9 @@ parquet = ["dep:parquet", "dep:arrow-array", "dep:arrow-schema", "dep:arrow-ipc"
 ## write ZSTD GeoParquet without C. Pages, encodings, dictionaries and statistics are the same either way.
 parquet-zstd = ["parquet", "parquet/zstd"]
 ## HTTP(S), S3, GCS and Azure inputs, range reads of remote COGs and STAC (native builds only).
-remote = ["dep:ureq", "dep:rustls-graviola", "dep:hmac", "dep:sha2", "terrio-crs/grid-transport"]
+## HTTPS uses `rustls` with `ring` (C and assembly, CLB fork), so natively this feature needs a C
+## compiler; in WebAssembly it builds nothing. Not in `drivers`, on by default.
+remote = ["dep:ureq", "dep:hmac", "dep:sha2", "terrio-crs/grid-transport"]
 ## AVIF tiles of PMTiles and MBTiles archives.
 avif = ["tiles", "dep:rusty_av1d"]
 ## NetCDF, HDF5 and HDF-EOS reading, netCDF writing.
@@ -194,14 +196,6 @@ tar.workspace = true
 ureq = { workspace = true, optional = true }
 hmac = { workspace = true, optional = true }
 sha2 = { workspace = true, optional = true }
-
-# HTTPS without a C compiler, on the architectures `rustls-graviola` supports.
-[target.'cfg(all(not(target_family = "wasm"), any(target_arch = "x86_64", target_arch = "aarch64")))'.dependencies]
-rustls-graviola = { workspace = true, optional = true }
-
-# Elsewhere (no release is built for these), HTTPS with `ring`, which needs a C compiler.
-[target.'cfg(all(not(target_family = "wasm"), not(any(target_arch = "x86_64", target_arch = "aarch64"))))'.dependencies]
-ureq = { workspace = true, optional = true, features = ["rustls"] }
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true

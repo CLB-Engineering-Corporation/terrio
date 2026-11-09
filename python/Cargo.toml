@@ -32,7 +32,10 @@ parquet-zstd = ["terrio/parquet-zstd"]
 libzstd-geotiff = ["terrio/libzstd-geotiff", "terrio-cli/libzstd-geotiff"]
 ## GeoTIFF, EPT and GeoParquet Zstandard with the zstd C library (`terrio/libzstd`).
 libzstd = ["terrio/libzstd", "libzstd-geotiff"]
-default = ["hecras", "libzstd-geotiff"]
+## Remote inputs (`terrio/remote`), in the native wheels by default; HTTPS is `rustls` with `ring`
+## (CLB fork). The Pyodide wheel builds no HTTP client whatever the features.
+remote = ["terrio/remote", "terrio-cli/remote"]
+default = ["hecras", "libzstd-geotiff", "remote"]
 
 [dependencies]
 terrio.workspace = true

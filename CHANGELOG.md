@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- HTTPS uses `rustls` with `ring` in every native build (CLB fork), as `terrio-clb` does. The
+  default library, the `terrio` command, the native Python wheels and the Docker image used
+  `rustls-graviola` on x86-64 and AArch64, which panicked on the first HTTPS request on an x86-64
+  CPU without AVX2, ADX or BMI2 (or an AArch64 one without `aes`, `sha2`, `pmull` or `neon`);
+  `ring` detects the CPU's features at run time. `remote` is no longer part of `drivers`: it stays
+  a default feature of terrio, and is a new default feature of terrio-cli and the Python package,
+  so `--no-default-features` (and `features = ["drivers"]`) still builds without a C compiler, now
+  without remote inputs. WebAssembly and the Pyodide wheel are unchanged. CI fails if a default
+  native build links graviola.
 - GeoTIFF/COG Zstandard uses the zstd C library by default again, natively (CLB fork, owner's
   decision of 2026-11-08): the new `libzstd-geotiff` feature, a default feature of terrio,
   terrio-cli and the Python package, writes ZSTD and LERC_ZSTD chunks and reads ZSTD chunks with

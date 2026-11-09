@@ -1028,18 +1028,11 @@ fn agent(options: &HttpOptions) -> ureq::Agent {
     })
 }
 
-/// HTTPS without a C compiler (`ureq` uses `ring` on the other architectures).
-#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+/// HTTPS with `rustls` and `ring`, on every architecture (CLB fork). `ring` checks the CPU's
+/// features at run time and has portable code for every operation, so no CPU makes an HTTPS
+/// request panic, as `rustls-graviola` 0.4 did on x86-64 without AVX2, ADX or BMI2.
 fn tls_config() -> ureq::tls::TlsConfig {
-    ureq::tls::TlsConfig::builder()
-        .provider(ureq::tls::TlsProvider::Rustls)
-        .unversioned_rustls_crypto_provider(Arc::new(rustls_graviola::default_provider()))
-        .build()
-}
-
-#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-fn tls_config() -> ureq::tls::TlsConfig {
-    ureq::tls::TlsConfig::default()
+    ureq::tls::TlsConfig::builder().provider(ureq::tls::TlsProvider::Rustls).build()
 }
 
 fn new_agent(options: &HttpOptions) -> ureq::Agent {

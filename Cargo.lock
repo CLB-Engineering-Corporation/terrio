@@ -934,16 +934,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "graviola"
-version = "0.4.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4ceed5ad5e9637af6fbc9de8734d9c6014ceacf3d8c5736e8eafa72d839fa0ac"
-dependencies = [
- "cfg-if",
- "getrandom 0.4.3",
-]
-
-[[package]]
 name = "half"
 version = "2.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2354,16 +2344,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rustls-graviola"
-version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bf5d0a370be690f7f1aa4e1b912fde3f5f9a5c53285062fd2d6ac1a52ab3e883"
-dependencies = [
- "graviola",
- "rustls",
-]
-
-[[package]]
 name = "rustls-pki-types"
 version = "1.15.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2746,7 +2726,6 @@ dependencies = [
  "rayon",
  "rstar 0.13.0",
  "rust-aec",
- "rustls-graviola",
  "rusty_av1d",
  "same-file",
  "serde",
