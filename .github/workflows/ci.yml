@@ -68,8 +68,8 @@ jobs:
       - uses: actions/checkout@v7
       - uses: fsfe/reuse-action@v6
 
-  # Linux only: macOS and Windows run in ci-platforms.yml, on every push to main and, for pull
-  # requests, by hand or with the label ci:macos, ci:windows or ci:all.
+  # Linux only: Windows runs in ci-platforms.yml, on every push to main and, for pull requests, by
+  # hand or with the label ci:windows or ci:all. macOS runs there only by hand or with ci:macos.
   # The npm package and the conformance report run in ci-extended.yml, on the same terms (labels
   # ci:npm, ci:conformance or ci:all).
   check:
