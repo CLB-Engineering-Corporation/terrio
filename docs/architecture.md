@@ -81,11 +81,12 @@ rest pure Rust:
   decodes to the same bytes as the zstd C library's and each reads the other's. The opt-in
   `libzstd-ept` and `libzstd-geoparquet` features (or `libzstd`, all three) use the C library
   natively for EPT and GeoParquet too.
-- HTTPS uses `rustls` with `rustls-graviola`, whose cryptography is Rust and assembly and needs no
-  C compiler. It requires `aes`, `pclmulqdq`, `ssse3`, `avx`, `avx2`, `adx`, `bmi1` and `bmi2` on
-  x86-64 (most CPUs since about 2014), and `aes`, `sha2`, `pmull` and `neon` on AArch64: without the
-  ones it checks, an HTTPS request panics, naming the missing feature. Other
-  architectures, for which no release is built, use `ring`, which needs a C compiler.
+- HTTPS uses `rustls` with `ring` on every architecture (CLB fork). `ring` is C and assembly, so
+  the `remote` feature needs a C compiler; it detects the CPU's features at run time and runs on
+  any CPU. Upstream uses `rustls-graviola` on x86-64 and AArch64, which panics on CPUs without
+  AVX2, ADX or BMI2; see `docs/CONSOLIDATION-2026-11.md`. `remote` is a default feature but not
+  part of `drivers`, so a build with `default-features = false, features = ["drivers"]` still
+  needs no C compiler, and has no remote inputs.
 - GeoParquet is written with Snappy or Zstandard. The `parquet` crate's Zstandard is the C
   library, so terrio has the crate write ZSTD pages uncompressed and compresses each page itself
   (`drivers/vector/geoparquet_zstd.rs`): the pages, encodings, dictionaries, statistics and page

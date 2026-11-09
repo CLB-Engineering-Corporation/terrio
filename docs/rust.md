@@ -713,7 +713,7 @@ the operations and the streams. The other drivers are features:
 |---|---|---|
 | `geotiff` | on | GeoTIFF and COG: always built, the feature exists so that `features = ["geotiff"]` says what a build needs. |
 | `parquet` | on | GeoParquet, the `arrow` module and Arrow streams of vector layers (arrow, parquet). |
-| `remote` | on | URLs, `s3://`, `gs://` and `az://` objects, range reads of remote COGs, COPC, PMTiles and Zarr, and datum grids from the PROJ CDN (native builds only). |
+| `remote` | on | URLs, `s3://`, `gs://` and `az://` objects, range reads of remote COGs, COPC, PMTiles and Zarr, and datum grids from the PROJ CDN (native builds only). HTTPS is `rustls` with `ring`, which needs a C compiler (CLB fork). Not part of `drivers`. |
 | `netcdf-hdf5` | on | NetCDF, HDF5 and HDF-EOS reading, netCDF writing. |
 | `sqlite` | on | GeoPackage (vector and raster tiles) and SQLite/SpatiaLite. |
 | `tiles` | on | MBTiles, PMTiles and MVT, raster and vector (the `tiles` module's archives; needs `sqlite`). |
@@ -731,7 +731,7 @@ the operations and the streams. The other drivers are features:
 | `gdal` | off | The optional GDAL backend: formats terrio has no driver for, through GDAL (needs GDAL installed). See [the GDAL backend](gdal.md#the-optional-gdal-backend). |
 | `ndarray` | off | Raster pixels as `ndarray` arrays, without copying them: views, owned transfers and the masks of lazy reads, with the crate re-exported as `terrio::ndarray`; floating-point windows as owned arrays, bands first or last. See [ndarray](#ndarray). |
 | `cad` | on | DWG and DXF, read and written, through acadrust. See [CAD drawings](formats.md#cad-drawings-dwg-and-dxf). |
-| `drivers` | on | Every driver above that is on by default: the default features but `libzstd-geotiff`. `default-features = false, features = ["drivers"]` builds them all without a C compiler. |
+| `drivers` | on | Every driver above that is on by default: the default features but `remote` and `libzstd-geotiff`. `default-features = false, features = ["drivers"]` builds them all without a C compiler. |
 | `libzstd-geotiff` | on (CLB fork) | GeoTIFF/COG Zstandard (ZSTD and LERC_ZSTD chunks written, ZSTD chunks read) through the zstd C library, natively: the C library's bytes at every level, 1.1 to 1.5 times faster to write and faster to decode (a whole COG read in 0.75 of the time) than the pure-Rust `ruzstd` (the `zstd-rust` crate). Without it, and always in WebAssembly, GeoTIFF Zstandard is `ruzstd`, to the same decoded pixels. Needs a C compiler. |
 | `libzstd-ept` | off | EPT tiles' Zstandard through the zstd C library, natively. |
 | `libzstd-geoparquet` | off | The Zstandard of the GeoParquet pages terrio compresses and decompresses itself through the zstd C library, natively: then the same bytes as `parquet-zstd`'s. |
