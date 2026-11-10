@@ -121,6 +121,29 @@ test("Zstandard GeoTIFFs with predictors, decoded without the C library", () => 
   }
 });
 
+// A debug build of the module (TERRIO_JS_DEBUG=1) writes level 1 whatever is asked for: the
+// Zstandard encoder's index arithmetic wraps on wasm32, which the overflow checks of a debug build
+// refuse.
+test("Zstandard GeoTIFFs and COGs are written at the LEVEL asked for", { skip: process.env.TERRIO_JS_DEBUG === "1" && "a debug build" }, () => {
+  // A terrain with a little noise: a higher level finds more to share.
+  let state = 12345;
+  const terrain = new Float32Array(512 * 512).map((_, i) => {
+    state = (state * 1103515245 + 12345) >>> 0;
+    const [x, y] = [i % 512, Math.floor(i / 512)];
+    return 1200 + 400 * Math.sin(x / 97) * Math.cos(y / 61) + 90 * Math.sin((x + 2 * y) / 23) + (state >>> 24) / 64;
+  });
+  const ds = terrio.rasterFromArray(terrain, 512, 512, [0, 1, 0, 512, 0, -1], "EPSG:32611");
+  for (const base of [{ compress: "ZSTD", tileSize: 256, creationOptions: { PREDICTOR: "3" } }, { format: "COG", compress: "ZSTD" }]) {
+    const sizes = [1, 9, 19, 22].map((level) => {
+      const bytes = ds.toBytes("z.tif", { ...base, creationOptions: { ...base.creationOptions, LEVEL: String(level) } });
+      assert.deepEqual([...terrio.open(bytes, "z.tif").readBand(1)], [...terrain], `level ${level}`);
+      return bytes.length;
+    });
+    // Without the zstd C library every level was written as about level 1.
+    assert.ok(sizes[1] < sizes[0] && sizes[2] < sizes[1] && sizes[3] <= sizes[2], `${JSON.stringify(base)}: ${sizes}`);
+  }
+});
+
 test("JPEG 2000 to bytes and back", { skip: needs("jp2") }, () => {
   // Int16 with a nodata value: the JP2 file and its .aux.xml sidecar, zipped, as GDAL keeps it.
   const dem = new Int16Array(40 * 30).map((_, i) => ((i * 37) % 3000) - 1500);
