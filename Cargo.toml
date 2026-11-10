@@ -74,9 +74,9 @@ lz4_flex = { version = "0.14", default-features = false, features = ["alloc", "s
 # Pure-Rust Zstandard: `zstd-rust`, CLB's fork of `ruzstd` with the Default, Better and Best
 # levels, a decoder of whole frames and a row match finder (within 1.0 to 1.25 times the C
 # library's time to decode, 1.2 to 1.7 times to compress), under the `ruzstd` name so the code
-# keeps its `ruzstd::` paths. From git (gpt-cmdr/zstd-rs, `perf/decode-and-match-speed`); it is
+# keeps its `ruzstd::` paths. From git (gpt-cmdr/zstd-rs `main`); it is
 # not on crates.io.
-ruzstd = { package = "zstd-rust", git = "https://github.com/gpt-cmdr/zstd-rs", rev = "ab47de3e6311ddb87c4ad7bc75f52aab32227ecf" }
+ruzstd = { package = "zstd-rust", git = "https://github.com/gpt-cmdr/zstd-rs", rev = "55cf37ea6ea9e4b1a7a2a560ac7161df6067cc0e" }
 # 0.10 reads HDF5 files written in the earliest format with version 1/2 compound datatypes
 # (every HEC-RAS geometry and plan file, among others) and old fill value messages
 # (roteiro-gis/netcdf-rust#95). The HEC-RAS engine uses the same hdf5-reader 0.10.1, so a build

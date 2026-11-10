@@ -14,7 +14,7 @@
   builds link no C but `ring` and still tests the C library path.
 - Pure-Rust Zstandard (Zarr, EPT, GeoParquet pages, the WebAssembly builds, and GeoTIFF/COG without
   `libzstd-geotiff`) reads at the speed of the zstd C library and writes much closer to it.
-  `zstd-rust` (gpt-cmdr/zstd-rs at `ab47de3`) decodes whole frames straight into their output and
+  `zstd-rust` (gpt-cmdr/zstd-rs at `55cf37e`) decodes whole frames straight into their output and
   matches with the row match finder of the reference implementation, and terrio keeps a
   compressor and a decoder per thread instead of allocating their tables for every chunk. A stream
   whose frames all record their size is decoded at once into a vector of that size (others still
