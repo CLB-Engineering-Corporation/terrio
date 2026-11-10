@@ -31,14 +31,43 @@ mod libzstd {
 
     /// Decompresses every frame of `data`, to at most `limit` bytes (more is an error, rather
     /// than an allocation of whatever a small stream expands to).
+    ///
+    /// A stream whose frames all record their size (as the C library's and `mzstd`'s do) is
+    /// decompressed in one call into a vector of that size; a frame decompressing past its recorded
+    /// size is an error. Others are decompressed as a stream.
     #[cfg_attr(not(feature = "pointcloud"), allow(dead_code))]
     pub(crate) fn decompress(data: &[u8], limit: usize) -> Result<Vec<u8>> {
+        match recorded_size(data) {
+            Some(size) if size > limit as u64 => return Err(too_long(limit)),
+            Some(size) => return zstd::bulk::decompress(data, size as usize),
+            None => {}
+        }
         let mut out = Vec::new();
         zstd::stream::read::Decoder::with_buffer(data)?.take((limit as u64).saturating_add(1)).read_to_end(&mut out)?;
         if out.len() > limit {
             return Err(too_long(limit));
         }
         Ok(out)
+    }
+
+    /// The bytes `data` decompresses to as its frames record them (a skippable frame's are none),
+    /// or `None` when a frame does not record them, or is truncated or not a frame.
+    fn recorded_size(mut data: &[u8]) -> Option<u64> {
+        use zstd::zstd_safe::{find_frame_compressed_size, get_frame_content_size};
+        if data.is_empty() {
+            return None;
+        }
+        let mut total = 0u64;
+        while !data.is_empty() {
+            let size = get_frame_content_size(data).ok()??;
+            let len = find_frame_compressed_size(data).ok()?;
+            if len == 0 || len > data.len() {
+                return None;
+            }
+            total = total.checked_add(size)?;
+            data = &data[len..];
+        }
+        Some(total)
     }
 }
 
@@ -153,6 +182,25 @@ mod tests {
             assert!(e.to_string().contains("more than 1048576 bytes"), "{e}");
         }
         assert_eq!(decompress(&bomb, 64 << 20).unwrap().len(), 64 << 20);
+    }
+
+    /// Frames that do not record their size (a stream encoder's) are read as a stream, a frame
+    /// recording its size in one call, the two concatenated too, each within the limit.
+    #[cfg(all(feature = "libzstd", not(target_family = "wasm")))]
+    #[test]
+    fn frames_with_and_without_their_size_are_read() {
+        let (a, b) = (data(150_000, 11), data(40_000, 5));
+        let unsized_frame = zstd::stream::encode_all(&a[..], 3).unwrap();
+        assert_eq!(zstd::zstd_safe::get_frame_content_size(&unsized_frame).unwrap(), None);
+        let sized = libzstd::compress(&b, 3).unwrap();
+        assert_eq!(zstd::zstd_safe::get_frame_content_size(&sized).unwrap(), Some(b.len() as u64));
+        assert_eq!(libzstd::decompress(&unsized_frame, a.len()).unwrap(), a);
+        assert_eq!(libzstd::decompress(&sized, b.len()).unwrap(), b);
+        let both = [a.clone(), b.clone()].concat();
+        assert_eq!(libzstd::decompress(&[unsized_frame.clone(), sized.clone()].concat(), both.len()).unwrap(), both);
+        for e in [libzstd::decompress(&unsized_frame, a.len() - 1).unwrap_err(), libzstd::decompress(&sized, b.len() - 1).unwrap_err()] {
+            assert!(e.to_string().contains("more than"), "{e}");
+        }
     }
 
     /// Each implementation reads what the other writes, frames concatenated across them too.
