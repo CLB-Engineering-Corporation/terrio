@@ -648,6 +648,10 @@ fn read_at_most(r: impl Read, most: usize, what: &str) -> Result<Vec<u8>> {
 /// Decompresses every frame of `b`, to at most `most` bytes: more is an error rather than an
 /// allocation of whatever a small chunk expands to.
 fn zstd_decode(b: &[u8], most: usize) -> Result<Vec<u8>> {
+    // Frames that record their size, of no more than `most` bytes in all, are decoded at once.
+    if let Some(out) = crate::zstandard::pure::whole(b, most).map_err(|e| bad(e.to_string().replacen("Zstandard", "zstd", 1)))? {
+        return Ok(out);
+    }
     let mut out = codec_output(most)?;
     let mut src = b;
     while !src.is_empty() && out.len() <= most {

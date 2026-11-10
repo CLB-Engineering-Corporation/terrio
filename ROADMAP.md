@@ -719,8 +719,12 @@ opt-in) is kept on the branch
 - [ ] `zstd-rust` writes GeoTIFF/COG chunks at the speed of the zstd C library at the same level.
       Measured for #35 (Windows x86-64, release, Bald Eagle Depth (Max) and Terrain50 1x float32
       COGs, `PREDICTOR=3`): 1.16x to 1.51x the C library's write time at levels 1, 3 and 9, to
-      within -11% to +0.3% of its size.
-- [ ] `zstd-rust` decodes ZSTD chunks at the C library's speed (about 2x slower for the decoder; a whole COG read takes 1.3x as long, fork PR #36).
+      within -11% to +0.3% of its size. With the row match finder (same machine; USGS, SRTM and
+      Landsat rasters of 340 to 480 MB, docs/testing.md): 1.16x to 1.47x on one thread and 0.77x to
+      1.24x on eight, to within 0.4% of its size. The compressor alone takes 1.2x to 1.7x as long.
+- [x] `zstd-rust` decodes ZSTD chunks at the C library's speed. The decoder alone takes 0.99x to
+      1.25x as long (it took about 2x to 5x); a whole read takes 0.98x to 1.07x as long on one
+      thread (it took 1.3x, fork PR #36).
 - [ ] `zstd-rust` is on crates.io (it is a git dependency, gpt-cmdr/zstd-rs, which `cargo publish`
       refuses and upstream cannot take), or the encoder is contributed to `ruzstd` itself.
 - [ ] Then the branch is rebased on the fork's `main`, `libzstd-geotiff` leaves the defaults, and

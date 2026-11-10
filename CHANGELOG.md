@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- Pure-Rust Zstandard (Zarr, EPT, GeoParquet pages, the WebAssembly builds, and GeoTIFF/COG without
+  `libzstd-geotiff`) reads at the speed of the zstd C library and writes much closer to it.
+  `zstd-rust` (gpt-cmdr/zstd-rs at `ab47de3`) decodes whole frames straight into their output and
+  matches with the row match finder of the reference implementation, and terrio keeps a
+  compressor and a decoder per thread instead of allocating their tables for every chunk. A stream
+  whose frames all record their size is decoded at once into a vector of that size (others still
+  through a stream decoder, with the same limits and bounds), and terrio's frames now record
+  theirs, as the C library's do, and carry no checksum. Measured on rasters of 340 to 480 MB
+  (docs/testing.md): a whole ZSTD GeoTIFF read takes 0.98 to 1.07 times as long as with the C
+  library on one thread, a whole write 1.16 to 1.47 times (0.77 to 1.24 times on eight threads),
+  to within 0.4% of the size at levels 1 to 9. `LEVEL` 6 to 9 (`Better`) now searches as level 9
+  of the C library does, and `LEVEL` 1 and 2 (`Fastest`) match as its level 1: their files are
+  within 1% of the C library's (level 1's were up to 3% smaller, and slower to write). Content
+  that does not have the checksum its frame ends with is now an error in these paths, as it is
+  with the C library. The default features are unchanged.
 - Zstandard with the zstd C library (`libzstd-geotiff`, a default feature, and the opt-in
   `libzstd-ept` and `libzstd-geoparquet`): a stream whose frames all record their size, as the C
   library's do, is decompressed in one call into a vector of that size, rather than through a

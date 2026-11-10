@@ -1478,6 +1478,67 @@ Local, in-memory and decompressed ZIP member regressions check exact-limit
 success, oversized rejection and transport-error preservation. Malformed
 text/XML channels outside 0–255 are rejected rather than wrapped.
 
+## Zstandard: pure Rust against the C library
+
+terrio's pure-Rust Zstandard is `zstd-rust` (`ruzstd` in the code), and GeoTIFF/COG chunks use the
+zstd C library instead with the `libzstd-geotiff` feature. The unit tests of `zstandard.rs` check
+that each reads what the other writes, that a stream whose frames record their size decodes at
+once to the bytes a stream decoder gives, and that limits and bounds hold either way:
+
+```sh
+cargo test -p terrio --lib zstandard
+cargo test -p terrio --no-default-features --features drivers,remote --lib zstandard
+```
+
+Speed is compared with two release builds of the command, on the same files:
+
+```sh
+cargo build --release -p terrio-cli                                        # C library
+cargo build --release -p terrio-cli --no-default-features --features remote  # zstd-rust
+terrio convert raw.tif out.tif --co COMPRESS=ZSTD --co LEVEL=9 --co PREDICTOR=3 \
+  --co TILED=YES --co BLOCKXSIZE=512 --co BLOCKYSIZE=512 --co BIGTIFF=YES
+terrio convert out.tif plain.tif --co COMPRESS=NONE --co BIGTIFF=YES         # the read
+```
+
+Measured on Windows x86-64 (Core i7-11700K, 8 cores), best of three runs, on uncompressed tiled
+GeoTIFFs of 340 to 480 MB: the USGS 1 arc-second elevation tile n40w106 (Float32, repeated 3 x 3),
+SRTM 90 m (Int16, repeated 4 x 4) and a Landsat scene (4 x UInt8, repeated 6 x 6), each chunk
+(512 x 512 pixels, 0.5 to 1 MiB) its own frame. Times are those of the whole command, so they hold
+the reading, the predictor and the writing too: copying the same rasters uncompressed takes 0.6 to
+1.0 s. "x" is the time of the pure-Rust build over that of the C build.
+
+| Raster, predictor | Level | Write, 1 thread: C, Rust | x | Write, 8 threads: C, Rust | x | Size, Rust / C | Read, 1 thread: C, Rust | x |
+|---|---|---|---|---|---|---|---|---|
+| USGS Float32, 3 | 1 | 2.06 s, 2.47 s | 1.20 | 0.78 s, 0.83 s | 1.06 | 0.998 | 2.76 s, 2.83 s | 1.03 |
+| | 3 | 2.71 s, 3.55 s | 1.31 | 0.88 s, 1.09 s | 1.24 | 1.000 | 2.85 s, 2.78 s | 0.98 |
+| | 9 | 8.58 s, 9.93 s | 1.16 | 2.85 s, 2.20 s | 0.77 | 0.996 | 2.72 s, 2.76 s | 1.02 |
+| USGS Float32, none | 1 | 1.31 s, 1.64 s | 1.25 | 0.67 s, 0.80 s | 1.19 | 1.001 | 1.45 s, 1.48 s | 1.02 |
+| | 3 | 1.84 s, 2.20 s | 1.20 | 0.80 s, 0.90 s | 1.12 | 1.001 | 1.48 s, 1.51 s | 1.02 |
+| | 9 | 5.43 s, 8.00 s | 1.47 | 2.38 s, 2.48 s | 1.04 | 0.997 | 1.48 s, 1.52 s | 1.03 |
+| SRTM Int16, 2 | 1 | 1.69 s, 2.04 s | 1.21 | 0.57 s, 0.63 s | 1.10 | 1.003 | 1.03 s, 1.10 s | 1.07 |
+| | 3 | 2.51 s, 3.05 s | 1.21 | 0.75 s, 0.79 s | 1.05 | 1.001 | 1.16 s, 1.23 s | 1.06 |
+| | 9 | 8.56 s, 11.47 s | 1.34 | 2.15 s, 2.23 s | 1.04 | 1.001 | 1.12 s, 1.19 s | 1.06 |
+| Landsat UInt8, 2 | 1 | 2.73 s, 3.41 s | 1.25 | 0.96 s, 1.00 s | 1.05 | 1.004 | 1.96 s, 1.98 s | 1.01 |
+| | 3 | 4.61 s, 5.71 s | 1.24 | 1.32 s, 1.48 s | 1.12 | 1.002 | 2.23 s, 2.36 s | 1.06 |
+| | 9 | 14.13 s, 18.20 s | 1.29 | 4.59 s, 3.91 s | 0.85 | 1.003 | 2.16 s, 2.27 s | 1.05 |
+
+The reads are of the files the C build wrote; the pure-Rust build reads its own in the same time
+(within 6%). On eight threads a read takes 0.80 to 1.16 times as long, within the run-to-run
+variation of this machine. On eight threads the pure-Rust build writes level 9 as fast as the C build or faster, although
+its compressor alone is slower. The likely reason: the C build sets up the tables of the C library
+for every chunk, and the pure-Rust build keeps a compressor per thread.
+
+The 24 files of the table decode to the pixels of their sources bit for bit when GDAL 3.10.1 reads
+them (through rasterio), those of the pure-Rust build included, as do `LEVEL=15` and `LEVEL=19`
+files of the pure-Rust build; and the pure-Rust build reads the files of the C build to the same
+pixels.
+
+The codecs alone, a frame per 1 MiB chunk of the same rasters on one thread (`zstd-rust`'s
+`cargo run --release --example rasterbench`, best of seven): `zstd-rust` takes 0.99 to 1.25
+times as long as the C library to decode, 1.3 to 1.5 times at level 1, 1.25 to 1.5 times at level
+3 and 1.2 to 1.7 times at level 9 to compress, to within 1% of its size. Levels 10 and up map to
+`Best`, which is 3.5 to 5 times faster than level 19 of the C library and 1% to 8% larger.
+
 ## COG validation
 
 The registered `cog-validate` suite compares GDAL 3.13.3's unified COG validator

@@ -815,10 +815,8 @@ impl ChunkCodec {
         let blob = match self.lerc_wrapper {
             0 => raw,
             1 => inflate(&mut flate2::read::ZlibDecoder::new(&raw[..]))?,
-            2 => {
-                let mut src = &raw[..];
-                inflate(&mut ruzstd::decoding::StreamingDecoder::new(&mut src).map_err(|e| invalid(format!("Zstandard: {e}")))?)?
-            }
+            // Bounded as `inflate` bounds a stream, which then only checks the length.
+            2 => inflate(&mut &crate::zstandard::pure::frames(&raw, cap.min(self.limit).saturating_add(1))?[..])?,
             other => return Err(invalid(format!("unknown LERC compression wrapper {other}"))),
         };
         self.lerc_headers(&blob, w, h)?;

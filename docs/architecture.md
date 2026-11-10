@@ -68,14 +68,17 @@ Every driver builds without C dependencies, and CI builds them without a C compi
 WebAssembly builds always, and natively with `default-features = false, features = ["drivers"]`
 (`terrio-cli --no-default-features`). One exception is on by default in the CLB fork: GeoTIFF/COG
 Zstandard uses the zstd C library natively (`libzstd-geotiff`, a default feature of terrio,
-terrio-cli and the Python package), because the pure-Rust path is not yet as fast (1.1 to 1.5 times
-slower to write; a whole ZSTD COG read takes 1.3 times as long). The pure-Rust GeoTIFF default is kept on the branch
-`feat/pure-zstd-geotiff-default` until it reaches parity (see the ROADMAP). Three choices keep the
+terrio-cli and the Python package), because the pure-Rust path was not as fast when that was
+decided. It now reads ZSTD GeoTIFFs as fast and takes 1.2 to 1.5 times as long to write them on one
+thread, 0.8 to 1.25 times on eight (docs/testing.md, "Zstandard: pure Rust against the C library").
+The pure-Rust GeoTIFF default is kept on the branch
+`feat/pure-zstd-geotiff-default` (see the ROADMAP). Three choices keep the
 rest pure Rust:
 
 - Zstandard is decoded and written with `ruzstd` but for that exception: Zarr, EPT and GeoParquet's
   pages, and GeoTIFF/COG in WebAssembly and in builds without `libzstd-geotiff`. terrio uses
-  `zstd-rust`, CLB's fork of `ruzstd` with the `Default`, `Better` and `Best` levels, from git
+  `zstd-rust`, CLB's fork of `ruzstd` with the `Default`, `Better` and `Best` levels, a decoder of
+  whole frames and the row match finder of the reference implementation, from git
   (gpt-cmdr/zstd-rs; not on crates.io) under the `ruzstd` name. zstd's levels map to its four:
   2 and below `Fastest`, 0 and 3 to 5 `Default`, 6 to 9 `Better`, 10 and up `Best`. Its output
   decodes to the same bytes as the zstd C library's and each reads the other's. The opt-in
