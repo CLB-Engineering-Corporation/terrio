@@ -1032,3 +1032,86 @@ and `USGS_1_n40w106.tif` each used one GET and 65,536 served body bytes, matchin
 ordinary lazy info opens. Raster index construction never called the pixel source in
 its panic-on-read unit fixture. These observations apply to lazy-capable readers;
 formats whose reader lacks a metadata-only path may materialize the input.
+
+## Zstandard without the zstd C library
+
+Without the `libzstd` feature, and in WebAssembly, Zstandard is compressed with `mzstd` (a
+safe-Rust port of zstd 1.5.7's encoder) at the level asked for, and decompressed with `ruzstd`.
+A debug build for a 32-bit target (a development WebAssembly build) is the exception: it writes
+`ruzstd`'s fastest level, as `mzstd` 0.2.12 adds to indexes that wrap past 32 bits, which that
+build's overflow checks refuse (`TERRIO_JS_DEBUG=1` skips the level test of
+`js/tests/node.test.mjs` on such a module). The two back ends are compared in a default build,
+which has both:
+
+```sh
+# Frames of levels 1 to 22 (and levels outside them) of empty, tiny, incompressible, repetitive
+# and raster-tile inputs decode with ruzstd and with the C library; their sizes against libzstd's.
+cargo test -p terrio --lib zstandard -- --nocapture
+# ZSTD and LERC_ZSTD GeoTIFFs and COGs at levels 1, 3, 9, 19 and 22, and Zstandard chunks of
+# 1 to 7-bit, Float16 and WhiteIsZero samples, in each build.
+cargo test -p terrio --test zstd_levels
+cargo test -p terrio --test zstd_levels --no-default-features --features geotiff,lerc
+# Zstandard TIFF chunks decoded for the tiff crate, with the C library and without.
+cargo test -p terrio-crs --lib tiff_zstd
+cargo test -p terrio-crs --lib tiff_zstd --no-default-features
+```
+
+With `TERRIO_ZSTD_EXCHANGE` set to a directory, `zstd_levels` also leaves its 40 files there and
+reads the files the other build left: run the default build, the build without `libzstd`, then the
+default build again. Each build read the other's 40 files, sample for sample (within
+`MAX_Z_ERROR` for the lossy LERC case), and the two builds' files were byte-identical.
+
+The unit tests require a frame within 1% (and 16 bytes) of libzstd's at every level; with the
+zstd 1.5.7 the `zstd` crate bundles, all 286 frames of the synthetic inputs (13 inputs, levels 1 to
+22) were the same bytes. Another version of the C library may choose other matches, so identical
+bytes are not asserted.
+
+The comparison on real rasters is an ignored test, to run optimized:
+
+```sh
+TERRIO_TEST_DATA=../terrio-data cargo test --release -p terrio --lib zstandard -- --ignored --nocapture
+```
+
+It compresses 512 x 512 chunks spread over `usgs_dem.tif` (Float32), `srtm90.tif` (Int16) and
+`landsat.tif` (four 8-bit bands, pixel-interleaved), as they are and with the predictor a GeoTIFF
+writer applies, one thread, the faster of three alternating runs. Measured on Windows x86-64
+(rustc 1.99.1, zstd 1.5.7) while other builds were running on the machine, so the speeds are
+indicative (the ratios less so than the sizes, which are exact):
+
+| Chunks | Level | libzstd bytes | `mzstd` bytes | Identical frames | libzstd MB/s | `mzstd` MB/s | Speed ratio |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| USGS Float32, 7 x 1.05 MB | 1 | 5913855 | 5913855 | 7 of 7 | 738.9 | 842.8 | 1.14 |
+| | 3 | 5905654 | 5905654 | 7 of 7 | 405.5 | 404.7 | 1.00 |
+| | 9 | 5884187 | 5884187 | 7 of 7 | 103.0 | 96.9 | 0.94 |
+| | 19 | 5684588 | 5684588 | 7 of 7 | 6.3 | 11.1 | 1.76 |
+| | 22 | 5684588 | 5684588 | 7 of 7 | 6.4 | 11.3 | 1.77 |
+| USGS Float32, predictor 3 | 1 | 4021960 | 4021960 | 7 of 7 | 541.4 | 576.8 | 1.07 |
+| | 3 | 3986832 | 3986832 | 7 of 7 | 308.7 | 310.3 | 1.01 |
+| | 9 | 3926908 | 3926908 | 7 of 7 | 67.8 | 62.3 | 0.92 |
+| | 19 | 3815476 | 3815476 | 7 of 7 | 6.4 | 7.8 | 1.22 |
+| | 22 | 3811533 | 3811533 | 7 of 7 | 5.2 | 6.6 | 1.28 |
+| SRTM Int16, 8 x 0.52 MB | 1 | 2537843 | 2537843 | 8 of 8 | 366.8 | 428.2 | 1.17 |
+| | 3 | 2181605 | 2181605 | 8 of 8 | 157.6 | 165.9 | 1.05 |
+| | 9 | 2077682 | 2077682 | 8 of 8 | 50.6 | 50.3 | 1.00 |
+| | 19 | 1959494 | 1959494 | 8 of 8 | 5.0 | 7.1 | 1.40 |
+| | 22 | 1959361 | 1959361 | 8 of 8 | 5.0 | 6.9 | 1.39 |
+| SRTM Int16, predictor 2 | 1 | 1736985 | 1736985 | 8 of 8 | 311.1 | 345.0 | 1.11 |
+| | 3 | 1605720 | 1605720 | 8 of 8 | 171.8 | 193.4 | 1.13 |
+| | 9 | 1546374 | 1546374 | 8 of 8 | 42.0 | 43.3 | 1.03 |
+| | 19 | 1465693 | 1465693 | 8 of 8 | 3.5 | 3.9 | 1.11 |
+| | 22 | 1465622 | 1465622 | 8 of 8 | 3.5 | 4.1 | 1.16 |
+| Landsat 4 x UInt8, 6 x 1.05 MB | 1 | 4337063 | 4337063 | 6 of 6 | 373.2 | 436.4 | 1.17 |
+| | 3 | 3843338 | 3843338 | 6 of 6 | 145.0 | 148.7 | 1.03 |
+| | 9 | 3542477 | 3542477 | 6 of 6 | 41.9 | 39.9 | 0.95 |
+| | 19 | 3282188 | 3282188 | 6 of 6 | 3.8 | 4.9 | 1.28 |
+| | 22 | 3282145 | 3282145 | 6 of 6 | 3.6 | 5.3 | 1.47 |
+| Landsat 4 x UInt8, predictor 2 | 1 | 3280558 | 3280558 | 6 of 6 | 331.1 | 382.4 | 1.15 |
+| | 3 | 3274455 | 3274455 | 6 of 6 | 142.1 | 148.3 | 1.04 |
+| | 9 | 3102310 | 3102310 | 6 of 6 | 36.7 | 34.2 | 0.93 |
+| | 19 | 3000874 | 3000874 | 6 of 6 | 2.8 | 3.0 | 1.10 |
+| | 22 | 3000322 | 3000322 | 6 of 6 | 2.6 | 3.0 | 1.14 |
+
+Every frame was the size of libzstd's, and the same bytes; compression ran at 0.92 to 1.77 times
+its speed. Decompressing the level 9 frames, `ruzstd` ran at 0.32 to 0.37 times the C library's
+speed (160 to 306 MB/s against 470 to 828 MB/s): reading Zstandard is what the `libzstd` feature
+still buys, and why it stays in the default features.
