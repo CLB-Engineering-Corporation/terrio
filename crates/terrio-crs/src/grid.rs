@@ -222,7 +222,7 @@ impl TiffImage {
                 *current = self.ifd;
             }
             let (w, _) = dec.chunk_data_dimensions(id);
-            let values = match dec.read_chunk(id).ok()? {
+            let values = match crate::tiff_zstd::read_chunk(dec, id, usize::MAX).ok()? {
                 tiff::decoder::DecodingResult::F32(v) => v.into_iter().map(f64::from).collect(),
                 tiff::decoder::DecodingResult::F64(v) => v,
                 tiff::decoder::DecodingResult::I16(v) => v.into_iter().map(f64::from).collect(),

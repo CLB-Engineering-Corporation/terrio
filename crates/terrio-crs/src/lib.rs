@@ -59,6 +59,9 @@ mod projjson;
 mod projjson_write;
 mod rotation;
 mod route;
+/// Zstandard TIFF chunks decoded without the zstd C library (shared with terrio's GeoTIFF reader).
+#[doc(hidden)]
+pub mod tiff_zstd;
 mod wkt1;
 mod wkt1_write;
 mod wkt2;

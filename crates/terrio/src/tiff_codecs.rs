@@ -1,6 +1,7 @@
 //! TIFF compressions the `tiff` crate does not decode, read as GDAL (libtiff) reads them: LERC
 //! (alone, or wrapped in Deflate or Zstandard), JPEG XL and LZMA, and Zstandard without the
-//! `libzstd` feature (the crate's Zstandard, a C library) and in WebAssembly. And JPEG, decoded as
+//! `libzstd` feature (the crate's Zstandard, a C library) and in WebAssembly: decompressed in pure
+//! Rust, whatever the samples. And JPEG, decoded as
 //! libjpeg decodes it for GDAL ([`crate::jpeg`]), YCbCr converted to RGB. And unsigned samples
 //! packed in 9 to 31 bits (GDAL's `NBITS`, as written for Sentinel-2's 15-bit bands), in any of the
 //! lossless compressions, read as UInt16 or UInt32 as GDAL reads them. And pixel-interleaved RGB or
@@ -30,6 +31,10 @@ enum Codec {
     Lzma,
     /// Zstandard, with `ruzstd`: the `tiff` crate decodes it with the `libzstd` feature, natively.
     Zstd,
+    /// Zstandard, of samples the `tiff` crate unpacks, converts or inverts (bit depths under 8,
+    /// Float16, WhiteIsZero): decompressed with `ruzstd`, then decoded by the crate as an
+    /// uncompressed chunk ([`terrio_crs::tiff_zstd`]).
+    ZstdSamples,
     /// LZW of 8 to 64-bit samples, decoded whole: the `tiff` crate's reader fails on some chunks
     /// it reads row by row (edge tiles narrower than the tile).
     Lzw,
@@ -127,7 +132,7 @@ fn decompress(compression: u16, raw: Vec<u8>, limit: usize) -> TiffResult<Vec<u8
         LZMA => bounded(&mut lzma_rust2::XzReader::new(&raw[..], true), &mut out).map_err(|e| invalid(format!("LZMA: {e}")))?,
         #[cfg(not(feature = "lzma"))]
         LZMA => return Err(disabled("lzma")),
-        ZSTD => out = crate::zstandard::pure::frames(&raw, limit)?,
+        ZSTD => out = terrio_crs::tiff_zstd::frames(&raw, limit)?,
         32773 => {
             // PackBits: a count byte n, then n + 1 literal bytes (n >= 0) or one byte repeated
             // 1 - n times (n < 0, -128 skipped).
@@ -185,7 +190,7 @@ fn invalid(msg: impl Into<String>) -> TiffError {
 }
 
 /// The error of a compression this build leaves out: terrio was built without `feature`.
-#[cfg(not(all(feature = "lerc", feature = "lzma", any(target_family = "wasm", feature = "libzstd"))))]
+#[cfg(not(all(feature = "lerc", feature = "lzma")))]
 fn disabled(feature: &str) -> TiffError {
     TiffError::IoError(std::io::Error::new(std::io::ErrorKind::Unsupported, format!("built without the `{feature}` feature")))
 }
@@ -240,7 +245,7 @@ impl ChunkCodec {
             LERC => Codec::Lerc,
             JXL | JXL_DNG => Codec::Jxl,
             LZMA => Codec::Lzma,
-            ZSTD if cfg!(any(target_family = "wasm", not(feature = "libzstd"))) => Codec::Zstd,
+            ZSTD if !terrio_crs::tiff_zstd::crate_decodes_zstd() => Codec::Zstd,
             5 => Codec::Lzw,
             7 => Codec::Jpeg,
             50001 => Codec::WebP,
@@ -262,16 +267,20 @@ impl ChunkCodec {
             return Ok(None);
         }
         // LZW and Zstandard: other sample types, and WhiteIsZero images (which the crate
-        // inverts), are left to the `tiff` crate.
-        if matches!(codec, Codec::Lzw | Codec::Zstd | Codec::Chunky(_)) && (Sample::new(format, bits).is_none() || photometric == Some(0)) {
-            // Natively, the crate decodes Zstandard with the `libzstd` feature only.
-            #[cfg(not(any(target_family = "wasm", feature = "libzstd")))]
-            if codec == Codec::Zstd {
-                return Err(disabled("libzstd"));
+        // inverts), are left to the `tiff` crate, which decodes Zstandard chunks decompressed
+        // for it.
+        let codec = match codec {
+            Codec::Lzw | Codec::Zstd | Codec::Chunky(_) if Sample::new(format, bits).is_none() || photometric == Some(0) => {
+                if codec != Codec::Zstd {
+                    return Ok(None);
+                }
+                Codec::ZstdSamples
             }
-            return Ok(None);
-        }
+            codec => codec,
+        };
         let sample = match codec {
+            // The crate's sample type: this one is unused.
+            Codec::ZstdSamples => Sample::U8,
             Codec::Packed(_) if format != 1 => {
                 return Err(invalid(format!("TIFF samples of {bits} bits (format {format}) are not supported")));
             }
@@ -325,6 +334,9 @@ impl ChunkCodec {
         let (Some(&offset), Some(&count)) = (self.offsets.get(i), self.counts.get(i)) else {
             return Err(invalid(format!("no TIFF chunk {idx}")));
         };
+        if self.codec == Codec::ZstdSamples {
+            return terrio_crs::tiff_zstd::read_zstd_chunk(dec, idx, self.limit);
+        }
         let (dw, dh) = dec.chunk_data_dimensions(idx);
         let (dw, dh) = (dw as usize, dh as usize);
         // Tiles are coded whole, strips with their own rows.
@@ -343,6 +355,7 @@ impl ChunkCodec {
         }
         let bytes = match self.codec {
             Codec::Lzma | Codec::Lzw | Codec::Zstd | Codec::Chunky(_) => self.lossless(raw, w, h)?,
+            Codec::ZstdSamples => unreachable!("decoded by the `tiff` crate above"),
             Codec::Lerc => self.lerc(raw, w, h)?,
             Codec::Jxl => self.jxl(&raw, w, h)?,
             Codec::Jpeg => self.jpeg(&raw, w, h)?,
