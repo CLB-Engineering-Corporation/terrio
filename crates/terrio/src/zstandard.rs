@@ -63,7 +63,16 @@ mod libzstd {
 
     /// Decompresses every frame of `data`, to at most `limit` bytes (more is an error, rather
     /// than an allocation of whatever a small stream expands to).
+    ///
+    /// A stream whose frames all record their size (as the C library's do) is decompressed in one
+    /// call into a vector of that size; a frame decompressing past its recorded size is an error.
+    /// Others are decompressed as a stream.
     pub(crate) fn decompress(data: &[u8], limit: usize) -> Result<Vec<u8>> {
+        match recorded_size(data) {
+            Some(size) if size > limit as u64 => return Err(too_long(limit)),
+            Some(size) => return zstd::bulk::decompress(data, size as usize),
+            None => {}
+        }
         let mut out = Vec::new();
         zstd::stream::read::Decoder::with_buffer(data)?.take((limit as u64).saturating_add(1)).read_to_end(&mut out)?;
         if out.len() > limit {
@@ -74,10 +83,36 @@ mod libzstd {
 
     /// The first `max` bytes `data` decompresses to, frame after frame, skippable frames
     /// skipped, as [`super::pure::frames`]: the rest is not decoded.
+    ///
+    /// A stream recording a size of no more than `max` is decompressed in one call, as by
+    /// [`decompress`]; others as a stream, to `max` bytes.
     pub(crate) fn frames(data: &[u8], max: usize) -> Result<Vec<u8>> {
+        if let Some(size) = recorded_size(data).filter(|&size| size <= max as u64) {
+            return zstd::bulk::decompress(data, size as usize);
+        }
         let mut out = Vec::new();
         zstd::stream::read::Decoder::with_buffer(data)?.take(max as u64).read_to_end(&mut out)?;
         Ok(out)
+    }
+
+    /// The bytes `data` decompresses to as its frames record them (a skippable frame's are none),
+    /// or `None` when a frame does not record them, or is truncated or not a frame.
+    fn recorded_size(mut data: &[u8]) -> Option<u64> {
+        use zstd::zstd_safe::{find_frame_compressed_size, get_frame_content_size};
+        if data.is_empty() {
+            return None;
+        }
+        let mut total = 0u64;
+        while !data.is_empty() {
+            let size = get_frame_content_size(data).ok()??;
+            let len = find_frame_compressed_size(data).ok()?;
+            if len == 0 || len > data.len() {
+                return None;
+            }
+            total = total.checked_add(size)?;
+            data = &data[len..];
+        }
+        Some(total)
     }
 }
 
@@ -249,6 +284,37 @@ mod tests {
             assert_eq!(out != ruzstd, c && native, "{format}");
             assert_eq!(pure::decompress(&out, a.len()).unwrap(), a, "{format}");
         }
+    }
+
+    /// Frames that do not record their size (a stream encoder's) are read as a stream, frames
+    /// recording it in one call, the two concatenated too, each within its limit or bound.
+    #[cfg(all(any(feature = "libzstd-geotiff", feature = "libzstd-ept", feature = "libzstd-geoparquet"), not(target_family = "wasm")))]
+    #[test]
+    fn frames_with_and_without_their_size_are_read() {
+        use zstd::zstd_safe::get_frame_content_size;
+        let (a, b) = (data(150_000, 11), data(70_000, 5));
+        let unsized_frame = zstd::stream::encode_all(&a[..], 3).unwrap();
+        assert_eq!(get_frame_content_size(&unsized_frame).unwrap(), None);
+        let sized = libzstd::compress(&b, 3).unwrap();
+        assert_eq!(get_frame_content_size(&sized).unwrap(), Some(b.len() as u64));
+        let both = [a.clone(), b.clone()].concat();
+        for (stream, want) in
+            [(unsized_frame.clone(), &a), (sized.clone(), &b), ([unsized_frame.clone(), skippable(5), sized.clone()].concat(), &both)]
+        {
+            assert_eq!(&libzstd::decompress(&stream, want.len()).unwrap(), want);
+            assert_eq!(&libzstd::frames(&stream, want.len()).unwrap(), want);
+            assert_eq!(&libzstd::frames(&stream, usize::MAX).unwrap(), want);
+            assert_eq!(libzstd::frames(&stream, want.len() - 1).unwrap(), want[..want.len() - 1]);
+            let e = libzstd::decompress(&stream, want.len() - 1).unwrap_err();
+            assert!(e.to_string().contains("more than"), "{e}");
+        }
+        // A frame decompressing past the size it records is an error, not a longer vector.
+        let mut lying = libzstd::compress(&b, 3).unwrap();
+        let (header, fcs) = (lying[4], 4 + 1 + usize::from(lying[4] & 0x20 == 0));
+        assert_eq!(header >> 6, 2, "a 4-byte content size field");
+        lying[fcs..fcs + 4].copy_from_slice(&(b.len() as u32 - 1).to_le_bytes());
+        assert!(libzstd::decompress(&lying, b.len()).is_err());
+        assert!(libzstd::frames(&lying, b.len()).is_err());
     }
 
     /// Each implementation reads what the other writes, frames concatenated across them too.

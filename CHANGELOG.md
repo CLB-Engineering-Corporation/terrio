@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Zstandard with the zstd C library (`libzstd-geotiff`, a default feature, and the opt-in
+  `libzstd-ept` and `libzstd-geoparquet`): a stream whose frames all record their size, as the C
+  library's do, is decompressed in one call into a vector of that size, rather than through a
+  stream decoder into a growing vector. ZSTD GeoTIFF chunks decode 1.5 to 3.3 times faster (1 MiB
+  level 9 frames of USGS, SRTM and Landsat rasters, release build). Frames that do not record their
+  size still stream, and the limits and bounds are unchanged.
 - HTTPS uses `rustls` with `ring` in every native build (CLB fork), as `terrio-clb` does. The
   default library, the `terrio` command, the native Python wheels and the Docker image used
   `rustls-graviola` on x86-64 and AArch64, which panicked on the first HTTPS request on an x86-64
