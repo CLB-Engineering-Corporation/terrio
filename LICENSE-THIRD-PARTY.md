@@ -9,8 +9,8 @@ LICENSE-THIRD-PARTY.md`, from `about.toml`.
 
 ## Overview
 
-- Apache License 2.0 (267)
-- MIT License (75)
+- Apache License 2.0 (270)
+- MIT License (77)
 - ISC License (19)
 - BSD 3-Clause "New" or "Revised" License (14)
 - BSD 2-Clause "Simplified" License (8)
@@ -6480,6 +6480,8 @@ Used by:
 - [anyhow 1.0.104](https://github.com/dtolnay/anyhow)
 - [atomig-macro 0.4.0](https://github.com/LukasKalbertodt/atomig/)
 - [fdeflate 0.3.7](https://github.com/image-rs/fdeflate)
+- [fearless_simd 1.2.0](https://github.com/linebender/fearless_simd)
+- [fearless_simd_macros 0.1.0](https://github.com/linebender/fearless_simd)
 - [flat_map 0.0.10](https://github.com/toffaletti/flat_map.git)
 - [flatbuffers 24.12.23](https://github.com/google/flatbuffers)
 - [flatbuffers 25.12.19](https://github.com/google/flatbuffers)
@@ -6510,6 +6512,7 @@ Used by:
 - [libc 0.2.191](https://github.com/rust-lang/libc)
 - [miniz_oxide 0.8.9](https://github.com/Frommi/miniz_oxide/tree/master/miniz_oxide)
 - [miniz_oxide 0.9.1](https://github.com/Frommi/miniz_oxide/tree/master/miniz_oxide)
+- [mzstd 0.2.12](https://github.com/M-Compressors/mzstd)
 - [paste 1.0.15](https://github.com/dtolnay/paste)
 - [pin-project-lite 0.2.17](https://github.com/taiki-e/pin-project-lite)
 - [portable-atomic-util 0.2.8](https://github.com/taiki-e/portable-atomic-util)
@@ -9271,6 +9274,37 @@ SOFTWARE.
 
 Used by:
 
+- [branches 0.5.1](https://github.com/fereidani/branches)
+
+```text
+MIT License
+
+Copyright (c) 2023 Khashayar Fereidani
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+```
+
+## MIT License
+
+Used by:
+
 - [i_float 1.16.0](https://github.com/iShape-Rust/iFloat)
 - [i_shape 1.18.0](https://github.com/iShape-Rust/iShape)
 
@@ -9309,6 +9343,37 @@ Used by:
 MIT License
 
 Copyright (c) 2024 iShape-Rust
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+```
+
+## MIT License
+
+Used by:
+
+- [borrowed-buf 0.1.1](https://github.com/M-Compressors/borrowed-buf)
+
+```text
+MIT License
+
+Copyright (c) 2026 M Compressors
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal

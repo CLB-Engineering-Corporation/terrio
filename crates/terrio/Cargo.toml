@@ -50,6 +50,7 @@ weezl.workspace = true
 png.workspace = true
 lz4_flex = { workspace = true, optional = true }
 ruzstd.workspace = true
+mzstd.workspace = true
 netcdf-reader = { workspace = true, optional = true }
 hdf5-reader = { workspace = true, optional = true }
 jpeg-decoder.workspace = true
@@ -86,7 +87,8 @@ ndarray = { workspace = true, optional = true }
 # Every driver is on by default. A build with `default-features = false` keeps the core: GeoTIFF
 # and COG (deflate, LZW, PackBits, ZSTD, WebP, JPEG, JPEG XL), the raw and ASCII rasters (AAIGrid,
 # EHdr, ENVI, ERS, HFA, RST, SAGA, GSBG, XYZ...), PNG, JPEG, VRT, GeoJSON, Shapefile, KML/KMZ,
-# GML, GPX, CSV, MapInfo, the CRS engine and the operations, without C (Zstandard with `ruzstd`).
+# GML, GPX, CSV, MapInfo, the CRS engine and the operations, without C (Zstandard with `mzstd`
+# and `ruzstd`).
 # Disabled drivers stay in the API (`RasterDriver`, `VectorDriver`) and fail with "built without
 # the `...` feature".
 [features]
@@ -124,11 +126,13 @@ tiles = ["sqlite"]
 zarr = ["dep:lz4_flex"]
 ## GeoPackage (vector and raster tiles), SQLite/SpatiaLite and the SQLite store of MBTiles.
 sqlite = []
-## Zstandard (GeoTIFF and EPT tiles) with the zstd C library, natively: it decodes faster and
-## compresses better than `ruzstd`, used without it and in WebAssembly, which writes at its fastest
-## level (about zstd's 1) whatever level is asked for. Without it, natively, ZSTD GeoTIFFs whose
-## samples only the `tiff` crate decodes (Float16, 1 to 7 bits, WhiteIsZero) are not read, as in
-## WebAssembly. In WebAssembly it compiles the C library (as `parquet` does) but does not use it.
+## Zstandard (GeoTIFF and EPT tiles) with the zstd C library, natively: it decompresses faster
+## than `ruzstd`, used without it and in WebAssembly. What is written and read is the same either
+## way: without it, `mzstd` (a pure-Rust port of the C library's encoder) compresses at the level
+## asked for, 1 to 22, into frames the size of the C library's, and ZSTD GeoTIFFs whose samples
+## only the `tiff` crate decodes (Float16, 1 to 7 bits, WhiteIsZero) are decompressed for it
+## (a debug build for a 32-bit target writes `ruzstd`'s fastest level: see `zstandard.rs`). In
+## WebAssembly it compiles the C library (as `parquet` does) but does not use it.
 libzstd = ["dep:zstd", "tiff/zstd", "terrio-crs/libzstd"]
 ## Open any format GDAL reads, through the same data model, when terrio has no driver for it.
 gdal = ["dep:gdal", "dep:gdal-sys"]
@@ -138,7 +142,8 @@ gdal = ["dep:gdal", "dep:gdal-sys"]
 ndarray = ["dep:ndarray"]
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
-# `libzstd`: EPT tiles' Zstandard, natively (without it, and in WebAssembly, `ruzstd`).
+# `libzstd`: Zstandard with the C library, natively (without it, and in WebAssembly, `mzstd` and
+# `ruzstd`).
 memmap2.workspace = true
 zstd = { workspace = true, optional = true }
 tempfile.workspace = true

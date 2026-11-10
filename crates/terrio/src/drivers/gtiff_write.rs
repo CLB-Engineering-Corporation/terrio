@@ -355,7 +355,7 @@ fn jpeg_encode(data: &[u8], c: &ChunkInfo, quality: u8, ycbcr: bool) -> Result<V
     Ok(out)
 }
 
-/// Zstandard at `level` (GDAL's default 9 when `None`; without the zstd C library, its fastest).
+/// Zstandard at `level` (GDAL's default 9 when `None`), with the zstd C library or without.
 fn zstd_at(data: &[u8], level: Option<u8>) -> Result<Vec<u8>> {
     Ok(crate::zstandard::compress(data, level.unwrap_or(9) as i32)?)
 }

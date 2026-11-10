@@ -51,7 +51,7 @@ quick-xml = "0.42"
 # OpenStreetMap PBF decoding, the version wbvector uses.
 osmpbfreader = "0.19"
 # Its Zstandard (a C library) is enabled by the `libzstd` features of terrio and terrio-crs only:
-# otherwise terrio decodes Zstandard with `ruzstd`.
+# otherwise terrio decompresses Zstandard chunks with `ruzstd` (terrio-crs's `tiff_zstd`).
 tiff = { version = "0.11", features = ["webp"] }
 half = "2"
 flate2 = "1"
@@ -59,6 +59,10 @@ weezl = "0.2"
 png = "0.18"
 lz4_flex = { version = "0.14", default-features = false, features = ["alloc", "safe-decode", "checked-decode"] }
 ruzstd = "0.9"
+# Zstandard compression at zstd's levels in safe Rust, for builds without the zstd C library and
+# WebAssembly: a port of zstd 1.5.7's encoder that writes the frames the C library writes.
+# `ruzstd` compresses at its fastest level only.
+mzstd = { version = "0.2.12", default-features = false, features = ["std", "compression"] }
 netcdf-reader = { version = "0.9", default-features = false, features = ["netcdf4"] }
 hdf5-reader = { version = "0.9", default-features = false }
 # The portable decoder: the same pixels on every platform, closer to libjpeg's than its SIMD paths.
@@ -129,6 +133,11 @@ debug-assertions = false
 overflow-checks = false
 opt-level = 3
 
+# The Zstandard encoder of builds without the zstd C library: unoptimized, its highest levels take
+# seconds per megabyte, as would the tests writing GeoTIFFs at them.
+[profile.dev.package.mzstd]
+opt-level = 3
+
 # The WebAssembly modules of the npm package (`node js/build.mjs`): one codegen unit and
 # whole-program LTO, optimized for size ("s") but for the codecs, optimized for speed; wasm-opt then
 # runs with -Oz (js/Cargo.toml). The full module is 21% smaller than with the release profile (16.4
@@ -160,6 +169,7 @@ jxl-frame = { opt-level = 3 }
 jxl-coding = { opt-level = 3 }
 jxl-grid = { opt-level = 3 }
 ruzstd = { opt-level = 3 }
+mzstd = { opt-level = 3 }
 lerc-core = { opt-level = 3 }
 lerc-reader = { opt-level = 3 }
 lerc-writer = { opt-level = 3 }
