@@ -29,10 +29,10 @@ enum Codec {
     Lerc,
     Jxl,
     Lzma,
-    /// Zstandard, with `ruzstd`: the `tiff` crate decodes it with the `libzstd` feature, natively.
+    /// Zstandard, with `mzstd`: the `tiff` crate decodes it with the `libzstd` feature, natively.
     Zstd,
     /// Zstandard, of samples the `tiff` crate unpacks, converts or inverts (bit depths under 8,
-    /// Float16, WhiteIsZero): decompressed with `ruzstd`, then decoded by the crate as an
+    /// Float16, WhiteIsZero): decompressed with `mzstd`, then decoded by the crate as an
     /// uncompressed chunk ([`terrio_crs::tiff_zstd`]).
     ZstdSamples,
     /// LZW of 8 to 64-bit samples, decoded whole: the `tiff` crate's reader fails on some chunks
@@ -132,7 +132,7 @@ fn decompress(compression: u16, raw: Vec<u8>, limit: usize) -> TiffResult<Vec<u8
         LZMA => bounded(&mut lzma_rust2::XzReader::new(&raw[..], true), &mut out).map_err(|e| invalid(format!("LZMA: {e}")))?,
         #[cfg(not(feature = "lzma"))]
         LZMA => return Err(disabled("lzma")),
-        ZSTD => out = terrio_crs::tiff_zstd::frames(&raw, limit)?,
+        ZSTD => out = crate::zstandard::pure::frames(&raw, limit)?,
         32773 => {
             // PackBits: a count byte n, then n + 1 literal bytes (n >= 0) or one byte repeated
             // 1 - n times (n < 0, -128 skipped).
@@ -335,7 +335,7 @@ impl ChunkCodec {
             return Err(invalid(format!("no TIFF chunk {idx}")));
         };
         if self.codec == Codec::ZstdSamples {
-            return terrio_crs::tiff_zstd::read_zstd_chunk(dec, idx, self.limit);
+            return terrio_crs::tiff_zstd::read_zstd_chunk_with(dec, idx, self.limit, crate::zstandard::pure::frames);
         }
         let (dw, dh) = dec.chunk_data_dimensions(idx);
         let (dw, dh) = (dw as usize, dh as usize);
@@ -603,8 +603,8 @@ impl ChunkCodec {
             0 => raw,
             1 => inflate(&mut flate2::read::ZlibDecoder::new(&raw[..]))?,
             2 => {
-                let mut src = &raw[..];
-                inflate(&mut ruzstd::decoding::StreamingDecoder::new(&mut src).map_err(|e| invalid(format!("Zstandard: {e}")))?)?
+                let blob = crate::zstandard::pure::frames(&raw, cap.min(self.limit).saturating_add(1))?;
+                inflate(&mut &blob[..])?
             }
             other => return Err(invalid(format!("unknown LERC compression wrapper {other}"))),
         };
@@ -909,7 +909,7 @@ mod tests {
         }
     }
 
-    /// Zstandard chunks decode with `ruzstd` (without the `libzstd` feature, and in WebAssembly),
+    /// Zstandard chunks decode in pure Rust (without the `libzstd` feature, and in WebAssembly),
     /// whichever encoder wrote them.
     #[test]
     fn zstandard_chunks_decode_in_pure_rust() {

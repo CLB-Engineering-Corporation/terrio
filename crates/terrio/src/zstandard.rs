@@ -1,7 +1,8 @@
 //! Zstandard: with the zstd C library with the `libzstd` feature, in native builds; otherwise in
-//! pure Rust, compressing with `mzstd` (a port of the C library's encoder: zstd's levels, and the
-//! frames the C library writes at them) and decompressing with `ruzstd`. Both read every frame of
-//! a stream (skippable frames skipped), and each reads what the other writes.
+//! pure Rust, with `mzstd` (a port of the C library: zstd's levels, and the frames the C library
+//! writes at them). Both read every frame of a stream (skippable frames skipped), and each reads
+//! what the other writes. LERC's Zstandard wrapper, Zarr chunks and PMTiles payloads are read in
+//! pure Rust in every build.
 
 use std::io::{Error, ErrorKind, Result};
 
@@ -73,9 +74,36 @@ pub(crate) mod pure {
         Ok(out)
     }
 
-    /// The first `max` bytes `data` decompresses to with `ruzstd`, frame after frame (its decoder
-    /// reads one), skippable frames skipped.
-    pub(crate) use terrio_crs::tiff_zstd::frames;
+    /// The first `max` bytes `data` decompresses to, frame after frame, skippable frames skipped.
+    /// A stream of no more than `max` bytes is decoded whole, into the vector returned (its frames
+    /// and their checksums verified); a longer one is decoded no further than `max`.
+    ///
+    /// A debug build for a 32-bit target decodes with `ruzstd` (see [`compress`]).
+    pub(crate) fn frames(data: &[u8], max: usize) -> Result<Vec<u8>> {
+        if cfg!(all(target_pointer_width = "32", debug_assertions)) {
+            return terrio_crs::tiff_zstd::frames(data, max);
+        }
+        let mut out = Vec::new();
+        if data.is_empty() || max == 0 {
+            return Ok(out);
+        }
+        let failed = |e: mzstd::DecodeError| {
+            let message = format!("Zstandard: {e}");
+            Error::new(Error::from(e).kind(), message)
+        };
+        let limits = mzstd::DecodeLimits::DEFAULT.with_max_output_bytes(Some(max as u64));
+        match mzstd::Decompressor::new(limits.into()).decompress_into(data, &mut out) {
+            Ok(_) => Ok(out),
+            // Longer than `max`: its first `max` bytes, block after block.
+            Err(mzstd::DecodeError::OutputLimitExceeded { .. }) => {
+                use std::io::Read;
+                let mut decoder = mzstd::Decompressor::default();
+                decoder.reader(data).take(max as u64).read_to_end(&mut out).map_err(|e| Error::new(e.kind(), format!("Zstandard: {e}")))?;
+                Ok(out)
+            }
+            Err(e) => Err(failed(e)),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -212,13 +240,14 @@ mod tests {
     }
 
     /// Frames compressed in pure Rust at every level, 1 to 22, and at levels outside them,
-    /// decompress to their input with `ruzstd` and with the zstd C library.
+    /// decompress to their input with `mzstd`, `ruzstd` and the zstd C library.
     #[test]
     fn pure_rust_frames_of_every_level_decompress() {
         for (name, input) in inputs() {
             for level in (1..=22).chain([0, -1, -7, 23, 100, i32::MIN, i32::MAX]) {
                 let frame = pure::compress(&input, level).unwrap();
-                assert_eq!(pure::decompress(&frame, input.len()).unwrap(), input, "{name}, level {level}: ruzstd");
+                assert_eq!(pure::decompress(&frame, input.len()).unwrap(), input, "{name}, level {level}: mzstd");
+                assert_eq!(terrio_crs::tiff_zstd::frames(&frame, usize::MAX).unwrap(), input, "{name}, level {level}: ruzstd");
                 #[cfg(all(feature = "libzstd", not(target_family = "wasm")))]
                 assert_eq!(libzstd::decompress(&frame, input.len()).unwrap(), input, "{name}, level {level}: libzstd");
             }
@@ -397,6 +426,9 @@ mod tests {
             };
             let (c, p) = (time(libzstd::decompress), time(pure::decompress));
             println!("| {name}, decompressed | 9 | | | | | {c:.0} | {p:.0} | {:.2} |", p / c);
+            // And by `ruzstd`, the decoder of terrio-crs's grids.
+            let r = time(terrio_crs::tiff_zstd::frames);
+            println!("| {name}, decompressed with ruzstd | 9 | | | | | {c:.0} | {r:.0} | {:.2} |", r / c);
         }
     }
 }

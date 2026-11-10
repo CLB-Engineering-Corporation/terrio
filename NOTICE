@@ -659,8 +659,8 @@ SPDX-License-Identifier: MIT. See the GDAL license text above.
 
 Zstandard (through the mzstd crate)
 -----------------------------------
-Without the `libzstd` feature, and in WebAssembly, terrio compresses Zstandard with the mzstd
-crate (https://github.com/M-Compressors/mzstd, MIT OR Apache-2.0), whose encoder (the compression
+Without the `libzstd` feature, and in WebAssembly, terrio compresses and decompresses Zstandard
+with the mzstd crate (https://github.com/M-Compressors/mzstd, MIT OR Apache-2.0), whose encoder (the compression
 level tables, the match finders, the optimal parser, long distance matching, the block splitters,
 the FSE and Huffman encoders and the streaming logic) is a Rust port of the Zstandard reference
 implementation, zstd 1.5.7 (https://github.com/facebook/zstd), used under its BSD license. terrio

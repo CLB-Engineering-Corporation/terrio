@@ -58,6 +58,17 @@ pub fn read_chunk<R: Read + Seek>(dec: &mut Decoder<R>, idx: u32, limit: usize) 
 /// than `limit` bytes is refused, before any of it is decompressed, and a stream expanding past its
 /// chunk is decompressed no further than the chunk.
 pub fn read_zstd_chunk<R: Read + Seek>(dec: &mut Decoder<R>, idx: u32, limit: usize) -> TiffResult<DecodingResult> {
+    read_zstd_chunk_with(dec, idx, limit, frames)
+}
+
+/// [`read_zstd_chunk`] with the caller's Zstandard decoder: `decompress(stream, max)` gives the
+/// first `max` bytes the stream decompresses to, as [`frames`] does.
+pub fn read_zstd_chunk_with<R: Read + Seek>(
+    dec: &mut Decoder<R>,
+    idx: u32,
+    limit: usize,
+    decompress: impl FnOnce(&[u8], usize) -> std::io::Result<Vec<u8>>,
+) -> TiffResult<DecodingResult> {
     // A sample layout the crate does not decode is refused as it refuses it.
     dec.colortype()?;
     let tiled = dec.get_chunk_type() == ChunkType::Tile;
@@ -127,7 +138,7 @@ pub fn read_zstd_chunk<R: Read + Seek>(dec: &mut Decoder<R>, idx: u32, limit: us
     if chunk_bytes > limit {
         return Err(TiffError::LimitsExceeded);
     }
-    let data = frames(&raw, chunk_bytes)?;
+    let data = decompress(&raw, chunk_bytes)?;
     drop(raw);
     let file = tiff_file(big_endian, fields, tiled, &[&data])?;
     drop(data);

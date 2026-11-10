@@ -444,13 +444,7 @@ fn decompress(codec: &Codec, b: Vec<u8>) -> Result<Vec<u8>> {
 }
 
 fn zstd_decode(b: &[u8]) -> Result<Vec<u8>> {
-    let mut out = Vec::new();
-    let mut src = b;
-    while !src.is_empty() {
-        let mut d = ruzstd::decoding::StreamingDecoder::new(&mut src).map_err(|e| bad(format!("zstd: {e}")))?;
-        d.read_to_end(&mut out)?;
-    }
-    Ok(out)
+    crate::zstandard::pure::frames(b, usize::MAX).map_err(|e| bad(format!("zstd: {e}")))
 }
 
 /// Decompresses a Blosc (version 1 format) buffer.

@@ -87,8 +87,7 @@ ndarray = { workspace = true, optional = true }
 # Every driver is on by default. A build with `default-features = false` keeps the core: GeoTIFF
 # and COG (deflate, LZW, PackBits, ZSTD, WebP, JPEG, JPEG XL), the raw and ASCII rasters (AAIGrid,
 # EHdr, ENVI, ERS, HFA, RST, SAGA, GSBG, XYZ...), PNG, JPEG, VRT, GeoJSON, Shapefile, KML/KMZ,
-# GML, GPX, CSV, MapInfo, the CRS engine and the operations, without C (Zstandard with `mzstd`
-# and `ruzstd`).
+# GML, GPX, CSV, MapInfo, the CRS engine and the operations, without C (Zstandard with `mzstd`).
 # Disabled drivers stay in the API (`RasterDriver`, `VectorDriver`) and fail with "built without
 # the `...` feature".
 [features]
@@ -126,13 +125,13 @@ tiles = ["sqlite"]
 zarr = ["dep:lz4_flex"]
 ## GeoPackage (vector and raster tiles), SQLite/SpatiaLite and the SQLite store of MBTiles.
 sqlite = []
-## Zstandard (GeoTIFF and EPT tiles) with the zstd C library, natively: it decompresses faster
-## than `ruzstd`, used without it and in WebAssembly. What is written and read is the same either
-## way: without it, `mzstd` (a pure-Rust port of the C library's encoder) compresses at the level
-## asked for, 1 to 22, into frames the size of the C library's, and ZSTD GeoTIFFs whose samples
-## only the `tiff` crate decodes (Float16, 1 to 7 bits, WhiteIsZero) are decompressed for it
-## (a debug build for a 32-bit target writes `ruzstd`'s fastest level: see `zstandard.rs`). In
-## WebAssembly it compiles the C library (as `parquet` does) but does not use it.
+## Zstandard (GeoTIFF and EPT tiles) with the zstd C library, natively. What is written and read
+## is the same either way: without it, and in WebAssembly, `mzstd` (safe Rust; its encoder a port
+## of the C library's) compresses at the level asked for, 1 to 22, into frames the size of the C
+## library's, and decompresses; ZSTD GeoTIFFs whose samples only the `tiff` crate decodes
+## (Float16, 1 to 7 bits, WhiteIsZero) are decompressed for it (a debug build for a 32-bit target
+## uses `ruzstd`, and writes its fastest level: see `zstandard.rs`). In WebAssembly it compiles
+## the C library (as `parquet` does) but does not use it.
 libzstd = ["dep:zstd", "tiff/zstd", "terrio-crs/libzstd"]
 ## Open any format GDAL reads, through the same data model, when terrio has no driver for it.
 gdal = ["dep:gdal", "dep:gdal-sys"]
@@ -142,8 +141,7 @@ gdal = ["dep:gdal", "dep:gdal-sys"]
 ndarray = ["dep:ndarray"]
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
-# `libzstd`: Zstandard with the C library, natively (without it, and in WebAssembly, `mzstd` and
-# `ruzstd`).
+# `libzstd`: Zstandard with the C library, natively (without it, and in WebAssembly, `mzstd`).
 memmap2.workspace = true
 zstd = { workspace = true, optional = true }
 tempfile.workspace = true
