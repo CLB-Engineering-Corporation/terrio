@@ -731,8 +731,8 @@ the operations and the streams. The other drivers are features:
 | `gdal` | off | The optional GDAL backend: formats terrio has no driver for, through GDAL (needs GDAL installed). See [the GDAL backend](gdal.md#the-optional-gdal-backend). |
 | `ndarray` | off | Raster pixels as `ndarray` arrays, without copying them: views, owned transfers and the masks of lazy reads, with the crate re-exported as `terrio::ndarray`; floating-point windows as owned arrays, bands first or last. See [ndarray](#ndarray). |
 | `cad` | on | DWG and DXF, read and written, through acadrust. See [CAD drawings](formats.md#cad-drawings-dwg-and-dxf). |
-| `drivers` | on | Every driver above that is on by default: the default features but `remote` and `libzstd-geotiff`. `default-features = false, features = ["drivers"]` builds them all without a C compiler. |
-| `libzstd-geotiff` | on (CLB fork) | GeoTIFF/COG Zstandard (ZSTD and LERC_ZSTD chunks written, ZSTD chunks read) through the zstd C library, natively: the C library's bytes at every level. The pure-Rust `ruzstd` (the `zstd-rust` crate) reads these as fast and takes 1.2 to 1.5 times as long to write them on one thread, 0.8 to 1.25 times on eight, to within 0.4% of the size at levels 1 to 9. Without it, and always in WebAssembly, GeoTIFF Zstandard is `ruzstd`, to the same decoded pixels. Needs a C compiler. |
+| `drivers` | on | Every driver above that is on by default: the default features but `remote`. `default-features = false, features = ["drivers"]` builds them all without a C compiler. |
+| `libzstd-geotiff` | off | GeoTIFF/COG Zstandard (ZSTD and LERC_ZSTD chunks written, ZSTD chunks read) through the zstd C library, natively: the C library's bytes at each of its 22 levels, written in 0.7 to 0.85 of the time on one thread. Without it (the default), and always in WebAssembly, GeoTIFF Zstandard is the pure-Rust `ruzstd` (the `zstd-rust` crate), which reads these as fast and writes them to within 0.4% of the size at levels 1 to 9; levels 10 and up are its `Best`, 1% to 8% larger than the C library's level 19 and 3.5 to 5 times faster. Needs a C compiler. |
 | `libzstd-ept` | off | EPT tiles' Zstandard through the zstd C library, natively. |
 | `libzstd-geoparquet` | off | The Zstandard of the GeoParquet pages terrio compresses and decompresses itself through the zstd C library, natively: then the same bytes as `parquet-zstd`'s. |
 | `libzstd` | off | `libzstd-geotiff`, `libzstd-ept` and `libzstd-geoparquet`: every Zstandard path but Zarr's through the zstd C library. |
@@ -772,8 +772,8 @@ terrio is heading for a stable 1.0 API. What to rely on, and the decisions behin
 ## WebAssembly
 
 The library builds for `wasm32-unknown-unknown`, with any features; network access and
-temporary files are native only. No C compiler is needed: Zstandard is decoded in pure Rust (the
-default `libzstd-geotiff` applies to native builds only). JPEG 2000 (the `jp2` feature) works there too, with two settings in the program that is built: the global
+temporary files are native only. No C compiler is needed: Zstandard is pure Rust (the
+opt-in `libzstd-*` features apply to native builds only). JPEG 2000 (the `jp2` feature) works there too, with two settings in the program that is built: the global
 allocator `terrio::NullSafeAllocator` (the OpenJPEG port releases null pointers, which the
 WebAssembly allocator does not tolerate), and the link flag `-C link-arg=--allow-undefined` for
 `wasm32-unknown-unknown`, as in the repository's `.cargo/config.toml` (the port is built as a C

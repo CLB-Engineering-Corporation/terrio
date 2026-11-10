@@ -27,15 +27,15 @@ hecras = ["terrio/hecras"]
 ## (`terrio/parquet-zstd`), opt-in; without it (the wheels), terrio compresses the same pages in
 ## pure Rust.
 parquet-zstd = ["terrio/parquet-zstd"]
-## GeoTIFF/COG Zstandard with the zstd C library (`terrio/libzstd-geotiff`), in the native wheels by
-## default (CLB fork); the Pyodide wheel is `ruzstd` whatever the features.
+## GeoTIFF/COG Zstandard with the zstd C library (`terrio/libzstd-geotiff`), opt-in: the wheels
+## write and read it in pure Rust (`ruzstd`), as the Pyodide wheel does whatever the features.
 libzstd-geotiff = ["terrio/libzstd-geotiff", "terrio-cli/libzstd-geotiff"]
 ## GeoTIFF, EPT and GeoParquet Zstandard with the zstd C library (`terrio/libzstd`).
 libzstd = ["terrio/libzstd", "libzstd-geotiff"]
 ## Remote inputs (`terrio/remote`), in the native wheels by default; HTTPS is `rustls` with `ring`
 ## (CLB fork). The Pyodide wheel builds no HTTP client whatever the features.
 remote = ["terrio/remote", "terrio-cli/remote"]
-default = ["hecras", "libzstd-geotiff", "remote"]
+default = ["hecras", "remote"]
 
 [dependencies]
 terrio.workspace = true

@@ -1,8 +1,8 @@
 //! Zstandard, with the pure-Rust `ruzstd` (the `zstd-rust` crate, CLB's fork of `ruzstd` with the
 //! `Default`, `Better` and `Best` levels) or, in native builds, the zstd C library. The choice is
-//! made per format, by feature: GeoTIFF/COG chunks use the C library with `libzstd-geotiff` (on by
-//! default in this fork), EPT tiles with `libzstd-ept` and GeoParquet pages with
-//! `libzstd-geoparquet` (both opt-in; `libzstd` turns on all three). WebAssembly is always
+//! made per format, by opt-in feature: GeoTIFF/COG chunks use the C library with
+//! `libzstd-geotiff`, EPT tiles with `libzstd-ept` and GeoParquet pages with
+//! `libzstd-geoparquet` (`libzstd` turns on all three). WebAssembly is always
 //! `ruzstd`, and so is Zarr. Both read every frame of a stream (skippable frames skipped), and each
 //! reads what the other writes.
 

@@ -8,7 +8,7 @@ url="https://terrio.dev"
 license=('MIT' 'MPL-2.0')
 depends=('gcc-libs' 'glibc')
 makedepends=('cargo')
-# Its C dependencies (zstd, ring) are linked by Rust's linker, which cannot read GCC's LTO objects.
+# Its C dependency (ring) is linked by Rust's linker, which cannot read GCC's LTO objects.
 options=('!lto')
 conflicts=('terrio-bin')
 source=("${pkgname}-${pkgver}.tar.gz::https://github.com/opengeos/terrio/archive/refs/tags/v${pkgver}.tar.gz")

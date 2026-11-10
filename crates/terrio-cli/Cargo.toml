@@ -13,9 +13,9 @@ homepage.workspace = true
 authors.workspace = true
 
 [features]
-default = ["libzstd-geotiff", "remote"]
-## GeoTIFF/COG Zstandard with the zstd C library (`terrio/libzstd-geotiff`), on by default in this
-## fork. `--no-default-features` builds the command without C.
+default = ["remote"]
+## GeoTIFF/COG Zstandard with the zstd C library (`terrio/libzstd-geotiff`), opt-in: without it
+## the command writes and reads it in pure Rust.
 libzstd-geotiff = ["terrio/libzstd-geotiff"]
 ## Remote inputs (`terrio/remote`): HTTP(S), S3, GCS and Azure. HTTPS is `rustls` with `ring`
 ## (C and assembly) in this fork, so `--no-default-features` builds the command without them.

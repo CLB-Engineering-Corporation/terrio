@@ -14,9 +14,9 @@ authors = ["Qiusheng Wu <giswqs@gmail.com>"]
 [workspace.dependencies]
 # Memory-mapped reads of SQLite files (GeoPackage, MBTiles), native builds only.
 memmap2 = "0.9"
-# Every driver, without the zstd C library or remote inputs (whose HTTPS is `ring`): the members
-# that link them say so (`libzstd-geotiff` and `remote`, default features of terrio, terrio-cli and
-# the Python package), so `--no-default-features` builds them without C.
+# Every driver, without remote inputs (whose HTTPS is `ring`): the members that link them say so
+# (`remote`, a default feature of terrio, terrio-cli and the Python package), so
+# `--no-default-features` builds them without C. The zstd C library is opt-in (`libzstd-*`).
 terrio = { path = "crates/terrio", version = "0.6.1", default-features = false, features = ["drivers"] }
 terrio-crs = { path = "crates/terrio-crs", version = "0.2.1", default-features = false }
 # For the Python package (not published to crates.io), so without a version to keep in step.

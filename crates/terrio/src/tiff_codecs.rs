@@ -46,8 +46,8 @@ enum Codec {
     Lerc,
     Jxl,
     Lzma,
-    /// Zstandard, with the zstd C library natively with the `libzstd-geotiff` feature (a default
-    /// one), with `ruzstd` otherwise ([`crate::zstandard::geotiff::frames`]).
+    /// Zstandard, with `ruzstd`, or with the zstd C library natively with the opt-in
+    /// `libzstd-geotiff` feature ([`crate::zstandard::geotiff::frames`]).
     Zstd,
     /// LZW of 8 to 64-bit samples, decoded whole: the `tiff` crate's reader fails on some chunks
     /// it reads row by row (edge tiles narrower than the tile).

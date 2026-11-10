@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- Pure-Rust Zstandard by default again (CLB fork, owner's decision of 2026-11-10): `libzstd-geotiff`
+  is no longer a default feature of terrio, terrio-cli and the Python package, so the default
+  build, the `terrio` command and the wheels write and read ZSTD and LERC_ZSTD GeoTIFF/COG chunks
+  with `zstd-rust`, and link no C but `ring` (HTTPS). Files written at `LEVEL` 1 to 9 are within
+  0.4% of the size the C library gave; `LEVEL` 10 and up map to one level, `Best`, whose files are
+  1% to 8% larger than the C library's level 19 (and written 3.5 to 5 times faster). Reading takes
+  as long as before, writing 1.2 to 1.5 times as long on one thread and about as long on eight
+  (docs/testing.md). Decoded pixels are the same either way. Build with `--features
+  libzstd-geotiff` (or `libzstd`) for the C library's bytes and levels. CI checks that the default
+  builds link no C but `ring` and still tests the C library path.
 - Pure-Rust Zstandard (Zarr, EPT, GeoParquet pages, the WebAssembly builds, and GeoTIFF/COG without
   `libzstd-geotiff`) reads at the speed of the zstd C library and writes much closer to it.
   `zstd-rust` (gpt-cmdr/zstd-rs at `ab47de3`) decodes whole frames straight into their output and

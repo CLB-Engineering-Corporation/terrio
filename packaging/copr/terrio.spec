@@ -4,7 +4,7 @@
 
 # The binary carries no debug information worth splitting out.
 %global debug_package %{nil}
-# Its C dependencies (zstd, ring) are linked by Rust's linker, which cannot read GCC's LTO objects.
+# Its C dependency (ring) is linked by Rust's linker, which cannot read GCC's LTO objects.
 %global _lto_cflags %{nil}
 
 Name:           terrio
