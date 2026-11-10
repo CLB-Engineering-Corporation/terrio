@@ -1036,16 +1036,16 @@ formats whose reader lacks a metadata-only path may materialize the input.
 ## Zstandard without the zstd C library
 
 Without the `libzstd` feature, and in WebAssembly, Zstandard is compressed with `mzstd` (a
-safe-Rust port of zstd 1.5.7's encoder) at the level asked for, and decompressed with `ruzstd`.
-A debug build for a 32-bit target (a development WebAssembly build) is the exception: it writes
-`ruzstd`'s fastest level, as `mzstd` 0.2.12 adds to indexes that wrap past 32 bits, which that
+safe-Rust port of zstd 1.5.7's encoder) at the level asked for, and decompressed with `mzstd`
+(`terrio-crs` decompresses its grids with `ruzstd`). A debug build for a 32-bit target (a
+development WebAssembly build) is the exception: it reads with `ruzstd` and writes its fastest level, as `mzstd` 0.2.12 adds to indexes that wrap past 32 bits, which that
 build's overflow checks refuse (`TERRIO_JS_DEBUG=1` skips the level test of
 `js/tests/node.test.mjs` on such a module). The two back ends are compared in a default build,
 which has both:
 
 ```sh
 # Frames of levels 1 to 22 (and levels outside them) of empty, tiny, incompressible, repetitive
-# and raster-tile inputs decode with ruzstd and with the C library; their sizes against libzstd's.
+# and raster-tile inputs decode with mzstd, ruzstd and the C library; their sizes against libzstd's.
 cargo test -p terrio --lib zstandard -- --nocapture
 # ZSTD and LERC_ZSTD GeoTIFFs and COGs at levels 1, 3, 9, 19 and 22, and Zstandard chunks of
 # 1 to 7-bit, Float16 and WhiteIsZero samples, in each build.
@@ -1112,6 +1112,8 @@ indicative (the ratios less so than the sizes, which are exact):
 | | 22 | 3000322 | 3000322 | 6 of 6 | 2.6 | 3.0 | 1.14 |
 
 Every frame was the size of libzstd's, and the same bytes; compression ran at 0.92 to 1.77 times
-its speed. Decompressing the level 9 frames, `ruzstd` ran at 0.32 to 0.37 times the C library's
-speed (160 to 306 MB/s against 470 to 828 MB/s): reading Zstandard is what the `libzstd` feature
-still buys, and why it stays in the default features.
+its speed. Decompressing the level 9 frames, `mzstd` ran at 1.14 to 1.42 times the speed of the C
+library (452 to 1671 MB/s against 369 to 1469 MB/s), the C library decompressing a stream of frames
+that record their size in one call; `ruzstd`, terrio's decoder before `mzstd`, ran at 0.14 to 0.29
+times it (108 to 200 MB/s). Timings on one Windows workstation vary by tens of percent from run to
+run.

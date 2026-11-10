@@ -11,15 +11,20 @@
   whatever was asked for; they now compress with `mzstd`, a safe-Rust port of
   zstd 1.5.7's encoder. On chunks of USGS, SRTM and Landsat rasters its frames
   are the bytes the C library writes at levels 1 to 22 (the tests require
-  sizes within 1%, not the same bytes). Zstandard is still decompressed with
-  `ruzstd` in these builds. A debug build for a 32-bit target (a development
-  WebAssembly build) still writes `ruzstd`'s level: `mzstd` 0.2.12 trips that
-  build's overflow checks.
+  sizes within 1%, not the same bytes). These builds also decompress
+  Zstandard (GeoTIFF chunks, LERC, Zarr, PMTiles, EPT tiles) with `mzstd`,
+  5 to 9 times faster than with `ruzstd`, which `terrio-crs` keeps for its
+  grids. A debug build for a 32-bit target (a development WebAssembly build)
+  still reads with `ruzstd` and writes its fastest level: `mzstd` 0.2.12 trips
+  that build's overflow checks.
+- Zstandard with the `libzstd` feature: a stream whose frames record their
+  size (as the C library's and `mzstd`'s do) is decompressed in one call, 1.4
+  to 2.3 times faster on GeoTIFF chunks than through a stream decoder.
 - GeoTIFF and Zstandard TIFF datum grids: a build without `libzstd` reads
   Zstandard chunks of the samples the `tiff` crate decodes (1 to 7 bits,
   Float16, WhiteIsZero), which it refused ("built without the `libzstd`
   feature"), and `terrio-crs` without `libzstd` reads Zstandard TIFF grids,
-  which it skipped. The chunk is decompressed with `ruzstd`, no further than
+  which it skipped. The chunk is decompressed in pure Rust, no further than
   the chunk's size, and decoded by the `tiff` crate as an uncompressed chunk,
   to the same samples as with the C library. The `libzstd` feature stays in
   the default features.
