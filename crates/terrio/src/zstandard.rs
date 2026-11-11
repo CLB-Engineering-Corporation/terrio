@@ -1,8 +1,8 @@
 //! Zstandard, with the pure-Rust `ruzstd` (the `zstd-rust` crate, CLB's fork of `ruzstd` with the
 //! `Default`, `Better` and `Best` levels) or, in native builds, the zstd C library. The choice is
-//! made per format, by feature: GeoTIFF/COG chunks use the C library with `libzstd-geotiff` (on by
-//! default in this fork), EPT tiles with `libzstd-ept` and GeoParquet pages with
-//! `libzstd-geoparquet` (both opt-in; `libzstd` turns on all three). WebAssembly is always
+//! made per format, by opt-in feature: GeoTIFF/COG chunks use the C library with
+//! `libzstd-geotiff`, EPT tiles with `libzstd-ept` and GeoParquet pages with
+//! `libzstd-geoparquet` (`libzstd` turns on all three). WebAssembly is always
 //! `ruzstd`, and so is Zarr. Both read every frame of a stream (skippable frames skipped), and each
 //! reads what the other writes.
 
@@ -122,15 +122,33 @@ mod libzstd {
 #[allow(dead_code)]
 pub(crate) mod pure {
     use super::*;
+    use ruzstd::decoding::FrameDecoder;
     use ruzstd::decoding::errors::{FrameDecoderError, ReadFrameHeaderError};
+    use ruzstd::encoding::Compressor;
+    use std::cell::RefCell;
 
-    /// Compresses `data` at the `ruzstd` level closest to zstd's `level` (see [`ruzstd_level`]).
-    pub(crate) fn compress(data: &[u8], level: i32) -> Result<Vec<u8>> {
-        Ok(ruzstd::encoding::compress_to_vec(data, ruzstd_level(level)))
+    thread_local! {
+        /// The compressor of this thread, kept from chunk to chunk: its tables (megabytes at the
+        /// higher levels) are then allocated once per thread, not once per chunk.
+        static COMPRESSOR: RefCell<Option<Compressor>> = const { RefCell::new(None) };
+        /// The decoder of this thread, for its tables and buffers.
+        static DECODER: RefCell<FrameDecoder> = RefCell::new(FrameDecoder::new());
     }
 
-    /// The `ruzstd` level for a zstd level: up to 2 `Fastest` (about zstd 1), 0 (zstd's default)
-    /// and 3 to 5 `Default` (about zstd 3), 6 to 9 `Better`, from 10 on `Best`.
+    /// Compresses `data` at the `ruzstd` level closest to zstd's `level` (see [`ruzstd_level`]),
+    /// to a frame that records its size, as the C library's does.
+    pub(crate) fn compress(data: &[u8], level: i32) -> Result<Vec<u8>> {
+        let level = ruzstd_level(level);
+        Ok(COMPRESSOR.with(|compressor| {
+            let mut compressor = compressor.borrow_mut();
+            let compressor = compressor.get_or_insert_with(|| Compressor::new(level));
+            compressor.set_compression_level(level);
+            compressor.compress(data)
+        }))
+    }
+
+    /// The `ruzstd` level for a zstd level: up to 2 `Fastest` (zstd 1), 0 (zstd's default) and 3
+    /// to 5 `Default` (about zstd 3), 6 to 9 `Better` (about zstd 9), from 10 on `Best`.
     pub(crate) fn ruzstd_level(level: i32) -> ruzstd::encoding::CompressionLevel {
         use ruzstd::encoding::CompressionLevel as L;
         match level {
@@ -150,9 +168,47 @@ pub(crate) mod pure {
         Ok(out)
     }
 
-    /// The first `max` bytes `data` decompresses to, frame after frame (`ruzstd`'s decoder reads
-    /// one), skippable frames skipped.
-    pub(crate) fn frames(mut data: &[u8], max: usize) -> Result<Vec<u8>> {
+    /// The first `max` bytes `data` decompresses to, frame after frame, skippable frames skipped.
+    ///
+    /// A stream whose frames all record their size (as the frames of [`compress`] and of the C
+    /// library do), of no more than `max` bytes in all, is decoded at once into a vector of that
+    /// size, which takes a third of the time or less; content that does not have the checksum of
+    /// its frame is then an error. Other streams are decoded through the window of a stream
+    /// decoder, to `max` bytes.
+    pub(crate) fn frames(data: &[u8], max: usize) -> Result<Vec<u8>> {
+        if let Some(out) = whole(data, max)? {
+            return Ok(out);
+        }
+        stream(data, max)
+    }
+
+    /// The content of `data` when its frames record their size, of at most `max` bytes in all,
+    /// and decode at once into a vector of that size; `None` for a stream decoder to decode it
+    /// (or to say what is wrong with it). Content without the checksum of its frame is an error.
+    pub(crate) fn whole(data: &[u8], max: usize) -> Result<Option<Vec<u8>>> {
+        // What the headers record is checked against what frames can hold at all: a block of at
+        // most 128 KiB takes four bytes or more.
+        let most = (data.len() as u64 / 4 + 1).saturating_mul(128 << 10).min(max as u64);
+        let Some(size) = ruzstd::decoding::content_size(data).filter(|&size| size <= most) else {
+            return Ok(None);
+        };
+        let mut out = Vec::new();
+        if out.try_reserve_exact(size as usize).is_err() {
+            return Ok(None);
+        }
+        out.resize(size as usize, 0);
+        match DECODER.with(|decoder| decoder.borrow_mut().decode_all(data, &mut out)) {
+            Ok(decoded) => {
+                out.truncate(decoded);
+                Ok(Some(out))
+            }
+            Err(e @ FrameDecoderError::ChecksumMismatch { .. }) => Err(Error::new(ErrorKind::InvalidData, format!("Zstandard: {e}"))),
+            Err(_) => Ok(None),
+        }
+    }
+
+    /// The first `max` bytes `data` decompresses to, a frame at a time through a stream decoder.
+    fn stream(mut data: &[u8], max: usize) -> Result<Vec<u8>> {
         let mut out = Vec::new();
         while !data.is_empty() && out.len() < max {
             match ruzstd::decoding::StreamingDecoder::new(&mut data) {
@@ -168,6 +224,12 @@ pub(crate) mod pure {
             }
         }
         Ok(out)
+    }
+
+    /// [`frames`] through the stream decoder alone, to compare the two ways of decoding.
+    #[cfg(test)]
+    pub(crate) fn frames_as_a_stream(data: &[u8], max: usize) -> Result<Vec<u8>> {
+        stream(data, max)
     }
 }
 
@@ -201,6 +263,59 @@ mod tests {
         // A truncated skippable frame is an error.
         let cut = [pure::compress(&a, 3).unwrap(), skippable(9)[..12].to_vec()].concat();
         assert!(pure::decompress(&cut, usize::MAX).is_err());
+    }
+
+    /// Streams whose frames record their size are decoded at once, others through a stream decoder,
+    /// to the same bytes, and to their first bytes when they hold more than is asked for.
+    #[test]
+    fn whole_streams_decode_as_through_a_stream_decoder() {
+        use ruzstd::encoding::{CompressionLevel, compress_to_vec};
+        let (a, b) = (data(300_000, 31), data(200_000, 97));
+        // The frames of `compress` record their size; a stream compressor's only if they are one block.
+        let sized = pure::compress(&a, 9).unwrap();
+        assert_eq!(ruzstd::decoding::content_size(&sized), Some(a.len() as u64));
+        let unsized_frame = compress_to_vec(&b[..], CompressionLevel::Default);
+        assert_eq!(ruzstd::decoding::content_size(&unsized_frame), None);
+        let twice = [a.clone(), a.clone()].concat();
+        let both = [a.clone(), b.clone()].concat();
+        for (stream, want, at_once) in [
+            (sized.clone(), &a, true),
+            ([sized.clone(), skippable(9), sized.clone()].concat(), &twice, true),
+            (unsized_frame.clone(), &b, false),
+            ([sized.clone(), unsized_frame.clone()].concat(), &both, false),
+        ] {
+            assert_eq!(pure::whole(&stream, usize::MAX).unwrap().is_some(), at_once);
+            assert_eq!(&pure::frames(&stream, usize::MAX).unwrap(), want);
+            assert_eq!(&pure::frames(&stream, want.len()).unwrap(), want);
+            assert_eq!(&pure::frames_as_a_stream(&stream, usize::MAX).unwrap(), want);
+            // More than is asked for: the first bytes, through the stream decoder.
+            assert!(pure::whole(&stream, want.len() - 1).unwrap().is_none());
+            assert_eq!(pure::frames(&stream, want.len() - 1).unwrap(), want[..want.len() - 1]);
+            assert_eq!(&pure::decompress(&stream, want.len()).unwrap(), want);
+            assert!(pure::decompress(&stream, want.len() - 1).is_err());
+            // Cut short, either way an error.
+            assert!(pure::frames(&stream[..stream.len() - 7], usize::MAX).is_err());
+        }
+        // A header recording more than its frame could hold is not believed: no vector of that size.
+        let mut lying = sized.clone();
+        assert_eq!(lying[4] >> 6, 2, "a 4-byte content size field");
+        lying[5..9].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(pure::whole(&lying, usize::MAX).unwrap().is_none());
+    }
+
+    /// Content that does not have the checksum its frame ends with is an error when the frame is
+    /// decoded at once, as it is with the C library.
+    #[test]
+    fn a_wrong_checksum_is_an_error() {
+        use ruzstd::encoding::{CompressionLevel, compress_to_vec};
+        let a = data(100_000, 31);
+        // The frames of the stream compressor end with a checksum; one block records its size.
+        let mut frame = compress_to_vec(&a[..], CompressionLevel::Default);
+        assert_eq!(pure::frames(&frame, usize::MAX).unwrap(), a);
+        let last = frame.len() - 1;
+        frame[last] ^= 1;
+        let e = pure::frames(&frame, usize::MAX).unwrap_err();
+        assert!(e.to_string().contains("checksum"), "{e}");
     }
 
     #[test]

@@ -14,9 +14,9 @@ authors = ["Qiusheng Wu <giswqs@gmail.com>"]
 [workspace.dependencies]
 # Memory-mapped reads of SQLite files (GeoPackage, MBTiles), native builds only.
 memmap2 = "0.9"
-# Every driver, without the zstd C library or remote inputs (whose HTTPS is `ring`): the members
-# that link them say so (`libzstd-geotiff` and `remote`, default features of terrio, terrio-cli and
-# the Python package), so `--no-default-features` builds them without C.
+# Every driver, without remote inputs (whose HTTPS is `ring`): the members that link them say so
+# (`remote`, a default feature of terrio, terrio-cli and the Python package), so
+# `--no-default-features` builds them without C. The zstd C library is opt-in (`libzstd-*`, `parquet-zstd`).
 terrio = { path = "crates/terrio", version = "0.6.1", default-features = false, features = ["drivers"] }
 terrio-crs = { path = "crates/terrio-crs", version = "0.2.1", default-features = false }
 # For the Python package (not published to crates.io), so without a version to keep in step.
@@ -72,9 +72,12 @@ weezl = "0.2"
 png = "0.18"
 lz4_flex = { version = "0.14", default-features = false, features = ["alloc", "safe-decode", "checked-decode"] }
 # Pure-Rust Zstandard: `zstd-rust`, CLB's fork of `ruzstd` with the Default, Better and Best
-# levels, under the `ruzstd` name so the code keeps its `ruzstd::` paths. From git (gpt-cmdr/zstd-rs
-# `main`, the 0.1.0 release merge); it is not on crates.io.
-ruzstd = { package = "zstd-rust", git = "https://github.com/gpt-cmdr/zstd-rs", rev = "667892790903fdaba3361787d99df10c0946c22e" }
+# levels, a decoder of whole frames and the matchers of the reference implementation (0.9 to 1.4
+# times the C library's time to decode, 1.2 to 1.7 times to compress, by platform: docs/testing.md),
+# under the `ruzstd` name so the code
+# keeps its `ruzstd::` paths. From git (gpt-cmdr/zstd-rs `main`); it is
+# not on crates.io.
+ruzstd = { package = "zstd-rust", git = "https://github.com/gpt-cmdr/zstd-rs", rev = "e716f7375fceb321fb603db1e97721bf72be1ca2" }
 # 0.10 reads HDF5 files written in the earliest format with version 1/2 compound datatypes
 # (every HEC-RAS geometry and plan file, among others) and old fill value messages
 # (roteiro-gis/netcdf-rust#95). The HEC-RAS engine uses the same hdf5-reader 0.10.1, so a build

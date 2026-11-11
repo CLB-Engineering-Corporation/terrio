@@ -46,8 +46,8 @@ enum Codec {
     Lerc,
     Jxl,
     Lzma,
-    /// Zstandard, with the zstd C library natively with the `libzstd-geotiff` feature (a default
-    /// one), with `ruzstd` otherwise ([`crate::zstandard::geotiff::frames`]).
+    /// Zstandard, with `ruzstd`, or with the zstd C library natively with the opt-in
+    /// `libzstd-geotiff` feature ([`crate::zstandard::geotiff::frames`]).
     Zstd,
     /// LZW of 8 to 64-bit samples, decoded whole: the `tiff` crate's reader fails on some chunks
     /// it reads row by row (edge tiles narrower than the tile).
@@ -815,9 +815,15 @@ impl ChunkCodec {
         let blob = match self.lerc_wrapper {
             0 => raw,
             1 => inflate(&mut flate2::read::ZlibDecoder::new(&raw[..]))?,
+            // Bounded as `inflate` bounds a stream, and checked as it checks one.
             2 => {
-                let mut src = &raw[..];
-                inflate(&mut ruzstd::decoding::StreamingDecoder::new(&mut src).map_err(|e| invalid(format!("Zstandard: {e}")))?)?
+                let blob = crate::zstandard::pure::frames(&raw, cap.min(self.limit).saturating_add(1))?;
+                if blob.len() > self.limit {
+                    return Err(TiffError::LimitsExceeded);
+                } else if blob.len() > cap {
+                    return Err(invalid(format!("LERC: blobs of over {cap} bytes for a {w} x {h} chunk")));
+                }
+                blob
             }
             other => return Err(invalid(format!("unknown LERC compression wrapper {other}"))),
         };

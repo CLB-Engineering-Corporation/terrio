@@ -89,8 +89,8 @@ gdal-sys = { workspace = true, optional = true }
 # feature), without copying the pixels.
 ndarray = { workspace = true, optional = true }
 
-# Every driver is on by default (`drivers` and `remote`), and so is GeoTIFF/COG Zstandard with the
-# zstd C library in native builds (`libzstd-geotiff`, CLB fork). A build with `default-features = false`
+# Every driver is on by default (`drivers` and `remote`). Zstandard is pure Rust (`ruzstd`); the
+# zstd C library is opt-in (`libzstd-*`). A build with `default-features = false`
 # keeps the core: GeoTIFF and COG (deflate, LZW, PackBits, ZSTD, WebP, JPEG, JPEG XL), the raw and
 # ASCII rasters (AAIGrid, EHdr, ENVI, ERS, HFA, RST, SAGA, GSBG, XYZ...), PNG, JPEG, VRT, GeoJSON,
 # Shapefile, KML/KMZ, GML, GPX, CSV, MapInfo, the CRS engine and the operations, without C
@@ -98,9 +98,9 @@ ndarray = { workspace = true, optional = true }
 # without C, for hosts with no C toolchain: everything but remote inputs, whose HTTPS is `ring`. Disabled drivers stay in the API (`RasterDriver`,
 # `VectorDriver`) and fail with "built without the `...` feature".
 [features]
-default = ["drivers", "remote", "libzstd-geotiff"]
-## Every format driver: the default features but `remote` and `libzstd-geotiff`, so pure Rust (no C
-## compiler needed) natively as in WebAssembly.
+default = ["drivers", "remote"]
+## Every format driver: the default features but `remote`, so pure Rust (no C compiler needed)
+## natively as in WebAssembly.
 drivers = ["cad", "geotiff", "parquet", "avif", "netcdf-hdf5", "osm", "lzma", "flatgeobuf", "jp2", "lerc", "pointcloud", "tiles", "zarr", "sqlite", "grib", "hecras", "xlsx", "filegdb"]
 ## GeoTIFF and COG reading and writing. Always built (it is the core): the feature exists so that
 ## `features = ["geotiff"]` states what a build needs.
@@ -156,12 +156,13 @@ zarr = ["dep:lz4_flex"]
 ## GeoPackage (vector and raster tiles), SQLite/SpatiaLite and the SQLite store of MBTiles.
 sqlite = []
 ## Zstandard of GeoTIFF/COG chunks (ZSTD and LERC_ZSTD writing, ZSTD reading) with the zstd C
-## library, in native builds. On by default in this fork (the CLB fork's decision of 2026-11-08):
-## the pure-Rust `ruzstd` (the `zstd-rust` crate) writes these 1.1 to 1.5 times slower and decodes
-## them slower (a whole Terrain50 COG read takes 1.3 times as long). Without it, and always in WebAssembly, GeoTIFF/COG Zstandard is
-## `ruzstd`, which decodes to the same pixels and maps zstd's levels to its four (`Fastest`,
-## `Default`, `Better`, `Best`; see `zstandard::pure::ruzstd_level`). A host with no C compiler
-## builds `default-features = false, features = ["drivers"]`. terrio decodes every ZSTD GeoTIFF
+## library, in native builds. Opt-in (it was a default feature of the CLB fork from 2026-11-08 to
+## 2026-11-10): it writes the C library's bytes at each of zstd's 22 levels, on one thread in
+## 0.7 to 1.15 of the time. Without it, and always in WebAssembly, GeoTIFF/COG Zstandard is the
+## pure-Rust `ruzstd` (the `zstd-rust` crate), which reads these as fast, writes them to within
+## about 3% of the size at levels 1 to 9 and larger above (docs/testing.md, "Zstandard: pure Rust
+## against the C library"), decodes to the same pixels and maps zstd's levels to its four (`Fastest`,
+## `Default`, `Better`, `Best`; see `zstandard::pure::ruzstd_level`). terrio decodes every ZSTD GeoTIFF
 ## chunk itself, Float16, complex and WhiteIsZero samples included: the `tiff` crate is built
 ## without its Zstandard (zstd 0.13, whose streaming decoder has known advisories), so ZSTD datum
 ## grids, which terrio-crs reads with the crate, are not read (PROJ's are DEFLATE-compressed).
@@ -175,8 +176,9 @@ libzstd-ept = ["dep:zstd"]
 ## every build.
 libzstd-geoparquet = ["dep:zstd"]
 ## Every Zstandard path above with the zstd C library: `libzstd-geotiff`, `libzstd-ept` and
-## `libzstd-geoparquet`. The C library writes 1.1 to 1.5 times faster than `ruzstd`, to about the
-## same size.
+## `libzstd-geoparquet`. The C library compresses in 0.6 to 0.85 of the time of `ruzstd` (a
+## chunk alone, by platform), to about the same size at levels 1 to 9, and decodes in 0.73 to 1.09
+## of its time.
 libzstd = ["libzstd-geotiff", "libzstd-ept", "libzstd-geoparquet"]
 ## Open any format GDAL reads, through the same data model, when terrio has no driver for it.
 gdal = ["dep:gdal", "dep:gdal-sys"]

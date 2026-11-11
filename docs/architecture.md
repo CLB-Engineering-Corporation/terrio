@@ -66,20 +66,21 @@ and parallel iterators everywhere else.
 
 Every driver builds without C dependencies, and CI builds them without a C compiler: the
 WebAssembly builds always, and natively with `default-features = false, features = ["drivers"]`
-(`terrio-cli --no-default-features`). One exception is on by default in the CLB fork: GeoTIFF/COG
-Zstandard uses the zstd C library natively (`libzstd-geotiff`, a default feature of terrio,
-terrio-cli and the Python package), because the pure-Rust path is not yet as fast (1.1 to 1.5 times
-slower to write; a whole ZSTD COG read takes 1.3 times as long). The pure-Rust GeoTIFF default is kept on the branch
-`feat/pure-zstd-geotiff-default` until it reaches parity (see the ROADMAP). Three choices keep the
-rest pure Rust:
+(`terrio-cli --no-default-features`); the default native build adds only `ring`, for HTTPS.
+GeoTIFF/COG Zstandard used the zstd C library by default in the CLB fork from 2026-11-08 to
+2026-11-10, while the pure-Rust path was slower; it now reads ZSTD GeoTIFFs as fast and takes 0.86 to 1.38
+times as long to write them on one thread, 0.61 to 1.16 times on eight (docs/testing.md,
+"Zstandard: pure Rust against the C library"), and the C library is opt-in (`libzstd-geotiff`).
+Three choices keep the drivers pure Rust:
 
-- Zstandard is decoded and written with `ruzstd` but for that exception: Zarr, EPT and GeoParquet's
-  pages, and GeoTIFF/COG in WebAssembly and in builds without `libzstd-geotiff`. terrio uses
-  `zstd-rust`, CLB's fork of `ruzstd` with the `Default`, `Better` and `Best` levels, from git
+- Zstandard is decoded and written with `ruzstd`: GeoTIFF/COG, Zarr, EPT and GeoParquet's
+  pages. terrio uses
+  `zstd-rust`, CLB's fork of `ruzstd` with the `Default`, `Better` and `Best` levels, a decoder of
+  whole frames and the row match finder of the reference implementation, from git
   (gpt-cmdr/zstd-rs; not on crates.io) under the `ruzstd` name. zstd's levels map to its four:
   2 and below `Fastest`, 0 and 3 to 5 `Default`, 6 to 9 `Better`, 10 and up `Best`. Its output
   decodes to the same bytes as the zstd C library's and each reads the other's. The opt-in
-  `libzstd-ept` and `libzstd-geoparquet` features (or `libzstd`, all three) use the C library
+  `libzstd-geotiff`, `libzstd-ept` and `libzstd-geoparquet` features (or `libzstd`, all three) use the C library
   natively for EPT and GeoParquet too.
 - HTTPS uses `rustls` with `ring` on every architecture (CLB fork). `ring` is C and assembly, so
   the `remote` feature needs a C compiler; it detects the CPU's features at run time and runs on

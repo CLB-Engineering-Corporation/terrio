@@ -198,7 +198,7 @@ locations usually show how each was installed.
 ## Requirements
 
 terrio has no system dependencies: no GDAL, PROJ, GEOS or SQLite to install. Building from source
-needs a Rust toolchain, 1.90 or later, and a C compiler for the zstd library the CLB fork builds in
-for GeoTIFF/COG Zstandard (`libzstd-geotiff`) and for `ring`, its HTTPS cryptography (`remote`).
+needs a Rust toolchain, 1.90 or later, and a C compiler for `ring`, the HTTPS cryptography of
+remote inputs in the CLB fork (`remote`).
 Without one, build terrio with `default-features = false, features = ["drivers"]` or `terrio-cli`
 with `--no-default-features`, which leaves out remote inputs.

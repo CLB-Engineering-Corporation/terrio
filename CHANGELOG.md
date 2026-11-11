@@ -2,6 +2,32 @@
 
 ## Unreleased
 
+- Pure-Rust Zstandard by default again (CLB fork, owner's decision of 2026-11-10): `libzstd-geotiff`
+  is no longer a default feature of terrio, terrio-cli and the Python package, so the default
+  build, the `terrio` command and the wheels write and read ZSTD and LERC_ZSTD GeoTIFF/COG chunks
+  with `zstd-rust`, and link no C but `ring` (HTTPS). Decoded pixels are the same either way;
+  compressed bytes and sizes are not. Files written at `LEVEL` 1 to 9 are within about 3% of the
+  size the C library gave (within 0.4% on the rasters measured for speed). `LEVEL` 10 and up map
+  to one level, `Best`, whose files are 1% to 23.5% larger than the C library's level 19, and
+  written 3.5 to 5 times faster; a higher `LEVEL` is not always a smaller file. Reading takes as
+  long as before; writing takes 0.86 to 1.38 times as long on one thread and 0.61 to 1.16 times on
+  eight (Windows x86-64, docs/testing.md). Build with `--features libzstd-geotiff` (or `libzstd`)
+  for the C library's bytes and levels. CI checks that the default builds link no C but `ring` and
+  still tests the C library path.
+- Pure-Rust Zstandard (GeoTIFF/COG, Zarr, EPT, GeoParquet pages, LERC_ZSTD blobs, the WebAssembly
+  builds) is several times faster. `zstd-rust` (gpt-cmdr/zstd-rs at `e716f73`) decodes whole
+  frames and streams straight into their output, without `unsafe` but for choosing BMI2 loops at
+  run time, and matches as the reference implementation does at each of its levels: its `fast`
+  and `dfast` loops, and its row match finder for the lazy levels. terrio keeps a compressor and
+  a decoder per thread instead of allocating their tables for every chunk. A stream whose frames
+  all record their size is decoded at once into a vector of that size (others still through a
+  stream decoder, with the same limits and bounds), and terrio's frames now record theirs, as the
+  C library's do, and carry no checksum. A chunk alone decodes in 0.92 to 1.37 times the C
+  library's time and compresses in 1.2 to 1.7 times, by platform and level (it took 1.5 to 5 and
+  up to 7 times); the table by platform is in docs/testing.md. `LEVEL` 6 to 9 (`Better`) now
+  searches as level 9 of the C library does, and `LEVEL` 1 and 2 (`Fastest`) match as its level
+  1 (its files were up to 3% smaller, and slower to write). Content that does not have the
+  checksum its frame ends with is now an error in these paths, as it is with the C library.
 - Zstandard with the zstd C library (`libzstd-geotiff`, a default feature, and the opt-in
   `libzstd-ept` and `libzstd-geoparquet`): a stream whose frames all record their size, as the C
   library's do, is decompressed in one call into a vector of that size, rather than through a

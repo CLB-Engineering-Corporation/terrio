@@ -709,23 +709,27 @@ Windows read as `f32` or `f64` values, NaN where GDAL's mask band marks pixels i
 
 ## Pure-Rust GeoTIFF/COG Zstandard by default (CLB fork, for upstream contribution)
 
-The CLB fork's default build compiles the zstd C library for GeoTIFF/COG Zstandard
+The CLB fork's default build compiled the zstd C library for GeoTIFF/COG Zstandard
 (`libzstd-geotiff`, owner's decision of 2026-11-08), which this roadmap's first principle does not
-allow upstream. The all-pure-Rust default (fork PR #35: `zstd-rust` for every Zstandard path, C
-opt-in) is kept on the branch
-[`feat/pure-zstd-geotiff-default`](https://github.com/CLB-Engineering-Corporation/terrio/tree/feat/pure-zstd-geotiff-default)
-(c913ad7) for a later upstream contribution. It is ready when:
+allow upstream. Since 2026-11-10 the default is pure Rust again (`zstd-rust` for every Zstandard
+path, C opt-in): the owner judged the remaining difference in write speed acceptable. What is left
+for the upstream contribution:
 
 - [ ] `zstd-rust` writes GeoTIFF/COG chunks at the speed of the zstd C library at the same level.
       Measured for #35 (Windows x86-64, release, Bald Eagle Depth (Max) and Terrain50 1x float32
       COGs, `PREDICTOR=3`): 1.16x to 1.51x the C library's write time at levels 1, 3 and 9, to
-      within -11% to +0.3% of its size.
-- [ ] `zstd-rust` decodes ZSTD chunks at the C library's speed (about 2x slower for the decoder; a whole COG read takes 1.3x as long, fork PR #36).
+      within -11% to +0.3% of its size. With the matchers of the reference implementation (same
+      machine; USGS, SRTM and Landsat rasters of 340 to 480 MB, docs/testing.md): 0.86x to 1.38x on
+      one thread and 0.61x to 1.16x on eight, to within 0.4% of its size on those rasters. The
+      compressor alone takes 1.2x to 1.7x as long, depending on the platform and the level.
+- [x] `zstd-rust` decodes ZSTD chunks at the C library's speed on Windows (the decoder alone takes
+      0.92x to 0.98x as long; it took about 2x to 5x), and within 1.12x to 1.37x on Linux, where
+      the C library is faster. A whole read takes 0.91x to 1.02x as long on one thread (it took 1.3x,
+      fork PR #36).
 - [ ] `zstd-rust` is on crates.io (it is a git dependency, gpt-cmdr/zstd-rs, which `cargo publish`
       refuses and upstream cannot take), or the encoder is contributed to `ruzstd` itself.
-- [ ] Then the branch is rebased on the fork's `main`, `libzstd-geotiff` leaves the defaults, and
-      the equivalence checks of #35 (decoded pixels bit-identical by terrio and GDAL, overviews
-      identical) are re-run.
+- [x] `libzstd-geotiff` leaves the defaults, with the decoded pixels of ZSTD GeoTIFFs checked
+      bit for bit against GDAL (docs/testing.md, "Zstandard: pure Rust against the C library").
 
 The rest of the fork's C dependencies that upstream would refuse are listed with this one in
 docs/CONSOLIDATION-2026-11.md ("Upstream migration: C dependencies").

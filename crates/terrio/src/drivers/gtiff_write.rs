@@ -383,7 +383,7 @@ fn jpeg_encode(data: &[u8], c: &ChunkInfo, quality: u8, ycbcr: bool) -> Result<V
 }
 
 /// Zstandard at `level` (GDAL's default 9 when `None`), of ZSTD and LERC_ZSTD chunks: the zstd C
-/// library with `libzstd-geotiff` (the default natively). Without it, and in WebAssembly, 9 is
+/// library with the opt-in `libzstd-geotiff`. Without it (the default), and in WebAssembly, 9 is
 /// `ruzstd`'s `Better`, smaller but slower than its `Default`, which the `LEVEL=3` creation option
 /// asks for (see `zstandard::pure::ruzstd_level`).
 fn zstd_at(data: &[u8], level: Option<u8>) -> Result<Vec<u8>> {
