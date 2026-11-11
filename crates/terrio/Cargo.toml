@@ -157,11 +157,11 @@ zarr = ["dep:lz4_flex"]
 sqlite = []
 ## Zstandard of GeoTIFF/COG chunks (ZSTD and LERC_ZSTD writing, ZSTD reading) with the zstd C
 ## library, in native builds. Opt-in (it was a default feature of the CLB fork from 2026-11-08 to
-## 2026-11-10): it writes the C library's bytes at each of zstd's 22 levels, and on one thread in
-## 0.7 to 0.85 of the time. Without it, and always in WebAssembly, GeoTIFF/COG Zstandard is the
+## 2026-11-10): it writes the C library's bytes at each of zstd's 22 levels, on one thread in
+## 0.7 to 1.15 of the time. Without it, and always in WebAssembly, GeoTIFF/COG Zstandard is the
 ## pure-Rust `ruzstd` (the `zstd-rust` crate), which reads these as fast, writes them to within
-## 0.4% of the size at levels 1 to 9 (docs/testing.md, "Zstandard: pure Rust against the C
-## library"), decodes to the same pixels and maps zstd's levels to its four (`Fastest`,
+## about 3% of the size at levels 1 to 9 and larger above (docs/testing.md, "Zstandard: pure Rust
+## against the C library"), decodes to the same pixels and maps zstd's levels to its four (`Fastest`,
 ## `Default`, `Better`, `Best`; see `zstandard::pure::ruzstd_level`). terrio decodes every ZSTD GeoTIFF
 ## chunk itself, Float16, complex and WhiteIsZero samples included: the `tiff` crate is built
 ## without its Zstandard (zstd 0.13, whose streaming decoder has known advisories), so ZSTD datum
@@ -176,8 +176,9 @@ libzstd-ept = ["dep:zstd"]
 ## every build.
 libzstd-geoparquet = ["dep:zstd"]
 ## Every Zstandard path above with the zstd C library: `libzstd-geotiff`, `libzstd-ept` and
-## `libzstd-geoparquet`. The C library compresses in 0.6 to 0.85 of the time of `ruzstd`, to
-## about the same size, and decodes at about its speed.
+## `libzstd-geoparquet`. The C library compresses in 0.6 to 0.85 of the time of `ruzstd` (a
+## chunk alone, by platform), to about the same size at levels 1 to 9, and decodes in 0.73 to 1.09
+## of its time.
 libzstd = ["libzstd-geotiff", "libzstd-ept", "libzstd-geoparquet"]
 ## Open any format GDAL reads, through the same data model, when terrio has no driver for it.
 gdal = ["dep:gdal", "dep:gdal-sys"]

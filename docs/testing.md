@@ -1509,35 +1509,55 @@ the reading, the predictor and the writing too: copying the same rasters uncompr
 
 | Raster, predictor | Level | Write, 1 thread: C, Rust | x | Write, 8 threads: C, Rust | x | Size, Rust / C | Read, 1 thread: C, Rust | x |
 |---|---|---|---|---|---|---|---|---|
-| USGS Float32, 3 | 1 | 2.06 s, 2.47 s | 1.20 | 0.78 s, 0.83 s | 1.06 | 0.998 | 2.76 s, 2.83 s | 1.03 |
-| | 3 | 2.71 s, 3.55 s | 1.31 | 0.88 s, 1.09 s | 1.24 | 1.000 | 2.85 s, 2.78 s | 0.98 |
-| | 9 | 8.58 s, 9.93 s | 1.16 | 2.85 s, 2.20 s | 0.77 | 0.996 | 2.72 s, 2.76 s | 1.02 |
-| USGS Float32, none | 1 | 1.31 s, 1.64 s | 1.25 | 0.67 s, 0.80 s | 1.19 | 1.001 | 1.45 s, 1.48 s | 1.02 |
-| | 3 | 1.84 s, 2.20 s | 1.20 | 0.80 s, 0.90 s | 1.12 | 1.001 | 1.48 s, 1.51 s | 1.02 |
-| | 9 | 5.43 s, 8.00 s | 1.47 | 2.38 s, 2.48 s | 1.04 | 0.997 | 1.48 s, 1.52 s | 1.03 |
-| SRTM Int16, 2 | 1 | 1.69 s, 2.04 s | 1.21 | 0.57 s, 0.63 s | 1.10 | 1.003 | 1.03 s, 1.10 s | 1.07 |
-| | 3 | 2.51 s, 3.05 s | 1.21 | 0.75 s, 0.79 s | 1.05 | 1.001 | 1.16 s, 1.23 s | 1.06 |
-| | 9 | 8.56 s, 11.47 s | 1.34 | 2.15 s, 2.23 s | 1.04 | 1.001 | 1.12 s, 1.19 s | 1.06 |
-| Landsat UInt8, 2 | 1 | 2.73 s, 3.41 s | 1.25 | 0.96 s, 1.00 s | 1.05 | 1.004 | 1.96 s, 1.98 s | 1.01 |
-| | 3 | 4.61 s, 5.71 s | 1.24 | 1.32 s, 1.48 s | 1.12 | 1.002 | 2.23 s, 2.36 s | 1.06 |
-| | 9 | 14.13 s, 18.20 s | 1.29 | 4.59 s, 3.91 s | 0.85 | 1.003 | 2.16 s, 2.27 s | 1.05 |
+| USGS Float32, 3 | 1 | 2.04 s, 2.20 s | 1.08 | 0.72 s, 0.75 s | 1.05 | 0.997 | 2.76 s, 2.81 s | 1.02 |
+| | 3 | 2.58 s, 3.05 s | 1.18 | 0.83 s, 0.97 s | 1.16 | 0.999 | 2.65 s, 2.66 s | 1.00 |
+| | 9 | 7.93 s, 9.24 s | 1.16 | 2.70 s, 1.97 s | 0.73 | 0.996 | 2.69 s, 2.66 s | 0.99 |
+| USGS Float32, none | 1 | 1.23 s, 1.30 s | 1.05 | 0.66 s, 0.70 s | 1.06 | 1.001 | 1.40 s, 1.27 s | 0.91 |
+| | 3 | 1.70 s, 1.84 s | 1.08 | 0.83 s, 0.79 s | 0.96 | 1.001 | 1.41 s, 1.31 s | 0.93 |
+| | 9 | 5.10 s, 4.41 s | 0.86 | 2.42 s, 1.47 s | 0.61 | 1.000 | 1.42 s, 1.29 s | 0.91 |
+| SRTM Int16, 2 | 1 | 1.63 s, 1.75 s | 1.07 | 0.56 s, 0.56 s | 1.00 | 1.003 | 1.01 s, 1.03 s | 1.02 |
+| | 3 | 2.43 s, 2.78 s | 1.15 | 0.72 s, 0.77 s | 1.07 | 1.001 | 1.15 s, 1.12 s | 0.97 |
+| | 9 | 8.27 s, 11.46 s | 1.38 | 2.04 s, 2.07 s | 1.02 | 1.000 | 1.11 s, 1.05 s | 0.95 |
+| Landsat UInt8, 2 | 1 | 2.65 s, 2.83 s | 1.07 | 0.95 s, 0.96 s | 1.02 | 1.003 | 1.96 s, 1.94 s | 0.99 |
+| | 3 | 4.54 s, 5.18 s | 1.14 | 1.28 s, 1.36 s | 1.07 | 1.001 | 2.12 s, 2.08 s | 0.98 |
+| | 9 | 13.92 s, 18.32 s | 1.32 | 4.48 s, 3.84 s | 0.86 | 1.003 | 2.12 s, 2.00 s | 0.94 |
 
 The reads are of the files the C build wrote; the pure-Rust build reads its own in the same time
-(within 6%). On eight threads a read takes 0.80 to 1.16 times as long, within the run-to-run
-variation of this machine. On eight threads the pure-Rust build writes level 9 as fast as the C build or faster, although
-its compressor alone is slower. The likely reason: the C build sets up the tables of the C library
-for every chunk, and the pure-Rust build keeps a compressor per thread.
+(within 5%). On eight threads a read takes 0.92 to 1.08 times as long, within the run-to-run
+variation of this machine. On eight threads the pure-Rust build writes level 9 as fast as the C
+build or faster, although its compressor alone is slower. The likely reason: the C build sets up
+the tables of the C library for every chunk, and the pure-Rust build keeps a compressor per thread.
 
 The 24 files of the table decode to the pixels of their sources bit for bit when GDAL 3.10.1 reads
 them (through rasterio), those of the pure-Rust build included, as do `LEVEL=15` and `LEVEL=19`
 files of the pure-Rust build; and the pure-Rust build reads the files of the C build to the same
-pixels.
+pixels. A further 133 round trips on five smaller rasters (ZSTD tiled, with a predictor, LERC_ZSTD
+and COG, at `LEVEL` default, 1, 3, 9, 15, 19 and 22) were exact in pixels, type, nodata, CRS and
+transform with GDAL 3.12.2, both builds writing and each reading the other's files; those were run
+one `zstd-rust` revision earlier, before its last decoder change.
+
+Sizes. On the three rasters of the table the pure-Rust files are within 0.4% of the C library's at
+`LEVEL` 1 to 9. That is not a bound: on the five smaller rasters, 32 of 76 pairs of files are
+further apart, from 2.8% smaller to 2.5% larger. `LEVEL` 10 and up map to one level, `Best`, which
+searches no deeper than a lazy matcher does: its files are 1% to 8% larger than the C library's
+level 19 on the rasters of the table and up to 23.5% larger on others (one elevation raster,
+tiled without a predictor: 873,562 bytes against 707,130), for 3.5 to 5 times the speed. A higher
+`LEVEL` is not always a smaller file: on synthetic categorical UInt8, `LEVEL=1` wrote 745,323
+bytes, `LEVEL=3` 816,787 and `LEVEL=9` 791,680.
 
 The codecs alone, a frame per 1 MiB chunk of the same rasters on one thread (`zstd-rust`'s
-`cargo run --release --example rasterbench`, best of seven): `zstd-rust` takes 0.99 to 1.25
-times as long as the C library to decode, 1.3 to 1.5 times at level 1, 1.25 to 1.5 times at level
-3 and 1.2 to 1.7 times at level 9 to compress, to within 1% of its size. Levels 10 and up map to
-`Best`, which is 3.5 to 5 times faster than level 19 of the C library and 1% to 8% larger.
+`.github/workflows/bench.yml` on GitHub-hosted runners, best of seven, geometric mean over the six
+files at levels 1, 3 and 9; the time of `zstd-rust` over that of the C library, zstd 1.5.7):
+
+| Platform | Decode whole frames | Decode as a stream to the end | Compress, level 1 | level 3 | level 9 |
+|---|---|---|---|---|---|
+| Windows x86-64 (MSVC) | 0.92 to 0.98 | 1.02 to 1.11 | 1.17 | 1.21 | 1.31 |
+| Linux x86-64 (EPYC, Xeon) | 1.22 to 1.37 | 1.35 to 1.51 | 1.34 | 1.47 | 1.70 |
+| Linux AArch64 (Neoverse N2) | 1.12 to 1.17 | 1.25 to 1.26 | 1.37 | 1.35 | 1.47 |
+
+The decode figures are ranges over runs and processors (gpt-cmdr/zstd-rs#9), the compress
+figures one run (gpt-cmdr/zstd-rs#8). The C library is faster on Linux than under MSVC on the
+same processor, which is most of the difference between the first two rows. macOS is not measured.
 
 ## COG validation
 

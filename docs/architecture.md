@@ -68,8 +68,8 @@ Every driver builds without C dependencies, and CI builds them without a C compi
 WebAssembly builds always, and natively with `default-features = false, features = ["drivers"]`
 (`terrio-cli --no-default-features`); the default native build adds only `ring`, for HTTPS.
 GeoTIFF/COG Zstandard used the zstd C library by default in the CLB fork from 2026-11-08 to
-2026-11-10, while the pure-Rust path was slower; it now reads ZSTD GeoTIFFs as fast and takes 1.2
-to 1.5 times as long to write them on one thread, 0.8 to 1.25 times on eight (docs/testing.md,
+2026-11-10, while the pure-Rust path was slower; it now reads ZSTD GeoTIFFs as fast and takes 0.86 to 1.38
+times as long to write them on one thread, 0.61 to 1.16 times on eight (docs/testing.md,
 "Zstandard: pure Rust against the C library"), and the C library is opt-in (`libzstd-geotiff`).
 Three choices keep the drivers pure Rust:
 
