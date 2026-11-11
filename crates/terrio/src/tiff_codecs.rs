@@ -815,8 +815,16 @@ impl ChunkCodec {
         let blob = match self.lerc_wrapper {
             0 => raw,
             1 => inflate(&mut flate2::read::ZlibDecoder::new(&raw[..]))?,
-            // Bounded as `inflate` bounds a stream, which then only checks the length.
-            2 => inflate(&mut &crate::zstandard::pure::frames(&raw, cap.min(self.limit).saturating_add(1))?[..])?,
+            // Bounded as `inflate` bounds a stream, and checked as it checks one.
+            2 => {
+                let blob = crate::zstandard::pure::frames(&raw, cap.min(self.limit).saturating_add(1))?;
+                if blob.len() > self.limit {
+                    return Err(TiffError::LimitsExceeded);
+                } else if blob.len() > cap {
+                    return Err(invalid(format!("LERC: blobs of over {cap} bytes for a {w} x {h} chunk")));
+                }
+                blob
+            }
             other => return Err(invalid(format!("unknown LERC compression wrapper {other}"))),
         };
         self.lerc_headers(&blob, w, h)?;

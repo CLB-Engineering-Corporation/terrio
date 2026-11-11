@@ -1486,15 +1486,16 @@ that each reads what the other writes, that a stream whose frames record their s
 once to the bytes a stream decoder gives, and that limits and bounds hold either way:
 
 ```sh
-cargo test -p terrio --lib zstandard
-cargo test -p terrio --no-default-features --features drivers,remote --lib zstandard
+cargo test -p terrio --lib zstandard                       # pure Rust (the default)
+cargo test -p terrio --features libzstd --lib zstandard    # with the C library: each reads the other
 ```
 
 Speed is compared with two release builds of the command, on the same files:
 
 ```sh
-cargo build --release -p terrio-cli                                        # C library
-cargo build --release -p terrio-cli --no-default-features --features remote  # zstd-rust
+cargo build --release -p terrio-cli && cp target/release/terrio terrio-rust   # zstd-rust (the default)
+cargo build --release -p terrio-cli --features libzstd-geotiff && cp target/release/terrio terrio-c
+# with each of the two:
 terrio convert raw.tif out.tif --co COMPRESS=ZSTD --co LEVEL=9 --co PREDICTOR=3 \
   --co TILED=YES --co BLOCKXSIZE=512 --co BLOCKYSIZE=512 --co BIGTIFF=YES
 terrio convert out.tif plain.tif --co COMPRESS=NONE --co BIGTIFF=YES         # the read

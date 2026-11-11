@@ -16,7 +16,7 @@ authors = ["Qiusheng Wu <giswqs@gmail.com>"]
 memmap2 = "0.9"
 # Every driver, without remote inputs (whose HTTPS is `ring`): the members that link them say so
 # (`remote`, a default feature of terrio, terrio-cli and the Python package), so
-# `--no-default-features` builds them without C. The zstd C library is opt-in (`libzstd-*`).
+# `--no-default-features` builds them without C. The zstd C library is opt-in (`libzstd-*`, `parquet-zstd`).
 terrio = { path = "crates/terrio", version = "0.6.1", default-features = false, features = ["drivers"] }
 terrio-crs = { path = "crates/terrio-crs", version = "0.2.1", default-features = false }
 # For the Python package (not published to crates.io), so without a version to keep in step.
