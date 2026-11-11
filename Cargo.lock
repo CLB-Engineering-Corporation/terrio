@@ -3560,7 +3560,7 @@ dependencies = [
 [[package]]
 name = "zstd-rust"
 version = "0.1.0"
-source = "git+https://github.com/gpt-cmdr/zstd-rs?rev=e716f7375fceb321fb603db1e97721bf72be1ca2#e716f7375fceb321fb603db1e97721bf72be1ca2"
+source = "git+https://github.com/gpt-cmdr/zstd-rs?rev=de91207843185acceda9f94b1623af8860c347e3#de91207843185acceda9f94b1623af8860c347e3"
 dependencies = [
  "twox-hash",
 ]
