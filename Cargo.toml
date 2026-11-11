@@ -77,7 +77,7 @@ lz4_flex = { version = "0.14", default-features = false, features = ["alloc", "s
 # under the `ruzstd` name so the code
 # keeps its `ruzstd::` paths. From git (gpt-cmdr/zstd-rs `main`); it is
 # not on crates.io.
-ruzstd = { package = "zstd-rust", git = "https://github.com/gpt-cmdr/zstd-rs", rev = "e716f7375fceb321fb603db1e97721bf72be1ca2" }
+ruzstd = { package = "zstd-rust", git = "https://github.com/gpt-cmdr/zstd-rs", rev = "de91207843185acceda9f94b1623af8860c347e3" }
 # 0.10 reads HDF5 files written in the earliest format with version 1/2 compound datatypes
 # (every HEC-RAS geometry and plan file, among others) and old fill value messages
 # (roteiro-gis/netcdf-rust#95). The HEC-RAS engine uses the same hdf5-reader 0.10.1, so a build
