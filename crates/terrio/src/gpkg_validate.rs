@@ -3,19 +3,14 @@ use crate::{Error, Result};
 
 #[cfg(feature = "sqlite")]
 fn same_image_metadata(before: &std::fs::Metadata, after: &std::fs::Metadata) -> bool {
-    if before.len() != after.len() || before.modified().ok() != after.modified().ok() {
-        return false;
-    }
     #[cfg(unix)]
-    {
+    let same_inode = {
         use std::os::unix::fs::MetadataExt;
-        if (before.dev(), before.ino(), before.ctime(), before.ctime_nsec())
-            != (after.dev(), after.ino(), after.ctime(), after.ctime_nsec())
-        {
-            return false;
-        }
-    }
-    true
+        (before.dev(), before.ino(), before.ctime(), before.ctime_nsec()) == (after.dev(), after.ino(), after.ctime(), after.ctime_nsec())
+    };
+    #[cfg(not(unix))]
+    let same_inode = true;
+    before.len() == after.len() && before.modified().ok() == after.modified().ok() && same_inode
 }
 
 /// A GeoPackage core requirement number or a named extension requirement.
