@@ -1256,6 +1256,7 @@ const ITEM_TYPES: &[(&str, &str, &str)] = &[
 ];
 
 /// The item relationship types as ArcGIS Pro 3.6 writes them (content and order).
+#[rustfmt::skip]
 const REL_TYPES: &[(&str, &str, &str, &str, &str, &str, i64)] = &[
     ("{ccd6e1c9-9238-40d4-843f-c5dafd3d2bde}", "{37672bd2-b9f3-48c1-89b5-8c43bbbb6d57}", "{cd06bc3b-789d-4c51-aafa-a467912b8965}", "TableInUtilityNetwork", "Manages Table", "Participates In Utility Network", 0),
     ("{fb166a8c-c09c-4121-9fa7-cb73406e2944}", "{60ea40cf-2667-45e2-bdff-7f6892538fe8}", "{cd06bc3b-789d-4c51-aafa-a467912b8965}", "TableInTraceNetwork", "Manages Table", "Participates In Trace Network", 0),
@@ -1419,8 +1420,7 @@ mod tests {
             fields: vec![FieldDef::new("X", FieldType::Int32)],
         })
         .unwrap();
-        w.create_table(&TableDef { name: "Tab".into(), geometry: None, fields: vec![FieldDef::new("X", FieldType::Int32)] })
-            .unwrap();
+        w.create_table(&TableDef { name: "Tab".into(), geometry: None, fields: vec![FieldDef::new("X", FieldType::Int32)] }).unwrap();
         w.finish().unwrap();
         let h = std::fs::read(dir.join("a00000009.horizon")).unwrap();
         let vals: Vec<f64> = h.chunks(8).map(|c| f64::from_le_bytes(c.try_into().unwrap())).collect();
@@ -1432,7 +1432,8 @@ mod tests {
         let rels = gdb.open_table("GDB_ItemRelationshipTypes").unwrap().read_all().unwrap();
         assert_eq!(rels.len(), 26);
         let names: Vec<String> = types.iter().filter_map(|r| r.values.last().and_then(|v| v.as_str()).map(String::from)).collect();
-        for n in ["Utility Network", "Trace Network", "Sync Replica", "Location Referencing Dataset", "Feature Class", "Coded Value Domain"] {
+        for n in ["Utility Network", "Trace Network", "Sync Replica", "Location Referencing Dataset", "Feature Class", "Coded Value Domain"]
+        {
             assert!(names.iter().any(|x| x == n), "{n}");
         }
         std::fs::remove_dir_all(&dir).unwrap();
