@@ -30,17 +30,18 @@ use crate::filegdb::{CurveSegment, Error, FieldType, GeometryFieldInfo, Result, 
 
 const FOLDER_TYPE: &str = "{f3783e6f-65ca-4514-8315-ce3985dad3b1}";
 const WORKSPACE_TYPE: &str = "{c673fe0f-7280-404f-8532-20755dd8fc06}";
-const FEATURE_DATASET_TYPE: &str = "{74737149-DCB5-4257-8904-B9724E32A530}";
 const FEATURE_CLASS_TYPE: &str = "{70737809-852c-4a03-9e22-2cecea5b9bfa}";
 const TABLE_TYPE: &str = "{cd06bc3b-789d-4c51-aafa-a467912b8965}";
-const RANGE_DOMAIN_TYPE: &str = "{c29da988-8c3e-45f7-8b5c-18e51ee7beb4}";
 const CODED_DOMAIN_TYPE: &str = "{8c368b12-a12e-4c7e-9638-c9c64e69e98f}";
-const DATASET_IN_FEATURE_DATASET: &str = "{a1633a59-46ba-4448-8706-d8abe2b2b02e}";
 const DATASET_IN_FOLDER: &str = "{dc78f1ab-34e4-43ac-ba47-1c4eabd0e7c7}";
 const DOMAIN_IN_DATASET: &str = "{17e08adb-2b31-4dcd-8fdd-df529e88f843}";
 
 /// ESRI WKT of EPSG:2278 as ArcGIS Pro writes it.
 pub const ESRI_WKT_2278: &str = "PROJCS[\"NAD_1983_StatePlane_Texas_South_Central_FIPS_4204_Feet\",GEOGCS[\"GCS_North_American_1983\",DATUM[\"D_North_American_1983\",SPHEROID[\"GRS_1980\",6378137.0,298.257222101]],PRIMEM[\"Greenwich\",0.0],UNIT[\"Degree\",0.0174532925199433]],PROJECTION[\"Lambert_Conformal_Conic\"],PARAMETER[\"False_Easting\",1968500.0],PARAMETER[\"False_Northing\",13123333.33333333],PARAMETER[\"Central_Meridian\",-99.0],PARAMETER[\"Standard_Parallel_1\",28.38333333333333],PARAMETER[\"Standard_Parallel_2\",30.28333333333333],PARAMETER[\"Latitude_Of_Origin\",27.83333333333333],UNIT[\"Foot_US\",0.3048006096012192],AUTHORITY[\"EPSG\",2278]]";
+
+/// The horizon of EPSG:2278 in ArcGIS Pro (xmin, ymin, xmax, ymax; feet), the content of the
+/// `.horizon` file ArcGIS writes for every EPSG:2278 feature class, whatever its XY grid.
+pub const HORIZON_2278: [f64; 4] = [-126_725_700.0, -77_828_800.0, 130_662_700.0, 50_930_400.0];
 
 const ESRI_WKT_WGS84: &str = "GEOGCS[\"GCS_WGS_1984\",DATUM[\"D_WGS_1984\",SPHEROID[\"WGS_1984\",6378137.0,298.257223563]],PRIMEM[\"Greenwich\",0.0],UNIT[\"Degree\",0.0174532925199433]]";
 
@@ -80,6 +81,13 @@ impl GeometryDef {
             xy_scale: 3_048.006_096_012_192_8,
             xy_tolerance: 0.003_280_833_333_333_333,
         }
+    }
+
+    /// The coordinate system's horizon, as ArcGIS Pro writes it in a feature class's
+    /// `.horizon` file (known for EPSG:2278 only; other systems get none, and ArcGIS writes
+    /// the file when it first opens the feature class).
+    pub fn horizon(&self) -> Option<[f64; 4]> {
+        (self.latest_wkid == Some(2278) || self.wkid == Some(102740)).then_some(HORIZON_2278)
     }
 
     fn info(&self) -> GeometryFieldInfo {
@@ -177,6 +185,9 @@ struct RawTable {
     shapes: Vec<(i64, Shape)>,
     /// Spatial index grid size written in the geometry field descriptor.
     grid: f64,
+    /// The coordinate system's horizon (xmin, ymin, xmax, ymax), written as the `.horizon`
+    /// file of a feature class as ArcGIS Pro does; `None`: not written.
+    horizon: Option<[f64; 4]>,
 }
 
 fn guid_bytes(s: &str) -> Result<[u8; 16]> {
@@ -213,6 +224,7 @@ impl RawTable {
             user: false,
             shapes: Vec::new(),
             grid: 0.0,
+            horizon: None,
         }
     }
 
@@ -386,6 +398,11 @@ impl RawTable {
                 self.grid = spatial_index::grid_size(g.shape_type, &self.shapes, self.extent);
                 let p = base.with_extension("spx");
                 std::fs::write(&p, spatial_index::spx(self.grid, &self.shapes)).map_err(|e| Error::Io { path: p, source: e })?;
+                if let Some(h) = self.horizon {
+                    let p = base.with_extension("horizon");
+                    let bytes: Vec<u8> = h.iter().flat_map(|v| v.to_le_bytes()).collect();
+                    std::fs::write(&p, bytes).map_err(|e| Error::Io { path: p, source: e })?;
+                }
             }
             let p = base.with_extension("gdbindexes");
             std::fs::write(&p, spatial_index::gdbindexes(oid, geom)).map_err(|e| Error::Io { path: p, source: e })?;
@@ -777,6 +794,7 @@ impl GdbWriter {
         self.next_file_id += 1;
         let mut raw = RawTable::new(file_id, gi.clone(), 5);
         raw.user = true;
+        raw.horizon = def.geometry.as_ref().and_then(GeometryDef::horizon);
         raw.fields.push(RawField::new("OBJECTID", FieldType::ObjectId, false, 4));
         let mut geom_idx = None;
         if gi.is_some() {
@@ -1192,178 +1210,80 @@ const DBTUNE: &[(&str, &str, &str)] = &[
     ("MOSAICDATASET_INLINE", "RASTER_STORAGE", "InLine"),
 ];
 
+/// The item types of a file geodatabase as ArcGIS Pro 3.6 writes them (content and order).
+/// ArcGIS adds any missing type to a geodatabase it opens, which rewrites the file: keep
+/// this list complete.
 const ITEM_TYPES: &[(&str, &str, &str)] = &[
-    ("{8405add5-8df8-4227-8fac-3fcade073386}", "{00000000-0000-0000-0000-000000000000}", "Item"),
-    (FOLDER_TYPE, "{8405add5-8df8-4227-8fac-3fcade073386}", "Folder"),
-    ("{ffd09c28-fe70-4e25-907c-af8e8a5ec5f3}", "{8405add5-8df8-4227-8fac-3fcade073386}", "Resource"),
-    ("{28da9e89-ff80-4d6d-8926-4ee2b161677d}", "{ffd09c28-fe70-4e25-907c-af8e8a5ec5f3}", "Dataset"),
-    ("{fbdd7dd6-4a25-40b7-9a1a-ecc3d1172447}", "{28da9e89-ff80-4d6d-8926-4ee2b161677d}", "Tin"),
-    ("{d4912162-3413-476e-9da4-2aefbbc16939}", "{28da9e89-ff80-4d6d-8926-4ee2b161677d}", "AbstractTable"),
-    ("{b606a7e1-fa5b-439c-849c-6e9c2481537b}", "{28da9e89-ff80-4d6d-8926-4ee2b161677d}", "Relationship Class"),
-    (FEATURE_DATASET_TYPE, "{28da9e89-ff80-4d6d-8926-4ee2b161677d}", "Feature Dataset"),
-    ("{73718a66-afb9-4b88-a551-cffa0ae12620}", "{28da9e89-ff80-4d6d-8926-4ee2b161677d}", "Geometric Network"),
-    ("{767152d3-ed66-4325-8774-420d46674e07}", "{28da9e89-ff80-4d6d-8926-4ee2b161677d}", "Topology"),
-    ("{e6302665-416b-44fa-be33-4e15916ba101}", "{28da9e89-ff80-4d6d-8926-4ee2b161677d}", "Survey Dataset"),
-    ("{d5a40288-029e-4766-8c81-de3f61129371}", "{28da9e89-ff80-4d6d-8926-4ee2b161677d}", "Schematic Dataset"),
-    ("{db1b697a-3bb6-426a-98a2-6ee7a4c6aed3}", "{28da9e89-ff80-4d6d-8926-4ee2b161677d}", "Toolbox"),
-    (WORKSPACE_TYPE, "{28da9e89-ff80-4d6d-8926-4ee2b161677d}", "Workspace"),
-    ("{dc9ef677-1aa3-45a7-8acd-303a5202d0dc}", "{28da9e89-ff80-4d6d-8926-4ee2b161677d}", "Workspace Extension"),
+    ("{5b966567-fb87-4dde-938b-b4b37423539d}", "{28da9e89-ff80-4d6d-8926-4ee2b161677d}", "Sync Replica"),
     ("{77292603-930f-475d-ae4f-b8970f42f394}", "{28da9e89-ff80-4d6d-8926-4ee2b161677d}", "Extension Dataset"),
-    ("{8637f1ed-8c04-4866-a44a-1cb8288b3c63}", "{28da9e89-ff80-4d6d-8926-4ee2b161677d}", "Domain"),
-    ("{4ed4a58e-621f-4043-95ed-850fba45fcbc}", "{28da9e89-ff80-4d6d-8926-4ee2b161677d}", "Replica"),
-    ("{d98421eb-d582-4713-9484-43304d0810f6}", "{28da9e89-ff80-4d6d-8926-4ee2b161677d}", "Replica Dataset"),
-    ("{dc64b6e4-dc0f-43bd-b4f5-f22385dcf055}", "{28da9e89-ff80-4d6d-8926-4ee2b161677d}", "Historical Marker"),
-    (TABLE_TYPE, "{d4912162-3413-476e-9da4-2aefbbc16939}", "Table"),
-    (FEATURE_CLASS_TYPE, "{d4912162-3413-476e-9da4-2aefbbc16939}", "Feature Class"),
-    ("{5ed667a3-9ca9-44a2-8029-d95bf23704b9}", "{d4912162-3413-476e-9da4-2aefbbc16939}", "Raster Dataset"),
+    ("{8405add5-8df8-4227-8fac-3fcade073386}", "{00000000-0000-0000-0000-000000000000}", "Item"),
     ("{35b601f7-45ce-4aff-adb7-7702d3839b12}", "{d4912162-3413-476e-9da4-2aefbbc16939}", "Raster Catalog"),
-    ("{7771fc7d-a38b-4fd3-8225-639d17e9a131}", "{77292603-930f-475d-ae4f-b8970f42f394}", "Network Dataset"),
-    ("{76357537-3364-48af-a4be-783c7c28b5cb}", "{77292603-930f-475d-ae4f-b8970f42f394}", "Terrain"),
-    ("{a3803369-5fc2-4963-bae0-13effc09dd73}", "{77292603-930f-475d-ae4f-b8970f42f394}", "Parcel Fabric"),
+    ("{b606a7e1-fa5b-439c-849c-6e9c2481537b}", "{28da9e89-ff80-4d6d-8926-4ee2b161677d}", "Relationship Class"),
     ("{a300008d-0cea-4f6a-9dfa-46af829a3df2}", "{77292603-930f-475d-ae4f-b8970f42f394}", "Representation Class"),
-    ("{787bea35-4a86-494f-bb48-500b96145b58}", "{77292603-930f-475d-ae4f-b8970f42f394}", "Catalog Dataset"),
+    ("{d4912162-3413-476e-9da4-2aefbbc16939}", "{28da9e89-ff80-4d6d-8926-4ee2b161677d}", "AbstractTable"),
+    ("{ebeee2c9-fa73-4bed-ac7d-aee7d68afc80}", "{77292603-930f-475d-ae4f-b8970f42f394}", "Parcel Dataset"),
+    ("{8637f1ed-8c04-4866-a44a-1cb8288b3c63}", "{28da9e89-ff80-4d6d-8926-4ee2b161677d}", "Domain"),
+    ("{ffd09c28-fe70-4e25-907c-af8e8a5ec5f3}", "{8405add5-8df8-4227-8fac-3fcade073386}", "Resource"),
+    ("{74737149-dcb5-4257-8904-b9724e32a530}", "{28da9e89-ff80-4d6d-8926-4ee2b161677d}", "Feature Dataset"),
     ("{f8413dcb-2248-4935-bfe9-315f397e5110}", "{77292603-930f-475d-ae4f-b8970f42f394}", "Mosaic Dataset"),
-    (RANGE_DOMAIN_TYPE, "{8637f1ed-8c04-4866-a44a-1cb8288b3c63}", "Range Domain"),
-    (CODED_DOMAIN_TYPE, "{8637f1ed-8c04-4866-a44a-1cb8288b3c63}", "Coded Value Domain"),
+    ("{5ed667a3-9ca9-44a2-8029-d95bf23704b9}", "{d4912162-3413-476e-9da4-2aefbbc16939}", "Raster Dataset"),
+    ("{4945a015-d612-448d-ae82-24ceb89508ae}", "{28da9e89-ff80-4d6d-8926-4ee2b161677d}", "Network Diagram"),
+    ("{60ea40cf-2667-45e2-bdff-7f6892538fe8}", "{77292603-930f-475d-ae4f-b8970f42f394}", "Trace Network"),
+    ("{70737809-852c-4a03-9e22-2cecea5b9bfa}", "{d4912162-3413-476e-9da4-2aefbbc16939}", "Feature Class"),
+    ("{db1b697a-3bb6-426a-98a2-6ee7a4c6aed3}", "{28da9e89-ff80-4d6d-8926-4ee2b161677d}", "Toolbox"),
+    ("{8c368b12-a12e-4c7e-9638-c9c64e69e98f}", "{8637f1ed-8c04-4866-a44a-1cb8288b3c63}", "Coded Value Domain"),
+    ("{73718a66-afb9-4b88-a551-cffa0ae12620}", "{28da9e89-ff80-4d6d-8926-4ee2b161677d}", "Geometric Network"),
+    ("{dc64b6e4-dc0f-43bd-b4f5-f22385dcf055}", "{28da9e89-ff80-4d6d-8926-4ee2b161677d}", "Historical Marker"),
+    ("{c673fe0f-7280-404f-8532-20755dd8fc06}", "{28da9e89-ff80-4d6d-8926-4ee2b161677d}", "Workspace"),
+    ("{fbdd7dd6-4a25-40b7-9a1a-ecc3d1172447}", "{28da9e89-ff80-4d6d-8926-4ee2b161677d}", "Tin"),
+    ("{76357537-3364-48af-a4be-783c7c28b5cb}", "{77292603-930f-475d-ae4f-b8970f42f394}", "Terrain"),
+    ("{767152d3-ed66-4325-8774-420d46674e07}", "{28da9e89-ff80-4d6d-8926-4ee2b161677d}", "Topology"),
+    ("{cc53cc54-4cca-43b7-9a9b-64dc59c999bd}", "{77292603-930f-475d-ae4f-b8970f42f394}", "Location Referencing Dataset"),
+    ("{e6302665-416b-44fa-be33-4e15916ba101}", "{28da9e89-ff80-4d6d-8926-4ee2b161677d}", "Survey Dataset"),
+    ("{7771fc7d-a38b-4fd3-8225-639d17e9a131}", "{77292603-930f-475d-ae4f-b8970f42f394}", "Network Dataset"),
+    ("{dc9ef677-1aa3-45a7-8acd-303a5202d0dc}", "{28da9e89-ff80-4d6d-8926-4ee2b161677d}", "Workspace Extension"),
+    ("{2d0bfe5d-66c0-4536-8534-b9c50771aae4}", "{28da9e89-ff80-4d6d-8926-4ee2b161677d}", "Diagram Dataset"),
+    ("{cd06bc3b-789d-4c51-aafa-a467912b8965}", "{d4912162-3413-476e-9da4-2aefbbc16939}", "Table"),
+    ("{787bea35-4a86-494f-bb48-500b96145b58}", "{77292603-930f-475d-ae4f-b8970f42f394}", "Catalog Dataset"),
+    ("{d86502f9-9758-45c6-9d23-6dd1a0107b47}", "{28da9e89-ff80-4d6d-8926-4ee2b161677d}", "Sync Dataset"),
+    ("{28da9e89-ff80-4d6d-8926-4ee2b161677d}", "{ffd09c28-fe70-4e25-907c-af8e8a5ec5f3}", "Dataset"),
+    ("{d98421eb-d582-4713-9484-43304d0810f6}", "{28da9e89-ff80-4d6d-8926-4ee2b161677d}", "Replica Dataset"),
+    ("{c29da988-8c3e-45f7-8b5c-18e51ee7beb4}", "{8637f1ed-8c04-4866-a44a-1cb8288b3c63}", "Range Domain"),
+    ("{f3783e6f-65ca-4514-8315-ce3985dad3b1}", "{8405add5-8df8-4227-8fac-3fcade073386}", "Folder"),
+    ("{37672bd2-b9f3-48c1-89b5-8c43bbbb6d57}", "{77292603-930f-475d-ae4f-b8970f42f394}", "Utility Network"),
+    ("{a3803369-5fc2-4963-bae0-13effc09dd73}", "{77292603-930f-475d-ae4f-b8970f42f394}", "Parcel Fabric"),
+    ("{4ed4a58e-621f-4043-95ed-850fba45fcbc}", "{28da9e89-ff80-4d6d-8926-4ee2b161677d}", "Replica"),
 ];
 
+/// The item relationship types as ArcGIS Pro 3.6 writes them (content and order).
+#[rustfmt::skip]
 const REL_TYPES: &[(&str, &str, &str, &str, &str, &str, i64)] = &[
-    ("{0d10b3a7-2f64-45e6-b7ac-2fc27bf2133c}", FOLDER_TYPE, FOLDER_TYPE, "FolderInFolder", "Parent Folder Of", "Child Folder Of", 1),
-    (
-        "{5dd0c1af-cb3d-4fea-8c51-cb3ba8d77cdb}",
-        FOLDER_TYPE,
-        "{8405add5-8df8-4227-8fac-3fcade073386}",
-        "ItemInFolder",
-        "Contains Item",
-        "Contained In Folder",
-        1,
-    ),
-    (
-        DATASET_IN_FEATURE_DATASET,
-        FEATURE_DATASET_TYPE,
-        "{28da9e89-ff80-4d6d-8926-4ee2b161677d}",
-        "DatasetInFeatureDataset",
-        "Contains Dataset",
-        "Contained In FeatureDataset",
-        1,
-    ),
-    (
-        DATASET_IN_FOLDER,
-        FOLDER_TYPE,
-        "{28da9e89-ff80-4d6d-8926-4ee2b161677d}",
-        "DatasetInFolder",
-        "Contains Dataset",
-        "Contained in Dataset",
-        1,
-    ),
-    (
-        DOMAIN_IN_DATASET,
-        "{28da9e89-ff80-4d6d-8926-4ee2b161677d}",
-        "{8637f1ed-8c04-4866-a44a-1cb8288b3c63}",
-        "DomainInDataset",
-        "Contains Domain",
-        "Contained in Dataset",
-        0,
-    ),
-    (
-        "{725badab-3452-491b-a795-55f32d67229c}",
-        "{28da9e89-ff80-4d6d-8926-4ee2b161677d}",
-        "{28da9e89-ff80-4d6d-8926-4ee2b161677d}",
-        "DatasetsRelatedThrough",
-        "Origin Of",
-        "Destination Of",
-        0,
-    ),
-    (
-        "{d088b110-190b-4229-bdf7-89fddd14d1ea}",
-        "{767152d3-ed66-4325-8774-420d46674e07}",
-        FEATURE_CLASS_TYPE,
-        "FeatureClassInTopology",
-        "Spatially Manages Feature Class",
-        "Participates In Topology",
-        0,
-    ),
-    (
-        "{dc739a70-9b71-41e8-868c-008cf46f16d7}",
-        "{73718a66-afb9-4b88-a551-cffa0ae12620}",
-        FEATURE_CLASS_TYPE,
-        "FeatureClassInGeometricNetwork",
-        "Spatially Manages Feature Class",
-        "Participates In Geometric Network",
-        0,
-    ),
-    (
-        "{b32b8563-0b96-4d32-92c4-086423ae9962}",
-        "{7771fc7d-a38b-4fd3-8225-639d17e9a131}",
-        FEATURE_CLASS_TYPE,
-        "FeatureClassInNetworkDataset",
-        "Spatially Manages Feature Class",
-        "Participates In Network Dataset",
-        0,
-    ),
-    (
-        "{908a4670-1111-48c6-8269-134fdd3fe617}",
-        "{7771fc7d-a38b-4fd3-8225-639d17e9a131}",
-        TABLE_TYPE,
-        "TableInNetworkDataset",
-        "Manages Table",
-        "Participates In Network Dataset",
-        0,
-    ),
-    (
-        "{55d2f4dc-cb17-4e32-a8c7-47591e8c71de}",
-        "{76357537-3364-48af-a4be-783c7c28b5cb}",
-        FEATURE_CLASS_TYPE,
-        "FeatureClassInTerrain",
-        "Spatially Manages Feature Class",
-        "Participates In Terrain",
-        0,
-    ),
-    (
-        "{583a5baa-3551-41ae-8aa8-1185719f3889}",
-        "{a3803369-5fc2-4963-bae0-13effc09dd73}",
-        FEATURE_CLASS_TYPE,
-        "FeatureClassInParcelFabric",
-        "Spatially Manages Feature Class",
-        "Participates In Parcel Fabric",
-        0,
-    ),
-    (
-        "{5f9085e0-788f-4354-ae3c-34c83a7ea784}",
-        "{a3803369-5fc2-4963-bae0-13effc09dd73}",
-        TABLE_TYPE,
-        "TableInParcelFabric",
-        "Manages Table",
-        "Participates In Parcel Fabric",
-        0,
-    ),
-    (
-        "{e79b44e3-f833-4b12-90a1-364ec4ddc43e}",
-        FEATURE_CLASS_TYPE,
-        "{a300008d-0cea-4f6a-9dfa-46af829a3df2}",
-        "RepresentationOfFeatureClass",
-        "Feature Class Representation",
-        "Represented Feature Class",
-        0,
-    ),
-    (
-        "{8db31af1-df7c-4632-aa10-3cc44b0c6914}",
-        "{4ed4a58e-621f-4043-95ed-850fba45fcbc}",
-        "{d98421eb-d582-4713-9484-43304d0810f6}",
-        "ReplicaDatasetInReplica",
-        "Replicated Dataset",
-        "Participates In Replica",
-        1,
-    ),
-    (
-        "{d022de33-45bd-424c-88bf-5b1b6b957bd3}",
-        "{d98421eb-d582-4713-9484-43304d0810f6}",
-        "{28da9e89-ff80-4d6d-8926-4ee2b161677d}",
-        "DatasetOfReplicaDataset",
-        "Replicated Dataset",
-        "Dataset of Replicated Dataset",
-        0,
-    ),
+    ("{ccd6e1c9-9238-40d4-843f-c5dafd3d2bde}", "{37672bd2-b9f3-48c1-89b5-8c43bbbb6d57}", "{cd06bc3b-789d-4c51-aafa-a467912b8965}", "TableInUtilityNetwork", "Manages Table", "Participates In Utility Network", 0),
+    ("{fb166a8c-c09c-4121-9fa7-cb73406e2944}", "{60ea40cf-2667-45e2-bdff-7f6892538fe8}", "{cd06bc3b-789d-4c51-aafa-a467912b8965}", "TableInTraceNetwork", "Manages Table", "Participates In Trace Network", 0),
+    ("{94cd4fc6-307e-430b-a883-5fe68cf19ae8}", "{60ea40cf-2667-45e2-bdff-7f6892538fe8}", "{70737809-852c-4a03-9e22-2cecea5b9bfa}", "FeatureClassInTraceNetwork", "Spatially Manages Feature Class", "Participates In Trace Network", 0),
+    ("{583a5baa-3551-41ae-8aa8-1185719f3889}", "{a3803369-5fc2-4963-bae0-13effc09dd73}", "{70737809-852c-4a03-9e22-2cecea5b9bfa}", "FeatureClassInParcelFabric", "Spatially Manages Feature Class", "Participates In Parcel Fabric", 0),
+    ("{908a4670-1111-48c6-8269-134fdd3fe617}", "{7771fc7d-a38b-4fd3-8225-639d17e9a131}", "{cd06bc3b-789d-4c51-aafa-a467912b8965}", "TableInNetworkDataset", "Manages Table", "Participates In Network Dataset", 0),
+    ("{d022de33-45bd-424c-88bf-5b1b6b957bd3}", "{d98421eb-d582-4713-9484-43304d0810f6}", "{28da9e89-ff80-4d6d-8926-4ee2b161677d}", "DatasetOfReplicaDataset", "Replicated Dataset", "Dataset of Replicated Dataset", 0),
+    ("{0d10b3a7-2f64-45e6-b7ac-2fc27bf2133c}", "{f3783e6f-65ca-4514-8315-ce3985dad3b1}", "{f3783e6f-65ca-4514-8315-ce3985dad3b1}", "FolderInFolder", "Parent Folder Of", "Child Folder Of", 1),
+    ("{95c22afd-aa36-431d-b195-1779a256c6b2}", "{37672bd2-b9f3-48c1-89b5-8c43bbbb6d57}", "{70737809-852c-4a03-9e22-2cecea5b9bfa}", "FeatureClassInUtilityNetwork", "Spatially Manages Feature Class", "Participates In Utility Network", 0),
+    ("{74dac6c1-a6f2-4603-88a8-d09bccfdcf21}", "{ebeee2c9-fa73-4bed-ac7d-aee7d68afc80}", "{70737809-852c-4a03-9e22-2cecea5b9bfa}", "FeatureClassInParcelDataset", "Spatially Manages Feature Class", "Participates In Parcel Dataset", 0),
+    ("{dc739a70-9b71-41e8-868c-008cf46f16d7}", "{73718a66-afb9-4b88-a551-cffa0ae12620}", "{70737809-852c-4a03-9e22-2cecea5b9bfa}", "FeatureClassInGeometricNetwork", "Spatially Manages Feature Class", "Participates In Geometric Network", 0),
+    ("{20d1f656-14ba-44cb-9a60-58d2d44f7a83}", "{cc53cc54-4cca-43b7-9a9b-64dc59c999bd}", "{70737809-852c-4a03-9e22-2cecea5b9bfa}", "FeatureClassInLocationReferencingDataset", "Spatially Manages Feature Class", "Participates In Location Referencing Dataset", 0),
+    ("{8db31af1-df7c-4632-aa10-3cc44b0c6914}", "{4ed4a58e-621f-4043-95ed-850fba45fcbc}", "{d98421eb-d582-4713-9484-43304d0810f6}", "ReplicaDatasetInReplica", "Replicated Dataset", "Participates In Replica", 1),
+    ("{725badab-3452-491b-a795-55f32d67229c}", "{28da9e89-ff80-4d6d-8926-4ee2b161677d}", "{28da9e89-ff80-4d6d-8926-4ee2b161677d}", "DatasetsRelatedThrough", "Origin Of", "Destination Of", 0),
+    ("{5f9085e0-788f-4354-ae3c-34c83a7ea784}", "{a3803369-5fc2-4963-bae0-13effc09dd73}", "{cd06bc3b-789d-4c51-aafa-a467912b8965}", "TableInParcelFabric", "Manages Table", "Participates In Parcel Fabric", 0),
+    ("{7d2a7a69-abd8-4aa7-ac08-9e4ddb86289e}", "{ebeee2c9-fa73-4bed-ac7d-aee7d68afc80}", "{cd06bc3b-789d-4c51-aafa-a467912b8965}", "TableInParcelDataset", "Manages Table", "Participates In Parcel Dataset", 0),
+    ("{dc78f1ab-34e4-43ac-ba47-1c4eabd0e7c7}", "{f3783e6f-65ca-4514-8315-ce3985dad3b1}", "{28da9e89-ff80-4d6d-8926-4ee2b161677d}", "DatasetInFolder", "Contains Dataset", "Contained in Dataset", 1),
+    ("{55d2f4dc-cb17-4e32-a8c7-47591e8c71de}", "{76357537-3364-48af-a4be-783c7c28b5cb}", "{70737809-852c-4a03-9e22-2cecea5b9bfa}", "FeatureClassInTerrain", "Spatially Manages Feature Class", "Participates In Terrain", 0),
+    ("{e79b44e3-f833-4b12-90a1-364ec4ddc43e}", "{70737809-852c-4a03-9e22-2cecea5b9bfa}", "{a300008d-0cea-4f6a-9dfa-46af829a3df2}", "RepresentationOfFeatureClass", "Feature Class Representation", "Represented Feature Class", 0),
+    ("{79cc71c8-b7d9-4141-9014-b6373e236abb}", "{d86502f9-9758-45c6-9d23-6dd1a0107b47}", "{28da9e89-ff80-4d6d-8926-4ee2b161677d}", "DatasetOfSyncDataset", "Replicated Dataset", "Dataset Of Sync Dataset", 0),
+    ("{cc28387c-441f-4d7c-a802-41a160317fe0}", "{5b966567-fb87-4dde-938b-b4b37423539d}", "{d86502f9-9758-45c6-9d23-6dd1a0107b47}", "SyncDatasetInSyncReplica", "Sync Dataset", "Participates In Sync Replica", 1),
+    ("{d088b110-190b-4229-bdf7-89fddd14d1ea}", "{767152d3-ed66-4325-8774-420d46674e07}", "{70737809-852c-4a03-9e22-2cecea5b9bfa}", "FeatureClassInTopology", "Spatially Manages Feature Class", "Participates In Topology", 0),
+    ("{a1633a59-46ba-4448-8706-d8abe2b2b02e}", "{74737149-dcb5-4257-8904-b9724e32a530}", "{28da9e89-ff80-4d6d-8926-4ee2b161677d}", "DatasetInFeatureDataset", "Contains Dataset", "Contained In FeatureDataset", 1),
+    ("{b32b8563-0b96-4d32-92c4-086423ae9962}", "{7771fc7d-a38b-4fd3-8225-639d17e9a131}", "{70737809-852c-4a03-9e22-2cecea5b9bfa}", "FeatureClassInNetworkDataset", "Spatially Manages Feature Class", "Participates In Network Dataset", 0),
+    ("{5dd0c1af-cb3d-4fea-8c51-cb3ba8d77cdb}", "{f3783e6f-65ca-4514-8315-ce3985dad3b1}", "{8405add5-8df8-4227-8fac-3fcade073386}", "ItemInFolder", "Contains Item", "Contained In Folder", 1),
+    ("{17e08adb-2b31-4dcd-8fdd-df529e88f843}", "{28da9e89-ff80-4d6d-8926-4ee2b161677d}", "{8637f1ed-8c04-4866-a44a-1cb8288b3c63}", "DomainInDataset", "Contains Domain", "Contained in Dataset", 0),
+    ("{6eedddce-64f9-4549-baad-f05a36c205ed}", "{cc53cc54-4cca-43b7-9a9b-64dc59c999bd}", "{cd06bc3b-789d-4c51-aafa-a467912b8965}", "TableInLocationReferencingDataset", "Manages Table", "Participates In Location Referencing Dataset", 0),
 ];
 
 #[cfg(test)]
@@ -1483,6 +1403,39 @@ mod tests {
         let t = gdb.open_table("Empty").unwrap();
         assert_eq!(t.spatial_index_grid(), &[0.0]);
         assert_eq!(std::fs::read(dir.join("a00000009.spx")).unwrap().len(), 4118);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// ArcGIS Pro rewrites a geodatabase it opens (even read-only) when its item types or item
+    /// relationship types are incomplete, or a feature class lacks its `.horizon` file: the
+    /// writer produces what ArcGIS Pro 3.6 writes, so opening leaves the files unchanged.
+    #[test]
+    fn system_tables_and_horizon_as_arcgis_pro_writes_them() {
+        let dir = std::env::temp_dir().join(format!("terrio_gdb_writer_horizon_{}.gdb", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut w = GdbWriter::create(&dir).unwrap();
+        w.create_table(&TableDef {
+            name: "Fc".into(),
+            geometry: Some(GeometryDef::epsg_2278(ShapeType::Polygon)),
+            fields: vec![FieldDef::new("X", FieldType::Int32)],
+        })
+        .unwrap();
+        w.create_table(&TableDef { name: "Tab".into(), geometry: None, fields: vec![FieldDef::new("X", FieldType::Int32)] }).unwrap();
+        w.finish().unwrap();
+        let h = std::fs::read(dir.join("a00000009.horizon")).unwrap();
+        let vals: Vec<f64> = h.chunks(8).map(|c| f64::from_le_bytes(c.try_into().unwrap())).collect();
+        assert_eq!(vals, HORIZON_2278.to_vec());
+        assert!(!dir.join("a0000000a.horizon").exists(), "tables get no horizon");
+        let gdb = Geodatabase::open(&dir).unwrap();
+        let types = gdb.open_table("GDB_ItemTypes").unwrap().read_all().unwrap();
+        assert_eq!(types.len(), 39);
+        let rels = gdb.open_table("GDB_ItemRelationshipTypes").unwrap().read_all().unwrap();
+        assert_eq!(rels.len(), 26);
+        let names: Vec<String> = types.iter().filter_map(|r| r.values.last().and_then(|v| v.as_str()).map(String::from)).collect();
+        for n in ["Utility Network", "Trace Network", "Sync Replica", "Location Referencing Dataset", "Feature Class", "Coded Value Domain"]
+        {
+            assert!(names.iter().any(|x| x == n), "{n}");
+        }
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
