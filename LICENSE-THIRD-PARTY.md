@@ -10,8 +10,8 @@ LICENSE-THIRD-PARTY.md`, from `about.toml`.
 
 ## Overview
 
-- Apache License 2.0 (263)
-- MIT License (70)
+- Apache License 2.0 (260)
+- MIT License (68)
 - ISC License (20)
 - BSD 3-Clause "New" or "Revised" License (15)
 - BSD 2-Clause "Simplified" License (8)
@@ -8577,7 +8577,6 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 Used by:
 
-- [ordered-float 3.9.2](https://github.com/reem/rust-ordered-float)
 - [ordered-float 5.5.1](https://github.com/reem/rust-ordered-float)
 
 ```text
