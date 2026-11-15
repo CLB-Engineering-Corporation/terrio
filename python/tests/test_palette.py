@@ -333,6 +333,15 @@ def test_lazy_write_rejects_explicit_mask_for_tile_archives(tmp_path, extension)
     with pytest.raises(ValueError, match="dataset masks"):
         lazy.write(str(output), mask=np.full((2, 2), 255, dtype="uint8"))
     assert not output.exists()
+    # The module-level writer follows the same mask/refusal path as Raster.write.
+    terrio.Raster.from_array(
+        np.ones((2, 2), dtype="uint8"), (0, 1, 0, 2, 0, -1), "EPSG:4326"
+    ).write(str(source), mask=np.array([[255, 0], [0, 255]], dtype="uint8"))
+    masked = terrio.open_raster(str(source), lazy=True)
+    assert masked.has_mask
+    with pytest.raises(ValueError, match="dataset masks"):
+        terrio.write_raster(masked, str(output))
+    assert not output.exists()
 
 
 def test_bounded_palette_xml_keeps_legacy_truncation_and_end_tag_handling():
@@ -375,7 +384,8 @@ def test_palette_destination_reuses_the_remote_source(tmp_path, gdal, monkeypatc
             self.send_header("Content-Range", f"bytes {first}-{last}/{len(payload)}")
             self.send_header("Content-Length", str(last - first + 1))
             self.end_headers()
-            # Counted first: the client can return before this thread runs again after the write.
+            # Counted before sending: the client can finish, and the test check, as soon as the
+            # bytes arrive.
             counts["bytes"] += last - first + 1
             self.wfile.write(payload[first : last + 1])
 

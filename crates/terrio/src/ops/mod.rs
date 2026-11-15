@@ -77,6 +77,7 @@ pub mod raster_retile;
 pub mod raster_tile;
 pub mod rasterio;
 pub mod rasterize;
+pub mod render;
 pub mod rpc;
 pub mod sample;
 pub mod sieve;
@@ -97,6 +98,7 @@ pub mod vector_schema;
 pub mod viewshed;
 pub mod vrt;
 pub mod warp;
+pub(crate) mod window;
 pub mod xyz;
 pub mod zonal;
 
@@ -135,7 +137,8 @@ pub enum Resampling {
     Q1,
     /// Third quartile of the contributing pixels.
     Q3,
-    /// Sum of the contributing pixels, weighted by their coverage.
+    /// Sum of the contributing pixels, each weighted by the share of its area inside the output
+    /// pixel.
     Sum,
 }
 
@@ -302,6 +305,47 @@ pub(crate) fn is_integer(dt: DataType) -> bool {
     !matches!(dt, DataType::F32 | DataType::F64)
 }
 
+/// GDALDataTypeUnion-style common buffer type for bands with different native types.
+/// Float64 is required when Float32 cannot cover an integer type's precision/range.
+pub(crate) fn common_type(types: impl IntoIterator<Item = DataType>) -> DataType {
+    fn union(a: DataType, b: DataType) -> DataType {
+        use DataType::*;
+        if a == b {
+            return a;
+        }
+        if a == F64 || b == F64 {
+            return F64;
+        }
+        if a == F32 || b == F32 {
+            let integer = if a == F32 { b } else { a };
+            return if integer.size_bytes() > 2 { F64 } else { F32 };
+        }
+        fn range(t: DataType) -> (i128, i128) {
+            match t {
+                U8 => (0, u8::MAX as i128),
+                I8 => (i8::MIN as i128, i8::MAX as i128),
+                U16 => (0, u16::MAX as i128),
+                I16 => (i16::MIN as i128, i16::MAX as i128),
+                U32 => (0, u32::MAX as i128),
+                I32 => (i32::MIN as i128, i32::MAX as i128),
+                U64 => (0, u64::MAX as i128),
+                I64 => (i64::MIN as i128, i64::MAX as i128),
+                F32 | F64 => unreachable!("integer types only"),
+            }
+        }
+        let (amin, amax) = range(a);
+        let (bmin, bmax) = range(b);
+        [U8, I8, U16, I16, U32, I32, U64, I64]
+            .into_iter()
+            .find(|&t| {
+                let (min, max) = range(t);
+                min <= amin.min(bmin) && max >= amax.max(bmax)
+            })
+            .unwrap_or(F64)
+    }
+    types.into_iter().reduce(union).unwrap_or(DataType::U8)
+}
+
 /// Converts a value to a data type as GDAL's `GDALCopyWords` does: integers are rounded half away
 /// from zero and clamped to the type's range, NaN becomes 0, and `Float32` keeps single precision.
 pub(crate) fn convert_value(v: f64, dt: DataType) -> f64 {
@@ -420,13 +464,11 @@ pub(crate) fn apply_gt(gt: &[f64; 6], x: f64, y: f64) -> (f64, f64) {
 pub(crate) fn crs_info(srs: &SpatialRef) -> CrsInfo {
     match srs.epsg {
         Some(code) => {
-            let mut c = CrsInfo::from_epsg(code);
-            if c.wkt.is_none() {
-                c.wkt = srs.to_wkt();
-            }
+            let mut c = crate::crs::epsg_crs_info(code);
+            c.wkt = crate::crs::raster_crs_wkt(&srs.to_crs_info()).or(c.wkt);
             c
         }
-        None => CrsInfo { epsg: None, wkt: srs.to_wkt(), proj4: srs.proj4.clone() },
+        None => CrsInfo { epsg: None, wkt: srs.to_file_wkt(), proj4: srs.proj4.clone() },
     }
 }
 
@@ -502,6 +544,22 @@ impl<'a> BandView<'a> {
     /// Which values are not `nodata` (see [`is_nodata`]).
     pub(crate) fn valid(self, nodata: f64) -> Vec<bool> {
         crate::par::map_range(self.len(), |i| !is_nodata(self.get(i), nodata))
+    }
+
+    /// The storage occupied by the borrowed samples, independent of working precision.
+    pub(crate) fn byte_len(self) -> usize {
+        match self {
+            Self::U8(v) => std::mem::size_of_val(v),
+            Self::I8(v) => std::mem::size_of_val(v),
+            Self::U16(v) => std::mem::size_of_val(v),
+            Self::I16(v) => std::mem::size_of_val(v),
+            Self::U32(v) => std::mem::size_of_val(v),
+            Self::I32(v) => std::mem::size_of_val(v),
+            Self::U64(v) => std::mem::size_of_val(v),
+            Self::I64(v) => std::mem::size_of_val(v),
+            Self::F32(v) => std::mem::size_of_val(v),
+            Self::F64(v) => std::mem::size_of_val(v),
+        }
     }
 
     /// The number of values.
@@ -714,33 +772,20 @@ pub(crate) use crate::crs::Transformer as Ct;
 /// Transforms a bounding box between two CRSs, as GDAL's `OGRCoordinateTransformation::TransformBounds`
 /// does with `densify` extra points per edge.
 pub(crate) fn transform_bounds(t: &Ct, b: (f64, f64, f64, f64), densify: usize) -> Result<(f64, f64, f64, f64)> {
-    let steps = densify + 1;
-    let (mut x0, mut y0, mut x1, mut y1) = (f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY);
-    for i in 0..=steps {
-        let f = i as f64 / steps as f64;
-        let x = b.0 + (b.2 - b.0) * f;
-        let y = b.1 + (b.3 - b.1) * f;
-        for (px, py) in [(x, b.1), (x, b.3), (b.0, y), (b.2, y)] {
-            if let Ok((tx, ty)) = t.transform(px, py)
-                && tx.is_finite()
-                && ty.is_finite()
-            {
-                x0 = x0.min(tx);
-                y0 = y0.min(ty);
-                x1 = x1.max(tx);
-                y1 = y1.max(ty);
-            }
-        }
-    }
-    if !x0.is_finite() {
-        return Err(Error::Crs("no point of the bounds could be transformed".into()));
-    }
-    Ok((x0, y0, x1, y1))
+    t.transform_bounds_densified(b, densify)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transform_bounds_includes_polar_caps() {
+        let t = Ct::new(&SpatialRef::from_epsg(3976).unwrap(), &SpatialRef::from_epsg(4326).unwrap()).unwrap();
+        let bounds = transform_bounds(&t, (-3_950_000.0, -3_950_000.0, 3_950_000.0, 4_350_000.0), 21).unwrap();
+        assert_eq!((bounds.0, bounds.1, bounds.2), (-180.0, -90.0, 180.0));
+        assert!(bounds.3 > -40.0 && bounds.3 < -39.0, "{bounds:?}");
+    }
 
     #[test]
     fn rounds_like_gdal() {

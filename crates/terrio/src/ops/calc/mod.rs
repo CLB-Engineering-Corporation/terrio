@@ -43,7 +43,7 @@ pub mod expr;
 pub use eval::DType;
 pub use expr::Expr;
 
-use super::mosaic::{MosaicOptions, MosaicSource, mosaic};
+use super::mosaic::{MosaicOptions, MosaicSource, mosaic_allow_empty};
 use super::{Grid, build_raster};
 use crate::{Error, RasterDataset, Result};
 use eval::{Arr, Data, Evaluator, Val};
@@ -355,10 +355,15 @@ pub fn calc(inputs: &[CalcInput], o: &CalcOptions) -> Result<RasterDataset> {
     let sources: Vec<Cow<RasterDataset>> = match &plan.align {
         None => inputs.iter().map(|a| Cow::Borrowed(a.ds)).collect(),
         Some(mo) => {
-            inputs.iter().map(|a| mosaic(&[MosaicSource { path: a.name.clone(), ds: a.ds }], mo).map(Cow::Owned)).collect::<Result<_>>()?
+            // An input wholly outside the window keeps the mosaic's nodata/zero fill.
+            inputs
+                .iter()
+                .map(|a| mosaic_allow_empty(&[MosaicSource { path: a.name.clone(), ds: a.ds }], mo).map(Cow::Owned))
+                .collect::<Result<_>>()?
         }
     };
-    let in_nodata: Vec<Option<f64>> = sources.iter().map(|s| if o.hide_nodata { None } else { s.nodata() }).collect();
+    // Each input band's own nodata value.
+    let in_nodata = |i: usize, band: usize| if o.hide_nodata { None } else { sources[i].band_nodata(band) };
 
     // Evaluate in chunks of rows.
     let (width, height) = (plan.width, plan.height);
@@ -429,7 +434,7 @@ pub fn calc_to_path(inputs: &[CalcPathInput], o: &CalcOptions, path: &str, optio
     // Each input's bands read: directly, or drawn on the inputs' common grid.
     let sources: Vec<[MosaicSource; 1]> = paths.iter().zip(&headers).map(|(p, ds)| [MosaicSource { path: p.clone(), ds }]).collect();
     let vrts = match &plan.align {
-        Some(mo) => sources.iter().map(|s| super::mosaic::build_vrt(s, mo, None).map(Some)).collect::<Result<Vec<_>>>()?,
+        Some(mo) => sources.iter().map(|s| super::mosaic::build_vrt_allow_empty(s, mo).map(Some)).collect::<Result<Vec<_>>>()?,
         None => vec![None; inputs.len()],
     };
     let bands: Vec<Vec<usize>> = (0..inputs.len())
@@ -440,24 +445,29 @@ pub fn calc_to_path(inputs: &[CalcPathInput], o: &CalcOptions, path: &str, optio
         })
         .collect();
     let mut strips = Vec::with_capacity(inputs.len());
-    let mut in_nodata = Vec::with_capacity(inputs.len());
+    // Each input's nodata values, by band read (the order of `bands[i]`).
+    let mut band_nodata: Vec<Vec<Option<f64>>> = Vec::with_capacity(inputs.len());
     let mut value_bytes = 0;
     for (i, vrt) in vrts.iter().enumerate() {
-        let nodata = match vrt {
+        let nodata: Vec<Option<f64>> = match vrt {
             Some(v) => {
                 let zero_based: Vec<usize> = bands[i].iter().map(|b| b - 1).collect();
                 strips.push(Some(super::mosaic::Strips::new(v, &sources[i], &zero_based)?));
                 value_bytes += bands[i].len() * v.bands[0].data_type.size_bytes();
-                super::mosaic::mosaic_header(v)?.nodata()
+                let header = super::mosaic::mosaic_header(v)?;
+                bands[i].iter().map(|b| header.band_nodata(*b)).collect()
             }
             None => {
                 strips.push(None);
                 value_bytes += bands[i].len() * headers[i].raster.data_type.size_bytes();
-                headers[i].nodata()
+                bands[i].iter().map(|b| headers[i].band_nodata(*b)).collect()
             }
         };
-        in_nodata.push(if o.hide_nodata { None } else { nodata });
+        band_nodata.push(nodata);
     }
+    let in_nodata = |i: usize, band: usize| {
+        if o.hide_nodata { None } else { bands[i].iter().position(|b| *b == band).and_then(|k| band_nodata[i][k]) }
+    };
 
     // Strips of whole chunks, sized to the budget: about three strips of inputs (read ahead,
     // read, evaluated) and the output's values (as f64, then in the output type, queued).
@@ -485,7 +495,7 @@ pub fn calc_to_path(inputs: &[CalcPathInput], o: &CalcOptions, path: &str, optio
                 data.push(match &strips[i] {
                     Some(strip) => {
                         let reads = strip.read(std::slice::from_mut(l), y0..y1)?;
-                        strip.draw(&reads, y0..y1)
+                        strip.draw(&reads, y0..y1)?
                     }
                     None => {
                         let window = crate::Window::new(0, y0, w, y1 - y0);
@@ -560,13 +570,21 @@ impl Plan {
     }
 
     /// Output band `b` of a chunk of `len` pixels from the inputs' `arrays` (in the inputs'
-    /// order), each input's pixels equal to its nodata value (`in_nodata`) masked.
-    fn eval_chunk(&self, inputs: &[CalcInput], b: usize, arrays: Vec<Arr>, in_nodata: &[Option<f64>], len: usize) -> Result<Vec<f64>> {
+    /// order), each input's pixels equal to the nodata value of its band read (`in_nodata`, by
+    /// input and one-based band) masked.
+    fn eval_chunk(
+        &self,
+        inputs: &[CalcInput],
+        b: usize,
+        arrays: Vec<Arr>,
+        in_nodata: &(dyn Fn(usize, usize) -> Option<f64> + Sync),
+        len: usize,
+    ) -> Result<Vec<f64>> {
         let expr = &self.exprs[if self.exprs.len() > 1 { b } else { 0 }];
         let mut mask: Option<Vec<bool>> = None;
         let mut vars: Vec<(String, Val)> = Vec::with_capacity(inputs.len());
         for (i, (a, arr)) in inputs.iter().zip(arrays).enumerate() {
-            if let Some(nd) = in_nodata[i] {
+            if let Some(nd) = in_nodata(i, self.input_band(inputs, i, b)) {
                 let eq = eval::binary_compare_eq(&Val::Arr(arr.clone()), &Val::Float(nd))?;
                 let m = mask.get_or_insert_with(|| vec![false; len]);
                 for (m, e) in m.iter_mut().zip(eq) {
@@ -726,7 +744,7 @@ fn plan(inputs: &[CalcInput], o: &CalcOptions) -> Result<Plan> {
         }
         let mo = MosaicOptions { extent: Some((rect.x, rect.y, rect.max_x(), rect.max_y())), ..Default::default() };
         // The grid of the first input's mosaic, which every input's shares.
-        let vrt = super::mosaic::build_vrt(&[MosaicSource { path: inputs[0].name.clone(), ds: first }], &mo, None)?;
+        let vrt = super::mosaic::build_vrt_allow_empty(&[MosaicSource { path: inputs[0].name.clone(), ds: first }], &mo)?;
         (width, height) = (vrt.width, vrt.height);
         // As the mosaic's raster holds it.
         let grid = Grid { width, height, geo_transform: vrt.geo_transform.unwrap_or([0.0, 1.0, 0.0, 0.0, 0.0, -1.0]) };
@@ -842,6 +860,25 @@ mod tests {
         assert_eq!(i.geo_transform()[0], 1.0);
         let c = ds(vec![2.0; 6], 3, 2, DataType::I16, None, 0.0);
         assert!(calc(&[input("A", &a), input("C", &c)], &base).is_err());
+    }
+
+    /// An off-window input is aligned to fill pixels, as in GDAL 3.13.3 gdal_calc.
+    #[test]
+    fn projwin_keeps_fill_for_nonintersecting_inputs() {
+        for nodata in [None, Some(-99.0)] {
+            let a = ds(vec![1.0; 4], 2, 2, DataType::F32, nodata, 0.0);
+            let b = ds(vec![2.0; 4], 2, 2, DataType::F32, nodata, 10.0);
+            let options = CalcOptions {
+                calc: vec!["A + B".into()],
+                extent: CalcExtent::Union,
+                projwin: Some((0.0, 2.0, 2.0, 0.0)),
+                ..Default::default()
+            };
+            let out = calc(&[input("A", &a), input("B", &b)], &options).unwrap();
+            assert_eq!((out.raster.cols, out.raster.rows), (3, 3));
+            let expected = if nodata.is_some() { vec![out.nodata().unwrap(); 9] } else { vec![1., 1., 0., 1., 1., 0., 0., 0., 0.] };
+            assert_eq!(out.raster.data.to_f64_vec(), expected);
+        }
     }
 
     #[test]

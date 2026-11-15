@@ -75,6 +75,12 @@ cog = terrio.open_raster("https://example.com/cog.tif", lazy=True)
 cog.overviews  # [(width, height), ...] of the overviews, largest first
 tile = cog.read(1, window=(1024, 1024, 512, 512))  # (col_off, row_off, width, height)
 thumb = cog.read(overview=2)
+# An output of another size, as GDAL's RasterIO (gdal_translate -outsize, rasterio's out_shape)
+# reads it: from the overview it chooses, so only that overview's tiles are fetched.
+small = cog.read_resampled((512, 512), resampling="average")  # size is (width, height)
+masks = cog.read_resampled_masks((512, 512), resampling="average")  # 0 invalid, 255 valid
+pixels, valid = cog.read_resampled_with_masks((512, 512), resampling="average")  # both at once
+part = cog.read_resampled((256, 256), band=1, window=(100.5, 200.25, 4096, 4096), overview="AUTO-1")
 # PMTiles and MBTiles raster tiles too: zoom levels are overviews (PMTiles read in place).
 tiles = terrio.open_raster("https://example.com/tiles.pmtiles", lazy=True)
 
@@ -87,6 +93,24 @@ out.write("dem.zarr", options={"FORMAT": "ZARR_V3", "GEOREFERENCING_CONVENTION":
 red = terrio.open_raster('STACIT:"https://earth-search.aws.element84.com/v1/search?collections=sentinel-2-l2a&bbox=-105.05,40.5,-104.95,40.6&datetime=2023-07-05":asset=red', lazy=True)
 terrio.open_raster("landsat.tif").write("landsat.pmtiles")  # Byte rasters as tiles (or .mbtiles)
 ```
+
+Complex arrays can select physical storage with `Raster.from_array(...,
+complex_dtype="CInt32")`. The selector also accepts `complex_int32` as an alias;
+it names integer component storage, not a NumPy array dtype. Use a `complex128`
+input to retain every Int32 component exactly. The rasterio-compatible writer
+accepts its supported array dtype names and refuses `dtype="complex_int32"`;
+`terrio.rio.shutil.copy` preserves an existing CInt32 raster without that dtype
+selector. An explicit `dtype` creation option overrides the source sample type and
+can reduce component precision. Default complex reads retain their existing dtype; request
+`read(out_dtype="complex128")` for exact Int32 components. An explicit real
+`out_dtype`, such as `float32`, follows NumPy casting: it keeps the real component
+and emits `ComplexWarning`. Real outputs that hold every Int32 component, such as
+`float64` or `int32`, read them exactly; narrower ones, such as `float32`, pass through
+complex64 first, so values above 2^24 may round. Use
+`read(out_dtype="complex128").real` for exact real components. Select a complex dtype
+to preserve both components. Complex `terrio.rio` reads support unresampled windows and
+nearest-neighbour resampling. Other interpolation methods compute real and imaginary
+components separately; their complex results have not been validated against GDAL.
 
 ## Vector data
 
@@ -151,7 +175,9 @@ ndvi = terrio.calc("(B - A * 1.0) / (B + A * 1.0)", A="landsat.tif", A_band=3, B
                    type="Float32")  # like gdal_calc.py, with NumPy's typing rules
 dist = terrio.proximity("roads.tif", values=[1], distunits="GEO")
 clean = terrio.sieve("landcover.tif", threshold=10, connectedness=8)
+png = terrio.render("dem.tif", colormap="terrain", max_size=512)  # PNG bytes; Rasters also render in Jupyter
 xs, ys = terrio.transform_points([699960], [3900000], "EPSG:32610", "EPSG:4326")
+albers = terrio.list_crs("albers", authority="EPSG", kind="projected")  # registry CRSs, for a CRS picker
 
 data = open("dem.tif", "rb").read()
 raster = terrio.open_bytes(data, "dem.tif")  # from bytes; to bytes with raster.to_bytes("x.tif")
@@ -207,7 +233,7 @@ encoded = index.to_bytes("index.fgb")
 
 `raster_index`/`vector_index` return `DatasetIndex` (count, layer, metadata,
 `to_bytes`, `write`); optional `dst` writes the result. Options follow the
-[CLI index subset](../docs/cli.md#rastervector-indexes-and-gti-creation) in snake_case;
+[CLI index subset](https://terrio.dev/cli/#rastervector-indexes-and-gti-creation) in snake_case;
 repeatable options are lists: `filename_filters`, `source_layer_names`,
 `source_layer_indexes`, `color_interpretations`. `fetch_metadata` is a list of
 `(key, field, type)` triples, and `metadata` is a dictionary. Non-finite nodata
@@ -287,8 +313,13 @@ raster path entries are materialized separately; paths are not cached. Each poly
 transformed into each raster's CRS before center/all-touched membership is evaluated.
 Nodata and nonfinite values are excluded; empty zones have count zero and null other
 statistics. `t_srs` reprojects output geometry; `decimal_places` (0–15) rounds only
-newly computed floating statistics. Counts and source attributes are unchanged.
-Weighted/fractional statistics are not implemented.
+newly computed floating statistics. Integer counts and source attributes are unchanged.
+Use `fractional=True` for polygon/cell coverage fractions, with Real counts and
+coverage-weighted mean/sum/stddev/median. Supply `weights=` and `weight_band=1`,
+then select `weighted_mean`, `weighted_sum` or `weighted_stddev` in `stats` for a
+second weighting raster. It must match every value raster's grid and CRS.
+See [fractional zonal statistics](https://terrio.dev/cli/#fractional-coverage-and-weighting-rasters)
+for formulas, nodata/zero-weight behavior and limits.
 
 The shared engine's geometry, CRS, precision and eager-memory limits apply.
 
@@ -384,5 +415,5 @@ in-memory `Raster`. Set `prefix="name"` to choose it explicitly.
 `terrio.raster_tiles(source, output, publication={"viewers": ["all"], "kml": True})`
 adds applicable Leaflet/OpenLayers pages, MapML, STACTA and KML companions.
 `publication.url` names the tile directory itself. Serve the directory over HTTP
-to use the viewers. See the [CLI reference](../docs/cli.md#retile) for supported
+to use the viewers. See the [CLI reference](https://terrio.dev/cli/#retile) for supported
 options, memory limits, resume rules and measured GDAL differences.

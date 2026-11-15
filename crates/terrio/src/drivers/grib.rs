@@ -115,6 +115,8 @@ pub(crate) fn read(path: &Path) -> Result<RasterDataset> {
 pub(crate) fn read_bytes(bytes: &[u8]) -> Result<RasterDataset> {
     let bands = bands(bytes, normalize_units())?;
     let (mut ds, split) = header(&bands, bytes.len())?;
+    // What the messages declare, before any field is unpacked (see `crate::declared`).
+    crate::declared::check_dataset(&ds)?;
     let (cols, rows) = (ds.raster.cols, ds.raster.rows);
     let size =
         cols.checked_mul(rows).and_then(|n| n.checked_mul(bands.len())).ok_or_else(|| Error::InvalidData("grid too large".into()))?;
@@ -1188,7 +1190,7 @@ impl Ellipsoid {
     /// The CRS of a latitude/longitude grid: EPSG:4326 for WGS 84 regular grids, as GDAL.
     fn geographic_crs(&self, regular: bool) -> CrsInfo {
         if regular && self.is_wgs84() {
-            return CrsInfo::from_epsg(4326);
+            return crate::crs::epsg_crs_info(4326);
         }
         let wkt = format!("{},AXIS[\"Latitude\",NORTH],AXIS[\"Longitude\",EAST]]", self.geogcs());
         CrsInfo { epsg: None, wkt: Some(wkt), proj4: None }

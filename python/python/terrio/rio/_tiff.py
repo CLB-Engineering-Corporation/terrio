@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from terrio import _terrio
+from terrio.errors import InvalidArgumentError, TerrioError
 from terrio.rio._jpeg_quality import guess_jpeg_quality
 from terrio.rio.enums import ColorInterp
 
@@ -33,6 +34,7 @@ PHOTOMETRIC = 262
 SAMPLES = 277
 ROWS_PER_STRIP = 278
 PLANAR = 284
+PREDICTOR = 317
 COLOR_MAP = 320
 JPEG_TABLES = 347
 TILE_WIDTH = 322
@@ -171,6 +173,12 @@ class Structure:
     # The 92 values of the RPCCoefficientTag, or GDAL's RPC items of a sidecar.
     rpc_tag: list[float] | None = None
     rpc_items: dict[str, str] | None = None
+    # Whether IMAGE_STRUCTURE's LAYOUT=COG is GDAL 3.13's inference from the file's layout
+    # rather than its structural metadata: GDAL infers it for datasets opened read-only only.
+    layout_inferred: bool = False
+    # The file whose layout GDAL 3.13 would check when IMAGE_STRUCTURE is first read (see
+    # `infer_layout`); None once checked, or when nothing is to be checked.
+    layout_path: str | None = None
 
     def alpha_band(self) -> int | None:
         """The band GDAL uses as the alpha of the others (1-based), as `GetMaskFlags` does.
@@ -370,7 +378,44 @@ def tiff_structure(path: str, raster: Any) -> Structure | None:
     if not ifds:
         return None
     t = ifds[0]
+    # Selected-level masks may live in the external overview file, alongside its images.
+    mask_ifds = ifds
+    native = getattr(raster, "_base", raster)
     s = default_structure(raster)
+    if (level := getattr(raster, "_level", None)) is not None:
+        location = native._tiff_overview_ifd(level)
+        image = None
+        if location is not None:
+            is_external, index = location
+            images = ifds
+            if is_external:
+                images = _terrio.tiff_tags(path + ".ovr") or []
+                mask_ifds = [*ifds, *images]
+            if index < len(images):
+                image = images[index]
+        if image is None:
+            raise InvalidArgumentError(f"TIFF overview {level} has no matching image directory")
+        # A selected level owns its image layout/colors; georeferencing and dataset
+        # metadata still come from the base image, as GDAL 3.13.3 reports them.
+        image_tags = {
+            BITS,
+            COMPRESSION,
+            PHOTOMETRIC,
+            SAMPLES,
+            ROWS_PER_STRIP,
+            PLANAR,
+            COLOR_MAP,
+            JPEG_TABLES,
+            TILE_WIDTH,
+            TILE_LENGTH,
+            EXTRA_SAMPLES,
+            SAMPLE_FORMAT,
+            INK_SET,
+            LERC_PARAMETERS,
+            PREDICTOR,
+        }
+        t = {key: value for key, value in t.items() if key not in image_tags}
+        t.update({key: value for key, value in image.items() if key in image_tags})
     n = s.count
     if TILE_WIDTH in t and TILE_LENGTH in t:
         s.block_shape = (_first(t[TILE_LENGTH]), _first(t[TILE_WIDTH]))
@@ -421,8 +466,13 @@ def tiff_structure(path: str, raster: Any) -> Structure | None:
     if isinstance(ghost, str) and "LAYOUT=IFDS_BEFORE_DATA" in ghost:
         if "KNOWN_INCOMPATIBLE_EDITION=YES" not in ghost:
             image_structure["LAYOUT"] = "COG"
+    # GDAL 3.13 (`GTiffDataset::CheckCOGLayout()`) also reports a COG's layout without the
+    # structural metadata saying so, checked when IMAGE_STRUCTURE is first read.
+    if "LAYOUT" not in image_structure and _terrio.gdal_compat() != "3.12":
+        s.layout_path = path
     # libtiff's default BitsPerSample is 1, as the reader's.
     bits = _first(t.get(BITS), 1)
+    bits = native._sample_bits(getattr(raster, "_level", None)) or bits
     tables = t.get(JPEG_TABLES)
     if code == 7 and isinstance(tables, (bytes, list)):
         # The JPEG quality and tables mode GDAL guesses from the JPEGTables tag.
@@ -565,12 +615,43 @@ def tiff_structure(path: str, raster: Any) -> Structure | None:
     if isinstance(rpc, list) and len(rpc) == 92:
         s.rpc_tag = [float(v) for v in rpc]
 
-    # A per-dataset mask: a transparency mask image.
-    for ifd in ifds[1:]:
-        if _first(ifd.get(NEW_SUBFILE_TYPE)) & 4 and _first(ifd.get(PHOTOMETRIC)) == 4:
+    # A per-dataset mask of the selected image: type 4 at full resolution, type 5 for an overview.
+    mask_type = 5 if getattr(raster, "_level", None) is not None else 4
+    for ifd in mask_ifds[1:]:
+        if (_first(ifd.get(NEW_SUBFILE_TYPE)) & 5) == mask_type and _first(
+            ifd.get(PHOTOMETRIC)
+        ) == 4:
             if _first(ifd.get(WIDTH)) == s.width and _first(ifd.get(HEIGHT)) == s.height:
                 s.has_mask = True
     return s
+
+
+def infer_layout(s: Structure) -> None:
+    """Adds GDAL 3.13's inferred `LAYOUT=COG` to IMAGE_STRUCTURE, once.
+
+    GDAL checks a TIFF's layout when its IMAGE_STRUCTURE metadata is first read, so the file's
+    directories are read again only then, and only under GDAL 3.13 compatibility.
+
+    Args:
+        s: The structure (see `Structure.layout_path`).
+    """
+    path = s.layout_path
+    if path is None:
+        return
+    structure = s.namespaces.setdefault("IMAGE_STRUCTURE", {})
+    # GDAL infers the layout only when no LAYOUT item is there (one from GDAL_METADATA).
+    if "LAYOUT" in structure:
+        s.layout_path = None
+        return
+    try:
+        inferred = _terrio.tiff_infers_cog_layout(path)
+    except TerrioError:
+        # Left to be checked again on the next request (a failed remote read).
+        return
+    s.layout_path = None
+    if inferred:
+        structure["LAYOUT"] = "COG"
+        s.layout_inferred = True
 
 
 def _vertical_unit(wkt: str | None) -> str | None:

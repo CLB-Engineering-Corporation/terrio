@@ -129,7 +129,7 @@ enum Input {
     Path(String),
     Raster(LazyRaster),
     Bytes(Vec<u8>, String),
-    Failed(String),
+    Failed { message: String, resource_refusal: bool },
 }
 impl CatalogInput {
     /// Defers opening a native path until spatial selection.
@@ -140,7 +140,10 @@ impl CatalogInput {
     pub fn raster(raster: LazyRaster) -> Self {
         Self(Input::Raster(raster))
     }
-    /// Defers decoding/opening an encoded file until spatial selection.
+    /// Defers decoding/opening an encoded file until spatial selection. Bytes holding a VRT
+    /// resolve references only from the source map: an unmapped reference is refused with
+    /// `VRT source must be supplied in the source map`, never read from the file system or
+    /// network, as with an upload.
     pub fn bytes(bytes: Vec<u8>, name: impl Into<String>) -> Self {
         Self(Input::Bytes(bytes, name.into()))
     }
@@ -152,7 +155,7 @@ impl CatalogInput {
             });
             self.0 = match opened {
                 Ok(reader) => Input::Raster(reader),
-                Err(error) => Input::Failed(error.to_string()),
+                Err(error) => Input::Failed { resource_refusal: error.is_resource_refusal(), message: error.to_string() },
             };
         }
         match &mut self.0 {
@@ -163,7 +166,9 @@ impl CatalogInput {
                 LazyRaster::open(path)
             }
             Input::Raster(reader) => Ok(reader.shared()),
-            Input::Failed(message) => Err(bad(message)),
+            Input::Failed { message, resource_refusal } => {
+                Err(if *resource_refusal { Error::ResourceLimit(message.clone()) } else { bad(message) })
+            }
             Input::Bytes(..) => unreachable!(),
         }
     }
@@ -172,19 +177,58 @@ impl CatalogInput {
             Input::Path(path) => crate::ops::vrt::source_input_paths(path),
             Input::Raster(reader) => reader.input_paths(),
             Input::Bytes(bytes, name) => virtual_bytes(bytes, name)?.map_or_else(|| Ok(Vec::new()), |reader| reader.input_paths()),
-            Input::Failed(message) => Err(bad(message)),
+            Input::Failed { message, resource_refusal } => {
+                Err(if *resource_refusal { Error::ResourceLimit(message.clone()) } else { bad(message) })
+            }
         }
     }
 }
-// Unlike ordinary encoded tiles, a VRT may still read physical references after open.
-// Both opening and overwrite inventory must resolve them against the same filename.
+// Unlike ordinary encoded tiles, a VRT can refer to more inputs after open.
+// Both opening and overwrite inventory must keep supplied bytes in the closed-map
+// opener; using the file-enabled opener here would read the host's files.
 fn virtual_bytes(bytes: &[u8], name: &str) -> Result<Option<LazyRaster>> {
     let text = std::str::from_utf8(bytes);
-    let vrt = crate::formats::extension(name).as_deref() == Some("vrt") || text.is_ok_and(|s| s.trim_start().starts_with("<VRTDataset"));
+    // Inspect the full XML prolog: a bounded format sniff can miss a VRT root behind
+    // a long comment. Inconclusive XML must not reach the file-enabled fallback.
+    let mut vrt = crate::formats::extension(name).as_deref() == Some("vrt");
+    if !vrt && crate::drivers::vector::citygml::is_xml_prefix(bytes) {
+        let mut reader = quick_xml::Reader::from_reader(bytes);
+        let mut depth = 0usize;
+        let mut root_seen = false;
+        loop {
+            match reader.read_event() {
+                Ok(event @ (quick_xml::events::Event::Start(_) | quick_xml::events::Event::Empty(_))) => {
+                    let (quick_xml::events::Event::Start(root) | quick_xml::events::Event::Empty(root)) = &event else { unreachable!() };
+                    if depth == 0 {
+                        if root_seen {
+                            return Err(bad("multiple XML roots in supplied bytes"));
+                        }
+                        root_seen = true;
+                        // GDAL's fallback accepts case variants; our strict closed-map
+                        // parser must either accept or refuse them before file fallback.
+                        vrt = root.name().as_ref().eq_ignore_ascii_case("VRTDataset");
+                    }
+                    if matches!(event, quick_xml::events::Event::Start(_)) {
+                        depth += 1;
+                    }
+                }
+                Ok(quick_xml::events::Event::End(_)) => {
+                    depth = depth.checked_sub(1).ok_or_else(|| bad("invalid XML root in supplied bytes"))?;
+                }
+                Ok(quick_xml::events::Event::Text(text)) if depth == 0 && !text.as_ref().trim().is_empty() => {
+                    return Err(bad("text outside XML root in supplied bytes"));
+                }
+                Ok(quick_xml::events::Event::Eof) if root_seen && depth == 0 => break,
+                Ok(quick_xml::events::Event::Eof) | Err(_) => return Err(bad("invalid XML root in supplied bytes")),
+                _ => {}
+            }
+        }
+    }
     if !vrt {
         return Ok(None);
     }
     let text = text.map_err(|_| bad("invalid VRT XML encoding"))?;
+    // `into_lazy` refuses every reference: nothing is mapped, and none is read from the host.
     crate::ops::vrt::VirtualRaster::from_xml(text)?.into_lazy(Path::new(name).parent().unwrap_or(Path::new(".")), HashMap::new()).map(Some)
 }
 /// A catalog whose pixels are assembled on demand. Local catalogs use the index's on-disk
@@ -417,6 +461,8 @@ impl RasterCatalog {
         };
         let mut header = RasterDataset::with_driver(raster, crate::formats::RasterDriver::GTI, nodata.is_some());
         header.set_geo_transform([bounds.0, resolution.0, 0.0, bounds.3, 0.0, -resolution.1]);
+        // What the catalog declares, before any of its sources is read for pixels.
+        crate::declared::check_dataset(&header)?;
         catalog.header = header;
         Ok(catalog)
     }
@@ -891,7 +937,7 @@ fn apply_metadata(metadata: &[(String, String)], options: &mut CatalogOptions) -
             get("NODATA").and_then(|v| v.split(',').next()).map(|v| v.parse::<f64>().map_err(|_| bad("invalid NODATA"))).transpose()?;
     }
     if options.srs.is_none() {
-        options.srs = get("SRS").map(SpatialRef::parse).transpose()?;
+        options.srs = get("SRS").map(SpatialRef::parse_literal).transpose()?;
     }
     if options.alpha_band.is_none() {
         options.alpha_band =
@@ -1120,6 +1166,23 @@ mod lazy_source_tests {
         Arc,
         atomic::{AtomicUsize, Ordering},
     };
+
+    #[test]
+    fn byte_xml_roots_keep_other_formats_and_refuse_inconclusive_prologs() {
+        assert!(virtual_bytes(b"<?xml version=\"1.0\"?><!--comment--><kml/>", "upload.bin").unwrap().is_none());
+        assert!(virtual_bytes(b"<?xml version=\"1.0\"?><!--unfinished", "upload.bin").is_err());
+        assert!(virtual_bytes(b"<ignored/><VRTDataset/>", "upload.bin").is_err());
+    }
+
+    #[test]
+    fn deferred_byte_refusals_keep_the_resource_error_on_repeated_access() {
+        let xml = br#"<VRTDataset rasterXSize="2" rasterYSize="2"><VRTRasterBand dataType="Byte" band="1"/></VRTDataset>"#;
+        let mut input = CatalogInput::bytes(xml.to_vec(), "bounded.vrt");
+        let first = crate::config::with_options(&[("TERRIO_MAX_DECLARED_BYTES", "1")], || input.open());
+        assert!(matches!(first, Err(Error::ResourceLimit(_))));
+        assert!(matches!(input.open(), Err(Error::ResourceLimit(_))));
+        assert!(matches!(input.inputs(), Err(Error::ResourceLimit(_))));
+    }
 
     struct Count(Arc<AtomicUsize>);
     impl WindowSource for Count {

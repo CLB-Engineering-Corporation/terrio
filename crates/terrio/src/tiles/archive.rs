@@ -5,7 +5,7 @@ use source::ByteSource;
 
 enum Inner {
     Pm(Box<pmtiles::Reader>),
-    Mb(mbtiles::MbTiles),
+    Mb(Box<mbtiles::MbTiles>),
 }
 
 /// Per-payload decoded-byte limits for PMTiles. `None` preserves unlimited decoding.
@@ -29,6 +29,9 @@ pub struct PmTilesReadLimits {
 /// A PMTiles or MBTiles archive opened for reading tiles.
 pub struct TileArchive {
     inner: Inner,
+    /// The tile format, worked out on first use (for an MBTiles archive without a `format`
+    /// item, by reading a tile).
+    format: std::sync::OnceLock<TileFormat>,
     /// Keeps a local copy (of an archive member) alive.
     _local: Option<crate::vfs::LocalPath>,
 }
@@ -55,9 +58,16 @@ fn check_archive_driver(driver: &str, shown: &str, kinds: &[crate::formats::Kind
 
 impl TileArchive {
     /// Opens an archive: a local path, or a URL, `s3://`, `gs://` or `az://` object. PMTiles are
-    /// read in place (only the header and root directory now); MBTiles are read whole. Under a
+    /// read in place (only the header and root directory now); MBTiles are read in place too
+    /// (their schema and metadata now, each tile by an index lookup when it is asked for). Under a
     /// process-wide allow-list, the archive's driver (by its name, or its content for other names)
     /// must be allowed for both kinds of dataset, whose tiles it may hold.
+    ///
+    /// On native builds a local MBTiles file is mapped into memory, as GeoPackages are. It must
+    /// not be changed or truncated until the archive is dropped: a tile read from a file
+    /// truncated by another process ends the process with `SIGBUS`. On Unix, replace such a file
+    /// by renaming a new one over it, which leaves the open file intact; Windows does not let a
+    /// mapped file be replaced or deleted until the archive is dropped.
     pub fn open(path: &str) -> Result<Self> {
         Self::open_judged(path, Some(&EITHER_KIND))
     }
@@ -77,8 +87,11 @@ impl TileArchive {
             Some(ArchiveKind::MBTiles) => {
                 check_archive_driver("MBTiles", path, kinds.unwrap_or_default())?;
                 let local = crate::vfs::resolve(path)?;
-                let bytes = std::fs::read(local.path())?;
-                Ok(Self { inner: Inner::Mb(mbtiles::MbTiles::from_bytes(bytes)?), _local: None })
+                Ok(Self {
+                    inner: Inner::Mb(Box::new(mbtiles::MbTiles::open(local.path())?)),
+                    format: Default::default(),
+                    _local: Some(local),
+                })
             }
             _ => {
                 let (mut source, local) = ByteSource::open(path)?;
@@ -89,10 +102,14 @@ impl TileArchive {
                     // the MBTiles driver is allowed, by the list of each kind it serves.
                     check_archive_driver("MBTiles", path, kinds.unwrap_or(&EITHER_KIND))?;
                     let local = crate::vfs::resolve(path)?;
-                    return Ok(Self { inner: Inner::Mb(mbtiles::MbTiles::from_bytes(std::fs::read(local.path())?)?), _local: None });
+                    return Ok(Self {
+                        inner: Inner::Mb(Box::new(mbtiles::MbTiles::open(local.path())?)),
+                        format: Default::default(),
+                        _local: Some(local),
+                    });
                 }
                 check_archive_driver("PMTiles", path, kinds.unwrap_or_default())?;
-                Ok(Self { inner: Inner::Pm(Box::new(pmtiles::Reader::open(source)?)), _local: local })
+                Ok(Self { inner: Inner::Pm(Box::new(pmtiles::Reader::open(source)?)), format: Default::default(), _local: local })
             }
         }
     }
@@ -108,10 +125,10 @@ impl TileArchive {
     pub(crate) fn from_bytes_judged(bytes: Vec<u8>, kinds: &[crate::formats::Kind]) -> Result<Self> {
         if bytes.starts_with(b"SQLite format 3\0") {
             check_archive_driver("MBTiles", "an archive in memory", kinds)?;
-            return Ok(Self { inner: Inner::Mb(mbtiles::MbTiles::from_bytes(bytes)?), _local: None });
+            return Ok(Self { inner: Inner::Mb(Box::new(mbtiles::MbTiles::from_bytes(bytes)?)), format: Default::default(), _local: None });
         }
         check_archive_driver("PMTiles", "an archive in memory", kinds)?;
-        Ok(Self { inner: Inner::Pm(Box::new(pmtiles::Reader::open(ByteSource::Memory(bytes))?)), _local: None })
+        Ok(Self { inner: Inner::Pm(Box::new(pmtiles::Reader::open(ByteSource::Memory(bytes))?)), format: Default::default(), _local: None })
     }
 
     /// Opens a remote PMTiles archive whose bytes the caller fetches (see [`crate::sparse`]):
@@ -128,7 +145,11 @@ impl TileArchive {
     /// whole archive. Brotli remains unsupported. Limits are retained for later leaf/tile reads.
     pub fn from_sparse_with_limits(file: crate::sparse::SparseFile, limits: PmTilesReadLimits) -> Result<Self> {
         check_archive_driver("PMTiles", "a remote archive", &EITHER_KIND)?;
-        Ok(Self { inner: Inner::Pm(Box::new(pmtiles::Reader::open_with_limits(ByteSource::Sparse(file), limits)?)), _local: None })
+        Ok(Self {
+            inner: Inner::Pm(Box::new(pmtiles::Reader::open_with_limits(ByteSource::Sparse(file), limits)?)),
+            format: Default::default(),
+            _local: None,
+        })
     }
 
     /// The archive as a dataset: a raster for image tiles (at the zoom level of `options.tiles`),
@@ -158,6 +179,10 @@ impl TileArchive {
 
     /// The tiles' format.
     pub fn format(&self) -> TileFormat {
+        *self.format.get_or_init(|| self.sniff_format())
+    }
+
+    fn sniff_format(&self) -> TileFormat {
         match &self.inner {
             Inner::Pm(r) => match r.header.tile_type {
                 pmtiles::TILE_MVT => TileFormat::Mvt,
@@ -169,7 +194,7 @@ impl TileArchive {
             },
             Inner::Mb(m) => match m.item("format").map(TileFormat::from_mbtiles) {
                 Some(f) if f != TileFormat::Unknown => f,
-                _ => m.zoom_range().and_then(|(_, z)| m.any_tile(z)).map(TileFormat::sniff).unwrap_or(TileFormat::Unknown),
+                _ => m.zoom_range().and_then(|(_, z)| m.any_tile(z)).as_deref().map(TileFormat::sniff).unwrap_or(TileFormat::Unknown),
             },
         }
     }
@@ -249,7 +274,7 @@ impl TileArchive {
     pub fn tile(&mut self, z: u8, x: u32, y: u32) -> Result<Option<Vec<u8>>> {
         match &mut self.inner {
             Inner::Pm(r) => r.tile(z, x, y),
-            Inner::Mb(m) => Ok(m.tile(z, x, y).map(|b| b.to_vec())),
+            Inner::Mb(m) => m.tile(z, x, y),
         }
     }
 
@@ -257,7 +282,7 @@ impl TileArchive {
     pub(crate) fn tiles(&mut self, wanted: &[(u8, u32, u32)]) -> Result<Vec<Option<Vec<u8>>>> {
         match &mut self.inner {
             Inner::Pm(r) => r.tiles(wanted),
-            Inner::Mb(m) => Ok(wanted.iter().map(|&(z, x, y)| m.tile(z, x, y).map(|b| b.to_vec())).collect()),
+            Inner::Mb(m) => wanted.iter().map(|&(z, x, y)| m.tile(z, x, y)).collect(),
         }
     }
 
@@ -265,7 +290,7 @@ impl TileArchive {
     pub fn tiles_at_zoom(&mut self, z: u8) -> Result<Vec<(u32, u32)>> {
         match &mut self.inner {
             Inner::Pm(r) => r.tiles_at_zoom(z),
-            Inner::Mb(m) => Ok(m.tiles_at_zoom(z)),
+            Inner::Mb(m) => m.tiles_at_zoom(z),
         }
     }
 
@@ -311,13 +336,17 @@ pub(crate) fn archive_dataset(mut archive: TileArchive, name: &str, options: &cr
         };
         let names: Vec<String> = layers.iter().map(|l| l.name.clone()).collect();
         let mut ds = crate::dataset::finish_vector(layers, name, driver);
-        // Every layer keeps the name the tiles give it.
+        // Every layer keeps the name the tiles give it, and the range of features asked for
+        // (`skip_features`, `max_features`), after the spatial filter.
         for (l, n) in ds.layers.iter_mut().zip(names) {
             l.name = n;
+            options.keep_range(l);
         }
         return Ok(crate::Dataset::Vector(ds));
     }
     let mut r = raster::TileRaster::new(archive, options.tiles.zoom_level)?;
+    // What the zoom level declares, before its tiles are decoded.
+    crate::declared::check_dataset(&r.header())?;
     Ok(crate::Dataset::Raster(r.read_all()?))
 }
 
@@ -584,7 +613,7 @@ pub fn update_vector_bytes(bytes: Vec<u8>, layers: &[wbvector::Layer], o: &TileW
 }
 
 /// Writes bytes over a file, through a temporary file renamed over it once complete.
-#[cfg(not(target_family = "wasm"))]
+#[cfg(fs)]
 fn replace_file(path: &str, bytes: &[u8]) -> Result<()> {
     let tmp = format!("{path}.terrio-update");
     std::fs::write(&tmp, bytes)?;
@@ -596,7 +625,7 @@ fn replace_file(path: &str, bytes: &[u8]) -> Result<()> {
 
 /// Adds a raster to a local PMTiles or MBTiles archive of image tiles: see
 /// [`update_raster_bytes`]. The archive is rewritten, and replaced once complete.
-#[cfg(not(target_family = "wasm"))]
+#[cfg(fs)]
 pub fn update_raster(path: &str, ds: &crate::RasterDataset, o: &TileWriteOptions) -> Result<()> {
     let bytes = update_raster_bytes(std::fs::read(path)?, ds, o)?;
     replace_file(path, &bytes)
@@ -604,7 +633,7 @@ pub fn update_raster(path: &str, ds: &crate::RasterDataset, o: &TileWriteOptions
 
 /// Adds vector layers to a local PMTiles or MBTiles archive of vector tiles: see
 /// [`update_vector_bytes`]. The archive is rewritten, and replaced once complete.
-#[cfg(not(target_family = "wasm"))]
+#[cfg(fs)]
 pub fn update_vector(path: &str, layers: &[wbvector::Layer], o: &TileWriteOptions, overwrite: bool) -> Result<()> {
     let bytes = update_vector_bytes(std::fs::read(path)?, layers, o, overwrite)?;
     replace_file(path, &bytes)
@@ -800,4 +829,64 @@ pub(crate) fn layer_names(path: &str) -> Result<Vec<String>> {
         };
     }
     Ok(names)
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::formats::VectorDriver;
+    use crate::{VectorOpenOptions, VectorWriteOptions};
+
+    /// The names of a layer's features: the `name` field of the points written.
+    fn names(layer: &crate::Layer) -> Vec<String> {
+        let i = layer.schema.fields().iter().position(|f| f.name == "name").unwrap();
+        layer.features.iter().map(|f| f.attributes[i].as_str().unwrap_or_default().to_string()).collect()
+    }
+
+    /// `skip_features` and `max_features` keep those features of each layer of a vector MBTiles or
+    /// PMTiles archive, read whole or by layer, from a file or from bytes.
+    #[test]
+    fn a_feature_range_keeps_those_features_of_each_layer() {
+        let dir = tempfile::tempdir().unwrap();
+        let layer = |name: &str, n: usize, x0: f64| {
+            let features: Vec<String> = (0..n)
+                .map(|i| {
+                    format!(
+                        r#"{{"type":"Feature","properties":{{"name":"{name}{i}"}},"geometry":{{"type":"Point","coordinates":[{},{}]}}}}"#,
+                        x0 + i as f64,
+                        0.5 * i as f64
+                    )
+                })
+                .collect();
+            let path = dir.path().join(format!("{name}.geojson"));
+            std::fs::write(&path, format!(r#"{{"type":"FeatureCollection","features":[{}]}}"#, features.join(","))).unwrap();
+            crate::open_vector(path.to_str().unwrap(), &VectorOpenOptions::default()).unwrap().layers.remove(0)
+        };
+        let two = [layer("five", 5, 0.0), layer("three", 3, 10.0)];
+        for (file, driver) in [("two.mbtiles", VectorDriver::MBTiles), ("two.pmtiles", VectorDriver::PMTiles)] {
+            let path = dir.path().join(file);
+            let path = path.to_str().unwrap();
+            let mut o = VectorWriteOptions { driver: Some(driver), ..Default::default() };
+            o.tiles.max_zoom = Some(2);
+            crate::write_vector(&two, path, &o).unwrap();
+            let whole: Vec<Vec<String>> =
+                crate::open_vector(path, &VectorOpenOptions::default()).unwrap().layers.iter().map(names).collect();
+            assert!(whole.iter().all(|l| l.len() >= 3), "{file}: {whole:?}");
+            let bytes = std::fs::read(path).unwrap();
+            for (layers, skip, max) in [(vec![], 1, Some(2)), (vec!["three".to_string()], 1, Some(1)), (vec![], 2, None)] {
+                let options = VectorOpenOptions { layers: layers.clone(), skip_features: skip, max_features: max, ..Default::default() };
+                for read in
+                    [crate::open_vector(path, &options).unwrap(), crate::memory::open_vector_bytes(bytes.clone(), file, &options).unwrap()]
+                {
+                    let got: Vec<(String, Vec<String>)> = read.layers.iter().map(|l| (l.name.clone(), names(l))).collect();
+                    let want: Vec<(String, Vec<String>)> = ["five", "three"]
+                        .iter()
+                        .zip(&whole)
+                        .filter(|(n, _)| layers.is_empty() || layers.iter().any(|l| l == *n))
+                        .map(|(n, all)| (n.to_string(), all.iter().skip(skip).take(max.unwrap_or(usize::MAX)).cloned().collect()))
+                        .collect();
+                    assert_eq!(got, want, "{file}, layers {layers:?}, skip {skip}, max {max:?}");
+                }
+            }
+        }
+    }
 }

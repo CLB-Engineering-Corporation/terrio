@@ -16,6 +16,7 @@
 //! types, bounds and CRS.
 
 use super::datetime::{format_date, format_datetime, parse_date, parse_datetime};
+use super::geoparquet_arrow::{DecodeGroup, GroupWindows, Prefetcher};
 use super::geoparquet_zstd::{self, SharedInput};
 use super::profile::LayerProfile;
 use crate::crs::SpatialRef;
@@ -31,7 +32,7 @@ use arrow_array::{
     Array, ArrayRef, BooleanArray, Date32Array, Float64Array, Int32Array, Int64Array, RecordBatch, StructArray, TimestampMillisecondArray,
 };
 use arrow_schema::{DataType, Field, Fields, Schema, TimeUnit};
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ParquetRecordBatchReader, ParquetRecordBatchReaderBuilder};
 use parquet::arrow::arrow_writer::{ArrowLeafColumn, ArrowRowGroupWriterFactory, compute_leaves};
 use parquet::arrow::{ArrowWriter, ProjectionMask};
 use parquet::file::properties::WriterProperties;
@@ -40,7 +41,13 @@ use serde_json::{Value, json};
 use std::sync::Arc;
 use wbvector::{Coord, Feature, FieldDef, FieldType, FieldValue, Geometry, GeometryType, Layer, Ring};
 
+#[path = "geoparquet_predicate.rs"]
+mod predicate;
+
+type ReadColumns = Box<dyn Fn(usize, ProjectionMask) -> Result<ParquetRecordBatchReader> + Send>;
+
 /// An attribute column: the path from a top-level column through struct members.
+#[derive(Clone)]
 pub(crate) struct Column {
     pub(crate) path: Vec<usize>,
     pub(crate) field_type: FieldType,
@@ -48,12 +55,102 @@ pub(crate) struct Column {
 
 /// Reads a GeoParquet file, skipping the features whose bounding box is outside `bbox`
 /// `(min_x, min_y, max_x, max_y)`: whole row groups by the statistics of the bounding-box
-/// covering column, then rows by its values (or by their geometries without one). Feature ids
-/// stay the row numbers in the file, as in GDAL.
+/// covering column or native geometry bounds, then rows by covering values (or by their
+/// geometries without one). Feature ids stay the row numbers in the file, as in GDAL.
 pub fn read_filtered(path: &str, bbox: Option<(f64, f64, f64, f64)>) -> Result<Layer> {
     let name = std::path::Path::new(path).file_stem().and_then(|s| s.to_str()).unwrap_or("layer");
-    parse_source(|| Ok(std::fs::File::open(path)?), name, None, bbox, None)
+    parse_source(|| open_file(path), name, None, bbox, None)
 }
+
+/// A local file opened for the `parquet` crate's readers, which threads decoding row groups in
+/// parallel share (a `File`'s clones share its position; WASI has no `File::try_clone`).
+pub(crate) type LocalFile = SharedFile;
+
+/// Opens a local Parquet file.
+pub(crate) fn open_file(path: &str) -> Result<LocalFile> {
+    SharedFile::new(std::fs::File::open(path)?)
+}
+
+/// A local Parquet file whose readers share one handle: on WASI (no `dup`), and for the threads
+/// that decode row groups in parallel (a `File`'s clones share its position).
+mod shared_file {
+    use crate::Result;
+    use std::sync::Arc;
+
+    /// A file whose readers share one handle, seeking where the handle is not. The `parquet` crate
+    /// reads a `std::fs::File` through `File::try_clone`, which WASI (no `dup`) does not support, so
+    /// the browser build could not read a local Parquet file at all.
+    pub(crate) struct SharedFile {
+        /// The handle, and its position.
+        file: Arc<std::sync::Mutex<(std::fs::File, u64)>>,
+        len: u64,
+    }
+
+    impl SharedFile {
+        /// Shares `file`.
+        pub(crate) fn new(mut file: std::fs::File) -> Result<Self> {
+            use std::io::Seek;
+            let len = file.metadata()?.len();
+            let pos = file.stream_position()?;
+            Ok(Self { file: Arc::new(std::sync::Mutex::new((file, pos))), len })
+        }
+
+        /// A reader from `start`.
+        fn reader(&self, start: u64) -> SharedFileRead {
+            SharedFileRead { file: self.file.clone(), pos: start }
+        }
+    }
+
+    /// A reader of a [`SharedFile`] from a position.
+    pub(crate) struct SharedFileRead {
+        file: Arc<std::sync::Mutex<(std::fs::File, u64)>>,
+        pos: u64,
+    }
+
+    impl std::io::Read for SharedFileRead {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            use std::io::{Seek, SeekFrom};
+            let mut guard = self.file.lock().map_err(|_| std::io::Error::other("Parquet: a poisoned file lock"))?;
+            let (file, at) = &mut *guard;
+            if *at != self.pos {
+                *at = file.seek(SeekFrom::Start(self.pos))?;
+            }
+            let n = file.read(buf)?;
+            *at += n as u64;
+            self.pos += n as u64;
+            Ok(n)
+        }
+    }
+
+    impl parquet::file::reader::Length for SharedFile {
+        fn len(&self) -> u64 {
+            self.len
+        }
+    }
+
+    impl parquet::file::reader::ChunkReader for SharedFile {
+        type T = std::io::BufReader<SharedFileRead>;
+
+        fn get_read(&self, start: u64) -> parquet::errors::Result<Self::T> {
+            Ok(std::io::BufReader::new(self.reader(start)))
+        }
+
+        fn get_bytes(&self, start: u64, length: usize) -> parquet::errors::Result<bytes::Bytes> {
+            use std::io::Read;
+            // A malformed file may declare more bytes than it has: refused before allocating them.
+            if start.checked_add(length as u64).is_none_or(|end| end > self.len) {
+                return Err(parquet::errors::ParquetError::EOF(format!(
+                    "{length} bytes at {start} are past the end of a {}-byte file",
+                    self.len
+                )));
+            }
+            let mut buf = vec![0; length];
+            self.reader(start).read_exact(&mut buf).map_err(|e| parquet::errors::ParquetError::External(Box::new(e)))?;
+            Ok(bytes::Bytes::from(buf))
+        }
+    }
+}
+pub(crate) use shared_file::SharedFile;
 
 /// Parses a GeoParquet (or plain Parquet) file held in memory. `name` names the layer.
 pub fn parse(bytes: Vec<u8>, name: &str) -> Result<Layer> {
@@ -69,7 +166,7 @@ pub struct RowGroupInfo {
     /// The row number (feature id) of its first row.
     pub first_row: u64,
     /// The bounding box `[min_x, min_y, max_x, max_y]` of its geometries, from the statistics of
-    /// the bounding-box covering column, when the file has them.
+    /// the bounding-box covering column or native geometry bounds, when the file has them.
     pub bbox: Option<[f64; 4]>,
     /// The size in bytes of its column chunks.
     pub bytes: u64,
@@ -77,36 +174,12 @@ pub struct RowGroupInfo {
 
 /// The row groups of a GeoParquet file, from its footer.
 pub(crate) fn row_groups<R: parquet::file::reader::ChunkReader + 'static>(input: R) -> Result<Vec<RowGroupInfo>> {
-    use parquet::file::statistics::Statistics as S;
-    let err = |e: &dyn std::fmt::Display| Error::InvalidData(format!("Parquet: {e}"));
-    let builder = ParquetRecordBatchReaderBuilder::try_new(input).map_err(|e| err(&e))?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(input).map_err(|e| perr(&e))?;
     let meta = builder.metadata().clone();
-    let descr = meta.file_metadata().schema_descr();
-    let geo: Value = meta
-        .file_metadata()
-        .key_value_metadata()
-        .and_then(|kv| kv.iter().find(|k| k.key == "geo"))
-        .and_then(|k| k.value.as_deref())
-        .and_then(|v| serde_json::from_str(v).ok())
-        .unwrap_or(Value::Null);
-    let primary = geo["primary_column"].as_str().unwrap_or("geometry");
-    let cov = &geo["columns"][primary]["covering"]["bbox"];
-    let leaf = |k: &str| -> Option<usize> {
-        let p: Vec<&str> = cov.get(k)?.as_array()?.iter().filter_map(Value::as_str).collect();
-        (0..descr.num_columns()).find(|&i| descr.column(i).path().parts() == p.as_slice())
-    };
-    let leaves = (|| Some([leaf("xmin")?, leaf("ymin")?, leaf("xmax")?, leaf("ymax")?]))();
+    let bboxes = group_bboxes(&meta, covering_leaves(&meta, &file_geo(&meta)));
     let mut out = Vec::new();
     let mut first_row = 0u64;
-    for rg in meta.row_groups() {
-        let stat = |leaf: usize, max: bool| -> Option<f64> {
-            match rg.column(leaf).statistics()? {
-                S::Double(s) => if max { s.max_opt() } else { s.min_opt() }.copied(),
-                S::Float(s) => if max { s.max_opt() } else { s.min_opt() }.map(|v| *v as f64),
-                _ => None,
-            }
-        };
-        let bbox = leaves.and_then(|l| Some([stat(l[0], false)?, stat(l[1], false)?, stat(l[2], true)?, stat(l[3], true)?]));
+    for (rg, bbox) in meta.row_groups().iter().zip(bboxes) {
         let bytes = rg.columns().iter().map(|c| c.byte_range().1).sum();
         out.push(RowGroupInfo { rows: rg.num_rows() as u64, first_row, bbox, bytes });
         first_row += rg.num_rows() as u64;
@@ -114,16 +187,73 @@ pub(crate) fn row_groups<R: parquet::file::reader::ChunkReader + 'static>(input:
     Ok(out)
 }
 
+/// The file's `geo` metadata, `null` without one.
+pub(super) fn file_geo(meta: &parquet::file::metadata::ParquetMetaData) -> Value {
+    meta.file_metadata()
+        .key_value_metadata()
+        .and_then(|kv| kv.iter().find(|k| k.key == "geo"))
+        .and_then(|k| k.value.as_deref())
+        .and_then(|v| serde_json::from_str(v).ok())
+        .unwrap_or(Value::Null)
+}
+
+/// The leaf (Parquet column) indices of the `[xmin, ymin, xmax, ymax]` members of the primary
+/// geometry's bounding-box covering column.
+pub(super) fn covering_leaves(meta: &parquet::file::metadata::ParquetMetaData, geo: &Value) -> Option<[usize; 4]> {
+    let descr = meta.file_metadata().schema_descr();
+    let primary = geo["primary_column"].as_str().unwrap_or("geometry");
+    let cov = &geo["columns"][primary]["covering"]["bbox"];
+    let leaf = |k: &str| -> Option<usize> {
+        let p: Vec<&str> = cov.get(k)?.as_array()?.iter().filter_map(Value::as_str).collect();
+        (0..descr.num_columns()).find(|&i| descr.column(i).path().parts() == p.as_slice())
+    };
+    Some([leaf("xmin")?, leaf("ymin")?, leaf("xmax")?, leaf("ymax")?])
+}
+
+/// The bounding box `[min_x, min_y, max_x, max_y]` of each row group, from the statistics of the
+/// covering column's `leaves`, or native geospatial statistics on the primary geometry column.
+/// Missing, non-finite and wrapped bounds cannot justify pruning and return `None`.
+pub(super) fn group_bboxes(meta: &parquet::file::metadata::ParquetMetaData, leaves: Option<[usize; 4]>) -> Vec<Option<[f64; 4]>> {
+    use parquet::file::statistics::Statistics as S;
+    let geo = file_geo(meta);
+    let primary = geo["primary_column"].as_str().unwrap_or("geometry");
+    let descr = meta.file_metadata().schema_descr();
+    let geometry = (0..descr.num_columns()).find(|&i| descr.column(i).path().parts() == [primary]);
+    let usable = |b: &[f64; 4]| b.iter().all(|v| v.is_finite()) && b[0] <= b[2] && b[1] <= b[3];
+    meta.row_groups()
+        .iter()
+        .map(|rg| {
+            let stat = |leaf: usize, max: bool| -> Option<f64> {
+                match rg.column(leaf).statistics()? {
+                    S::Double(s) => if max { s.max_opt() } else { s.min_opt() }.copied(),
+                    S::Float(s) => if max { s.max_opt() } else { s.min_opt() }.map(|v| *v as f64),
+                    _ => None,
+                }
+            };
+            let covering = leaves.and_then(|l| Some([stat(l[0], false)?, stat(l[1], false)?, stat(l[2], true)?, stat(l[3], true)?]));
+            covering
+                .filter(usable)
+                .or_else(|| {
+                    let bbox = rg.column(geometry?).geo_statistics()?.bounding_box()?;
+                    Some([bbox.get_xmin(), bbox.get_ymin(), bbox.get_xmax(), bbox.get_ymax()])
+                })
+                .filter(usable)
+        })
+        .collect()
+}
+
 /// Reads a file whose bytes the caller fetches: the rows of some row groups whose bounding box
-/// intersects `bbox`, fetching only the column chunks needed.
+/// intersects `bbox`, with the fields `columns` names (all by default; see
+/// [`crate::stream::FeatureReader::select_fields`]), fetching only the column chunks needed.
 pub(crate) fn read_sparse(
     file: &crate::sparse::SparseFile,
     name: &str,
     row_groups: Option<&[usize]>,
     bbox: Option<(f64, f64, f64, f64)>,
+    columns: Option<&[String]>,
 ) -> Result<Layer> {
     let prefetch = |ranges: &[(u64, u64)]| -> Result<()> { Ok(file.prefetch(ranges)?) };
-    parse_source(|| Ok(file.clone()), name, row_groups, bbox, Some(&prefetch))
+    ParquetStream::open(|| Ok(file.clone()), name, row_groups, bbox, 65536, Some(&prefetch), columns)?.read_all()
 }
 
 /// Announces the byte ranges about to be read, to readers whose bytes the caller fetches.
@@ -138,30 +268,76 @@ fn parse_source<R: parquet::file::reader::ChunkReader + 'static>(
     bbox: Option<(f64, f64, f64, f64)>,
     prefetch: Prefetch<'_>,
 ) -> Result<Layer> {
-    let mut s = ParquetStream::open(open, name, row_groups, bbox, 65536, prefetch)?;
-    let mut layer = s.layer.clone();
-    while let Some(batch) = s.next_batch()? {
-        layer.features.extend(batch);
+    ParquetStream::open(open, name, row_groups, bbox, 65536, prefetch, None)?.read_all()
+}
+
+/// Opens a remote file to be read by range requests, and the prefetcher that announces the byte
+/// ranges of each window of row groups to its block cache: a window of at most half the cache at
+/// a time.
+#[cfg(remote)]
+pub(crate) fn open_remote_file(remote: &crate::http::Remote) -> Result<(crate::http::RangeReader, Prefetcher)> {
+    let options = crate::http::HttpOptions::from_env();
+    let budget = (options.cache_size / 2).max(1);
+    let file = crate::http::RangeReader::open_with(remote, options)?;
+    let prefetcher = file.clone();
+    let prefetch: Prefetcher = (Box::new(move |ranges: &[(u64, u64)]| Ok(prefetcher.prefetch(ranges)?)), budget);
+    Ok((file, prefetch))
+}
+
+/// A remote GeoParquet file (a URL whose file name ends in `.parquet` or `.geoparquet`) opened to
+/// be read by range requests: its footer, the covering column of the row groups a filter keeps,
+/// then the column chunks of each window of row groups, fetched in parallel through the block
+/// cache, a window of at most half the cache at a time. `None` for other paths.
+#[cfg(remote)]
+pub(crate) fn open_remote(path: &str, bbox: Option<(f64, f64, f64, f64)>, batch_size: usize) -> Result<Option<ParquetStream>> {
+    let location = crate::vfs::Location::parse(path);
+    let Some(remote) = location.remote() else { return Ok(None) };
+    let file_name = location.file_name();
+    if crate::formats::VectorDriver::for_extension(&file_name) != Some(crate::formats::VectorDriver::Parquet) {
+        return Ok(None);
     }
-    Ok(layer)
+    crate::formats::check_driver_allowed("Parquet", path, crate::formats::Kind::Vector)?;
+    let (file, remote_prefetch) = open_remote_file(&remote)?;
+    let name = std::path::Path::new(&file_name).file_stem().and_then(|s| s.to_str()).unwrap_or("layer").to_string();
+    // The covering column of the row groups a filter keeps is fetched at once, when the stream
+    // opens; their data chunks are announced a window at a time (`with_prefetcher`), not all at
+    // the open, which would fetch up to half the cache before a batch is asked for.
+    let covering_pass = std::cell::Cell::new(bbox.is_some());
+    let prefetch = |ranges: &[(u64, u64)]| -> Result<()> {
+        if covering_pass.replace(false) {
+            file.prefetch(ranges)?;
+        }
+        Ok(())
+    };
+    let stream = ParquetStream::open(|| Ok(file.clone()), &name, None, bbox, batch_size, Some(&prefetch), None)?;
+    Ok(Some(stream.with_prefetcher(remote_prefetch)))
 }
 
 /// The features of a GeoParquet file, read a record batch at a time.
 pub(crate) struct ParquetStream {
     /// The layer, without its features.
     pub layer: Layer,
-    reader: parquet::arrow::arrow_reader::ParquetRecordBatchReader,
+    /// The row groups, decoded in parallel a window at a time.
+    windows: GroupWindows,
     columns: Vec<Column>,
     geom_index: Option<usize>,
     encoding: String,
     fids: Option<Vec<u64>>,
     fid: u64,
+    meta: Arc<parquet::file::metadata::ParquetMetaData>,
+    /// The columns decoded (all by default; see [`Self::select_columns`]), and the file's
+    /// top-level columns a decoded batch holds, in order, when not all.
+    mask: Arc<std::sync::Mutex<ProjectionMask>>,
+    roots: Option<Vec<usize>>,
+    file_schema: Arc<Schema>,
+    read_columns: ReadColumns,
 }
 
 impl ParquetStream {
     /// Opens a file whose bytes `open` gives (once, or twice with a filter), to read the rows of
-    /// `row_groups` (all by default) that intersect `bbox` in batches of `batch_size` rows.
-    /// `prefetch`, when given, is told the byte ranges about to be read.
+    /// `row_groups` (all by default) that intersect `bbox` in batches of `batch_size` rows, with
+    /// the fields `columns` names (all by default; see [`Self::select_columns`]). `prefetch`,
+    /// when given, is told the byte ranges about to be read.
     pub(crate) fn open<R: parquet::file::reader::ChunkReader + 'static>(
         open: impl Fn() -> Result<R>,
         name: &str,
@@ -169,6 +345,7 @@ impl ParquetStream {
         bbox: Option<(f64, f64, f64, f64)>,
         batch_size: usize,
         prefetch: Prefetch<'_>,
+        columns: Option<&[String]>,
     ) -> Result<Self> {
         let err = |e: &dyn std::fmt::Display| Error::InvalidData(format!("Parquet: {e}"));
         let input = SharedInput(Arc::new(open()?));
@@ -198,11 +375,16 @@ impl ParquetStream {
         let geom_index = schema.fields().iter().position(|f| f.name() == &primary && !geo.is_null());
 
         let mut layer = Layer::new(name);
-        let mut columns = Vec::new();
+        let mut fields = Vec::new();
+        let mut definitions = Vec::new();
         for (i, f) in schema.fields().iter().enumerate() {
             if !hidden.contains(f.name()) {
-                add_columns(&mut layer, &mut columns, vec![i], f.name().clone(), f.data_type());
+                add_columns(&mut definitions, &mut fields, vec![i], f.name().clone(), f.data_type());
             }
+        }
+
+        for field in super::unique_field_defs(definitions) {
+            layer.add_field(field);
         }
 
         // The covering column's members, by top-level column and member index.
@@ -247,20 +429,37 @@ impl ParquetStream {
             }
             fids = Some(groups.iter().flat_map(|&g| first[g]..first[g] + meta.row_group(g).num_rows() as u64).collect());
         }
-        if let Some(p) = prefetch {
-            let ranges: Vec<(u64, u64)> = groups.iter().flat_map(|&g| meta.row_group(g).columns().iter().map(|c| c.byte_range())).collect();
-            p(&ranges)?;
-        }
-        let reader = if geoparquet_zstd::has_zstd(&meta, &groups, &ProjectionMask::all()) {
-            geoparquet_zstd::reader(input, &meta, &schema, ProjectionMask::all(), groups, row_selection, batch_size)
-        } else {
-            let mut builder = builder.with_row_groups(groups).with_batch_size(batch_size.max(1));
-            if let Some(selection) = row_selection {
-                builder = builder.with_row_selection(selection);
+        // Each row group with its rows of the selection, which runs over the groups kept.
+        let mut selection = row_selection;
+        let queue: Vec<_> =
+            groups.iter().map(|&g| (g, selection.as_mut().map(|s| s.split_off(meta.row_group(g).num_rows() as usize)))).collect();
+        let arrow_meta = ArrowReaderMetadata::try_new(meta.clone(), Default::default()).map_err(|e| err(&e))?;
+        let (file_schema, batch_size) = (schema.clone(), batch_size.max(1));
+        let (window_meta, mask) = (meta.clone(), Arc::new(std::sync::Mutex::new(ProjectionMask::all())));
+        let decode_mask = mask.clone();
+        let (filter_input, filter_meta, filter_schema) = (input.clone(), meta.clone(), file_schema.clone());
+        let read_columns: ReadColumns = Box::new(move |g, mask| {
+            geoparquet_zstd::reader(filter_input.clone(), &filter_meta, &filter_schema, mask, vec![g], None, batch_size)
+                .map_err(|e| perr(&e))
+        });
+        let decode: DecodeGroup = Box::new(move |g, selection| {
+            let mask = decode_mask.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+            let reader = if geoparquet_zstd::has_zstd(&meta, &[g], &mask) {
+                geoparquet_zstd::reader(input.clone(), &meta, &file_schema, mask, vec![g], selection, batch_size)
+            } else {
+                let mut b = ParquetRecordBatchReaderBuilder::new_with_metadata(input.clone(), arrow_meta.clone())
+                    .with_row_groups(vec![g])
+                    .with_projection(mask)
+                    .with_batch_size(batch_size);
+                if let Some(selection) = selection {
+                    b = b.with_row_selection(selection);
+                }
+                b.build()
             }
-            builder.build()
-        }
-        .map_err(|e| err(&e))?;
+            .map_err(|e| perr(&e))?;
+            reader.collect::<std::result::Result<Vec<_>, _>>().map_err(|e| perr(&e))
+        });
+        let windows = GroupWindows::new(queue, decode, &window_meta, &ProjectionMask::all(), None);
 
         match col.get("crs") {
             _ if geo.is_null() => {}
@@ -272,15 +471,84 @@ impl ParquetStream {
                 types.iter().filter_map(Value::as_str).map(|t| t.trim_end_matches(" Z").trim_end_matches(" M")).collect();
             layer.geom_type = declared_type(&types);
         }
-        Ok(Self { layer, reader, columns, geom_index, encoding, fids, fid: 0 })
+        let mut stream = Self {
+            layer,
+            windows,
+            columns: fields,
+            geom_index,
+            encoding,
+            fids,
+            fid: 0,
+            meta: window_meta,
+            mask,
+            roots: None,
+            file_schema: schema,
+            read_columns,
+        };
+        if let Some(names) = columns {
+            stream.select_columns(&crate::stream::field_indices(&stream.layer.schema, names)?)?;
+        }
+        if let Some(p) = prefetch {
+            p(&stream.windows.ranges_left())?;
+        }
+        Ok(stream)
+    }
+
+    /// Reads only the fields `keep` (indices into the layer's fields, in the order kept) and the
+    /// geometry: the columns that hold them are the only ones fetched and decoded. `false`,
+    /// changing nothing, when batches decoded with other columns are held.
+    pub(crate) fn select_columns(&mut self, keep: &[usize]) -> Result<bool> {
+        let mut roots: Vec<usize> = keep.iter().map(|&i| self.columns[i].path[0]).chain(self.geom_index).collect();
+        roots.sort_unstable();
+        roots.dedup();
+        // Without a geometry or a field to read, the columns read stay as they are, none kept.
+        if !roots.is_empty() {
+            let mask = ProjectionMask::roots(self.meta.file_metadata().schema_descr(), roots.iter().copied());
+            if !self.windows.set_mask(&self.meta, &mask) {
+                return Ok(false);
+            }
+            *self.mask.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = mask;
+            self.roots = Some(roots);
+        }
+        self.columns = keep.iter().map(|&i| self.columns[i].clone()).collect();
+        let fields = std::mem::replace(&mut self.layer.schema, wbvector::Schema::new());
+        for &i in keep {
+            self.layer.schema.add_field(fields.fields()[i].clone());
+        }
+        Ok(true)
+    }
+
+    /// The layer with all its features.
+    pub(crate) fn read_all(mut self) -> Result<Layer> {
+        let mut layer = std::mem::replace(&mut self.layer, Layer::new(""));
+        while let Some(batch) = self.next_batch()? {
+            layer.features.extend(batch);
+        }
+        Ok(layer)
+    }
+
+    /// Announces the column chunks of each window of row groups to `prefetch` before they are
+    /// decoded (a remote file's block cache, which fetches them in parallel requests).
+    pub(crate) fn with_prefetcher(mut self, prefetch: Prefetcher) -> Self {
+        self.windows.set_prefetcher(prefetch);
+        self
     }
 
     /// The features of the next record batch, decoded in parallel; `None` at the end.
     pub(crate) fn next_batch(&mut self) -> Result<Option<Vec<Feature>>> {
-        let Some(batch) = self.reader.next() else { return Ok(None) };
-        let batch = batch.map_err(|e| Error::InvalidData(format!("Parquet: {e}")))?;
-        let geoms = self.geom_index.map(|i| batch.column(i).clone());
-        let arrays: Vec<ArrayRef> = self.columns.iter().map(|c| nested(&batch, &c.path)).collect();
+        let Some(batch) = self.windows.next()? else { return Ok(None) };
+        // the position in the batch of a top-level column of the file
+        let at = |root: usize| self.roots.as_ref().map_or(root, |r| r.binary_search(&root).unwrap_or_default());
+        let geoms = self.geom_index.map(|i| batch.column(at(i)).clone());
+        let arrays: Vec<ArrayRef> = self
+            .columns
+            .iter()
+            .map(|c| {
+                let mut path = c.path.clone();
+                path[0] = at(path[0]);
+                nested(&batch, &path)
+            })
+            .collect();
         let (columns, encoding, fids, first) = (&self.columns, self.encoding.as_str(), &self.fids, self.fid);
         let features = crate::par::map_range(batch.num_rows(), |row| {
             let geometry = geoms.as_ref().and_then(|g| geometry(g.as_ref(), row, encoding));
@@ -300,7 +568,7 @@ pub(crate) fn apply_crs(layer: &mut Layer, crs: &Value) {
     match crs {
         Value::Null => {}
         Value::String(s) => {
-            if let Ok(s) = SpatialRef::parse(s) {
+            if let Ok(s) = SpatialRef::parse_literal(s) {
                 s.apply_to_layer(layer);
             }
         }
@@ -311,8 +579,10 @@ pub(crate) fn apply_crs(layer: &mut Layer, crs: &Value) {
             },
             // A CRS without an EPSG code: through WKT.
             None => {
+                // WKT built from PROJJSON, whose names keep a NUL JSON gives (`\u0000`): its
+                // names cut there (`wkt_for_files`), so the WKT reads whole.
                 if let Some(wkt) = super::projjson::to_wkt1(crs) {
-                    SpatialRef::from_wkt(&wkt).apply_to_layer(layer);
+                    SpatialRef::from_wkt(&terrio_crs::wkt_for_files(&wkt)).apply_to_layer(layer);
                 }
             }
         },
@@ -335,7 +605,6 @@ fn select_rows<T: parquet::file::reader::ChunkReader + 'static>(
     prefetch: Prefetch<'_>,
 ) -> Result<(Vec<usize>, parquet::arrow::arrow_reader::RowSelection, Vec<u64>)> {
     use parquet::arrow::arrow_reader::{RowSelection, RowSelector};
-    use parquet::file::statistics::Statistics as S;
     let err = |e: &dyn std::fmt::Display| Error::InvalidData(format!("Parquet: {e}"));
     let meta = builder.metadata().clone();
     let descr = meta.file_metadata().schema_descr();
@@ -347,25 +616,14 @@ fn select_rows<T: parquet::file::reader::ChunkReader + 'static>(
         (0..descr.num_columns()).find(|&i| descr.column(i).path().parts() == path)
     };
     let leaves: Option<[usize; 4]> = covering.and_then(|cov| Some([leaf(cov[0])?, leaf(cov[1])?, leaf(cov[2])?, leaf(cov[3])?]));
-    let stat = |rg: usize, leaf: usize, max: bool| -> Option<f64> {
-        match meta.row_group(rg).column(leaf).statistics()? {
-            S::Double(s) => if max { s.max_opt() } else { s.min_opt() }.copied(),
-            S::Float(s) => if max { s.max_opt() } else { s.min_opt() }.map(|v| *v as f64),
-            _ => None,
-        }
-    };
+    let bboxes = group_bboxes(&meta, leaves);
     let (fxmin, fymin, fxmax, fymax) = rect;
     let mut groups = Vec::new();
     let mut first_rows = Vec::new();
     let mut start = 0u64;
-    for rg in 0..meta.num_row_groups() {
+    for (rg, bbox) in bboxes.iter().enumerate() {
         let n = meta.row_group(rg).num_rows() as u64;
-        let outside = leaves.is_some_and(|l| {
-            stat(rg, l[0], false).is_some_and(|v| v > fxmax)
-                || stat(rg, l[1], false).is_some_and(|v| v > fymax)
-                || stat(rg, l[2], true).is_some_and(|v| v < fxmin)
-                || stat(rg, l[3], true).is_some_and(|v| v < fymin)
-        });
+        let outside = bbox.is_some_and(|b| b[0] > fxmax || b[1] > fymax || b[2] < fxmin || b[3] < fymin);
         if !outside && allowed.binary_search(&rg).is_ok() {
             groups.push(rg);
             first_rows.push(start);
@@ -450,12 +708,12 @@ fn select_rows<T: parquet::file::reader::ChunkReader + 'static>(
 }
 
 /// Adds the fields of a column, flattening structs as GDAL does.
-pub(crate) fn add_columns(layer: &mut Layer, columns: &mut Vec<Column>, path: Vec<usize>, name: String, t: &DataType) {
+pub(crate) fn add_columns(definitions: &mut Vec<FieldDef>, columns: &mut Vec<Column>, path: Vec<usize>, name: String, t: &DataType) {
     if let DataType::Struct(fields) = t {
         for (i, f) in fields.iter().enumerate() {
             let mut p = path.clone();
             p.push(i);
-            add_columns(layer, columns, p, format!("{name}.{}", f.name()), f.data_type());
+            add_columns(definitions, columns, p, format!("{name}.{}", f.name()), f.data_type());
         }
         return;
     }
@@ -466,7 +724,7 @@ pub(crate) fn add_columns(layer: &mut Layer, columns: &mut Vec<Column>, path: Ve
     if matches!(t, DataType::Int64 | DataType::UInt32 | DataType::UInt64) {
         def.width = crate::ops::vector_schema::INTEGER64_WIDTH;
     }
-    layer.add_field(def);
+    definitions.push(def);
     columns.push(Column { path, field_type });
 }
 
@@ -494,19 +752,23 @@ pub(crate) fn nested(batch: &RecordBatch, path: &[usize]) -> ArrayRef {
     a
 }
 
+/// The bytes of a binary column's value, not copied.
+fn blob(a: &dyn Array, row: usize) -> Option<&[u8]> {
+    Some(match a.data_type() {
+        DataType::Binary => a.as_binary::<i32>().value(row),
+        DataType::LargeBinary => a.as_binary::<i64>().value(row),
+        DataType::BinaryView => a.as_binary_view().value(row),
+        DataType::FixedSizeBinary(_) => a.as_fixed_size_binary().value(row),
+        _ => return None,
+    })
+}
+
 pub(crate) fn value(a: &dyn Array, row: usize, t: FieldType) -> FieldValue {
     if a.is_null(row) {
         return FieldValue::Null;
     }
     if t == FieldType::Blob {
-        let bytes = match a.data_type() {
-            DataType::Binary => a.as_binary::<i32>().value(row).to_vec(),
-            DataType::LargeBinary => a.as_binary::<i64>().value(row).to_vec(),
-            DataType::BinaryView => a.as_binary_view().value(row).to_vec(),
-            DataType::FixedSizeBinary(_) => a.as_fixed_size_binary().value(row).to_vec(),
-            _ => return FieldValue::Null,
-        };
-        return FieldValue::Blob(bytes);
+        return blob(a, row).map_or(FieldValue::Null, |b| FieldValue::Blob(b.to_vec()));
     }
     let v = json_value(a, row);
     match (t, v) {
@@ -601,15 +863,12 @@ fn list_json(a: &dyn Array) -> Value {
     Value::Array((0..a.len()).map(|i| json_value(a, i)).collect())
 }
 
-fn geometry(a: &dyn Array, row: usize, encoding: &str) -> Option<Geometry> {
+pub(super) fn geometry(a: &dyn Array, row: usize, encoding: &str) -> Option<Geometry> {
     if a.is_null(row) {
         return None;
     }
     match encoding {
-        "wkb" => {
-            let FieldValue::Blob(b) = value(a, row, FieldType::Blob) else { return None };
-            Geometry::from_wkb(&b).ok()
-        }
+        "wkb" => super::wkb::from_wkb(blob(a, row)?),
         "point" => coords(a).into_iter().nth(row).map(Geometry::Point),
         "linestring" => Some(Geometry::LineString(coords(list_item(a, row)?.as_ref()))),
         "multipoint" => Some(Geometry::MultiPoint(coords(list_item(a, row)?.as_ref()))),
@@ -737,7 +996,7 @@ pub fn to_bytes(layer: &Layer) -> Result<Vec<u8>> {
     Ok(buf)
 }
 
-fn perr(e: &dyn std::fmt::Display) -> Error {
+pub(super) fn perr(e: &dyn std::fmt::Display) -> Error {
     Error::InvalidData(format!("Parquet: {e}"))
 }
 
@@ -1083,6 +1342,386 @@ impl Kind {
 mod tests {
     use super::*;
 
+    /// A GeoParquet `crs` given as PROJJSON with a NUL (`\u0000`) in its name (EPSG:32631's PROJ
+    /// 9.8.1 PROJJSON without its code) is read as without it: the WKT built from it has the name cut at the NUL.
+    #[test]
+    fn a_projjson_crs_with_a_nul_in_its_name_is_read() {
+        // EPSG:32631's PROJ 9.8.1 PROJJSON without its code, so that it is read through WKT.
+        let data: serde_json::Value = serde_json::from_str(include_str!("../../../../terrio-crs/tests/data/wkt1_proj_reads.json")).unwrap();
+        let mut v: serde_json::Value = serde_json::from_str(data["projjson"]["projjson"].as_str().unwrap()).unwrap();
+        v.as_object_mut().unwrap().remove("id");
+        let plain = v.to_string();
+        v["name"] = "WGS\0 84 / UTM zone 31N".into();
+        let text = v.to_string();
+        assert!(text.contains(r"WGS\u0000 84"), "{text}");
+        let proj4 = |t: &str| {
+            let mut layer = Layer::new("p");
+            apply_crs(&mut layer, &serde_json::from_str::<serde_json::Value>(t).unwrap());
+            crate::crs::SpatialRef::from_layer(&layer).to_proj4()
+        };
+        assert!(proj4(&plain).is_some());
+        assert_eq!(proj4(&text), proj4(&plain));
+    }
+
+    #[test]
+    fn attribute_selection_preserves_fids_spatial_selection_and_sql_semantics() {
+        use crate::ops::sql::Expression;
+        let mut layer = Layer::new("t");
+        layer.add_field(FieldDef::new("number", FieldType::Integer));
+        layer.add_field(FieldDef::new("text", FieldType::Text));
+        for i in 0..30 {
+            layer.push(Feature {
+                fid: i,
+                geometry: Some(Geometry::point(i as f64, 0.0)),
+                attributes: vec![
+                    FieldValue::Integer(i as i64),
+                    if i % 7 == 0 { FieldValue::Null } else { FieldValue::Text(if i % 2 == 0 { "Hello" } else { "WORLD" }.into()) },
+                ],
+            });
+        }
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let path = file.path().to_str().unwrap();
+        write(&layer, path).unwrap();
+        for bbox in [None, Some((5.0, -1.0, 25.0, 1.0))] {
+            let base = read_filtered(path, bbox).unwrap();
+            for text in [
+                "number = 13",
+                "10 < number AND number <= 20",
+                "number BETWEEN 10 AND 20",
+                "number > 50",
+                "text = 'hello'",
+                "text IS NULL",
+                "text LIKE 'W%' OR number % 3 = 0",
+                "NOT (number > 12)",
+                "FID BETWEEN 10 AND 20",
+                "number = '13'",
+                "number >= -2",
+            ] {
+                let expression = Expression::parse(text).unwrap();
+                let predicate = expression.bind(&base.schema).unwrap();
+                let expected = base.features.iter().filter(|f| predicate.matches(f)).collect::<Vec<_>>();
+                let mut stream = ParquetStream::open(|| open_file(path), "t", None, bbox, 4, None, None).unwrap();
+                stream.filter_attributes(&expression).unwrap();
+                stream.select_columns(&[0]).unwrap();
+                let got = stream.read_all().unwrap();
+                assert_eq!(
+                    got.features.iter().map(|f| f.fid).collect::<Vec<_>>(),
+                    expected.iter().map(|f| f.fid).collect::<Vec<_>>(),
+                    "{text}, {bbox:?}"
+                );
+                for (a, b) in got.features.iter().zip(expected) {
+                    assert_eq!(a.geometry, b.geometry);
+                    assert_eq!(a.attributes, b.attributes[..1]);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn native_geometry_statistics_supply_group_bounds() {
+        use parquet::geospatial::{bounding_box::BoundingBox, statistics::GeospatialStatistics};
+        let schema = Arc::new(Schema::new(vec![Field::new("geometry", DataType::Binary, false)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(arrow_array::BinaryArray::from_iter_values([Geometry::point(12.0, 44.0).to_wkb()]))],
+        )
+        .unwrap();
+        let mut bytes = Vec::new();
+        let mut writer = ArrowWriter::try_new(&mut bytes, schema, None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        let builder = ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::from(bytes)).unwrap();
+        let meta = builder.metadata().as_ref().clone();
+        let column = meta
+            .row_group(0)
+            .column(0)
+            .clone()
+            .into_builder()
+            .set_geo_statistics(Box::new(GeospatialStatistics::new(Some(BoundingBox::new(12.0, 13.0, 44.0, 45.0)), None)))
+            .build()
+            .unwrap();
+        let group = meta.row_group(0).clone().into_builder().set_column_metadata(vec![column]).build().unwrap();
+        let meta = meta.into_builder().set_row_groups(vec![group]).build();
+        assert_eq!(group_bboxes(&meta, None), vec![Some([12.0, 44.0, 13.0, 45.0])]);
+        for bbox in [BoundingBox::new(170.0, -170.0, -10.0, 10.0), BoundingBox::new(f64::NAN, 13.0, 44.0, 45.0)] {
+            let column = meta
+                .row_group(0)
+                .column(0)
+                .clone()
+                .into_builder()
+                .set_geo_statistics(Box::new(GeospatialStatistics::new(Some(bbox), None)))
+                .build()
+                .unwrap();
+            let group = meta.row_group(0).clone().into_builder().set_column_metadata(vec![column]).build().unwrap();
+            let invalid = meta.clone().into_builder().set_row_groups(vec![group]).build();
+            assert_eq!(group_bboxes(&invalid, None), vec![None], "unusable bounds cannot exclude rows");
+        }
+    }
+
+    #[cfg(remote)]
+    #[test]
+    fn native_spatial_statistics_prune_remote_feature_and_arrow_reads() {
+        use arrow_array::{BinaryArray, StringArray};
+        use parquet::arrow::arrow_writer::ArrowWriterOptions;
+        use parquet::file::metadata::ParquetMetaDataWriter;
+        use parquet::geospatial::{bounding_box::BoundingBox, statistics::GeospatialStatistics};
+        use parquet::schema::{parser::parse_message_type, types::SchemaDescriptor};
+        for logical in ["GEOMETRY", "GEOGRAPHY"] {
+            let schema =
+                Arc::new(Schema::new(vec![Field::new("payload", DataType::Utf8, false), Field::new("geometry", DataType::Binary, false)]));
+            let parquet_schema = SchemaDescriptor::new(Arc::new(
+                parse_message_type(&format!(
+                    "message schema {{ REQUIRED BINARY payload (STRING); REQUIRED BINARY geometry ({logical}); }}"
+                ))
+                .unwrap(),
+            ));
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(StringArray::from_iter_values((0..6000).map(|i| format!("{i:0>300}")))),
+                    Arc::new(BinaryArray::from_iter_values((0..6000).map(|i| Geometry::point(i as f64 / 100.0, 0.0).to_wkb()))),
+                ],
+            )
+            .unwrap();
+            let geo = json!({"version":"2.0.0", "primary_column":"geometry", "columns":{"geometry":{"encoding":"WKB", "geometry_types":["Point"]}}});
+            let props = WriterProperties::builder()
+                .set_dictionary_enabled(false)
+                .set_max_row_group_row_count(Some(500))
+                .set_key_value_metadata(Some(vec![parquet::file::metadata::KeyValue::new("geo".into(), geo.to_string())]))
+                .build();
+            let options = ArrowWriterOptions::new().with_properties(props).with_parquet_schema(parquet_schema);
+            let mut bytes = Vec::new();
+            let mut writer = ArrowWriter::try_new_with_options(&mut bytes, schema, options).unwrap();
+            writer.write(&batch).unwrap();
+            writer.close().unwrap();
+            let meta = ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::from(bytes.clone())).unwrap().metadata().as_ref().clone();
+            let groups = meta
+                .row_groups()
+                .iter()
+                .enumerate()
+                .map(|(g, group)| {
+                    let mut columns = group.columns().to_vec();
+                    columns[1] = columns[1]
+                        .clone()
+                        .into_builder()
+                        .set_geo_statistics(Box::new(GeospatialStatistics::new(
+                            Some(BoundingBox::new(g as f64 * 5.0, g as f64 * 5.0 + 4.99, 0.0, 0.0)),
+                            None,
+                        )))
+                        .build()
+                        .unwrap();
+                    group.clone().into_builder().set_column_metadata(columns).build().unwrap()
+                })
+                .collect();
+            let meta = meta.into_builder().set_row_groups(groups).build();
+            // Append an independently supplied statistics footer. Data offsets remain unchanged.
+            ParquetMetaDataWriter::new(&mut bytes, &meta).finish().unwrap();
+            let size = bytes.len();
+            let (base, seen) = crate::http::test_server(bytes);
+            crate::config::with_options(&[("TERRIO_HTTP_BLOCK_SIZE", "4096")], || {
+                let bbox = Some((12.00, -1.0, 12.02, 1.0));
+                let layer = crate::open_vector(
+                    &format!("{base}/features.parquet"),
+                    &crate::VectorOpenOptions { spatial_filter: bbox, ..Default::default() },
+                )
+                .unwrap()
+                .layers
+                .remove(0);
+                assert_eq!(layer.features.iter().map(|f| f.fid).collect::<Vec<_>>(), [1200, 1201, 1202]);
+                assert_eq!(layer.features[0].geometry, Some(Geometry::point(12.0, 0.0)));
+                let options = crate::arrow::GeoParquetReadOptions { bbox, columns: Some(vec!["payload".into()]), ..Default::default() };
+                let batches = crate::arrow::open_geoparquet(&format!("{base}/arrow.parquet"), &options)
+                    .unwrap()
+                    .collect::<std::result::Result<Vec<_>, _>>()
+                    .unwrap();
+                assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 3);
+                assert_eq!(batches[0].column(0).as_any().downcast_ref::<StringArray>().unwrap().value(0), format!("{:0>300}", 1200));
+            });
+            let seen = seen.lock().unwrap();
+            let fetched: usize = seen
+                .iter()
+                .map(|r| {
+                    let (a, b) = r.as_deref().unwrap().strip_prefix("bytes=").unwrap().split_once('-').unwrap();
+                    b.parse::<usize>().unwrap().min(size - 1) - a.parse::<usize>().unwrap() + 1
+                })
+                .sum();
+            assert!(fetched * 3 < size, "{logical}: fetched {fetched} of {size}: {seen:?}");
+        }
+    }
+
+    #[cfg(remote)]
+    #[test]
+    fn attribute_conversion_prunes_remote_groups_and_payloads() {
+        use arrow_array::StringArray;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("foglio", DataType::Utf8, false),
+            Field::new("particella", DataType::Utf8, false),
+            Field::new("payload", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from_iter_values((0..8000).map(|i| format!("{:04}", i / 500)))),
+                Arc::new(StringArray::from_iter_values((0..8000).map(|i| format!("{:04}", i % 500)))),
+                Arc::new(StringArray::from_iter_values((0..8000).map(|i| format!("{i:0>300}")))),
+            ],
+        )
+        .unwrap();
+        let props = WriterProperties::builder().set_dictionary_enabled(false).set_max_row_group_row_count(Some(500)).build();
+        let mut bytes = Vec::new();
+        let mut writer = ArrowWriter::try_new(&mut bytes, schema, Some(props)).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        let meta = ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::from(bytes.clone())).unwrap().metadata().clone();
+        let predicate_ranges: Vec<_> = meta.row_groups().iter().map(|g| g.column(0).byte_range()).collect();
+        let size = bytes.len();
+        let (base, seen) = crate::http::test_server(bytes);
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("result.csv");
+        let options = crate::stream::ConvertOptions {
+            translate: crate::ops::vector_filter::VectorTranslateOptions {
+                where_clause: Some("foglio = '0007' AND particella BETWEEN '0010' AND '0012'".into()),
+                select: Some(vec!["payload".into()]),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        crate::config::with_options(&[("TERRIO_HTTP_BLOCK_SIZE", "4096")], || {
+            crate::stream::convert(&format!("{base}/index.parquet"), output.to_str().unwrap(), &options).unwrap();
+        });
+        let output = std::fs::read_to_string(output).unwrap();
+        for i in 3510..=3512 {
+            assert!(output.contains(&format!("{i:0>300}")));
+        }
+        assert_eq!(output.lines().count(), 4);
+        let requests = seen.lock().unwrap();
+        let fetched: usize = requests
+            .iter()
+            .map(|r| {
+                let (a, b) = r.as_deref().unwrap().strip_prefix("bytes=").unwrap().split_once('-').unwrap();
+                b.parse::<usize>().unwrap().min(size - 1) - a.parse::<usize>().unwrap() + 1
+            })
+            .sum();
+        assert!(fetched * 4 < size, "fetched {fetched} of {size} bytes: {requests:?}");
+        drop(requests);
+        let before = seen.lock().unwrap().len();
+        let output = dir.path().join("empty.csv");
+        let mut options = options;
+        // Both independent bounds overlap the group, but no row matches. Reading the filter
+        // columns must discover this before fetching the large payload column.
+        options.translate.where_clause = Some("foglio = '0007' AND particella > '0000' AND particella < '0001'".into());
+        crate::config::with_options(&[("TERRIO_HTTP_BLOCK_SIZE", "4096")], || {
+            crate::stream::convert(&format!("{base}/empty.parquet"), output.to_str().unwrap(), &options).unwrap();
+        });
+        assert_eq!(std::fs::read_to_string(output).unwrap().lines().count(), 1);
+        let requests = seen.lock().unwrap();
+        let fetched: usize = requests[before..]
+            .iter()
+            .map(|r| {
+                let (a, b) = r.as_deref().unwrap().strip_prefix("bytes=").unwrap().split_once('-').unwrap();
+                b.parse::<usize>().unwrap().min(size - 1) - a.parse::<usize>().unwrap() + 1
+            })
+            .sum();
+        assert!(fetched * 20 < size, "empty selection fetched {fetched} of {size} bytes: {:?}", &requests[before..]);
+        drop(requests);
+
+        let before = seen.lock().unwrap().len();
+        let output = dir.path().join("limited.csv");
+        options.translate.where_clause = Some("foglio LIKE '%'".into());
+        options.translate.limit = Some(1);
+        crate::config::with_options(&[("TERRIO_HTTP_BLOCK_SIZE", "4096")], || {
+            crate::stream::convert(&format!("{base}/limited.parquet"), output.to_str().unwrap(), &options).unwrap();
+        });
+        assert_eq!(std::fs::read_to_string(output).unwrap().lines().count(), 2);
+        let requests = seen.lock().unwrap();
+        let ranges: Vec<(u64, u64)> = requests[before..]
+            .iter()
+            .map(|r| {
+                let (a, b) = r.as_deref().unwrap().strip_prefix("bytes=").unwrap().split_once('-').unwrap();
+                (a.parse().unwrap(), b.parse().unwrap())
+            })
+            .collect();
+        let received: u64 = ranges.iter().map(|&(a, b)| b.min(size as u64 - 1) - a + 1).sum();
+        for (offset, _) in predicate_ranges {
+            assert!(
+                ranges.iter().any(|&(a, b)| a <= offset && offset <= b),
+                "all candidate predicate chunks are read before LIMIT: {ranges:?}"
+            );
+        }
+        assert!(received > meta.row_groups().iter().map(|g| g.column(0).compressed_size() as u64).sum::<u64>());
+    }
+
+    #[cfg(remote)]
+    #[test]
+    fn remote_conversion_enforces_asset_policy_and_removes_failed_output() {
+        let mut layer = Layer::new("t");
+        layer.add_field(FieldDef::new("value", FieldType::Integer));
+        layer.push(Feature { fid: 0, geometry: None, attributes: vec![FieldValue::Integer(42)] });
+        let file = tempfile::NamedTempFile::new().unwrap();
+        write(&layer, file.path().to_str().unwrap()).unwrap();
+        let bytes = std::fs::read(file.path()).unwrap();
+        let (base, seen) = crate::http::test_server(bytes.clone());
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("refused.csv");
+        let policy = crate::stac::AssetReadPolicy::for_tests(&base, false);
+        let _scope = policy.enter().unwrap();
+        crate::config::with_options(
+            &[("GDAL_HTTP_HEADERS", "Authorization: synthetic"), ("TERRIO_STAC_ALLOW_CREDENTIALED_ASSETS", "NO")],
+            || {
+                let error =
+                    crate::stream::convert(&format!("{base}/refused.parquet"), output.to_str().unwrap(), &Default::default()).unwrap_err();
+                assert!(error.to_string().contains("TERRIO_STAC_ALLOW_CREDENTIALED_ASSETS"), "{error}");
+                assert!(seen.lock().unwrap().is_empty(), "refuse before sending requests");
+                assert!(!output.exists());
+            },
+        );
+        drop(_scope);
+
+        let meta = ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::from(bytes.clone())).unwrap().metadata().clone();
+        let offset = meta.row_group(0).column(0).data_page_offset() as usize;
+        let mut corrupt = bytes;
+        corrupt[offset..offset + 16].fill(0xff);
+        let (base, _) = crate::http::test_server(corrupt);
+        let output = dir.path().join("failed.csv");
+        let url = format!("{base}/corrupt.parquet");
+        assert!(crate::stream::can_convert_stream(&url, output.to_str().unwrap(), &Default::default()));
+        let error = crate::stream::convert(&url, output.to_str().unwrap(), &Default::default()).unwrap_err();
+        assert!(error.to_string().contains("Parquet"), "{error}");
+        assert!(!output.exists(), "remove partial output after decode failure");
+    }
+
+    #[test]
+    fn invalid_covering_bounds_fall_back_to_native_statistics() {
+        use parquet::geospatial::{bounding_box::BoundingBox, statistics::GeospatialStatistics};
+        let mut layer = Layer::new("t");
+        layer.push(Feature { fid: 0, geometry: Some(Geometry::point(12.0, 44.0)), attributes: vec![] });
+        let file = tempfile::NamedTempFile::new().unwrap();
+        write(&layer, file.path().to_str().unwrap()).unwrap();
+        let meta = ParquetRecordBatchReaderBuilder::try_new(open_file(file.path().to_str().unwrap()).unwrap())
+            .unwrap()
+            .metadata()
+            .as_ref()
+            .clone();
+        let leaves = covering_leaves(&meta, &file_geo(&meta)).unwrap();
+        let mut columns = meta.row_group(0).columns().to_vec();
+        columns[leaves[0]] = columns[leaves[0]]
+            .clone()
+            .into_builder()
+            .set_statistics(parquet::file::statistics::Statistics::double(Some(f64::NAN), Some(f64::NAN), None, Some(0), false))
+            .build()
+            .unwrap();
+        let geometry = columns.iter().position(|c| c.column_descr().path().parts() == ["geometry"]).unwrap();
+        columns[geometry] = columns[geometry]
+            .clone()
+            .into_builder()
+            .set_geo_statistics(Box::new(GeospatialStatistics::new(Some(BoundingBox::new(12.0, 13.0, 44.0, 45.0)), None)))
+            .build()
+            .unwrap();
+        let group = meta.row_group(0).clone().into_builder().set_column_metadata(columns).build().unwrap();
+        let meta = meta.into_builder().set_row_groups(vec![group]).build();
+        assert_eq!(group_bboxes(&meta, Some(leaves)), vec![Some([12.0, 44.0, 13.0, 45.0])]);
+    }
+
     #[test]
     fn identifies_projjson() {
         assert_eq!(projjson_epsg(&json!({"type": "GeographicCRS", "id": {"authority": "EPSG", "code": 4269}})), Some(4269));
@@ -1123,5 +1762,84 @@ mod tests {
         assert_eq!(back.features[0].attributes, [FieldValue::Integer(1), FieldValue::Date("2020-01-02".into())]);
         assert_eq!(back.features[0].geometry, Some(Geometry::point(500000.0, 0.0)));
         assert_eq!(back.features[1].geometry, None);
+    }
+
+    /// A selection of fields reads the column chunks of those fields and of the geometry only,
+    /// and their values land in the fields kept, with or without a filter.
+    #[test]
+    fn selected_columns_read_only_their_chunks() {
+        let mut l = Layer::new("t").with_epsg(4326);
+        for name in ["a", "b", "c", "d"] {
+            l.add_field(FieldDef::new(name, FieldType::Integer));
+        }
+        for i in 0..20 {
+            let attributes = (0..4).map(|k| FieldValue::Integer(i * 10 + k)).collect();
+            l.push(Feature { fid: i as u64, geometry: Some(Geometry::point(i as f64, 0.0)), attributes });
+        }
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let path = file.path().to_str().unwrap();
+        write(&l, path).unwrap();
+        let meta = ParquetRecordBatchReaderBuilder::try_new(open_file(path).unwrap()).unwrap().metadata().clone();
+        let roots = |names: &[&str]| -> Vec<(u64, u64)> {
+            let mut r: Vec<_> = meta.row_groups()[0]
+                .columns()
+                .iter()
+                .filter(|c| names.contains(&c.column_descr().path().parts()[0].as_str()))
+                .map(|c| c.byte_range())
+                .collect();
+            r.sort_unstable();
+            r
+        };
+        for bbox in [None, Some((4.5, -1.0, 7.5, 1.0))] {
+            let mut s = ParquetStream::open(|| open_file(path), "t", None, bbox, 64, None, None).unwrap();
+            assert!(s.select_columns(&[2, 0]).unwrap());
+            let announced = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let seen = announced.clone();
+            let record = move |r: &[(u64, u64)]| {
+                seen.lock().unwrap().extend_from_slice(r);
+                Ok(())
+            };
+            let mut s = s.with_prefetcher((Box::new(record), u64::MAX));
+            let features = s.next_batch().unwrap().unwrap();
+            assert_eq!(*announced.lock().unwrap(), roots(&["a", "c", "geometry"]), "bbox {bbox:?}");
+            let ids: Vec<i64> = if bbox.is_some() { (5..8).collect() } else { (0..20).collect() };
+            assert_eq!(features.len(), ids.len());
+            for (f, i) in features.iter().zip(ids) {
+                assert_eq!(f.attributes, [FieldValue::Integer(i * 10 + 2), FieldValue::Integer(i * 10)]);
+                assert_eq!(f.geometry, Some(Geometry::point(i as f64, 0.0)));
+            }
+            assert_eq!(s.layer.schema.fields().iter().map(|f| f.name.as_str()).collect::<Vec<_>>(), ["c", "a"]);
+        }
+    }
+
+    /// The reader WASI uses, as it has no `File::try_clone`, reads what a `File` does.
+    #[test]
+    fn shared_file_reads_like_a_file() {
+        let mut l = Layer::new("t").with_epsg(4326);
+        l.add_field(FieldDef::new("name", FieldType::Text));
+        for i in 0..50 {
+            l.push(Feature {
+                fid: i,
+                geometry: Some(Geometry::point(i as f64, -(i as f64))),
+                attributes: vec![FieldValue::Text(format!("feature {i}"))],
+            });
+        }
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let path = file.path().to_str().unwrap();
+        write(&l, path).unwrap();
+        let open = || SharedFile::new(std::fs::File::open(path).unwrap());
+        let back = parse_source(open, "t", None, Some((10.0, -20.0, 20.0, -10.0)), None).unwrap();
+        let expected = read_filtered(path, Some((10.0, -20.0, 20.0, -10.0))).unwrap();
+        assert_eq!(back.len(), 11);
+        let rows = |l: &Layer| l.features.iter().map(|f| (f.fid, f.geometry.clone(), f.attributes.clone())).collect::<Vec<_>>();
+        assert_eq!(rows(&back), rows(&expected));
+        assert_eq!(back.crs_epsg(), Some(4326));
+
+        use parquet::file::reader::ChunkReader;
+        let shared = open().unwrap();
+        let len = parquet::file::reader::Length::len(&shared);
+        assert_eq!(&shared.get_bytes(len - 4, 4).unwrap()[..], b"PAR1");
+        assert!(shared.get_bytes(len - 4, 5).is_err(), "a read past the end is refused");
+        assert!(shared.get_bytes(u64::MAX, 1).is_err());
     }
 }

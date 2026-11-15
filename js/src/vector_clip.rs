@@ -1,5 +1,5 @@
 //! Vector clipping through the shared core.
-use crate::ops::{file_bytes, input_layers, invalid};
+use crate::ops::{file_bytes, input_layers, invalid, selected_input_layers};
 use crate::{Dataset, Inner, js_err, parse_options};
 use serde::Deserialize;
 use terrio::crs::SpatialRef;
@@ -40,7 +40,7 @@ pub fn clip_vector(src: JsValue, options: JsValue) -> Result<Dataset, JsError> {
     if args.like.is_some() && args.crs.is_some() {
         return Err(invalid("crs applies only to bbox/geometry"));
     }
-    let crs = args.crs.as_deref().map(SpatialRef::parse).transpose().map_err(js_err)?;
+    let crs = args.crs.as_deref().map(SpatialRef::parse_literal).transpose().map_err(js_err)?;
     let template = ClipTemplateOptions { layer: args.like_layer, where_clause: args.like_where, sql: args.like_sql };
     let region = if let Some(bbox) = args.bbox {
         ClipRegion::bbox(bbox, crs).map_err(js_err)?
@@ -54,10 +54,7 @@ pub fn clip_vector(src: JsValue, options: JsValue) -> Result<Dataset, JsError> {
         let like = js_sys::Reflect::get(&options, &JsValue::from_str("like")).map_err(|_| invalid("cannot read like"))?;
         template_region(&like, &template)?
     };
-    let mut layers = input_layers(&src)?;
-    if let Some(names) = args.layers {
-        layers = terrio::ops::vector_filter::select_layers(layers, &names).map_err(js_err)?;
-    }
+    let layers = selected_input_layers(&src, args.layers.as_deref().unwrap_or_default())?;
     let out = layers.iter().map(|l| terrio::ops::vector_clip::clip(l, &region)).collect::<terrio::Result<Vec<_>>>().map_err(js_err)?;
     Ok(Dataset::from_layers(out, VectorDriver::GeoJSON))
 }

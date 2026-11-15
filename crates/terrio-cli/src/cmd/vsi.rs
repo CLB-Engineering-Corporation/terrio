@@ -415,15 +415,22 @@ fn report(args: &ReportArgs, r: &Report) -> terrio::Result<()> {
     Ok(())
 }
 
+/// The browser build makes no HTTP requests itself: the page fetches remote files for it, and
+/// reports the requests and bytes after each run.
+#[cfg(target_family = "wasm")]
+pub fn print_stats() {
+    eprintln!("terrio: HTTP statistics are not counted here in the browser build: the page reports the requests it made after the run");
+}
+
 /// Prints the HTTP requests and bytes of this process.
-#[cfg(feature = "remote")]
+#[cfg(all(feature = "remote", not(target_family = "wasm")))]
 pub fn print_stats() {
     let s = terrio::http::fetch_stats();
-    eprintln!("terrio: {} HTTP request(s), {} byte(s) received", s.requests, s.bytes);
+    eprintln!("terrio: {} HTTP request(s), {} byte(s) received, {} byte(s) sent", s.requests, s.bytes, s.sent_bytes);
 }
 
 /// Prints the HTTP requests and bytes of this process: none, without remote inputs.
-#[cfg(not(feature = "remote"))]
+#[cfg(all(not(feature = "remote"), not(target_family = "wasm")))]
 pub fn print_stats() {
     eprintln!("terrio: 0 HTTP request(s), 0 byte(s) received (built without remote inputs)");
 }

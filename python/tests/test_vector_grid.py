@@ -187,11 +187,42 @@ def test_keyword_zero_radius_matches_packed_error():
             terrio.vector_grid(source, algorithm=algorithm, **options)
 
 
-def test_existing_sql_layer_selection_remains_permissive(tmp_path):
-    """Strict selection belongs to the new gridding/lineref entry points."""
+def test_sql_refuses_a_layer_name_no_layer_has(tmp_path):
+    """A misspelled name beside a valid one is an error, from a path or a layer (#521)."""
     layer = terrio.Layer.from_geojson(points_geojson([(1, 1, 2.0)]), name="points")
     path = str(tmp_path / "points.geojson")
     layer.write(path)
     for source in (layer, path):
-        selected = terrio.sql(source, "SELECT * FROM points", layers=["points", "missing"])
-        assert len(selected) == 1
+        assert len(terrio.sql(source, "SELECT * FROM points", layers=["points"])) == 1
+        with pytest.raises(terrio.errors.InvalidArgumentError, match="missing"):
+            terrio.sql(source, "SELECT * FROM points", layers=["points", "missing"])
+
+
+@pytest.mark.parametrize("bigtiff", [False, True])
+def test_rasterize_and_vector_grid_write_tile_size_and_bigtiff(tmp_path, bigtiff):
+    # As `terrio rasterize`/`terrio vector-grid --tile-size 16 [--bigtiff]`.
+    src = points_geojson([(x + 0.5, y + 0.5, float(x + y)) for x in range(40) for y in range(40)])
+    outputs = {
+        "rasterize": lambda path: terrio.rasterize(
+            src, path, attribute="v", te=(0, 0, 40, 40), ts=(40, 40), tile_size=16, bigtiff=bigtiff
+        ),
+        "vector_grid": lambda path: terrio.vector_grid(
+            src,
+            path,
+            algorithm="nearest",
+            zfield="v",
+            extent=(0, 0, 40, 40),
+            size=(40, 40),
+            tile_size=16,
+            bigtiff=bigtiff,
+        ),
+    }
+    for name, make in outputs.items():
+        path = str(tmp_path / f"{name}.tif")
+        r = make(path)
+        with open(path, "rb") as f:
+            magic = f.read(4)
+        assert magic == (b"II+\x00" if bigtiff else b"II*\x00"), name
+        written = terrio.open_raster(path, lazy=True)
+        assert written.block_size == (16, 16), name
+        np.testing.assert_array_equal(written.read(1), r.read(1))

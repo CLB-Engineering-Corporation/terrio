@@ -402,6 +402,30 @@ def synthetic(rio: Any, ctx: Ctx, name: str = "synth.tif", overviews: bool = Tru
     return str(path)
 
 
+def written_meta_of(ds: Any) -> dict[str, Any]:
+    """`meta_of` a file a module wrote, read back by rasterio.
+
+    GDAL 3.13 reports `LAYOUT=COG` for a file without GDAL's structural metadata when its IFDs
+    come before its data. That tells the writers apart rather than what they wrote: terrio's
+    keeps the IFDs first, GDAL's rewrites them after the data when metadata changes after the
+    pixels. Such an inferred layout is left out; a layout the file declares is kept.
+
+    Args:
+        ds: A dataset opened with rasterio.
+
+    Returns:
+        dict: As `meta_of`.
+    """
+    meta = meta_of(ds)
+    structure = meta["image_structure"]
+    if structure.get("LAYOUT") == "COG":
+        with open(ds.name, "rb") as f:
+            declared = b"LAYOUT=IFDS_BEFORE_DATA" in f.read(1024)
+        if not declared:
+            structure.pop("LAYOUT")
+    return meta
+
+
 def meta_of(ds: Any) -> dict[str, Any]:
     """A dataset's metadata, as rasterio reports it.
 
@@ -808,7 +832,7 @@ for _name, _kw in WRITE_CASES:
             def f(rio: Any, ctx: Ctx) -> Any:
                 path = _write_case(rio, ctx, kw, extra)
                 with ctx.reference.open(path) as ds:
-                    return [meta_of(ds), ds.read(), ds.read_masks()]
+                    return [written_meta_of(ds), ds.read(), ds.read_masks()]
 
             return f
 
@@ -837,7 +861,7 @@ def _w_update(rio: Any, ctx: Ctx) -> Any:
         ds.update_tags(2, band="two")
         ds.nodata = -1
     with ctx.reference.open(path) as ds:
-        return [meta_of(ds), ds.read()]
+        return [written_meta_of(ds), ds.read()]
 
 
 @check("writing", "build_overviews nearest, average, mode (read through rasterio)", expect="tolerance", atol=1, max_frac=0.005, reason="GDAL's averaging and mode tie-breaking arithmetic on a few pixels")
@@ -1321,6 +1345,23 @@ def _f_rasterize(rio: Any, ctx: Ctx) -> Any:
     ]
 
 
+@check("features", "rasterize: burn values rounded, clamped and NaN as 0 into integer dtypes")
+def _f_rasterize_values(rio: Any, ctx: Ctx) -> Any:
+    # Burn values as in GDAL. Integers above 2**52 differ (terrio keeps them exact where GDAL rounds
+    # them through float64) and are left out, as are values of 2**64 and above into uint64.
+    F = rio.features
+    t = rio.transform.from_origin(500000, 4100000, 30, 30)
+    shapes = (GEOMS[1][0], GEOMS[4][0])
+    cases = [
+        ((2**40 + 5, -1), "uint64"), ((2**63 + 5, -1), "int64"), ((300, 1), "uint8"),
+        ((2.5, 1), "uint8"), ((-2.5, 1), "int16"), ((-0.4, 1), "uint8"),
+        ((float("nan"), 1), "int32"), ((float("inf"), 1), "int32"), ((float("-inf"), 1), "uint16"),
+        ((np.float64(2**63), 1), "int64"), ((np.int64(300), 1), "uint8"), ((-1, 1), "uint64"),
+        ((1e40, 1), "float32"), ((4503599627370495.5, 1), "int64"), ((70000.7, -3), "int16"),
+    ]
+    return [F.rasterize(list(zip(shapes, values)), out_shape=(120, 150), transform=t, dtype=dtype) for values, dtype in cases]
+
+
 @check("features", "geometry_mask, geometry_window, raster_geometry_mask")
 def _f_gmask(rio: Any, ctx: Ctx) -> Any:
     t = rio.transform.from_origin(500000, 4100000, 30, 30)
@@ -1767,7 +1808,7 @@ def raster_result(ref: Any, path: Path) -> Any:
     if not path.exists():
         return None
     with ref.open(path) as ds:
-        out = [norm(meta_of(ds)), ds.read(), ds.read_masks()]
+        out = [norm(written_meta_of(ds)), ds.read(), ds.read_masks()]
         factors = ds.overviews(1)
         if factors:
             # The first overview, read at its size.
@@ -2539,4 +2580,6 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    # Replay GDAL sampling for these reference comparisons; stable policy has its own suite.
+    os.environ.setdefault("TERRIO_WARP_GRID", "GDAL")
     sys.exit(main())

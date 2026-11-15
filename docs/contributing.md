@@ -76,9 +76,9 @@ around them. A new operation should be available from each of them where it appl
 |---|---|
 | Find compile errors quickly, without building | `cargo check -p terrio` |
 | Run the command-line tool | `cargo run -p terrio-cli -- info FILE` |
-| Run one integration test file | `cargo test -p terrio --test stac_geozarr` |
-| Run tests whose names contain a word | `cargo test -p terrio --test stac_geozarr stac_items` |
-| Show what passing tests print | `cargo test -p terrio --test stac_geozarr -- --nocapture` |
+| Run one integration test file | `cargo test -p terrio --test merged stac_geozarr::` |
+| Run tests whose names contain a word | `cargo test -p terrio --test merged stac_geozarr::stac_items` |
+| Show what passing tests print | `cargo test -p terrio --test merged stac_geozarr:: -- --nocapture` |
 | Format the code | `cargo fmt --all` |
 | Lint, treating warnings as errors | `cargo clippy --workspace --all-targets -- -D warnings` |
 | Open the API documentation | `cargo doc -p terrio --no-deps --open` |
@@ -88,6 +88,14 @@ are slow to run: add `--release` when you time something or process a large file
 
 While editing, repeat `cargo check` and the tests closest to your change. Leave the whole workspace
 for the end.
+
+terrio's integration tests (`crates/terrio/tests/*.rs`) are modules of one test binary, `merged`
+(`tests/merged/main.rs`): run one file's tests with `--test merged <file>::`. A file that sets driver
+allow-lists, environment variables, configuration or CRS settings (grid paths, network), reads
+process-wide counters, installs a global allocator, measures the process's memory, runs its own test
+binary again, or is run by name (CI, docs, scripts) is a binary of its own instead (a
+`[[test]]` of `crates/terrio/Cargo.toml`, run with `--test <file>`). Add a new file to one of the
+two; a test checks that each file is built once.
 
 ### Tests on real data
 
@@ -99,7 +107,7 @@ the copies in other formats (see [Testing Against GDAL](testing.md)).
 
 ```sh
 scripts/fetch_test_data.sh ../terrio-data
-TERRIO_TEST_DATA=../terrio-data cargo test -p terrio --test geopackage
+TERRIO_TEST_DATA=../terrio-data cargo test -p terrio --test merged geopackage::
 ```
 
 ### Python bindings
@@ -197,10 +205,15 @@ Then run what applies to your change:
 TERRIO_TEST_DATA=../terrio-data cargo test --workspace    # drivers and operations, on real data
 cargo build -p terrio --target wasm32-unknown-unknown     # library changes: it must build for the web
 RUSTDOCFLAGS="-D warnings" cargo doc -p terrio --no-deps  # new or changed public items
+cargo audit                                               # dependency changes (cargo install cargo-audit)
 cargo +1.90 check --workspace --all-targets               # new language features or dependencies
 ```
 
 The last one needs a one-time install: `rustup toolchain install 1.90`.
+
+`cargo audit` reads `.cargo/audit.toml`, whose ignores cover their advisories in every version of
+a crate. The `audit` job in CI also audits without that file and fails on any vulnerability but
+the five it ignores in zip 8.6.0 and ruzstd 0.8.3, so a local pass can still fail there.
 
 Continuous integration runs the cargo commands on Linux for pull requests, skipping the real-data
 tests when only documentation changed. If you cannot run one locally, say so in the description; a
@@ -249,6 +262,39 @@ to a Rust release less than six months old, and from 1.0 on only in a minor rele
   behavior without translating its code says so in a comment instead.
   Add the project to `NOTICE` and [Acknowledgements](acknowledgements.md), and data files from
   elsewhere to `REUSE.toml`.
+
+## Changelog
+
+Pull requests do not edit `CHANGELOG.md`. Each one would add its entry at the top of the
+`Unreleased` section, so every merge left the other open pull requests in conflict there. Instead,
+open the pull request description with a paragraph stating the change a user sees, written the way
+a changelog entry reads: what behaves differently now, and what it did before when that was a bug.
+
+The release pull request (titled `Release X.Y.Z`) writes the version's section. Draft it from the
+pull requests merged since the last release, then edit the entries into the changelog's style:
+
+```sh
+python scripts/draft_changelog.py --version X.Y.Z
+```
+
+The script reads the pull request numbers from the commit subjects since the last `v*` tag, takes
+the first paragraph of each description, leaves out `ci`, `chore`, `build` and `test` pull
+requests, and groups the rest by the type of their title. It needs an authenticated `gh` and a
+clone with full history and tags. Rename `Unreleased` to the version's heading, merge the draft
+into it, and drop drafted entries that an entry already there covers: pull requests merged before
+this rule still wrote their own entries. The `Changelog` CI check fails a pull request that changes
+`CHANGELOG.md` unless its title is `Release X.Y.Z`.
+
+The release pull request also brings `fuzz/Cargo.lock`, the fuzz targets' lockfile, to the versions
+of `Cargo.lock`, so that the targets fuzz the dependencies the release ships:
+
+```sh
+cp Cargo.lock fuzz/Cargo.lock
+cargo update --manifest-path fuzz/Cargo.toml --workspace
+```
+
+Dependency updates can leave it at older versions in between: CI fails it only when it no longer
+matches the manifests or pins a vulnerable version.
 
 ## Release notes
 

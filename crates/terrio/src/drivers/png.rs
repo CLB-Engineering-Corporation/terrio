@@ -34,6 +34,9 @@ pub(crate) fn read(path: &Path) -> Result<RasterDataset> {
         png::ColorType::Rgba => 4,
     };
     let bits = info.bit_depth as usize;
+    // What the header declares, before any row is decoded (see `crate::declared`).
+    let data_type = if bits == 16 { DataType::U16 } else { DataType::U8 };
+    crate::declared::check(cols, rows, bands, data_type, false)?;
     // The sizes come from the header: allocated fallibly.
     let size = reader.output_buffer_size().ok_or_else(|| png_err(path, "image too large"))?;
     let mut buf = fallible::filled(size, 0u8, "the PNG image")?;
@@ -89,9 +92,10 @@ pub(crate) fn read(path: &Path) -> Result<RasterDataset> {
             _ => None,
         }
     });
-    let gt = read_world_file(path).unwrap_or(common::NO_GEOTRANSFORM);
-    let raster = common::make_raster(cols, rows, bands, data, gt, Default::default(), nodata)?;
+    let gt = read_world_file(path);
+    let raster = common::make_raster(cols, rows, bands, data, gt.unwrap_or(common::NO_GEOTRANSFORM), Default::default(), nodata)?;
     let mut ds = RasterDataset::with_driver(raster, RasterDriver::PNG, nodata.is_some());
+    ds.geotransform_present = Some(gt.is_some());
     // GDAL's colour interpretations (`PNGRasterBand::GetColorInterpretation`); gray, a single
     // band's default, is left unset.
     let interps: &[&str] = match info.color_type {
@@ -110,7 +114,13 @@ pub(crate) fn read(path: &Path) -> Result<RasterDataset> {
 /// Reads a JPEG file with its world file, decoded as GDAL's JPEG driver decodes it (libjpeg's
 /// output, see [`crate::jpeg`]).
 pub(crate) fn read_jpeg(path: &Path) -> Result<RasterDataset> {
-    let img = crate::jpeg::decode_file(&std::fs::read(path)?).map_err(|e| {
+    let bytes = std::fs::read(path)?;
+    // What a baseline frame header declares, before the scans are decoded (see `crate::declared`);
+    // other frames are checked once decoded.
+    if let Ok((cols, rows, bands)) = crate::jpeg::frame_dimensions(&bytes) {
+        crate::declared::check(cols, rows, bands, DataType::U8, false)?;
+    }
+    let img = crate::jpeg::decode_file(&bytes).map_err(|e| {
         let message = format!("{}: {e}", path.display());
         if crate::jpeg::is_resource_refusal(&e) { Error::ResourceLimit(message) } else { Error::InvalidData(message) }
     })?;
@@ -122,16 +132,20 @@ pub(crate) fn read_jpeg(path: &Path) -> Result<RasterDataset> {
             data[b * n + i] = *v;
         }
     }
-    let gt = read_world_file(path).unwrap_or(common::NO_GEOTRANSFORM);
-    let raster = common::make_raster(cols, rows, bands, RasterData::U8(data), gt, Default::default(), None)?;
-    Ok(RasterDataset::with_driver(raster, RasterDriver::JPEG, false))
+    let gt = read_world_file(path);
+    let raster =
+        common::make_raster(cols, rows, bands, RasterData::U8(data), gt.unwrap_or(common::NO_GEOTRANSFORM), Default::default(), None)?;
+    let mut ds = RasterDataset::with_driver(raster, RasterDriver::JPEG, false);
+    ds.geotransform_present = Some(gt.is_some());
+    Ok(ds)
 }
 
 /// Writes a JPEG file (see [`encode_jpeg`]), its world file and its CRS sidecar.
-pub(crate) fn write_jpeg(r: &Raster, path: &Path, quality: Option<&str>) -> Result<()> {
+pub(crate) fn write_jpeg(r: &Raster, path: &Path, quality: Option<&str>, georeferenced: bool) -> Result<()> {
     let bytes = encode_jpeg(r, quality)?;
-    std::fs::write(path, bytes)?;
-    write_world_file(r, path)?;
+    common::write_replacing(path, bytes)?;
+    remove_stale_world_file(r, path, georeferenced)?;
+    write_world_file(r, path, georeferenced)?;
     common::write_pam(path, &r.crs)
 }
 
@@ -143,14 +157,7 @@ pub(crate) fn write_jpeg(r: &Raster, path: &Path, quality: Option<&str>) -> Resu
 /// luminance table, as libjpeg's do. Other data types are rounded and saturated to Byte. GDAL also
 /// writes 4 bands (as CMYK) and 12-bit samples; terrio does not.
 pub(crate) fn encode_jpeg(r: &Raster, quality: Option<&str>) -> Result<Vec<u8>> {
-    let quality = match quality {
-        None => 75,
-        // `atoi`, as GDAL reads it.
-        Some(q) => match crate::ops::dem::atoi(q) {
-            v @ 1..=100 => v as u8,
-            _ => return Err(Error::InvalidArgument(format!("QUALITY={q} is not a legal value in the range 1-100."))),
-        },
-    };
+    let quality = quality.map(common::jpeg_quality).transpose()?.unwrap_or(75);
     let color = match r.bands {
         1 => jpeg_encoder::ColorType::Luma,
         3 => jpeg_encoder::ColorType::Rgb,
@@ -223,16 +230,46 @@ pub(crate) fn read_world_file(path: &Path) -> Option<[f64; 6]> {
     Some([v[4] - v[0] / 2.0 - v[2] / 2.0, v[0], v[2], v[5] - v[1] / 2.0 - v[3] / 2.0, v[1], v[3]])
 }
 
-/// Writes a world file (`.wld`) for a raster.
-pub(crate) fn write_world_file(r: &Raster, path: &Path) -> Result<()> {
+/// Removes any world file (`.wld`) beside `path` after an image without a geotransform
+/// (`georeferenced` false, `GEOREFERENCED=NO`) and without a CRS is written there: one an earlier
+/// write left would georeference the new image. World files are named after the image's stem, so
+/// `a.png` and `a.jpg` share `a.wld`: this also removes a sibling image's shared file.
+/// A removal that fails reports an error after the image has been written.
+pub(crate) fn remove_stale_world_file(r: &Raster, path: &Path, georeferenced: bool) -> Result<()> {
+    if common::writes_georeferencing(r, georeferenced) {
+        return Ok(());
+    }
+    match std::fs::remove_file(path.with_extension("wld")) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
+        _ => Ok(()),
+    }
+}
+
+/// Writes a world file (`.wld`) for a raster, unless it has neither a geotransform
+/// (`georeferenced` false, `GEOREFERENCED=NO`) nor a CRS (see [`remove_stale_world_file`]).
+pub(crate) fn write_world_file(r: &Raster, path: &Path, georeferenced: bool) -> Result<()> {
+    if !common::writes_georeferencing(r, georeferenced) {
+        return Ok(());
+    }
     let (dx, dy) = (r.cell_size_x, -r.cell_size_y);
     let text = format!("{dx}\n0\n0\n{dy}\n{}\n{}\n", r.x_min + dx / 2.0, r.y_max() + dy / 2.0);
-    std::fs::write(path.with_extension("wld"), text)?;
+    common::write_replacing(path.with_extension("wld"), text)?;
     Ok(())
 }
 
-/// Writes a PNG (Byte or UInt16, 1 to 4 bands), its world file and its CRS sidecar.
-pub(crate) fn write(r: &Raster, nodata: Option<f64>, path: &Path) -> Result<()> {
+/// Writes a PNG (Byte or UInt16, 1 to 4 bands), its world file and its CRS sidecar. `zlevel` is the
+/// `ZLEVEL` creation option: the Deflate level of the image data, from 1 (the least effort) to 9
+/// (the most), 6 when it is not given; another value is refused.
+pub(crate) fn write(r: &Raster, nodata: Option<f64>, path: &Path, zlevel: Option<&str>, georeferenced: bool) -> Result<()> {
+    let level = match zlevel {
+        None => 6,
+        Some(z) => z
+            .trim()
+            .parse::<u8>()
+            .ok()
+            .filter(|z| (1..=9).contains(z))
+            .ok_or_else(|| Error::InvalidArgument(format!("invalid ZLEVEL '{z}' (1 to 9)")))?,
+    };
     let color = match r.bands {
         1 => png::ColorType::Grayscale,
         2 => png::ColorType::GrayscaleAlpha,
@@ -262,10 +299,11 @@ pub(crate) fn write(r: &Raster, nodata: Option<f64>, path: &Path) -> Result<()> 
             }
         }
     }
-    let file = std::io::BufWriter::new(std::fs::File::create(path)?);
-    let mut enc = png::Encoder::new(file, r.cols as u32, r.rows as u32);
+    let mut file = std::io::BufWriter::new(common::create_replacing(path)?);
+    let mut enc = png::Encoder::new(&mut file, r.cols as u32, r.rows as u32);
     enc.set_color(color);
     enc.set_depth(if sixteen { png::BitDepth::Sixteen } else { png::BitDepth::Eight });
+    enc.set_deflate_compression(png::DeflateCompression::Level(level));
     if let (Some(nd), png::ColorType::Grayscale) = (nodata, color)
         && nd >= 0.0
         && nd <= if sixteen { 65535.0 } else { 255.0 }
@@ -276,7 +314,9 @@ pub(crate) fn write(r: &Raster, nodata: Option<f64>, path: &Path) -> Result<()> 
     let mut w = enc.write_header().map_err(|e| png_err(path, e))?;
     w.write_image_data(&bytes).map_err(|e| png_err(path, e))?;
     w.finish().map_err(|e| png_err(path, e))?;
-    write_world_file(r, path)?;
+    file.into_inner().map_err(std::io::IntoInnerError::into_error)?.finish()?;
+    remove_stale_world_file(r, path, georeferenced)?;
+    write_world_file(r, path, georeferenced)?;
     common::write_pam(path, &r.crs)
 }
 
@@ -324,7 +364,7 @@ mod tests {
         // A grayscale PNG has no color table.
         let gray = common::make_raster(3, 2, 1, RasterData::U8(vec![0, 1, 2, 3, 4, 5]), common::NO_GEOTRANSFORM, Default::default(), None)
             .unwrap();
-        write(&gray, None, &p).unwrap();
+        write(&gray, None, &p, None, true).unwrap();
         let ds = read(&p).unwrap();
         assert!(ds.color_table.is_empty());
         assert!(ds.band_metadata.is_empty());
@@ -340,7 +380,7 @@ mod tests {
         for (bands, names) in (1..=4).zip(expected) {
             let r = common::make_raster(2, 2, bands, RasterData::U8(vec![7; 4 * bands]), common::NO_GEOTRANSFORM, Default::default(), None)
                 .unwrap();
-            write(&r, None, &p).unwrap();
+            write(&r, None, &p, None, true).unwrap();
             let ds = read(&p).unwrap();
             let got: Vec<&str> = ds.band_metadata.iter().filter_map(|m| m.color_interp.as_deref()).collect();
             assert_eq!(got, names, "{bands} bands");
@@ -512,6 +552,45 @@ mod tests {
             let RasterData::U8(got) = &back.raster.data else { panic!("Byte bands") };
             let mse = got.iter().zip(&v).map(|(a, b)| (*a as f64 - *b as f64).powi(2)).sum::<f64>() / v.len() as f64;
             assert!(10.0 * (255.0f64.powi(2) / mse.max(1e-9)).log10() > 30.0, "QUALITY={quality}: MSE {mse}");
+        }
+    }
+
+    /// Through the public write path: `ZLEVEL` sets the Deflate level of the image data, 1 to 9,
+    /// 6 when it is not given, and the pixels read back the same at every level. A level out of
+    /// range is refused.
+    #[test]
+    fn png_write_path_takes_the_zlevel_option() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cols, rows) = (96, 64);
+        let mut x = 11u64;
+        let v: Vec<u8> = (0..3 * cols * rows)
+            .map(|i| {
+                x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                ((i % cols) * 2 + (i / cols % rows) + (x >> 62) as usize) as u8
+            })
+            .collect();
+        let ds = RasterDataset::with_driver(rgb(cols, rows, v.clone()), RasterDriver::GTiff, false);
+        let write = |zlevel: Option<&str>| {
+            let p = dir.path().join("z.png");
+            let options = crate::RasterWriteOptions {
+                driver: Some(RasterDriver::PNG),
+                creation_options: zlevel.map(|z| ("zlevel".to_string(), z.to_string())).into_iter().collect(),
+                ..Default::default()
+            };
+            crate::write_raster_dataset(&ds, p.to_str().unwrap(), &options).map(|()| std::fs::read(&p).unwrap())
+        };
+        let levels: Vec<Vec<u8>> = (1..=9).map(|l| write(Some(&l.to_string())).unwrap()).collect();
+        assert_eq!(write(None).unwrap(), levels[5]);
+        assert_ne!(levels[0], levels[8]);
+        assert!(levels[8].len() <= levels[0].len());
+        for (l, bytes) in levels.iter().enumerate() {
+            let p = dir.path().join("back.png");
+            std::fs::write(&p, bytes).unwrap();
+            assert_eq!(read(&p).unwrap().raster.data.to_f64_vec(), ds.raster.data.to_f64_vec(), "ZLEVEL {}", l + 1);
+        }
+        for z in ["0", "10", "fast"] {
+            let error = write(Some(z)).unwrap_err().to_string();
+            assert!(error.contains(&format!("invalid ZLEVEL '{z}'")), "{error}");
         }
     }
 }

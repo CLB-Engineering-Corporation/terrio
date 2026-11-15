@@ -18,6 +18,7 @@ import struct
 import subprocess
 import sys
 import threading
+import time
 import zipfile
 import zlib
 from pathlib import Path
@@ -56,6 +57,14 @@ try:
         terrio.vsi_read(path)
     elif action == "tiles":
         terrio.open_raster(path, lazy=True).write(path + ".pmtiles")
+    elif action == "translate":
+        terrio.translate(path, path + ".cog.tif", format="COG")
+    elif action == "translate_cli":
+        from terrio._terrio import cli_main
+
+        args = ["terrio", "translate", path, path + ".cog.tif", "-f", "COG"]
+        code = cli_main(args, [sys.executable])
+        print(f"EXIT {code}")
     else:
         terrio.open_raster(path)
     print("OPENED")
@@ -87,7 +96,12 @@ def read_limited(action, path, env=None, headroom=HEADROOM):
 
 # A size refused before its allocation, or by it: the TIFF decoding limit (TiffReadLimits), a window
 # too large for the allocator, or a fallible allocation.
-REFUSALS = ("exceeds decoded-byte limit", "too large to allocate", "cannot allocate")
+REFUSALS = (
+    "exceeds decoded-byte limit",
+    "too large to allocate",
+    "cannot allocate",
+    " bytes, more than ",
+)
 
 
 def assert_raises_allocation_error(p):
@@ -149,11 +163,185 @@ def png_declaring(width, height):
     )
 
 
+def declaring_tiff(width, height, bands, bits, sample_format, block=None, rows_per_strip=None):
+    """A little-endian TIFF of `bands` bands of `bits`-bit samples (`sample_format` 1 for unsigned
+    integers, 3 for floats) declaring `width` x `height` pixels, as #724 writes its files:
+    band-separate strips of the whole height (`ExtraSamples` for every band but the first), strips
+    of `rows_per_strip` rows, or pixel-interleaved tiles of `block`; every strip or tile points to
+    the same deflated block of zeros."""
+    bw, bh = block or (width, rows_per_strip or height)
+    per_band = -(-width // bw) * -(-height // bh)
+    data = zlib.compress(bytes(bw * bh * bits // 8 * (bands if block else 1)), 9)
+    count = per_band * (1 if block else bands)
+    planar = 2 if bands > 1 and not block else 1
+    tags = {
+        256: (4, [width]),
+        257: (4, [height]),
+        258: (3, [bits] * bands),
+        259: (3, [8]),
+        262: (3, [1]),
+        277: (3, [bands]),
+        284: (3, [planar]),
+        339: (3, [sample_format] * bands),
+        33550: (12, [360.0 / width, 180.0 / height, 0.0]),
+        33922: (12, [0.0, 0.0, 0.0, -180.0, 90.0, 0.0]),
+        34735: (3, [1, 1, 0, 3, 1024, 0, 1, 2, 1025, 0, 1, 1, 2048, 0, 1, 4326]),
+    }
+    if bands > 1:
+        tags[338] = (3, [0] * (bands - 1))
+    if block is None:
+        tags[278], offsets, counts = (4, [bh]), 273, 279
+    else:
+        tags[322], tags[323], offsets, counts = (3, [bw]), (3, [bh]), 324, 325
+    tags[offsets], tags[counts] = (4, [8] * count), (4, [len(data)] * count)
+    ifd_at = 8 + len(data) + (len(data) & 1)
+    extra_at = ifd_at + 2 + 12 * len(tags) + 4
+    ifd, extra = bytearray(struct.pack("<H", len(tags))), bytearray()
+    for tag, (kind, values) in sorted(tags.items()):
+        code = {3: "H", 4: "I", 12: "d"}[kind]
+        packed = struct.pack(f"<{len(values)}{code}", *values)
+        if len(packed) <= 4:
+            ifd += struct.pack("<HHI", tag, kind, len(values)) + packed.ljust(4, b"\0")
+        else:
+            ifd += struct.pack("<HHII", tag, kind, len(values), extra_at + len(extra))
+            extra += packed + b"\0" * (len(packed) & 1)
+    head = b"II*\0" + struct.pack("<I", ifd_at) + data + b"\0" * (len(data) & 1)
+    return head + ifd + b"\0\0\0\0" + extra
+
+
+# The memory budget of whole reads (#724): what the process cannot hold is refused before it is
+# allocated, by the usable-memory check rather than by the allocation.
+USABLE = "bytes of memory the process can use"
+
+
+def test_whole_reads_the_process_cannot_hold_raise_before_allocating(tmp_path):
+    """#724's Float32 file (16,384 bands of 256 x 256 pixels, 4 GiB in 225 KiB) and its tiled one
+    (65,536 x 65,536 pixels, 4 GiB in 129 KiB), read whole through `terrio.rio` and
+    `terrio.open_raster`, by a process whose address space cannot hold them: refused, naming the
+    sizes, before the buffer is allocated, where a cgroup's limit would have killed the process as
+    its pages were written."""
+    files = {
+        "bands-f32.tif": declaring_tiff(256, 256, 16384, 32, 3),
+        "giant-u8.tif": declaring_tiff(65536, 65536, 1, 8, 1, block=(512, 512)),
+    }
+    for name, data in files.items():
+        path = tmp_path / name
+        path.write_bytes(data)
+        for action, what in (("read", "a window"), ("eager", "the raster")):
+            p = read_limited(action, path)
+            assert_raises_allocation_error(p)
+            assert f"{what} of " in p.stdout and USABLE in p.stdout, (name, action, p.stdout)
+
+
+def test_translate_refuses_what_it_would_hold_but_cannot(tmp_path):
+    """Translating to a COG a raster of 8,388,608 x 256 UInt8 pixels in strips of a row (2 GiB
+    declared, 4 GiB in its COG writer's row of 512-row tiles, held twice while strips are appended)
+    by a process whose address space cannot hold it: `terrio translate` streams the output and is
+    refused when its writer is created, after the first strip, instead of aborting once the rows
+    outgrow it; `terrio.translate`, which reads the whole output, is refused before reading it."""
+    path = tmp_path / "wide.tif"
+    path.write_bytes(declaring_tiff(1 << 23, 256, 1, 8, 1, rows_per_strip=1))
+    p = read_limited("translate_cli", path)
+    assert p.returncode == 0, f"the process died (exit code {p.returncode}): {p.stderr[-600:]}"
+    assert "EXIT 1" in p.stdout, p.stdout + p.stderr[-600:]
+    writer = "the rows a GeoTIFF writer holds (256 rows of 8388608 pixels"
+    assert writer in p.stderr, p.stderr[-600:]
+    assert USABLE in p.stderr, p.stderr[-600:]
+    p = read_limited("translate", path)
+    assert_raises_allocation_error(p)
+    assert "a resampled read of 8388608 x 256 pixels in 1 band(s)" in p.stdout, p.stdout
+    assert USABLE in p.stdout, p.stdout
+
+
+def test_the_declared_size_options_refuse_a_raster_at_open(tmp_path, monkeypatch):
+    """`TERRIO_MAX_DECLARED_BYTES` and `TERRIO_MAX_BANDS`, in the environment or an `Env`, refuse
+    a raster declaring more when it is opened, eagerly, lazily, by `convert` and `translate` and
+    through `terrio.rio`, with `ResourceLimitError` naming the option; an `Env` value applies
+    instead of the environment's; anything but a positive
+    integer is an `InvalidArgumentError` naming the option."""
+    path = tmp_path / "x.tif"
+    profile = dict(driver="GTiff", width=64, height=48, count=3, dtype="uint8", crs="EPSG:4326")
+    with rio.open(path, "w", **profile) as dst:
+        dst.write(np.zeros((3, 48, 64), "uint8"))
+    for option in ("TERRIO_MAX_DECLARED_BYTES", "TERRIO_MAX_BANDS"):
+        monkeypatch.delenv(option, raising=False)
+    opens = (
+        lambda: terrio.open_raster(str(path)),
+        lambda: terrio.open_raster(str(path), lazy=True),
+        lambda: terrio.convert(str(path), str(tmp_path / "converted.tif")),
+        lambda: terrio.translate(str(path), str(tmp_path / "translated.tif")),
+    )
+    for open_ in opens:
+        open_()
+    bytes_refusal = (
+        "the raster declares 64 x 48 pixels in 3 band(s), 9216 bytes, "
+        "more than TERRIO_MAX_DECLARED_BYTES=9215"
+    )
+    bands_refusal = "the raster declares 3 bands, more than TERRIO_MAX_BANDS=2"
+    for option, value, refusal in (
+        ("TERRIO_MAX_DECLARED_BYTES", "9215", bytes_refusal),
+        ("TERRIO_MAX_BANDS", "2", bands_refusal),
+    ):
+        monkeypatch.setenv(option, value)
+        for open_ in opens:
+            with pytest.raises(terrio.errors.ResourceLimitError, match=f"^{re.escape(refusal)}$"):
+                open_()
+        with pytest.raises(terrio.errors.ResourceLimitError, match=re.escape(refusal)):
+            rio.open(path)
+        # An `Env` value applies on its thread instead of the environment's.
+        within = "9216" if option == "TERRIO_MAX_DECLARED_BYTES" else "3"
+        with rio.Env(**{option: within}):
+            for open_ in opens:
+                open_()
+            with rio.open(path) as src:
+                assert src.read().shape == (3, 48, 64)
+        monkeypatch.delenv(option)
+        with rio.Env(**{option: value}):
+            for open_ in opens:
+                with pytest.raises(
+                    terrio.errors.ResourceLimitError, match=f"^{re.escape(refusal)}$"
+                ):
+                    open_()
+        monkeypatch.setenv(option, "4 GiB")
+        with pytest.raises(
+            terrio.errors.InvalidArgumentError, match=f"^{option} must be a positive integer"
+        ):
+            terrio.open_raster(str(path), lazy=True)
+        monkeypatch.delenv(option)
+
+
 def test_a_tiff_chunk_too_large_to_allocate_raises(tmp_path):
     """TIFF chunk: one 65,536 x 65,536 tile (4 GiB) for a 16 x 16 window."""
     path = tmp_path / "chunk.tif"
     path.write_bytes(tiled_tiff(65536, 65536, 65536))
     assert_raises_allocation_error(read_limited("window", path))
+
+
+def test_the_tiff_chunk_option_sets_the_limit_of_rasters_opened_without_limits(
+    tmp_path, monkeypatch
+):
+    """`TERRIO_TIFF_MAX_CHUNK_BYTES` sets the decoding limit of a raster opened without explicit
+    limits, from the environment or an `Env` scope: one 64 x 64 tile, 4,096 bytes decoded."""
+    path = tmp_path / "tile.tif"
+    path.write_bytes(tiled_tiff(64, 64, 64, tile_bytes=zlib.compress(b"\x01" * 4096)))
+
+    def read():
+        return int(terrio.open_raster(str(path), lazy=True).read(1).sum())
+
+    monkeypatch.delenv("TERRIO_TIFF_MAX_CHUNK_BYTES", raising=False)
+    assert read() == 4096
+    monkeypatch.setenv("TERRIO_TIFF_MAX_CHUNK_BYTES", "4095")
+    with pytest.raises(
+        terrio.errors.ResourceLimitError,
+        match="decoded-byte limit 4095; for a trusted file, raise it with the "
+        "TERRIO_TIFF_MAX_CHUNK_BYTES",
+    ):
+        read()
+    with rio.Env(TERRIO_TIFF_MAX_CHUNK_BYTES="4096"):
+        assert read() == 4096
+    monkeypatch.setenv("TERRIO_TIFF_MAX_CHUNK_BYTES", "4 MiB")
+    with pytest.raises(terrio.errors.InvalidArgumentError, match="TERRIO_TIFF_MAX_CHUNK_BYTES"):
+        read()
 
 
 def test_a_raster_too_large_to_allocate_raises(tmp_path):
@@ -250,7 +438,7 @@ def test_vsi_functions_keep_the_zip_limits_of_a_raster_open(tmp_path, monkeypatc
     message = re.escape(
         "zip: 'z.bin' and its files hold more than the 1000000 bytes allowed (TERRIO_ZIP_MAX_SIZE)"
     )
-    with pytest.raises(RasterioIOError, match=message):
+    with pytest.raises(terrio.errors.ResourceLimitError, match=message):
         rio.open(member)
     with pytest.raises(terrio.ResourceLimitError, match=f"^{message}$"):
         terrio.vsi_read(member)
@@ -367,6 +555,61 @@ def test_a_remote_zip_member_is_read_by_range(tmp_path, counting_server):
     # central directory, and the member: about 3 x 64 KiB of the 4.1 MiB archive.
     assert stats["requests"] <= 4, stats
     assert stats["bytes"] < size // 10, (stats, size)
+
+
+def test_env_keeps_a_read_on_the_origin_it_was_given(tmp_path, counting_server):
+    """TERRIO_HTTP_FOLLOW_CROSS_ORIGIN=NO, set with terrio.rio.Env, refuses a redirect to another
+    origin (another port) before anything is sent there; a redirect within the origin is still
+    followed, and without the option a redirect to another origin is followed."""
+    other, stats = counting_server
+    pixels = np.full((1, 64, 64), 42, "uint8")
+    terrio.Raster.from_array(pixels, (0.0, 1.0, 0.0, 64.0, 0.0, -1.0), "EPSG:4326").write(
+        str(tmp_path / "image.tif")
+    )
+    data = (tmp_path / "image.tif").read_bytes()
+
+    class Redirecting(http.server.BaseHTTPRequestHandler):
+        """/cross/NAME redirects to NAME on the other origin, /hop/NAME to /NAME on this one."""
+
+        def log_message(self, *args):
+            pass
+
+        def do_GET(self):
+            for prefix, to in (("/cross/", other + "/"), ("/hop/", "/")):
+                if self.path.startswith(prefix):
+                    self.send_response(302)
+                    self.send_header("Location", to + self.path[len(prefix) :])
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+            start, end, status = 0, len(data) - 1, 200
+            rng = self.headers.get("Range")
+            if rng and rng.startswith("bytes="):
+                a, _, b = rng[6:].partition("-")
+                start, status = int(a), 206
+                end = min(int(b), len(data) - 1) if b else len(data) - 1
+            self.send_response(status)
+            self.send_header("Content-Length", str(end + 1 - start))
+            if status == 206:
+                self.send_header("Content-Range", f"bytes {start}-{end}/{len(data)}")
+            self.end_headers()
+            self.wfile.write(data[start : end + 1])
+
+    httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Redirecting)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    asked = f"http://127.0.0.1:{httpd.server_address[1]}"
+    try:
+        with rio.Env(TERRIO_HTTP_FOLLOW_CROSS_ORIGIN="NO"):
+            with pytest.raises(RasterioIOError, match="reads stay on the origin they were given"):
+                rio.open(f"{asked}/cross/image.tif")
+            with rio.open(f"{asked}/hop/image.tif") as src:
+                assert src.read(1)[0, 0] == 42
+        assert stats["requests"] == 0, stats
+        with rio.open(f"{asked}/cross/image.tif") as src:
+            assert src.read(1)[0, 0] == 42
+        assert stats["requests"] > 0, stats
+    finally:
+        httpd.shutdown()
 
 
 @pytest.mark.parametrize("path", sorted((REGRESSIONS / "tiff").glob("*.tif")), ids=lambda p: p.name)
@@ -587,8 +830,9 @@ def test_a_zarr_store_declaring_a_huge_shape_is_read_decimated_and_refused_whole
         want = ds.read(out_shape=(1, 8, 8))
     assert got["decimated"] == want.tolist() and want.any(), (got["decimated"], want)
     refused = (
-        r"RAISED RasterioIOError: Read failed: .*a window of 2147483647x64 pixels in 1 band\(s\) "
-        r"is too large: \d+ bytes, more than the \d+ bytes of memory the process can use"
+        r"RAISED ResourceLimitError: .*a window of 2147483647\s*x\s*64 pixels in 1 band\(s\) "
+        r"(?:of 2-byte samples )?is too large(?: to allocate)?: \d+ bytes, "
+        r"more than the \d+ bytes of memory the process can use"
     )
     for stage in ("dataset_mask", "read"):
         assert re.match(refused, got[stage]), got[stage]
@@ -666,7 +910,7 @@ def test_a_zarr_chunk_of_1_gib_is_read_or_refused_never_aborted(zarr_1_gib_chunk
     else:
         for stage in ("window", "decimated"):
             refused = got[stage]
-            assert refused.startswith("RAISED RasterioIOError"), got
+            assert refused.startswith("RAISED ResourceLimitError"), got
             assert "cannot allocate" in refused, got
 
 
@@ -839,6 +1083,60 @@ def test_dem_path_to_path_releases_the_gil_through_the_guard(tmp_path):
     green = [[0, 100, 50], [100, 0, 100]]
     blue = [[0, 50, 25], [50, 0, 50]]
     assert json.loads(p.stdout) == [red, green, blue]
+
+
+def test_a_warp_of_a_raster_in_memory_releases_the_gil():
+    """`warp` of a `Raster` in memory visits its pixels without the GIL (the warp runs in the
+    guard's release), so Python threads warping arrays run in parallel. While one thread warps,
+    this one keeps running: it records times in the middle half of the warp, which it could not
+    with the GIL held for the whole warp (it would get the GIL back only once the warp returned).
+    No speed threshold decides, only whether the thread ran at all. A loaded runner may starve
+    the sampler in one attempt, so a few bounded attempts are allowed; with the GIL held, every
+    attempt fails."""
+    data = np.random.default_rng(0).random((3000, 3000), dtype="float32")
+    src = terrio.Raster.from_array(data, (500000.0, 10.0, 0.0, 4000000.0, 0.0, -10.0), "EPSG:32631")
+    reference = terrio.warp(src, t_srs="EPSG:32632", resampling="bilinear")
+
+    def attempt():
+        """Warps `src` on a thread while sampling times on this one.
+
+        Returns:
+            The warped raster, and whether a sample fell in the middle half of the warp.
+        """
+        span, errors, out = [], [], []
+        started = threading.Event()
+
+        def warp():
+            span.append(time.perf_counter())
+            started.set()  # the times are taken from here, so the warp cannot end before them
+            try:
+                out.append(terrio.warp(src, t_srs="EPSG:32632", resampling="bilinear"))
+            except Exception as e:  # a thread's exception is otherwise lost
+                errors.append(e)
+            span.append(time.perf_counter())
+
+        thread = threading.Thread(target=warp)
+        seen = []
+        thread.start()
+        started.wait()
+        while thread.is_alive():
+            seen.append(time.perf_counter())
+            time.sleep(0.0005)  # a bounded sample, and the GIL left to the warp between samples
+        thread.join()
+        assert not errors, errors
+        start, end = span
+        quarter = (end - start) / 4
+        (warped,) = out
+        return warped, any(start + quarter < t < end - quarter for t in seen)
+
+    for _ in range(3):
+        warped, ran = attempt()
+        # the warp is the one made with the GIL held: same pixels and georeferencing
+        np.testing.assert_array_equal(warped.read(), reference.read())
+        assert (warped.transform, warped.crs) == (reference.transform, reference.crs)
+        if ran:
+            break
+    assert ran, "the main thread never ran during the middle half of a warp"
 
 
 # Half the width of the Web Mercator world, in meters (EPSG:3857).
@@ -1156,3 +1454,118 @@ def test_content_checks_of_uploads_release_the_gil_through_the_guard(tmp_path):
         sys.setswitchinterval(interval)
     assert summary["raster_samples"] == 8192 * 8192, summary
     assert during > 0, during
+
+
+OPTION_CHILD = r"""
+import json, sys, threading
+import terrio, terrio.rio as rio
+grid = sys.argv[1]
+outcomes = {}
+
+
+def attempt(label, scope):
+    def run():
+        with rio.Env(**scope):
+            try:
+                with rio.open(grid):
+                    opened = True
+            except Exception:
+                opened = False
+            outcomes[label] = [terrio.allowed_drivers(), opened]
+
+    thread = threading.Thread(target=run)
+    thread.start()
+    thread.join()
+
+
+attempt("no scope", {})
+for value in ["", " ", "AAIGrid", None, "AAIGrid, GTiff"]:
+    attempt(repr(value), {"TERRIO_ALLOWED_DRIVERS": value})
+print(json.dumps(outcomes))
+"""
+
+
+@pytest.mark.parametrize(
+    ("environment", "listed"),
+    [(None, None), ("AAIGrid", ["AAIGRID"]), ("GTiff", ["GTIFF"]), ("", []), (" ", [])],
+)
+def test_the_allowed_drivers_option_fails_closed_and_scopes_only_narrow_it(
+    tmp_path, environment, listed
+):
+    """`TERRIO_ALLOWED_DRIVERS` set but empty or blank allows no driver, and an `Env` scope on a
+    thread only narrows the list the environment sets: an empty or blank value, other drivers, or
+    unsetting the option, open nothing that list refuses. With the option unset, or listing
+    `AAIGrid`, the grid opens wherever the scope allows it too. In a child process with the
+    option in its environment."""
+    grid = tmp_path / "grid.asc"
+    grid.write_text("ncols 2\nnrows 2\nxllcorner 0\nyllcorner 0\ncellsize 1\n1 2\n3 4\n")
+    env = {k: v for k, v in os.environ.items() if k != "TERRIO_ALLOWED_DRIVERS"}
+    if environment is not None:
+        env["TERRIO_ALLOWED_DRIVERS"] = environment
+    p = subprocess.run(
+        [sys.executable, "-c", OPTION_CHILD, str(grid)],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        env=env,
+    )
+    assert p.returncode == 0, p.stderr[-600:]
+    outcomes = json.loads(p.stdout)
+    opens = listed is None or "AAIGRID" in listed
+    assert outcomes == {
+        "no scope": [listed, opens],
+        "''": [[], False],
+        "' '": [[], False],
+        "'AAIGrid'": [["AAIGRID"] if opens else [], opens],
+        "None": [listed, opens],
+        "'AAIGrid, GTiff'": [["AAIGRID", "GTIFF"] if listed is None else listed, opens],
+    }
+
+
+MEM_CHILD = r"""
+import json, sys
+import numpy as np
+import terrio, terrio.rio as rio
+if sys.argv[1] == "set_allowed_drivers":
+    terrio.set_allowed_drivers([], kind="raster")
+pixels = np.arange(4, dtype=np.uint8).reshape(2, 2)
+name = f"MEM:::DATAPOINTER={pixels.ctypes.data},PIXELS=2,LINES=2,BANDS=1,DATATYPE=Byte"
+try:
+    with rio.open(name) as ds:
+        outcome = ds.read(1).tolist()
+except Exception as e:
+    outcome = f"{type(e).__name__}: {e}".replace(name, "<name>")
+print(json.dumps([terrio.allowed_drivers("raster"), outcome]))
+"""
+MEM_REFUSED = "RasterioIOError: <name>: '<name>': the MEM driver is not allowed (allowed: none)"
+
+
+@pytest.mark.parametrize(
+    ("environment", "call", "expected"),
+    [
+        (None, "", [None, [[0, 1], [2, 3]]]),
+        ("MEM", "", [["MEM"], [[0, 1], [2, 3]]]),
+        ("", "", [[], MEM_REFUSED]),
+        (" ", "", [[], MEM_REFUSED]),
+        (",", "", [[], MEM_REFUSED]),
+        (None, "set_allowed_drivers", [[], MEM_REFUSED]),
+    ],
+)
+def test_a_mem_pointer_name_opens_only_with_mem_allowed(environment, call, expected):
+    """With `GDAL_MEM_ENABLE_OPEN=YES`, `terrio.rio` opens a `MEM:::DATAPOINTER=` name only when
+    the raster allow-list is unset or names `MEM`: a list that allows nothing, from
+    `TERRIO_ALLOWED_DRIVERS` set empty or blank or from `set_allowed_drivers([])`, refuses it. In a
+    child process, as both lists are process-wide."""
+    env = {k: v for k, v in os.environ.items() if k != "TERRIO_ALLOWED_DRIVERS"}
+    env["GDAL_MEM_ENABLE_OPEN"] = "YES"
+    if environment is not None:
+        env["TERRIO_ALLOWED_DRIVERS"] = environment
+    p = subprocess.run(
+        [sys.executable, "-c", MEM_CHILD, call],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        env=env,
+    )
+    assert p.returncode == 0, p.stderr[-600:]
+    assert json.loads(p.stdout) == expected

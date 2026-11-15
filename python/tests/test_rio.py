@@ -18,17 +18,21 @@ import numpy as np
 import pytest
 from affine import Affine
 
+import terrio
 import terrio.rio as rio
 from terrio.rio import features, merge, warp
+from terrio.rio import shutil as rio_shutil
 from terrio.rio.enums import ColorInterp, MaskFlags, Resampling
 from terrio.rio.errors import (
     CRSError,
+    DriverCapabilityError,
+    DriverRegistrationError,
     RasterBlockError,
     RasterioIOError,
     UnsupportedOperation,
     WindowError,
 )
-from terrio.rio.io import ZipMemoryFile
+from terrio.rio.io import _EXTENSIONS, DatasetWriter, ZipMemoryFile, get_writer_for_driver
 from terrio.rio.windows import Window
 
 T = rio.transform.from_origin(500000, 4100000, 30, 30)
@@ -223,6 +227,97 @@ def test_write_misuse(tmp_path):
             dst.read()
         with pytest.raises(ValueError):
             dst.write(np.zeros((2, 4, 4), "uint8"))
+
+
+# The names of JPEG 2000 drivers, which the driver allow-list and `driver=` of a read take as JP2.
+JPEG_2000_NAMES = ["JP2", "JP2OpenJPEG", "jp2openjpeg", "JPEG2000", "JP2KAK", "JP2ECW", "JP2MrSID"]
+JP2_PIXELS = (np.arange(48 * 64) % 251).astype("uint8").reshape(1, 48, 64)
+JP2_PROFILE = dict(width=64, height=48, count=1, dtype="uint8", crs="EPSG:32611", transform=T)
+
+
+def _assert_written_as_jp2(path):
+    """Asserts that `path` reads back as terrio's JP2, with `JP2_PIXELS`, its CRS and transform."""
+    with rio.open(path) as ds:
+        assert ds.driver == "JP2"
+        assert np.array_equal(ds.read(), JP2_PIXELS)
+        assert ds.crs.to_epsg() == 32611 and ds.transform == T
+
+
+@pytest.mark.parametrize("driver", [None, *JPEG_2000_NAMES])
+def test_jpeg_2000_is_written_by_extension_and_by_each_jpeg_2000_driver_name(tmp_path, driver):
+    """A `.jp2` path opened for writing without a driver takes `JP2OpenJPEG` from its extension,
+    and writes JPEG 2000, as each name of a JPEG 2000 driver does: all but `JP2` were refused with
+    DriverCapabilityError. The file reads back as terrio's JP2."""
+    path = str(tmp_path / "a.jp2")
+    kwargs = {} if driver is None else {"driver": driver}
+    with rio.open(path, "w", **JP2_PROFILE, **kwargs) as dst:
+        dst.write(JP2_PIXELS)
+    _assert_written_as_jp2(path)
+
+
+@pytest.mark.parametrize("driver", [None, "JP2OpenJPEG", "JPEG2000"])
+def test_shutil_copy_writes_jpeg_2000_by_extension_and_by_driver_name(tmp_path, driver):
+    """`shutil.copy` to a `.jp2` path writes JPEG 2000 with the driver its extension gives,
+    `JP2OpenJPEG`, or with a JPEG 2000 name given: it raised DriverRegistrationError."""
+    src = str(tmp_path / "src.tif")
+    with rio.open(src, "w", driver="GTiff", **JP2_PROFILE) as dst:
+        dst.write(JP2_PIXELS)
+    out = str(tmp_path / "copy.jp2")
+    rio_shutil.copy(src, out, driver=driver)
+    _assert_written_as_jp2(out)
+
+
+def test_each_driver_of_the_extension_table_writes_when_terrio_writes_the_extension():
+    """`driver_from_extension` names the driver that `open(..., "w")` and `shutil.copy` write with
+    when none is given: each name in its table is accepted by `get_writer_for_driver` when a raster
+    driver of this build writes files with that extension, and refused when none does (`.img`
+    without the `gdal` feature). `.jp2`'s `JP2OpenJPEG` was refused."""
+    rasters = [d for d in terrio.drivers() if d["kind"] == "raster"]
+    for ext, driver in _EXTENSIONS.items():
+        claiming = [d for d in rasters if ext[1:] in d["extensions"]]
+        assert claiming, ext
+        if any(d["write"] for d in claiming):
+            assert get_writer_for_driver(driver) is DatasetWriter, (ext, driver)
+        else:
+            with pytest.raises(DriverCapabilityError):
+                get_writer_for_driver(driver)
+
+
+@pytest.mark.parametrize("driver", ["OpenJPEG", "HDF5", "ESRI Shapefile"])
+def test_a_name_no_raster_driver_writes_is_refused_before_writing(tmp_path, driver):
+    """A name of no driver, of a raster driver that only reads (HDF5) or of a vector driver is
+    refused by `open(..., "w")` and `shutil.copy`, and nothing is written."""
+    src = str(tmp_path / "src.tif")
+    with rio.open(src, "w", driver="GTiff", **JP2_PROFILE) as dst:
+        dst.write(JP2_PIXELS)
+    out = tmp_path / "a.jp2"
+    with pytest.raises(DriverCapabilityError, match=f"Writer does not exist for driver: {driver}"):
+        rio.open(str(out), "w", driver=driver, **JP2_PROFILE)
+    with pytest.raises(DriverRegistrationError, match=f"Unrecognized driver: {driver}"):
+        rio_shutil.copy(src, str(out), driver=driver)
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["src.tif"]
+
+
+@pytest.mark.parametrize(
+    "driver,canonical",
+    [(" GTiff ", "GTiff"), ("GTiff ", "GTiff"), (" JP2OpenJPEG ", "JP2"), ("\tCOG", "COG")],
+)
+def test_padded_driver_names_are_resolved_before_writing(tmp_path, driver, canonical):
+    """All writer entry points apply the same native driver-name normalization."""
+    assert get_writer_for_driver(driver) is DatasetWriter
+    source = str(tmp_path / "src.tif")
+    for writer in (rio.open, DatasetWriter):
+        with writer(source, "w", driver=driver, **JP2_PROFILE) as dst:
+            assert dst.driver == canonical
+            dst.write(JP2_PIXELS)
+    with rio.MemoryFile(ext=".tif") as memfile:
+        with memfile.open(driver=driver, **JP2_PROFILE) as dst:
+            assert dst.driver == canonical
+            dst.write(JP2_PIXELS)
+    target = str(tmp_path / "out.tif")
+    rio_shutil.copy(source, target, driver=driver)
+    with rio.open(target) as src:
+        np.testing.assert_array_equal(src.read(), JP2_PIXELS)
 
 
 def test_update_and_colormap(dem, tmp_path):
@@ -597,6 +692,107 @@ def test_features():
     assert features.bounds(geoms[0]) == (500000, 4099700, 500300, 4100000)
 
 
+@pytest.mark.parametrize(
+    "values, dtype",
+    [
+        ([3, -7, 300], "int16"),
+        ([2**40 + 3, -1, 2**33], "int64"),
+        ([2**63 + 5, 1, 2**63 + 9], "uint64"),
+        ([1.5, -2.25, float("nan")], "float32"),
+        ([1, 2.5, 3], None),
+        ([-0.0, 0.0, -0.0], "float64"),
+    ],
+)
+def test_rasterize_overlapping_shapes_match_burning_one_by_one(values, dtype):
+    # Later shapes win where they overlap.
+    T = Affine(1, 0, 0, 0, -1, 40)
+
+    def square(x, y, size):
+        ring = [(x, y), (x + size, y), (x + size, y - size), (x, y - size), (x, y)]
+        return {"type": "Polygon", "coordinates": [ring]}
+
+    geoms = [square(2, 38, 20), square(10, 30, 20), square(15, 25, 3)]
+    shapes = list(zip(geoms, values, strict=True))
+    for all_touched in (False, True):
+        got = features.rasterize(
+            shapes, out_shape=(40, 40), transform=T, dtype=dtype, all_touched=all_touched
+        )
+        if dtype is not None:
+            assert got.dtype == np.dtype(dtype)
+        want = np.zeros((40, 40), dtype=got.dtype)
+        for g, v in shapes:
+            hit = features.geometry_mask([g], (40, 40), T, all_touched=all_touched, invert=True)
+            want[hit] = v
+        np.testing.assert_array_equal(got, want)
+        np.testing.assert_array_equal(np.signbit(got), np.signbit(want))
+
+
+def test_rasterize_keeps_the_sign_of_zero_in_object_values():
+    # Decimal values give an object raster; -0 and 0 are two values, and the last shape wins.
+    from decimal import Decimal
+
+    T = Affine(1, 0, 0, 0, -1, 10)
+    first = {"type": "Polygon", "coordinates": [[(0, 10), (6, 10), (6, 4), (0, 4), (0, 10)]]}
+    last = {"type": "Polygon", "coordinates": [[(2, 8), (8, 8), (8, 2), (2, 2), (2, 8)]]}
+    got = features.rasterize(
+        [(first, Decimal("-0")), (last, Decimal("0"))], out_shape=(10, 10), transform=T
+    )
+    assert math.copysign(1, got[0, 0]) == -1 and math.copysign(1, got[4, 4]) == 1
+
+
+def test_rasterize_burns_values_as_rasterio():
+    # rasterio 1.5.2 (GDAL) burns values through float64: NaN as 0, rounded half away from zero,
+    # clamped to an integer dtype's range, overflowing floats to infinity. Recorded with rasterio
+    # 1.5.2 on NumPy 2.5.4, except integers above 2**52, which stay exact here (below). Left out:
+    # values of 2**64 and above into uint64 (GDAL burns 0, terrio the maximum).
+    T = Affine(1, 0, 0, 0, -1, 4)
+    left = {"type": "Polygon", "coordinates": [[(0, 0), (2, 0), (2, 4), (0, 4), (0, 0)]]}
+    right = {"type": "Polygon", "coordinates": [[(2, 0), (4, 0), (4, 4), (2, 4), (2, 0)]]}
+    cases = [
+        ((9223372036854775813, 1), "uint64", [9223372036854775813, 1]),
+        ((9223372036854775813, -1), "int64", [9223372036854775807, -1]),
+        ((300, 1), "uint8", [255, 1]),
+        ((2.5, 1), "uint8", [3, 1]),
+        ((-2.5, 1), "int16", [-3, 1]),
+        ((-1.5, 1), "int16", [-2, 1]),
+        ((0.5, 1), "uint8", [1, 1]),
+        ((1.5, 1), "uint8", [2, 1]),
+        ((-0.4, 1), "uint8", [0, 1]),
+        ((math.nan, 1), "int32", [0, 1]),
+        ((math.inf, 1), "int32", [2147483647, 1]),
+        ((-math.inf, 1), "uint16", [0, 1]),
+        ((np.float64(2**63), 1), "int64", [9223372036854775807, 1]),
+        ((np.int64(300), 1), "uint8", [255, 1]),
+        ((-1, 1), "uint64", [0, 1]),
+        ((1e40, 1), "float32", [float("inf"), 1.0]),
+        ((-1e40, 1), "float32", [float("-inf"), 1.0]),
+        ((math.nan, 1), "float32", [float("nan"), 1.0]),
+        ((0.1, 1), "float32", [0.10000000149011612, 1.0]),
+        ((9007199254740993, 1), "float64", [9007199254740992.0, 1.0]),
+        ((-9223372036854775818, 1), "int64", [-9223372036854775808, 1]),
+        ((70000.7, -3), "int16", [32767, -3]),
+        ((True, 2), "uint8", [1, 2]),
+        # Integers stay exact where GDAL rounds them through float64 (2**52 + 3 as 2**52 + 4,
+        # 2**53 + 1 and 2**53 + 3 alike): the differences from rasterio.
+        ((2**52 + 3, 1), "int64", [4503599627370499, 1]),
+        ((2**53 - 1, 1), "int64", [9007199254740991, 1]),
+        ((2**53 + 1, 2**53 + 3), "int64", [9007199254740993, 9007199254740995]),
+        # Floats round by adding 0.5 in float64, as in GDAL.
+        ((4503599627370495.5, 1), "int64", [4503599627370496, 1]),
+    ]
+    for values, dtype, expected in cases:
+        got = features.rasterize(
+            list(zip((left, right), values, strict=True)),
+            out_shape=(4, 4),
+            transform=T,
+            dtype=dtype,
+        )
+        assert got.dtype == np.dtype(dtype)
+        np.testing.assert_array_equal(
+            got[0, ::2], np.array(expected, dtype=dtype), err_msg=f"{values} {dtype}"
+        )
+
+
 def test_warp_merge_mask(dem, tmp_path):
     path, data = dem
     with rio.open(path) as ds:
@@ -862,3 +1058,243 @@ def test_streaming_writes(tmp_path, monkeypatch):
         with rio.open(path) as ds:
             assert ds.read(1, window=Window(0, 0, 6, 6))[:, 5].tolist() == data[0, :6, 5].tolist()
             assert np.array_equal(ds.dataset_mask(), mask)
+
+
+def test_disjoint_bounds_mixed_orientations_and_degenerate_lines():
+    from terrio.rio.coords import disjoint_bounds
+
+    north = (0, 0, 2, 2)
+    south = (0, 2, 2, 0)
+    for a, b in [(north, south), (south, north)]:
+        with pytest.raises(ValueError, match="same orientation"):
+            disjoint_bounds(a, b)
+    for box in [north, south]:
+        for line, expected in [((0, 1, 2, 1), False), ((0, 3, 2, 3), True)]:
+            assert disjoint_bounds(line, box) is expected
+            assert disjoint_bounds(box, line) is expected
+
+
+def test_lazy_tiff_open_rejects_gdal_readable_dangling_ifd(tmp_path):
+    """GDAL 3.13.3 tolerates this chain with a warning; Terrio requires valid IFDs."""
+    import struct
+
+    import terrio
+
+    gdal = pytest.importorskip("osgeo.gdal")
+    path = tmp_path / "dangling-ifd.tif"
+    values = np.array([[1, 2], [3, 4]], dtype="uint8")
+    dataset = gdal.GetDriverByName("GTiff").Create(str(path), 2, 2, 1, gdal.GDT_Byte)
+    dataset.GetRasterBand(1).WriteArray(values)
+    dataset = None
+    raw = bytearray(path.read_bytes())
+    assert raw[:4] == b"II*\x00"
+    offset = struct.unpack_from("<I", raw, 4)[0]
+    entries = struct.unpack_from("<H", raw, offset)[0]
+    struct.pack_into("<I", raw, offset + 2 + 12 * entries, len(raw) + 1024)
+    path.write_bytes(raw)
+    with gdal.quiet_errors():
+        reference = gdal.Open(str(path))
+        np.testing.assert_array_equal(reference.ReadAsArray(), values)
+    np.testing.assert_array_equal(terrio.open_raster(str(path)).read(1), values)
+    with pytest.raises(terrio.errors.TerrioIOError, match="buffer|IFD|directory"):
+        terrio.open_raster(str(path), lazy=True)
+
+
+def test_unsupported_inferred_mask_is_not_advertised_or_copied(tmp_path):
+    """An unsupported mask header cannot supply a readable mask to rio copy."""
+    import struct
+
+    import terrio
+    from terrio.rio import _tiff
+    from terrio.rio.enums import MaskFlags
+    from terrio.rio.shutil import copy
+
+    path = tmp_path / "unsupported-mask.tif"
+    values = np.array([[1, 2], [3, 4]], dtype="uint8")
+    with rio.open(path, "w", driver="GTiff", width=2, height=2, count=1, dtype="uint8") as dst:
+        dst.write(values, 1)
+        dst.write_mask(np.array([[0, 255], [255, 0]], dtype="uint8"))
+    raw = bytearray(path.read_bytes())
+    assert raw[:4] == b"II*\x00"
+    offset = struct.unpack_from("<I", raw, 4)[0]
+    changed = False
+    while offset:
+        count = struct.unpack_from("<H", raw, offset)[0]
+        entries = {
+            struct.unpack_from("<H", raw, offset + 2 + 12 * i)[0]: offset + 2 + 12 * i
+            for i in range(count)
+        }
+        if 254 in entries and struct.unpack_from("<I", raw, entries[254] + 8)[0] & 4:
+            # Internal TIFF masks are one-bit images; tag inference does not check this.
+            struct.pack_into("<H", raw, entries[258] + 8, 8)
+            changed = True
+        offset = struct.unpack_from("<I", raw, offset + 2 + 12 * count)[0]
+    assert changed
+    path.write_bytes(raw)
+    native = terrio.open_raster(str(path), lazy=True)
+    assert _tiff.tiff_structure(str(path), native).has_mask
+    assert not native.has_mask
+    output = tmp_path / "copied.tif"
+    copy(path, output)
+    for candidate in (path, output):
+        with rio.open(candidate) as opened:
+            assert opened.mask_flag_enums == ([MaskFlags.all_valid],)
+            np.testing.assert_array_equal(opened.read(1), values)
+            np.testing.assert_array_equal(opened.read_masks(1), np.full((2, 2), 255, dtype="uint8"))
+
+
+def test_subdatasets_listed_without_opening_again(tmp_path, monkeypatch):
+    """A file's subdatasets come from its open raster, as `info` lists them: no second open."""
+    import terrio
+    from terrio import _terrio
+
+    t = (480000.0, 30.0, 0.0, 4400000.0, 0.0, -30.0)
+    a = terrio.Raster.from_array(np.arange(12, dtype="float32").reshape(3, 4), t, "EPSG:32613")
+    nc = str(tmp_path / "groups.nc")
+    terrio.write_netcdf_groups({"/g/a": a, "/g/b": a, "/c": a}, nc)
+    store = tmp_path / "s.zarr"
+    store.mkdir()
+    (store / "zarr.json").write_text('{"zarr_format": 3, "node_type": "group", "attributes": {}}')
+    array = {
+        "zarr_format": 3,
+        "node_type": "array",
+        "shape": [3, 4],
+        "data_type": "float32",
+        "chunk_grid": {"name": "regular", "configuration": {"chunk_shape": [3, 4]}},
+        "chunk_key_encoding": {"name": "default", "configuration": {"separator": "/"}},
+        "fill_value": 0,
+        "codecs": [{"name": "bytes", "configuration": {"endian": "little"}}],
+        "dimension_names": ["y", "x"],
+    }
+    for name in ("a", "b"):
+        (store / name).mkdir()
+        (store / name / "zarr.json").write_text(json.dumps(array))
+    listed = {p: [s["name"] for s in terrio.info(p)["subdatasets"]] for p in (nc, str(store))}
+
+    calls: list[str] = []
+    real_info = _terrio.info
+    real_open = _terrio.open_raster
+    opens: list[str] = []
+
+    def spy_open(path, *args, **kwargs):
+        opens.append(path)
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(_terrio, "open_raster", spy_open)
+
+    def spy(path, *args, **kwargs):
+        calls.append(path)
+        return real_info(path, *args, **kwargs)
+
+    monkeypatch.setattr(_terrio, "info", spy)
+    for path, names in listed.items():
+        assert len(names) >= 2
+        with rio.open(path) as src:
+            before = len(opens)
+            assert src.subdatasets == names
+            assert len(opens) == before
+        with rio.open(names[0]) as sub:
+            before = len(opens)
+            assert sub.subdatasets == []
+            assert len(opens) == before
+    assert calls == []
+
+
+def test_geopackage_subdatasets_keep_info_fallback(tmp_path):
+    gdal = pytest.importorskip("osgeo.gdal")
+    import terrio
+
+    path = str(tmp_path / "tables.gpkg")
+    source = gdal.GetDriverByName("MEM").Create("", 2, 2, 1, gdal.GDT_Byte)
+    source.SetGeoTransform((0, 1, 0, 2, 0, -1))
+    source.SetProjection("EPSG:4326")
+    for index, name in enumerate(("first", "second")):
+        source.GetRasterBand(1).Fill(index + 1)
+        options = [f"RASTER_TABLE={name}", "TILE_FORMAT=PNG"]
+        if index:
+            options.append("APPEND_SUBDATASET=YES")
+        target = gdal.Translate(path, source, format="GPKG", creationOptions=options)
+        assert target is not None
+        target = None
+    expected = [item["name"] for item in terrio.info(path)["subdatasets"]]
+    assert len(expected) == 2
+    with rio.open(path) as dataset:
+        assert dataset.subdatasets == expected
+
+
+@pytest.mark.parametrize(
+    "option", ["TERRIO_DISABLE_READDIR_ON_OPEN", "GDAL_DISABLE_READDIR_ON_OPEN"]
+)
+def test_empty_dir_reads_nothing_beside_the_dataset(tmp_path, option):
+    """Under `EMPTY_DIR`, by either name of the option, a local GeoTIFF is read from its own file
+    only: its `.ovr`, `.msk` and `.aux.xml` give it no overviews, no mask and no band description,
+    a reduced read takes its own pixels, and `files` lists it alone. Without the option, the
+    three sidecars are read."""
+    path = str(tmp_path / "image.tif")
+    profile = dict(
+        driver="GTiff",
+        width=64,
+        height=64,
+        count=1,
+        dtype="uint8",
+        crs="EPSG:32633",
+        transform=rio.transform.from_origin(500000, 5000000, 10, 10),
+    )
+    with rio.open(path, "w", **profile) as dst:
+        dst.write(np.full((64, 64), 1, "uint8"), 1)
+    half = dict(
+        profile, width=32, height=32, transform=rio.transform.from_origin(500000, 5000000, 20, 20)
+    )
+    with rio.open(path + ".ovr", "w", **half) as dst:
+        dst.write(np.full((32, 32), 2, "uint8"), 1)
+    with rio.open(path + ".msk", "w", **profile) as dst:
+        dst.write(np.zeros((64, 64), "uint8"), 1)
+    with open(path + ".aux.xml", "w") as f:
+        f.write(
+            '<PAMDataset><PAMRasterBand band="1"><Description>from aux.xml</Description>'
+            "</PAMRasterBand></PAMDataset>"
+        )
+
+    def seen():
+        with rio.open(path) as src:
+            return (
+                src.overviews(1),
+                [os.path.basename(f) for f in src.files],
+                np.unique(src.read(1, out_shape=(16, 16))).tolist(),
+                int((src.dataset_mask() > 0).sum()),
+                src.descriptions,
+            )
+
+    sidecars = ["image.tif.aux.xml", "image.tif.ovr", "image.tif.msk"]
+    assert seen() == ([2], ["image.tif", *sidecars], [2], 0, ("from aux.xml",))
+    with rio.Env(**{option: "EMPTY_DIR"}):
+        assert seen() == ([], ["image.tif"], [1], 64 * 64, (None,))
+
+
+@pytest.mark.parametrize(
+    "option", ["TERRIO_DISABLE_READDIR_ON_OPEN", "GDAL_DISABLE_READDIR_ON_OPEN"]
+)
+def test_empty_dir_lists_a_hdr_only_as_the_header_it_reads(tmp_path, option):
+    """Under `EMPTY_DIR`, `files` lists the `.hdr` of an EHdr or ENVI raster, its header, which is
+    read, and not a `.hdr` beside a GeoTIFF, which is not."""
+    profile = dict(
+        width=8,
+        height=8,
+        count=1,
+        dtype="uint8",
+        crs="EPSG:32633",
+        transform=rio.transform.from_origin(500000, 5000000, 10, 10),
+    )
+    for driver, name in (("GTiff", "image.tif"), ("EHdr", "dem.bil"), ("ENVI", "img.dat")):
+        with rio.open(str(tmp_path / name), "w", driver=driver, **profile) as dst:
+            dst.write(np.ones((8, 8), "uint8"), 1)
+    (tmp_path / "image.hdr").write_text("ENVI\n")
+
+    def listed(name):
+        with rio.open(str(tmp_path / name)) as src:
+            return [os.path.basename(f) for f in src.files]
+
+    with rio.Env(**{option: "EMPTY_DIR"}):
+        assert listed("image.tif") == ["image.tif"]
+        assert listed("dem.bil") == ["dem.bil", "dem.hdr"]
+        assert listed("img.dat") == ["img.dat", "img.hdr"]

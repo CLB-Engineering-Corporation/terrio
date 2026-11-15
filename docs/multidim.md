@@ -43,6 +43,15 @@ nonfinite attributes and CLI JSON values use `NaN`, `Infinity` and `-Infinity` s
 buffers and NumPy/JavaScript typed arrays keep the original floating-point values.
 Original numeric attribute types are retained internally, so netCDF snapshots preserve
 Float32 attributes and numeric nonfinite values without converting literal text `NaN` to a number.
+netCDF-4 compound attributes read as objects of their fields and enum attributes as their
+integers, as GDAL 3.13.3's `gdalmdiminfo` prints them. A netCDF snapshot writes them as
+`gdalmdimtranslate -of netCDF` does: a compound as a compound of a named type of the same name
+(nested compounds too) and an enum as its base integer type, with enum fields as their base type
+and char fields as unsigned bytes. Compounds with array or vlen fields read as `null` and are
+left out of snapshots, as GDAL leaves them out; compounds with string fields, and values that do
+not fit their compound type, are written as JSON text. An object attribute of another source,
+such as Zarr, has no type to write and is written as its JSON text. A snapshot stores
+attributes in object headers, so an attribute larger than 64 KiB is an error.
 
 Native reads support local netCDF classic/CDF-2/CDF-5, netCDF-4 and numeric HDF5, including JPSS
 user blocks, plus local/remote Zarr v2/v3 using the existing codecs and store backends. netCDF/HDF5
@@ -215,6 +224,33 @@ a decode benchmark or a retained-memory/leak measurement. Byte-based opens still
 receive the whole encoded file; these tests make no HTTP range-I/O claim.
 The runner also reports module initialization separately. Selective builds check
 that Zarr operations report the excluded feature clearly.
+
+### Repeated initialization and decode lifecycle measurements
+
+The same runner starts five fresh module workers and performs one first decode
+plus twenty warm open/read/free cycles in each. Override the counts explicitly:
+
+```sh
+SCIENTIFIC_COLD_SAMPLES=10 SCIENTIFIC_WARM_SAMPLES=50 node js/tests/scientific-browser.mjs js/pkg/terrio.js js/pkg/terrio_bg.wasm
+```
+
+JSON output includes sample counts, median, nearest-rank p95 and maximum times
+for initialization (module import plus WASM initialization), cached initialization
+(repeated import and init in the same worker), first decode, and
+warm decode. Decode timing includes opening the encoded file, selecting `sample`,
+copying its native values to JavaScript and freeing both wrappers. Raw timings
+and memory counters before/after each worker's loop are retained in the output.
+Cold means a fresh worker/module instance; browser HTTP and compiled-module
+caches are not flushed. This is a small synthetic lifecycle workload, not a
+representative large-file throughput benchmark. Warm samples are pooled across
+workers and remain correlated; the output makes no statistical significance claim.
+
+Memory counters report WASM linear-memory capacity and, where the browser exposes
+it in workers, JS used/total heap bytes (`null` otherwise). These are not live Rust
+allocation counts, peak RSS or retained-input measurements. No forced GC is used;
+capacity growth or a nonshrinking heap alone is not evidence of a leak. Benchmark
+workers do not execute the conformance suite's explicit `memory.grow`. Worker
+startup, termination and input transfer are outside the timed decode sections.
 
 The Rust ownership regressions include `crates/terrio/tests/data/multidim-userblock.h5`,
 written independently with h5py using a real 512-byte HDF5 userblock:

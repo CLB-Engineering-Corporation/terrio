@@ -21,6 +21,8 @@
 use super::common;
 use crate::formats::RasterDriver;
 use crate::{Error, RasterDataset, Result};
+use hdf5_reader::messages::HdfMessage;
+use hdf5_reader::object_header::ObjectHeader;
 use netcdf_reader::{NcAttrValue, NcAttribute, NcFile, NcFormat, NcGroup, NcType, NcVariable};
 use std::path::Path;
 use wbraster::CrsInfo;
@@ -55,6 +57,43 @@ pub(crate) fn is_netcdf(path: &Path) -> bool {
     b.starts_with(b"CDF") || (netcdf_ext && super::hdf5::has_signature(path))
 }
 
+/// Whether a `GDAL` global attribute names GDAL 1.9 or later, the netCDF driver that writes
+/// CF-conformant files (`NCDFIsGDALVersionGTE(version, 1900)`): `GDAL 3.12.1, released ...`.
+fn gdal_attribute_marks_cf_netcdf(version: &str) -> bool {
+    let Some(rest) = version.get(..5).filter(|p| p.eq_ignore_ascii_case("GDAL ")).map(|_| &version[5..]) else {
+        return false;
+    };
+    // 2.0dev of 2011/12/29 was renamed 1.10dev.
+    if version.eq_ignore_ascii_case("GDAL 2.0dev, released 2011/12/29") {
+        return true;
+    }
+    let starts = |p: &str| rest.get(..p.len()).is_some_and(|r| r.eq_ignore_ascii_case(p));
+    if starts("1.9dev") {
+        return true;
+    }
+    if starts("1.8dev") {
+        return false;
+    }
+    // C's `atoi` of each of the first four `.`-separated tokens, clamped to 0..=99.
+    let atoi = |t: &str| {
+        let t = t.trim_start();
+        let (sign, digits) = match t.as_bytes().first() {
+            Some(b'-') => (-1i64, &t[1..]),
+            Some(b'+') => (1, &t[1..]),
+            _ => (1, t),
+        };
+        let n: i64 = digits.bytes().take_while(u8::is_ascii_digit).fold(0, |n, d| (n * 10 + i64::from(d - b'0')).min(1000));
+        (sign * n).clamp(0, 99)
+    };
+    let mut v = [0i64; 4];
+    for (slot, token) in v.iter_mut().zip(rest.split('.')) {
+        *slot = atoi(token);
+    }
+    let version =
+        if v[0] > 1 || v[1] >= 10 { v[0] * 1_000_000 + v[1] * 10_000 + v[2] * 100 } else { v[0] * 1000 + v[1] * 100 + v[2] * 10 + v[3] };
+    version >= 1900
+}
+
 fn attr<'a>(v: &'a NcVariable, name: &str) -> Option<&'a NcAttrValue> {
     v.attributes().iter().find(|a| a.name == name).map(|a| &a.value)
 }
@@ -69,6 +108,7 @@ fn attr_f64(v: &NcVariable, name: &str) -> Option<f64> {
 
 /// An attribute's value as GDAL's netCDF driver writes it in metadata: text as it is, numbers
 /// as C formats them (`%.8g` for floats, `%.16g` for doubles), several in braces (`{0,255}`).
+/// A compound, opaque or non-string vlen attribute is empty, as GDAL 3.13 leaves it.
 fn attr_text(a: &NcAttribute) -> String {
     let list = |parts: Vec<String>| if parts.len() == 1 { parts[0].clone() } else { format!("{{{}}}", parts.join(",")) };
     match &a.value {
@@ -84,6 +124,7 @@ fn attr_text(a: &NcAttribute) -> String {
         NcAttrValue::UInt64s(v) => list(v.iter().map(u64::to_string).collect()),
         NcAttrValue::Floats(v) => list(v.iter().map(|x| format_g(f64::from(*x), 8)).collect()),
         NcAttrValue::Doubles(v) => list(v.iter().map(|x| format_g(*x, 16)).collect()),
+        NcAttrValue::UserDefined { .. } => String::new(),
     }
 }
 
@@ -138,6 +179,18 @@ fn type_code(t: &NcType) -> u8 {
         NcType::UInt64 => 11,
         _ => 0,
     }
+}
+
+/// The value of a signed type's bits read as unsigned (`_Unsigned = "true"`): negative values
+/// of `Byte`, `Short` and `Int` wrap around, others are kept, as GDAL 3.12.2 reads them.
+fn as_unsigned(v: f64, t: &NcType) -> f64 {
+    let bits = match t {
+        NcType::Byte => 8,
+        NcType::Short => 16,
+        NcType::Int => 32,
+        _ => return v,
+    };
+    if v < 0.0 { v + 2f64.powi(bits) } else { v }
 }
 
 /// Replaces the values outside `[lo, hi]` with the nodata value, as GDAL's netCDF driver applies
@@ -209,48 +262,58 @@ impl VarRef<'_> {
     }
 }
 
-/// Every variable, in GDAL's order: the root group's in definition order, then each subgroup's
-/// (in definition order, recursively).
-fn all_variables<'a>(f: &'a NcFile, path: &Path, hdf5: &dyn Fn() -> Option<hdf5_reader::Hdf5File>) -> Result<Vec<VarRef<'a>>> {
+/// Every variable, in GDAL 3.13.3's order: the root group's in definition order, then each subgroup's
+/// (in definition order, recursively). A group that does not track creation order is listed by name.
+fn all_variables<'a>(
+    f: &'a NcFile,
+    path: &Path,
+    hdf5: &dyn Fn() -> Option<hdf5_reader::Hdf5File>,
+    ordered: bool,
+) -> Result<Vec<VarRef<'a>>> {
     let root = f.root_group().map_err(|e| err(path, e))?;
     let classic = matches!(f.format(), NcFormat::Classic | NcFormat::Offset64 | NcFormat::Cdf5);
-    // NetCDF-4 groups and variables come back in name order; their object headers were allocated
-    // in definition order, which is GDAL's order.
-    let addresses = if classic { None } else { hdf5() };
-    let group_address = |group_path: &str| -> u64 {
-        addresses
-            .as_ref()
-            .and_then(|h| {
-                let mut g = h.root_group().ok()?;
-                for part in group_path.split('/').filter(|p| !p.is_empty()) {
-                    g = g.group(part).ok()?;
-                }
-                Some(g.address())
-            })
-            .unwrap_or(u64::MAX)
+    // NetCDF-4 groups and variables come in the creation order of their HDF5 links when the group
+    // tracks it, as netCDF-4 groups do: their definition order. netCDF lists the links of a group
+    // that does not track it by name. The file is opened again, once, to tell.
+    let h5 = std::cell::OnceCell::new();
+    let sort_by_name = |group_path: &str| -> bool {
+        // Explicit variable lookup needs no ordering. In memory this also avoids copying the
+        // entire input into the auxiliary HDF5 reader; classic files need no HDF5 reader either.
+        if !ordered || classic {
+            return false;
+        }
+        let header = || {
+            let h = h5.get_or_init(hdf5).as_ref()?;
+            let mut g = h.root_group().ok()?;
+            for part in group_path.split('/').filter(|p| !p.is_empty()) {
+                g = g.group(part).ok()?;
+            }
+            ObjectHeader::parse_at_storage(g.storage(), g.address(), g.offset_size(), g.length_size()).ok()
+        };
+        // No Link Info message means untracked links, sorted by name. If reopening or
+        // parsing the header fails, retain the reader's order rather than guessing.
+        header().is_some_and(|h| !h.messages.iter().any(|m| matches!(m, HdfMessage::LinkInfo(li) if li.creation_order_tracked)))
     };
-    fn visit<'a>(chain: Vec<&'a NcGroup>, prefix: &str, classic: bool, group_address: &dyn Fn(&str) -> u64, out: &mut Vec<VarRef<'a>>) {
+    fn visit<'a>(chain: Vec<&'a NcGroup>, prefix: &str, sort_by_name: &dyn Fn(&str) -> bool, out: &mut Vec<VarRef<'a>>) {
         let g = *chain.last().unwrap_or(&chain[0]);
         let mut vars: Vec<&NcVariable> = g.variables.iter().collect();
-        if !classic {
-            vars.sort_by_key(|v| v.data_offset);
+        let mut groups: Vec<&NcGroup> = g.groups.iter().collect();
+        if (vars.len() > 1 || groups.len() > 1) && sort_by_name(prefix) {
+            vars.sort_by(|a, b| a.name.cmp(&b.name));
+            groups.sort_by(|a, b| a.name.cmp(&b.name));
         }
         for v in vars {
             let full = if prefix.is_empty() { v.name.clone() } else { format!("{prefix}/{}", v.name) };
             out.push(VarRef { groups: chain.clone(), v, full });
         }
-        let mut children: Vec<(&NcGroup, String)> = g.groups.iter().map(|c| (c, format!("{prefix}/{}", c.name))).collect();
-        if !classic {
-            children.sort_by_key(|(_, p)| group_address(p));
-        }
-        for (c, p) in children {
+        for c in groups {
             let mut next = chain.clone();
             next.push(c);
-            visit(next, &p, classic, group_address, out);
+            visit(next, &format!("{prefix}/{}", c.name), sort_by_name, out);
         }
     }
     let mut out = Vec::new();
-    visit(vec![root], "", classic, &group_address, &mut out);
+    visit(vec![root], "", &sort_by_name, &mut out);
     Ok(out)
 }
 
@@ -302,7 +365,7 @@ fn subdatasets(vars: &[VarRef], file: &str) -> Vec<(String, String)> {
 /// The paths of a file's raster variables (`Band1`, `/group/Band1`), as [`read`] names them.
 pub(crate) fn data_variable_paths(path: &Path) -> Result<Vec<String>> {
     let f = NcFile::open(path).map_err(|e| err(path, e))?;
-    let vars = all_variables(&f, path, &|| super::hdf5::open_file(path).ok())?;
+    let vars = all_variables(&f, path, &|| super::hdf5::open_file(path).ok(), true)?;
     Ok(data_variables(&vars).iter().map(|r| r.full.clone()).collect())
 }
 
@@ -394,7 +457,7 @@ pub(crate) fn read_bytes(bytes: &[u8], name: &str, variable: Option<&str>) -> Re
 }
 
 fn read_file(f: &NcFile, path: &Path, hdf5: &dyn Fn() -> Option<hdf5_reader::Hdf5File>, variable: Option<&str>) -> Result<RasterDataset> {
-    let vars = all_variables(f, path, hdf5)?;
+    let vars = all_variables(f, path, hdf5, variable.is_none())?;
     let candidates = data_variables(&vars);
     let var = match variable {
         Some(name) => {
@@ -434,11 +497,20 @@ fn read_file(f: &NcFile, path: &Path, hdf5: &dyn Fn() -> Option<hdf5_reader::Hdf
     let bands: usize = if interleaved {
         dims[2].size as usize
     } else if nd > 2 {
-        dims[..nd - 2].iter().map(|d| d.size as usize).product::<usize>().max(1)
+        dims[..nd - 2]
+            .iter()
+            .try_fold(1usize, |acc, d| acc.checked_mul(d.size as usize))
+            .ok_or_else(|| err(path, "variable dimensions overflow"))?
     } else {
         1
     };
-    let unsigned = attr_str(var, "_Unsigned").is_some_and(|s| s.eq_ignore_ascii_case("true"));
+    if cols == 0 || rows == 0 || bands == 0 {
+        return Err(err(path, format!("variable '{}' has an empty dimension", var.name)));
+    }
+    // `_Unsigned` marks the signed types of netCDF-3; GDAL ignores it on `Int64`, which netCDF-4
+    // pairs with `UInt64`.
+    let unsigned = matches!(var.dtype(), NcType::Byte | NcType::Short | NcType::Int)
+        && attr_str(var, "_Unsigned").is_some_and(|s| s.eq_ignore_ascii_case("true"));
     let name = read_path;
     // The values band by band: pixel-interleaved ones are read through their bands axis first.
     macro_rules! values {
@@ -461,6 +533,20 @@ fn read_file(f: &NcFile, path: &Path, hdf5: &dyn Fn() -> Option<hdf5_reader::Hdf
     // A compound of two members of the same numeric type: GDAL's complex bands (`CInt16`,
     // `CInt32`, `CFloat32`, `CFloat64`), read as pairs of real and imaginary bands.
     let complex = complex_part(var.dtype());
+    let raster_bands = crate::declared::component_band_count(bands, complex.is_some())?;
+    // What the variable declares, before its values are read (see `crate::declared`).
+    match complex {
+        Some(part) => crate::declared::check(cols, rows, raster_bands, part, true)?,
+        None => {
+            let size = match var.dtype() {
+                NcType::Byte | NcType::UByte | NcType::Char => 1,
+                NcType::Short | NcType::UShort => 2,
+                NcType::Int | NcType::UInt | NcType::Float => 4,
+                _ => 8,
+            };
+            crate::declared::check_bytes(cols, rows, bands, size, false)?;
+        }
+    }
     let data = match (var.dtype(), unsigned) {
         _ if complex.is_some() => {
             let part = complex.unwrap_or(wbraster::DataType::F32);
@@ -476,8 +562,7 @@ fn read_file(f: &NcFile, path: &Path, hdf5: &dyn Fn() -> Option<hdf5_reader::Hdf
         (NcType::Int, false) => typed!(i32, I32),
         (NcType::Int, true) => reinterpret!(i32, u32, U32),
         (NcType::UInt, _) => typed!(u32, U32),
-        (NcType::Int64, false) => typed!(i64, I64),
-        (NcType::Int64, true) => reinterpret!(i64, u64, U64),
+        (NcType::Int64, _) => typed!(i64, I64),
         (NcType::UInt64, _) => typed!(u64, U64),
         (NcType::Float, _) => typed!(f32, F32),
         (NcType::Double, _) => typed!(f64, F64),
@@ -522,6 +607,46 @@ fn read_file(f: &NcFile, path: &Path, hdf5: &dyn Fn() -> Option<hdf5_reader::Hdf
         gt = Some([x[0] - dx / 2.0, dx, 0.0, top, 0.0, -dy.abs()]);
     }
     let from_coordinates = gt.is_some();
+    // GDAL 3.13 also reads the grid mapping's `GeoTransform` when the coordinates give one: an
+    // agreeing attribute (made north-up) is kept, and the row order of an axis-aligned grid is
+    // then that of a file written by GDAL 1.9 or later (south-up) or not (north-up); a
+    // disagreeing one is ignored, with a warning (`netCDFDataset::SetProjectionFromVar`).
+    if let Some(coordinate_gt) = gt
+        && crate::ops::warp::KernelVersion::configured() == crate::ops::warp::KernelVersion::Gdal313
+        && let Some(mut attribute) = grid_mapping.and_then(|g| attr_str(g, "GeoTransform")).and_then(|s| {
+            let v: Vec<f64> = s.split_whitespace().filter_map(|x| x.parse().ok()).collect();
+            <[f64; 6]>::try_from(v).ok().filter(|g| g.iter().all(|x| x.is_finite()))
+        })
+    {
+        let axis_aligned = |g: &[f64; 6]| g[2] == 0.0 && g[4] == 0.0;
+        if attribute[5] > 0.0 && axis_aligned(&attribute) {
+            attribute[3] += rows as f64 * attribute[5];
+            attribute[5] = -attribute[5];
+        }
+        // Relative to each attribute element, as GDAL compares them (a zero is compared exactly).
+        let max_error = coordinate_gt
+            .iter()
+            .zip(&attribute)
+            .filter_map(|(c, a)| {
+                let e = (c - a).abs();
+                (e > (a * 1e-6).abs()).then_some(e)
+            })
+            .fold(0.0, f64::max);
+        if max_error > 0.0 {
+            crate::warnings::warn(format!(
+                "GeoTransform read from attribute of {} variable differs from value calculated from dimension variables (max diff = {max_error}). Using value calculated from dimension variables.",
+                attr_str(var, "grid_mapping").unwrap_or_default()
+            ));
+        } else {
+            if axis_aligned(&attribute) {
+                let gdal_cf = f.global_attributes().is_ok_and(|a| {
+                    a.iter().any(|a| a.name == "GDAL" && a.value.as_string().is_some_and(|v| gdal_attribute_marks_cf_netcdf(&v)))
+                });
+                south_up = gdal_cf;
+            }
+            gt = Some(attribute);
+        }
+    }
     if gt.is_none() {
         gt = grid_mapping.and_then(|g| attr_str(g, "GeoTransform")).and_then(|s| {
             let v: Vec<f64> = s.split_whitespace().filter_map(|x| x.parse().ok()).collect();
@@ -591,16 +716,8 @@ fn read_file(f: &NcFile, path: &Path, hdf5: &dyn Fn() -> Option<hdf5_reader::Hdf
         };
     }
     // A signed type read as unsigned keeps its fill value's bits.
-    if unsigned && let Some(nd) = nodata.filter(|v| *v < 0.0) {
-        let bits = match var.dtype() {
-            NcType::Byte => 8,
-            NcType::Short => 16,
-            NcType::Int => 32,
-            _ => 0,
-        };
-        if bits > 0 {
-            nodata = Some(nd + (1u64 << bits) as f64);
-        }
+    if unsigned {
+        nodata = nodata.map(|nd| as_unsigned(nd, var.dtype()));
     }
     if complex.is_some() {
         nodata = None;
@@ -616,10 +733,14 @@ fn read_file(f: &NcFile, path: &Path, hdf5: &dyn Fn() -> Option<hdf5_reader::Hdf
             },
         };
         if let Some((lo, hi)) = range {
-            mask_outside(&mut data, lo, hi, nd);
+            // The range is in the variable's type: unsigned too when `_Unsigned`, as GDAL reads it.
+            let (lo, hi) = if unsigned { (as_unsigned(lo, var.dtype()), as_unsigned(hi, var.dtype())) } else { (lo, hi) };
+            // GDAL ignores an inverted range.
+            if lo <= hi {
+                mask_outside(&mut data, lo, hi, nd);
+            }
         }
     }
-    let raster_bands = if complex.is_some() { bands * 2 } else { bands };
     let mut raster =
         common::make_raster(cols, rows, raster_bands, data, gt.unwrap_or(common::NO_GEOTRANSFORM), crs.unwrap_or_default(), nodata)?;
     if south_up {
@@ -862,10 +983,12 @@ fn flip(r: &mut wbraster::Raster) {
     let (cols, rows) = (r.cols, r.rows);
     macro_rules! go {
         ($v:expr) => {
-            for band in $v.chunks_mut(cols * rows) {
-                for row in 0..rows / 2 {
-                    let (a, b) = band.split_at_mut((rows - 1 - row) * cols);
-                    a[row * cols..(row + 1) * cols].swap_with_slice(&mut b[..cols]);
+            if cols > 0 && rows > 0 {
+                for band in $v.chunks_exact_mut(cols * rows) {
+                    for row in 0..rows / 2 {
+                        let (a, b) = band.split_at_mut((rows - 1 - row) * cols);
+                        a[row * cols..(row + 1) * cols].swap_with_slice(&mut b[..cols]);
+                    }
                 }
             }
         };
@@ -893,6 +1016,29 @@ fn grid_mapping_crs(g: &NcVariable) -> Option<CrsInfo> {
 mod tests {
     use super::*;
 
+    /// Explicit selection does not reopen HDF5 (or clone a byte-backed file); an unavailable
+    /// auxiliary header on a listing retains the netCDF reader's order rather than guessing.
+    #[test]
+    fn explicit_selection_skips_auxiliary_order_reads_and_unavailable_headers_keep_reader_order() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/netcdf_order/definition_order.nc");
+        let bytes = std::fs::read(&path).unwrap();
+        let file = NcFile::from_bytes(&bytes).unwrap();
+        let opens = std::cell::Cell::new(0);
+        let unavailable = || {
+            opens.set(opens.get() + 1);
+            None
+        };
+        let selected = read_file(&file, &path, &unavailable, Some("zulu")).unwrap();
+        assert_eq!(selected.raster.data.to_f64_vec(), [2.0, 3.0, 0.0, 1.0]);
+        assert_eq!(opens.get(), 0, "explicit selection must not open the auxiliary reader");
+        let vars = all_variables(&file, &path, &unavailable, true).unwrap();
+        assert_eq!(opens.get(), 1, "a listing attempts at most one auxiliary open");
+        let root = file.root_group().unwrap();
+        let expected: Vec<_> = root.variables.iter().map(|v| v.name.as_str()).collect();
+        let actual: Vec<_> = vars[..expected.len()].iter().map(|v| v.full.as_str()).collect();
+        assert_eq!(actual, expected);
+    }
+
     #[test]
     fn formats_numbers_as_c_does() {
         assert_eq!(format_g(f64::from(0.01f32), 8), "0.0099999998");
@@ -913,6 +1059,23 @@ mod tests {
     }
 
     #[test]
+    fn reads_signed_values_as_unsigned() {
+        // GOES ABI L2: Short `_Unsigned`, `_FillValue = -1`, `valid_range = [9200, -9536]`.
+        assert_eq!(as_unsigned(-1.0, &NcType::Short), 65535.0);
+        assert_eq!(as_unsigned(-9536.0, &NcType::Short), 56000.0);
+        assert_eq!(as_unsigned(9200.0, &NcType::Short), 9200.0);
+        assert_eq!(as_unsigned(-1.0, &NcType::Byte), 255.0);
+        assert_eq!(as_unsigned(-1.0, &NcType::Int), 4294967295.0);
+        // `_Unsigned` is ignored on `Int64`.
+        assert_eq!(as_unsigned(-1.0, &NcType::Int64), -1.0);
+        assert_eq!(as_unsigned(-1.0, &NcType::Float), -1.0);
+        assert_eq!(as_unsigned(f64::NEG_INFINITY, &NcType::Short), f64::NEG_INFINITY);
+        let mut d = RasterData::U16(vec![9199, 9200, 32197, 56000, 56001, 65535]);
+        mask_outside(&mut d, as_unsigned(9200.0, &NcType::Short), as_unsigned(-9536.0, &NcType::Short), 65535.0);
+        assert_eq!(d.to_f64_vec(), vec![65535.0, 9200.0, 32197.0, 56000.0, 65535.0, 65535.0]);
+    }
+
+    #[test]
     fn parses_subdataset_names() {
         assert_eq!(parse_subdataset("NETCDF:\"/data/a b.nc\":u_wind"), Some(("/data/a b.nc".into(), "u_wind".into())));
         assert_eq!(parse_subdataset("netcdf:wind.nc:v"), Some(("wind.nc".into(), "v".into())));
@@ -928,5 +1091,23 @@ mod tests {
         // The second part of another type, or not right after the first.
         assert_eq!(complex_part(&compound(8, vec![field("r", 0, NcType::Float), field("i", 4, NcType::Int)])), None);
         assert_eq!(complex_part(&compound(16, vec![field("r", 0, NcType::Float), field("i", 8, NcType::Float)])), None);
+    }
+
+    #[test]
+    fn gdal_attribute_marks_cf_netcdf_from_the_cf_driver_on() {
+        for (version, cf) in [
+            ("GDAL 3.12.1, released 2025/12/22", true),
+            ("GDAL 1.9.0, released 2011/12/29", true),
+            ("GDAL 1.10.1, released 2013/08/26", true),
+            ("GDAL 1.9dev, released 2011/01/18", true),
+            ("GDAL 2.0dev, released 2011/12/29", true),
+            ("GDAL 1.8.1 ", false),
+            ("GDAL 1.8dev", false),
+            ("gdal 3.13.3", true),
+            ("terrio 0.7", false),
+            ("", false),
+        ] {
+            assert_eq!(gdal_attribute_marks_cf_netcdf(version), cf, "{version}");
+        }
     }
 }

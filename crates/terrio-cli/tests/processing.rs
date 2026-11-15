@@ -179,6 +179,59 @@ fn crs_prints_projjson() {
 }
 
 #[test]
+fn crs_prints_axis_order_body_and_conversion_parameters() {
+    // As PROJ 9.8.1 reads EPSG:2056 (see terrio-crs's tests/crs_accessors.rs).
+    let dir = tempfile::tempdir().unwrap();
+    let output = run(&["crs", "EPSG:2056"], dir.path());
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(text.contains("Axis order: east, north\nBody: Earth\nMethod: somerc (lon_0=7.43958333333333 "), "{text}");
+    assert!(text.contains(" x_0=2600000 y_0=1200000 prime meridian=0 a=6377397.155 "), "{text}");
+    let output = run(&["crs", "EPSG:4326"], dir.path());
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(String::from_utf8(output.stdout).unwrap().contains("Axis order: north, east\n"));
+}
+
+#[test]
+fn crs_prints_proj_string() {
+    let dir = tempfile::tempdir().unwrap();
+    // PROJ 9.8.1's `projinfo -o PROJ EPSG:2056`: without its datum shift, as PROJ writes it.
+    let output = run(&["crs", "EPSG:2056", "--proj4"], dir.path());
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap().trim_end(),
+        "+proj=somerc +lat_0=46.9524055555556 +lon_0=7.43958333333333 +k_0=1 +x_0=2600000 +y_0=1200000 +ellps=bessel +units=m +no_defs +type=crs"
+    );
+    // An engineering CRS has none.
+    let local = r#"LOCAL_CS["Engineering",LOCAL_DATUM["site",0],UNIT["metre",1],AXIS["X",EAST],AXIS["Y",NORTH]]"#;
+    let output = run(&["crs", local, "--proj4"], dir.path());
+    assert!(!output.status.success() && String::from_utf8_lossy(&output.stderr).contains("no PROJ string"));
+    // Not with a transformation, which it would not apply to.
+    let output = run(&["crs", "EPSG:2056", "--proj4", "--to", "EPSG:4326"], dir.path());
+    assert!(!output.status.success() && String::from_utf8_lossy(&output.stderr).contains("cannot be used with"));
+}
+
+#[test]
+fn crs_prints_strict_wkt1() {
+    let dir = tempfile::tempdir().unwrap();
+    // PROJ 9.8.1's WKT1_GDAL of EPSG:4326, with GDAL's axes (pyproj 3.8.0,
+    // `to_wkt("WKT1_GDAL", output_axis_rule=True)`).
+    let output = run(&["crs", "EPSG:4326", "--wkt1-strict"], dir.path());
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap().trim_end(),
+        r#"GEOGCS["WGS 84",DATUM["WGS_1984",SPHEROID["WGS 84",6378137,298.257223563,AUTHORITY["EPSG","7030"]],AUTHORITY["EPSG","6326"]],PRIMEM["Greenwich",0,AUTHORITY["EPSG","8901"]],UNIT["degree",0.0174532925199433,AUTHORITY["EPSG","9122"]],AXIS["Latitude",NORTH],AXIS["Longitude",EAST],AUTHORITY["EPSG","4326"]]"#
+    );
+    // A datum grid needs the PROJ4 extension; PROJ writes no WKT 1 of a geographic 3D CRS.
+    for crs in ["+proj=longlat +ellps=clrk66 +nadgrids=conus +no_defs", "EPSG:4979"] {
+        let output = run(&["crs", crs, "--wkt1-strict"], dir.path());
+        assert!(!output.status.success() && String::from_utf8_lossy(&output.stderr).contains("no WKT 1 without"), "{crs}");
+    }
+    let output = run(&["crs", "EPSG:4326", "--wkt1-strict", "--wkt"], dir.path());
+    assert!(!output.status.success() && String::from_utf8_lossy(&output.stderr).contains("cannot be used with"));
+}
+
+#[test]
 fn crs_promotes_2d_crss_to_3d_on_request() {
     // RD New to WGS 84 3D: the height is kept (h = 0) unless the 2D CRS is promoted, when it goes
     // through the datum transformation (43.6 m, as GDAL after `PromoteTo3D`).
@@ -424,4 +477,48 @@ fn lazy_sample_multiband_multiraster_defers_output_reprojection() {
     assert!(
         !run(&["sample", "points.geojson", "bad.gpkg", "--lazy", "--raster", "a.tif", "--sample-window-size", "0"], d).status.success()
     );
+}
+
+/// `convert -f` writes terrio's JP2 under each name of a JPEG 2000 driver, in builds with the GDAL
+/// backend too, whose drivers are used only for names terrio does not know: `JP2MrSID` was refused
+/// (`unknown raster format`). The file reads back as JP2, with its pixels.
+#[test]
+fn convert_writes_jp2_under_each_jpeg_2000_driver_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let cfg = terrio::RasterConfig { cols: 4, rows: 3, data_type: terrio::DataType::U8, ..Default::default() };
+    let mut ds = terrio::RasterDataset::new(terrio::Raster::from_data(cfg, (0..12).map(f64::from).collect()).unwrap(), false);
+    ds.raster.crs.epsg = Some(4326);
+    terrio::write_raster_dataset(&ds, d.join("in.tif").to_str().unwrap(), &Default::default()).unwrap();
+    for name in ["JP2MrSID", "JP2OpenJPEG", "JPEG2000", "JP2KAK", "JP2ECW"] {
+        let out = format!("{name}.jp2");
+        ok(&["convert", "in.tif", &out, "-f", name], d);
+        let back = terrio::open_raster(d.join(&out).to_str().unwrap()).unwrap();
+        assert_eq!(back.driver, terrio::formats::RasterDriver::JP2, "{name}");
+        let terrio::raster::RasterData::U8(values) = &back.raster.data else { panic!("{name}: not Byte") };
+        assert_eq!(values, &(0..12).collect::<Vec<u8>>(), "{name}");
+    }
+}
+
+/// Streamed TIFF outputs clip as GDAL 3.13.3 does, with diagnostics on stderr.
+#[test]
+fn translate_reports_wider_packed_clipping_but_keeps_bilevel_silent() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    for (bits, data_type, value) in [(1, terrio::DataType::U8, 255.), (12, terrio::DataType::U16, 65535.)] {
+        let cfg = terrio::RasterConfig { cols: 4, rows: 6, data_type, ..Default::default() };
+        let ds = terrio::RasterDataset::new(terrio::Raster::from_data(cfg, vec![value; 24]).unwrap(), false);
+        terrio::write_raster_dataset(&ds, d.join("source.tif").to_str().unwrap(), &Default::default()).unwrap();
+        for driver in ["GTiff", "COG"] {
+            let output = format!("{driver}-{bits}.tif");
+            let nbits = format!("NBITS={bits}");
+            let result = run(&["translate", "source.tif", &output, "-f", driver, "--co", &nbits], d);
+            let stderr = String::from_utf8_lossy(&result.stderr);
+            assert!(result.status.success(), "{stderr}");
+            assert_eq!(stderr.matches("clipped to fit").count(), usize::from(bits > 1), "{stderr}");
+            let back = terrio::open_raster(d.join(&output).to_str().unwrap()).unwrap();
+            let maximum = ((1u32 << bits) - 1) as f64;
+            assert!(back.raster.data.to_f64_vec().iter().all(|&v| v == maximum));
+        }
+    }
 }

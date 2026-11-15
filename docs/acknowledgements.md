@@ -2,8 +2,18 @@
 
 terrio stands on the work of many projects and their authors. Thank you to all of them.
 
+The lossy WebP regression fixture adapts the seeded image reproduction supplied by
+[gmoralessanchez in issue #973](https://github.com/opengeos/terrio/issues/973), under
+Terrio's MIT license.
+
+The corrected private VP8 encoder adapts the MIT-licensed lossy encoder from
+[webp-rust 0.3.2](https://github.com/mith-mmk/webp-rust) by MITH@mmk. The existing
+dependency supplies its decoder tables; see `NOTICE` for the adapted files.
+
 terrio is released under the MIT License, except its point cloud eigensolver
-(`pointcloud/filters/selfadjoint.rs`), a port of Eigen under MPL-2.0, but much of it is ported or adapted from these
+(`pointcloud/filters/selfadjoint.rs`), a port of Eigen under MPL-2.0, and its
+coverage-weighted median (`ops/zonal_weighted_median.rs`), adapted from exactextract
+under Apache-2.0. Much of it is ported or adapted from these
 projects, and the copyright in that code and data remains with their authors: Frank Warmerdam,
 Even Rouault and the GDAL contributors; Gerald Evenden, Frank Warmerdam, Even Rouault and the PROJ
 contributors; Hobu, Inc. and the PDAL contributors; and the authors of the other projects below.
@@ -24,6 +34,8 @@ terrio began on the pure-Rust format libraries of
 [`wbraster`](https://crates.io/crates/wbraster), [`wbvector`](https://crates.io/crates/wbvector) and
 [`wbprojection`](https://crates.io/crates/wbprojection). They still read and write many of the
 formats terrio supports, and they made a C-free geospatial library in Rust a realistic goal.
+The declaration preflight reader adapts their DTED, PCRaster, Esri binary grid and GRASS ASCII
+header layouts, under the MIT license; see `NOTICE`.
 
 ## GDAL
 
@@ -138,6 +150,25 @@ published [`FeatureCollection.proto`](https://github.com/Esri/arcgis-pbf), copyr
 the Apache License 2.0. It follows the message and field numbers that file defines; no code is copied
 from it.
 
+## libdeflate
+
+terrio's GeoTIFF and COG writers compress Deflate chunks with a Rust port of
+[libdeflate](https://github.com/ebiggers/libdeflate)'s level 6 compressor
+(`crates/terrio/src/deflate_compress.rs`, copyright 2016 Eric Biggers, MIT). The level parameters,
+parsers, block splitting and coding follow that implementation. Levels 6–9 also probe a bounded
+number of periodic-run boundaries to improve repeating categorical rasters. Compressed bytes can
+therefore differ from libdeflate's; decoded raster values and metadata are checked independently
+with GDAL 3.13.3. At every level, the searches over a GeoTIFF or COG chunk's rows also examine the
+position one row back.
+
+## fdlibm
+
+terrio's vectorized aspect, and with the default (GDAL 3.12) kernel its slope in degrees and its
+combined and Igor hillshades (`crates/terrio/src/ops/dem.rs`), compute arctangents with fdlibm's
+algorithms and constants (`s_atan.c` and `e_atan2.c`, copyright 1993 Sun
+Microsystems), as FreeBSD's msun and the Rust [`libm`](https://crates.io/crates/libm) crate have
+them, falling back to the platform's functions wherever the two could round differently.
+
 ## Python APIs
 
 terrio's Python package borrows its shape from [rasterio](https://rasterio.readthedocs.io),
@@ -161,7 +192,6 @@ terrio reads and writes its formats with these crates, among others:
 | [`flatgeobuf`](https://crates.io/crates/flatgeobuf) | FlatGeobuf |
 | [Apache Arrow and Parquet](https://github.com/apache/arrow-rs) | GeoParquet and Arrow |
 | [`netcdf-reader`](https://crates.io/crates/netcdf-reader), [`hdf5-reader`](https://crates.io/crates/hdf5-reader) | netCDF and HDF5 |
-| [`osmpbfreader`](https://crates.io/crates/osmpbfreader) | OpenStreetMap PBF |
 | [`quick-xml`](https://crates.io/crates/quick-xml) | KML, GPX and other XML formats |
 | [`laz`](https://crates.io/crates/laz) | LAZ and COPC, a port of [LASzip](https://laszip.org) |
 | [`e57`](https://crates.io/crates/e57) | E57 laser scans |
@@ -176,6 +206,11 @@ runs it in parallel, [ureq](https://crates.io/crates/ureq) fetches remote data,
 [wasm-bindgen](https://github.com/rustwasm/wasm-bindgen) builds the JavaScript one. The optional
 `gdal` feature uses the [`gdal`](https://crates.io/crates/gdal) crate.
 
+The additional-CA TLS transport adapts the MIT-licensed rustls connector and
+transport adapter from [ureq 3.5.1](https://github.com/algesten/ureq) by
+Martin Algesten. Its custom verifier retains Mozilla-applied trust-anchor
+constraints while adding private roots; see `NOTICE` for the source files.
+
 JPEG writing (through `jpeg-encoder`) is based in part on the work of the Independent JPEG
 Group.
 
@@ -184,6 +219,12 @@ TPVW corner removal and ring rebuilding from commit
 `3460207216f3091cd7f72d48d6ddd1b561b2b8fd`, using the Eclipse Distribution License
 1.0 (BSD-3-Clause). Its source header, NOTICE entries and JTS provenance document
 retain exact source paths and copyright notices.
+
+## exactextract
+
+Coverage-weighted medians adapt the interpolated weighted quantiles of
+[exactextract](https://github.com/isciences/exactextract) (ISciences, Apache-2.0).
+Polygon coverage fractions use Terrio's existing pure-Rust geo topology engine.
 
 ## Notices and licenses
 
@@ -198,3 +239,11 @@ the npm package and the command-line archives.
 
 The full list of dependencies is in `Cargo.toml` and `Cargo.lock`. If your work is missing here,
 please [open an issue](https://github.com/opengeos/terrio/issues).
+
+## Colormaps
+
+`terrio preview`, `terrio view` and the `render` functions color data with stops sampled from
+[matplotlib](https://matplotlib.org)'s viridis, magma, inferno and plasma, designed by Nathaniel J.
+Smith, Stéfan van der Walt and Eric Firing (CC0), and [ColorBrewer](https://colorbrewer2.org)'s
+RdBu and RdYlGn by Cynthia Brewer, Mark Harrower and The Pennsylvania State University
+(Apache-2.0).

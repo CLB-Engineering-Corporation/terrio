@@ -99,6 +99,8 @@ terrio sieve landcover.tif clean.tif --st 10 -8                            # lik
 terrio info "https://earth-search.aws.element84.com/v1/search?collections=sentinel-2-l2a&bbox=..."  # STAC: footprints, mosaics
 terrio convert 'STACIT:"https://.../search?...":asset=red' red.tif --srcwin 0 0 1024 1024  # like GDAL's STACIT
 terrio convert dem.tif dem.zarr --co GEOREFERENCING_CONVENTION=SPATIAL_PROJ --co OVERVIEW_LEVELS=AUTO  # GeoZarr
+terrio preview dem.tif -o dem.png -c terrain     # PNG or terminal preview (Kitty, iTerm2, sixels, blocks)
+terrio view dem.tif -c terrain                   # pan-and-zoom map in your browser
 terrio formats                                   # list the drivers
 
 # Point clouds: LAS 1.0-1.4 (formats 0-10, extra bytes, waveforms), LAZ, COPC and EPT (read in
@@ -141,9 +143,10 @@ terrio ui --port 8080 --no-open  # prints the address instead
 
 Every command and option gets a form, generated from the catalog of the binary you run. Pick files
 with the built-in file browser or enter a URL, run or cancel the command, read its output, and copy
-the equivalent command line into a script. The server listens on 127.0.0.1 only and runs commands
-with your permissions, so treat its printed address, which contains a random token, as a password
-(see [`ui`](https://terrio.dev/cli/#ui)).
+the equivalent command line into a script. On `preview`, **Open map** opens the dataset in a
+pan-and-zoom map in a new tab (as [`terrio view`](https://terrio.dev/cli/#view) does). The server
+listens on 127.0.0.1 only and runs commands with your permissions, so treat its printed address,
+which contains a random token, as a password (see [`ui`](https://terrio.dev/cli/#ui)).
 
 ## Library
 
@@ -178,7 +181,7 @@ into the same data model, and writes rasters with GDAL's drivers: `terrio::open(
 `terrio info --driver gdal`, or a plain path when terrio's own drivers cannot open it.
 
 Every driver is on by default; each family of them is a cargo feature that can be turned off,
-for a smaller dependency tree and WebAssembly module: `cad` (DWG and DXF), `parquet`, `remote` (URLs and object
+for a smaller dependency tree and WebAssembly module: `cad` (DWG and DXF), `xlsx`, `parquet`, `remote` (URLs and object
 storage), `netcdf-hdf5`, `sqlite` (GeoPackage), `tiles` (MBTiles, PMTiles, MVT), `avif`, `zarr`,
 `jp2`, `grib`, `flatgeobuf`, `osm`, `pointcloud`, `lerc`, `lzma`, `hecras` (HEC-RAS geometry and
 plan HDF files) and `filegdb` (Esri File Geodatabases, read only). GeoTIFF and COG, the plain raster
@@ -186,7 +189,7 @@ and vector formats, the CRS engine and the operations are always built. A COG wr
 needs only:
 
 ```toml
-terrio = { version = "0.6", default-features = false, features = ["geotiff"] }
+terrio = { version = "0.9", default-features = false, features = ["geotiff"] }
 ```
 
 See [the features](https://terrio.dev/rust/#features) for what each one adds.
@@ -244,8 +247,9 @@ terrio.warp("dem.tif", "dem_4326.tif", t_srs="EPSG:4326", resampling="bilinear")
 ```
 
 The operations (`convert`, `translate`, `warp`, `mosaic`, `rasterize`, `polygonize`, `dem`,
-`calc`, `proximity`, `sieve`) take the command-line options as keyword arguments. See
-[python/README.md](python/README.md).
+`calc`, `proximity`, `sieve`, `fill_nodata`, `viewshed`, `zonal_stats` and more) take the
+command-line options as keyword arguments; `render` renders datasets as PNG bytes and rasters
+display as inline PNGs in Jupyter notebooks. See [python/README.md](python/README.md).
 
 rasterio scripts run with an import change, `import terrio.rio as rasterio`: datasets, windows,
 CRSs, features, warping, merging, masking and memory files follow rasterio's API, compared with
@@ -378,7 +382,7 @@ If you use terrio in your work, please cite it. terrio is archived on [Zenodo](h
 
 [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.23642204.svg)](https://doi.org/10.5281/zenodo.23642204)
 
-> Wu, Q., & Fitzgerald, M. (2026). terrio: Pure-Rust geospatial raster, vector and point cloud data I/O. Zenodo. <https://doi.org/10.5281/zenodo.23642204>
+> Wu, Q., Fitzgerald, M., & Morales Sanchez, G. (2026). terrio: Pure-Rust geospatial raster, vector and point cloud data I/O. Zenodo. <https://doi.org/10.5281/zenodo.23642204>
 
 You can also use GitHub's **"Cite this repository"** button (which reads [`CITATION.cff`](CITATION.cff)) to copy a ready-made APA or BibTeX entry. See the [How to Cite](https://terrio.dev/citation/) page for more formats.
 
@@ -405,6 +409,7 @@ permit their redistribution with this attribution; its ESRI table (`esri.tsv.zst
 [projection engine data](https://github.com/Esri/projection-engine-db-doc) (Apache-2.0). The
 tables were produced with [PROJ](https://proj.org) and [GDAL](https://gdal.org). The projection
 formulas in `crates/terrio-crs/src/` are ported from PROJ (MIT licence), and the cloth simulation
-filter from CSF (Apache-2.0). [`NOTICE`](NOTICE) holds the notices of the code and data terrio
+filter from CSF (Apache-2.0). Coverage-weighted medians adapt exactextract
+(Apache-2.0). [`NOTICE`](NOTICE) holds the notices of the code and data terrio
 adapts, and [`LICENSE-THIRD-PARTY.md`](LICENSE-THIRD-PARTY.md) the licenses of the Rust crates
 it is built with.

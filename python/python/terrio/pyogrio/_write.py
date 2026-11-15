@@ -24,8 +24,12 @@ from __future__ import annotations
 import datetime as _dt
 import math
 import os
+import re
 
 import numpy as np
+
+from terrio import _terrio
+from terrio.errors import CRSError, UnsupportedError
 
 
 def _escape(s: str) -> str:
@@ -279,17 +283,65 @@ def _is_null(v) -> bool:
 
 
 def _crs_member(crs) -> str | None:
+    """Format a CRS member accepted by the shared GeoJSON writer.
+
+    Args:
+        crs: The dataframe's pyproj CRS, or None.
+
+    Returns:
+        str | None: A json-c-style CRS member, omitted for an unknown CRS.
+
+    Raises:
+        UnsupportedError: GeoJSON cannot name the retained definition.
+    """
     if crs is None:
         return None
-    epsg = crs.to_epsg()
-    if epsg is None:
+    name: str | None
+    code = crs.to_epsg()
+    if code == 4326:
+        # Retain pyogrio's existing spelling for WGS 84.
+        name = "urn:ogc:def:crs:OGC:1.3:CRS84"
+    elif code is not None:
+        # Preserve pyproj's established EPSG identification without requiring its
+        # WKT dialect to be supported, but require the reader to resolve the code.
+        try:
+            name = _terrio._geojson_crs_name(f"EPSG:{code}")
+        except CRSError as exc:
+            raise UnsupportedError(
+                "GeoJSON cannot name this layer's CRS: reproject to EPSG:4326 (RFC7946=YES), "
+                "or use a format that stores CRS definitions"
+            ) from exc
+    else:
+        name = _terrio._geojson_crs_name(crs.to_wkt())
+    if name is None:
         return None
-    name = "urn:ogc:def:crs:OGC:1.3:CRS84" if epsg == 4326 else f"urn:ogc:def:crs:EPSG::{epsg}"
     return '{ "type": "name", "properties": { "name": ' + _escape(name) + " } }"
 
 
+# A JSON string (kept whole) or a space outside one (dropped).
+_PLAIN_TOKEN = re.compile(r'"(?:[^"\\]|\\.)*"| ')
+
+
+def _plain(text: str) -> str:
+    """json-c's `JSON_C_TO_STRING_PLAIN` form of its `JSON_C_TO_STRING_SPACED` text.
+
+    The spaces outside strings are dropped (`[ ]` and `{ }` become `[]` and `{}`).
+
+    Args:
+        text: The spaced JSON text.
+
+    Returns:
+        str: The same JSON without the spaces.
+    """
+    return _PLAIN_TOKEN.sub(lambda m: "" if m.group(0) == " " else m.group(0), text)
+
+
 def to_geojson(df, layer: str) -> str:
-    """The GeoJSON text GDAL writes for a (Geo)DataFrame through pyogrio."""
+    """The GeoJSON text GDAL writes for a (Geo)DataFrame through pyogrio.
+
+    GDAL 3.13 writes each feature without spaces (json-c's plain form), GDAL 3.12 with them:
+    the version `terrio.gdal_compat()` names is followed.
+    """
     geometry_name = getattr(df, "_geometry_column_name", None)
     has_geometry = geometry_name is not None and geometry_name in df.columns
     columns = [c for c in df.columns if not (has_geometry and c == geometry_name)]
@@ -317,6 +369,8 @@ def to_geojson(df, layer: str) -> str:
             + _geometry(geoms[i])
             + " }"
         )
+    if _terrio.gdal_compat() != "3.12":
+        feats = [_plain(f) for f in feats]
     lines.append(",\n".join(feats))
     lines.append("]")
     lines.append("}")

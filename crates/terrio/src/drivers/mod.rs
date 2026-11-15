@@ -11,11 +11,11 @@ pub(crate) mod area_matched;
 #[cfg(any(feature = "netcdf-hdf5", feature = "zarr"))]
 mod cf;
 pub(crate) mod common;
+pub(crate) mod declared_header;
 mod ehdr;
 mod envi;
 mod ers;
 pub(crate) mod gdal_overview;
-pub(crate) mod geokeys;
 #[cfg(feature = "sqlite")]
 pub(crate) mod gpkg;
 #[cfg(feature = "grib")]
@@ -50,7 +50,7 @@ pub(crate) mod sqlite_edit;
 #[cfg(feature = "sqlite")]
 pub(crate) mod sqlite_repack;
 pub(crate) mod vector;
-mod webp;
+pub(crate) mod webp;
 pub(crate) mod wkt;
 mod xyz;
 #[cfg(feature = "zarr")]
@@ -90,7 +90,17 @@ fn read_own(path: &str) -> Option<Result<RasterDataset>> {
     if by_extension.is_none() && grib::is_grib(p) {
         return Some(check_recognised(RasterDriver::GRIB, path).and_then(|()| grib::read(p)));
     }
-    let driver = by_extension?;
+    let driver = by_extension.or_else(|| {
+        use std::io::Read;
+        let mut head = [0; 16];
+        let n = std::fs::File::open(p).ok()?.read(&mut head).ok()?;
+        image_content_driver(&head[..n])
+    })?;
+    if by_extension.is_none()
+        && let Err(error) = check_recognised(driver, path)
+    {
+        return Some(Err(error));
+    }
     if let Err(e) = driver.ensure_built() {
         return Some(Err(e));
     }
@@ -99,6 +109,7 @@ fn read_own(path: &str) -> Option<Result<RasterDataset>> {
         RasterDriver::XYZ => xyz::read(p),
         RasterDriver::PNG => png::read(p),
         RasterDriver::JPEG => png::read_jpeg(p),
+        RasterDriver::GTiff if by_extension.is_none() => crate::geotiff::read_geotiff(p),
         RasterDriver::WEBP => webp::read(p),
         #[cfg(feature = "jp2")]
         RasterDriver::JP2 => jp2::read(p),
@@ -119,6 +130,16 @@ fn read_own(path: &str) -> Option<Result<RasterDataset>> {
         RasterDriver::Zarr => zarr::read(p),
         _ => return None,
     })
+}
+
+/// Native image formats whose signatures also select a whole-file reader without an extension.
+fn image_content_driver(head: &[u8]) -> Option<RasterDriver> {
+    match crate::formats::sniff(head)? {
+        "PNG" => Some(RasterDriver::PNG),
+        "JPEG" => Some(RasterDriver::JPEG),
+        "GTIFF" => Some(RasterDriver::GTiff),
+        _ => None,
+    }
 }
 
 /// Whether [`read`] takes a lone file named `name` (in a directory of its own, as a remote file's
@@ -163,7 +184,7 @@ pub(crate) fn lone_file_driver(name: &str, head: &[u8], len: u64) -> Option<Rast
     if grib::is_grib_bytes(head) {
         return Some(RasterDriver::GRIB);
     }
-    None
+    image_content_driver(head)
 }
 
 /// Refuses `path`, which one of terrio's drivers recognised by its content or by a file beside it
@@ -319,7 +340,7 @@ pub(crate) fn open_subdataset(path: &str) -> Option<Result<RasterDataset>> {
 /// Writes rasters into one netCDF-4 file, each in its group (see `netcdf_write::groups_to_bytes`).
 #[cfg(feature = "netcdf-hdf5")]
 pub(crate) fn write_netcdf_groups(rasters: &[(&str, &RasterDataset)], path: &str, options: &crate::RasterWriteOptions) -> Result<()> {
-    std::fs::write(path, netcdf_groups_to_bytes(rasters, options)?)?;
+    common::write_replacing(path, netcdf_groups_to_bytes(rasters, options)?)?;
     Ok(())
 }
 
@@ -376,6 +397,7 @@ pub(crate) fn write(
     #[cfg_attr(not(any(feature = "netcdf-hdf5", feature = "sqlite", feature = "zarr")), allow(unused_variables))]
     let compression = options.compression.as_deref();
     let co = |key: &str| options.creation_options.iter().find(|(k, _)| k.eq_ignore_ascii_case(key)).map(|(_, v)| v.as_str());
+    let georeferenced = common::georeferenced(&options.creation_options);
     Some(match driver {
         RasterDriver::ENVI => envi::write(r, nodata, p),
         RasterDriver::EHdr => ehdr::write(r, nodata, p),
@@ -386,13 +408,15 @@ pub(crate) fn write(
         RasterDriver::SAGA => saga::write(r, nodata, p),
         RasterDriver::XYZ => xyz::write(r, p),
         RasterDriver::RST => rst::write(r, nodata, p),
-        RasterDriver::PNG => png::write(r, nodata, p),
-        RasterDriver::JPEG => png::write_jpeg(r, p, co("QUALITY")),
+        RasterDriver::PNG => png::write(r, nodata, p, co("ZLEVEL"), georeferenced),
+        RasterDriver::JPEG => png::write_jpeg(r, p, co("QUALITY"), georeferenced),
         RasterDriver::WEBP => webp::write(r, nodata, p, &options.creation_options),
         #[cfg(feature = "grib")]
         RasterDriver::GRIB => grib::write::write(r, nodata, p, options),
         #[cfg(feature = "jp2")]
-        RasterDriver::JP2 => jp2::write(r, nodata, p),
+        RasterDriver::JP2 => {
+            jp2::write(r, nodata, p, georeferenced, options.geo_transform, &options.band_metadata, &options.creation_options)
+        }
         #[cfg(feature = "zarr")]
         RasterDriver::Zarr => zarr::write_with(r, nodata, p, compression, &options.creation_options, &options.band_metadata),
         #[cfg(feature = "netcdf-hdf5")]
@@ -415,7 +439,7 @@ pub(crate) fn write(
                     let bytes = netcdf_groups_to_bytes(&all, options)?;
                     // Written beside the file, then renamed over it: an interrupted write leaves the
                     // original as it was.
-                    let tmp = p.with_extension(format!("nc.tmp-{}", std::process::id()));
+                    let tmp = p.with_extension(format!("nc.tmp-{}", crate::process_id()));
                     std::fs::write(&tmp, bytes).and_then(|_| std::fs::rename(&tmp, p)).inspect_err(|_| {
                         let _ = std::fs::remove_file(&tmp);
                     })?;
@@ -434,7 +458,8 @@ pub(crate) fn write(
         }
         // Formats without a CRS of their own: GDAL's sidecar holds it.
         RasterDriver::PCRaster | RasterDriver::GRASSASCIIGrid => {
-            r.write(path, driver.to_wb()).map_err(Into::into).and_then(|()| common::write_pam(p, &r.crs))
+            let format = driver.to_wb().ok_or_else(|| crate::Error::Unsupported(format!("the {} driver cannot write", driver.name())));
+            format.and_then(|format| r.write(path, format).map_err(Into::into)).and_then(|()| common::write_pam(p, &r.crs))
         }
         _ => return None,
     })

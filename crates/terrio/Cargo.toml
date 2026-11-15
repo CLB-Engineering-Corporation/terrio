@@ -2,13 +2,16 @@
 name = "terrio"
 description = "Pure-Rust geospatial raster, vector and point cloud data I/O: read, write, convert and reproject GIS formats without C dependencies"
 readme = "../../README.md"
+# Integration tests: tests/merged/main.rs, and the [[test]] targets at the end.
+autotests = false
 documentation = "https://docs.rs/terrio"
 keywords = ["gis", "geospatial", "raster", "vector", "point-cloud"]
 categories = ["science::geo", "parser-implementations", "encoding"]
 version.workspace = true
 edition.workspace = true
 # MPL-2.0 for pointcloud/filters/selfadjoint.rs, a port of Eigen's eigensolver.
-license = "MIT AND MPL-2.0"
+# Apache-2.0 for the coverage-weighted median adapted from exactextract.
+license = "MIT AND MPL-2.0 AND Apache-2.0"
 rust-version.workspace = true
 repository.workspace = true
 homepage.workspace = true
@@ -24,7 +27,6 @@ terrio-crs = { workspace = true, features = ["wbprojection-fallback"] }
 wbraster.workspace = true
 wbvector.workspace = true
 wbprojection.workspace = true
-geographiclib-rs.workspace = true
 geo.workspace = true
 rstar.workspace = true
 spade.workspace = true
@@ -47,9 +49,10 @@ arrow-select = { workspace = true, optional = true }
 bytes = { workspace = true, optional = true }
 quick-xml.workspace = true
 encoding_rs.workspace = true
-osmpbfreader = { workspace = true, optional = true }
 half.workspace = true
 flate2.workspace = true
+# Adler-32 for the zlib streams of `deflate_compress`.
+zlib-rs.workspace = true
 fdeflate.workspace = true
 weezl.workspace = true
 png.workspace = true
@@ -79,12 +82,15 @@ rayon.workspace = true
 rusty_av1d = { workspace = true, optional = true }
 lzma-rust2 = { workspace = true, optional = true }
 # GRIB2's CCSDS packing (template 5.42): a pure-Rust decoder of CCSDS 121.0-B-3 (libaec's format).
-rust-aec = { version = "0.1.1", optional = true }
+rust-aec = { workspace = true, optional = true }
 
 # The optional GDAL backend: opens what GDAL can when terrio has no driver for it. Needs GDAL
 # (3.4 or later) installed, found with pkg-config or GDAL_HOME.
 gdal = { workspace = true, optional = true }
 gdal-sys = { workspace = true, optional = true }
+# The backend formats the date-time fields it reads as ISO 8601 text with chrono, whose formatting
+# needs `alloc`: gdal builds chrono without it.
+chrono = { version = "0.4", default-features = false, features = ["alloc"], optional = true }
 # Array views of raster pixels and owned transfers between rasters and arrays (the `ndarray`
 # feature), without copying the pixels.
 ndarray = { workspace = true, optional = true }
@@ -118,7 +124,7 @@ parquet-zstd = ["parquet", "parquet/zstd"]
 ## HTTP(S), S3, GCS and Azure inputs, range reads of remote COGs and STAC (native builds only).
 ## HTTPS uses `rustls` with `ring` (C and assembly, CLB fork), so natively this feature needs a C
 ## compiler; in WebAssembly it builds nothing. Not in `drivers`, on by default.
-remote = ["dep:ureq", "dep:hmac", "dep:sha2", "terrio-crs/grid-transport"]
+remote = ["dep:ureq", "dep:rustls", "dep:webpki-roots", "dep:hmac", "dep:sha2", "terrio-crs/grid-transport"]
 ## AVIF tiles of PMTiles and MBTiles archives.
 avif = ["tiles", "dep:rusty_av1d"]
 ## NetCDF, HDF5 and HDF-EOS reading, netCDF writing.
@@ -136,7 +142,7 @@ xlsx = []
 ## directory, and WebAssembly has no file system to hold one, so there the feature builds nothing.
 filegdb = []
 ## OpenStreetMap PBF and XML.
-osm = ["dep:osmpbfreader", "wbvector/osmpbf"]
+osm = ["dep:memmap2"]
 ## LZMA-compressed GeoTIFFs.
 lzma = ["dep:lzma-rust2"]
 ## FlatGeobuf.
@@ -154,7 +160,7 @@ tiles = ["sqlite"]
 ## Zarr v2 and v3.
 zarr = ["dep:lz4_flex"]
 ## GeoPackage (vector and raster tiles), SQLite/SpatiaLite and the SQLite store of MBTiles.
-sqlite = []
+sqlite = ["dep:memmap2"]
 ## Zstandard of GeoTIFF/COG chunks (ZSTD and LERC_ZSTD writing, ZSTD reading) with the zstd C
 ## library, in native builds. Opt-in (it was a default feature of the CLB fork from 2026-11-08 to
 ## 2026-11-10): it writes the C library's bytes at each of zstd's 22 levels, on one thread in
@@ -181,7 +187,7 @@ libzstd-geoparquet = ["dep:zstd"]
 ## of its time.
 libzstd = ["libzstd-geotiff", "libzstd-ept", "libzstd-geoparquet"]
 ## Open any format GDAL reads, through the same data model, when terrio has no driver for it.
-gdal = ["dep:gdal", "dep:gdal-sys"]
+gdal = ["dep:gdal", "dep:gdal-sys", "dep:chrono"]
 ## Raster pixels as `ndarray` arrays without copying them: borrowed and mutable views, owned
 ## transfers between rasters and arrays, and lazy reads' masks as arrays; floating-point windows
 ## (NaN where pixels are invalid) as owned arrays, bands first or last. Re-exports the crate as
@@ -189,26 +195,43 @@ gdal = ["dep:gdal", "dep:gdal-sys"]
 ndarray = ["dep:ndarray"]
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
+# Memory-mapped reads of SQLite files (`sqlite`) and OSM PBF files (`osm`).
+memmap2 = { workspace = true, optional = true }
 # The `libzstd-*` features' zstd C library, natively (in WebAssembly, `ruzstd` whatever the features).
-memmap2.workspace = true
 zstd = { workspace = true, optional = true }
 tempfile.workspace = true
 # Listing and extracting tar archives (`terrio::vsi`).
 tar.workspace = true
 ureq = { workspace = true, optional = true }
+rustls = { workspace = true, optional = true }
+webpki-roots = { workspace = true, optional = true }
 hmac = { workspace = true, optional = true }
 sha2 = { workspace = true, optional = true }
+
+# WASI (the browser build of the command line) has a filesystem: index and table-of-contents
+# writes stage their output in a temporary file there too.
+[target.'cfg(target_os = "wasi")'.dependencies]
+tempfile.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_IO"] }
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_IO"] }
 # Windows file identity (including hard links) for dataset destination guards.
 same-file.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+webpki-root-certs.workspace = true
+
+# The bounded-memory test of compressed XLSX workbooks maps its input.
+[target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
+memmap2.workspace = true
+
+[[example]]
+name = "xlsx_workbook"
+required-features = ["xlsx"]
 
 [[example]]
 name = "bench"
@@ -233,3 +256,207 @@ required-features = ["filegdb"]
 [[example]]
 name = "sample_columns"
 required-features = ["parquet"]
+
+# Integration tests. Most are modules of one binary (tests/merged/main.rs). A file that sets driver
+# allow-lists, environment variables, configuration or CRS settings, reads process-wide counters,
+# installs a global allocator, measures the process's memory, runs its own test binary again, or is
+# run by name (CI, docs, scripts) is a binary of its own.
+[[test]]
+name = "merged"
+path = "tests/merged/main.rs"
+
+[[test]]
+name = "allowed_drivers_option"
+path = "tests/allowed_drivers_option.rs"
+
+[[test]]
+name = "allow_list"
+path = "tests/allow_list.rs"
+
+[[test]]
+name = "cdn_default_off"
+path = "tests/cdn_default_off.rs"
+
+[[test]]
+name = "cdn_missing_grid"
+path = "tests/cdn_missing_grid.rs"
+
+[[test]]
+name = "content_allow_list"
+path = "tests/content_allow_list.rs"
+
+[[test]]
+name = "crs_grids_remote"
+path = "tests/crs_grids_remote.rs"
+
+[[test]]
+name = "crs_point_motion"
+path = "tests/crs_point_motion.rs"
+
+[[test]]
+name = "crs_policy"
+path = "tests/crs_policy.rs"
+
+[[test]]
+name = "crs_vertical"
+path = "tests/crs_vertical.rs"
+
+[[test]]
+name = "declared_size"
+path = "tests/declared_size.rs"
+
+[[test]]
+name = "entry_allow_list"
+path = "tests/entry_allow_list.rs"
+
+[[test]]
+name = "ept_append_allow_list"
+path = "tests/ept_append_allow_list.rs"
+
+[[test]]
+name = "esri"
+path = "tests/esri.rs"
+
+[[test]]
+name = "esrijson_allow_list"
+path = "tests/esrijson_allow_list.rs"
+
+[[test]]
+name = "esrijson_allow_list_only"
+path = "tests/esrijson_allow_list_only.rs"
+
+[[test]]
+name = "esripbf"
+path = "tests/esripbf.rs"
+
+[[test]]
+name = "esripbf_allow_list"
+path = "tests/esripbf_allow_list.rs"
+
+[[test]]
+name = "esripbf_allow_list_json"
+path = "tests/esripbf_allow_list_json.rs"
+
+[[test]]
+name = "esripbf_allow_list_only"
+path = "tests/esripbf_allow_list_only.rs"
+
+[[test]]
+name = "external_overviews"
+path = "tests/external_overviews.rs"
+
+[[test]]
+name = "file_list"
+path = "tests/file_list.rs"
+
+[[test]]
+name = "float_reads"
+path = "tests/float_reads.rs"
+
+[[test]]
+name = "gdal_backend"
+path = "tests/gdal_backend.rs"
+
+[[test]]
+name = "geostationary"
+path = "tests/geostationary.rs"
+
+[[test]]
+name = "geotiff_band_metadata"
+path = "tests/geotiff_band_metadata.rs"
+
+[[test]]
+name = "geotiff_nodata"
+path = "tests/geotiff_nodata.rs"
+
+[[test]]
+name = "hecras_corpus"
+path = "tests/hecras_corpus.rs"
+
+[[test]]
+name = "hgt_allow_list"
+path = "tests/hgt_allow_list.rs"
+
+[[test]]
+name = "lazy_reads"
+path = "tests/lazy_reads.rs"
+
+[[test]]
+name = "lazy_rpc"
+path = "tests/lazy_rpc.rs"
+
+[[test]]
+name = "lazy_sample_bits"
+path = "tests/lazy_sample_bits.rs"
+
+[[test]]
+name = "local_vector_by_content"
+path = "tests/local_vector_by_content.rs"
+
+[[test]]
+name = "ndarray"
+path = "tests/ndarray.rs"
+
+[[test]]
+name = "pmtiles_limits"
+path = "tests/pmtiles_limits.rs"
+
+[[test]]
+name = "point_cloud_allow_list"
+path = "tests/point_cloud_allow_list.rs"
+
+[[test]]
+name = "pointcloud_heights"
+path = "tests/pointcloud_heights.rs"
+
+[[test]]
+name = "query_allow_list"
+path = "tests/query_allow_list.rs"
+
+[[test]]
+name = "remote_vector_response"
+path = "tests/remote_vector_response.rs"
+
+[[test]]
+name = "remote_zarr"
+path = "tests/remote_zarr.rs"
+
+[[test]]
+name = "shapefile_archive"
+path = "tests/shapefile_archive.rs"
+
+[[test]]
+name = "stacta_allow_list"
+path = "tests/stacta_allow_list.rs"
+
+[[test]]
+name = "stacta_local_refusals"
+path = "tests/stacta_local_refusals.rs"
+
+[[test]]
+name = "stacta_missing"
+path = "tests/stacta_missing.rs"
+
+[[test]]
+name = "tiff_chunk_tables"
+path = "tests/tiff_chunk_tables.rs"
+
+[[test]]
+name = "tiles"
+path = "tests/tiles.rs"
+
+[[test]]
+name = "vector_stream_ranges"
+path = "tests/vector_stream_ranges.rs"
+
+[[test]]
+name = "wfs_service"
+path = "tests/wfs_service.rs"
+
+[[test]]
+name = "zarr_input_limits"
+path = "tests/zarr_input_limits.rs"
+
+[[test]]
+name = "zonal_scoped_options"
+path = "tests/zonal_scoped_options.rs"

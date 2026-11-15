@@ -18,7 +18,7 @@ import terrio.rio as trio
 import terrio.rio.shutil  # noqa: F401
 
 rasterio = pytest.importorskip("rasterio")
-pytest.importorskip("rasterio.shutil")
+import rasterio.shutil  # noqa: E402, F811 - importorskip assigned rasterio
 from rasterio.transform import from_origin  # noqa: E402
 
 COLS, ROWS = 65, 35
@@ -240,7 +240,10 @@ def test_resamplings_gdal_refuses_are_refused(tmp_path, name):
     else:
         a, dtype, nodata, method, _ = SCENARIOS[name]
     src = _source(tmp_path / "src.tif", a, dtype, nodata, {})
-    with pytest.raises(Exception):  # noqa: B017 - GDAL exception types depend on its build
+    with pytest.raises(Exception, match=r"(?i)(unsupported|unknown) resampling"):
         _convert(rasterio, src, tmp_path / "gdal.tif", method)
-    with pytest.raises(Exception, match="resampling"):
+    with pytest.raises(
+        Exception,
+        match=r"(?i)(overview resampling is not supported|(unsupported|unknown) resampling)",
+    ):
         _convert(trio, src, tmp_path / "terrio.tif", method)

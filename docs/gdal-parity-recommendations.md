@@ -16,6 +16,19 @@ documented in [the roadmap](https://terrio.dev/roadmap/), [formats](formats.md) 
 The optional GDAL backend provides additional format access; it does not constitute
 native implementation of the proposed operations.
 
+## Deliberate TIFF mask difference
+
+Issue [#748](https://github.com/opengeos/terrio/issues/748) requests that a TIFF image's
+own reduced-resolution flag select its transparency mask, including the first image
+of an external overview file. Terrio honors a first-image/mask pair marked 1/5;
+GDAL 3.13.3 ignores that first mask. This applies to existing GDAL-written external
+pyramids as well as TIFFs opened directly and intentionally changes their masked reads.
+
+The frozen masked-external cubic 26×41 reference pins 488 differing values out of
+3,198 against unmodified GDAL output. Terrio is checked against a second GDAL control
+whose first image/mask flags are normalized to 0/4 without changing stored samples.
+Both references remain checked; this behavior is not described as GDAL pixel parity.
+
 ## Prioritized additions
 
 | Order | Feature | Suggested first deliverable | Relative effort |
@@ -106,7 +119,10 @@ single-field DISTINCT, COUNT/SUM/AVG/MIN/MAX summaries and same-dataset attribut
 Duplicate join keys use OGR's first matching secondary row; null keys and unmatched
 rows retain the primary feature with null joined fields. Rust, CLI/MCP, Python
 and JavaScript share the subset. Queries retain primary geometry except DISTINCT
-and summaries. GROUP BY and spatial SQL remain separate extensions.
+and summaries. The grouped/spatial extension now supports attribute GROUP BY,
+selected output ordering and the six planar/EPSG spatial functions documented in
+the [SQL guide](sql.md), with GDAL SQLite conformance comparisons. Explicit
+geometry expressions replace the primary geometry; GROUP BY discards it.
 [GDAL OGR SQL](https://gdal.org/en/stable/user/ogr_sql_dialect.html).
 
 Acceptance: compare values, nulls, field types and geometry retention with OGR SQL,
@@ -121,7 +137,8 @@ heights, maximum distance, curvature/refraction and projected-unit handling.
 CLI/MCP, Python and JavaScript expose the operation. Real projected DEM comparisons
 are registered in conformance; numeric input nodata is treated as elevation, as in
 GDAL, and nonfinite elevations must be filled or cropped first. Cumulative
-visibility remains outside this subset.
+visibility is available with `--om ACCUM --os N`, matching GDAL 3.13.3 normalization
+and its disabled curvature in cumulative mode.
 [GDAL viewshed](https://gdal.org/en/stable/programs/gdal_viewshed.html).
 
 Acceptance: compare with GDAL on projected DEMs, hills/ridges, maximum distances
@@ -179,8 +196,12 @@ viewshed and pansharpening can ship independently. Schedule indexed catalogs and
 the multidimensional model according to demand for continental mosaics and
 scientific data cubes, respectively.
 
-Other worthwhile follow-ups are weighted/fractional zonal statistics, OGC API
-Features access and overview refresh tooling. Avoid prioritizing proprietary
+Weighted/fractional zonal statistics now extend the existing zonal operation, with
+aligned weighting rasters and exactextract-style coverage fractions (see the CLI
+for the supported statistics and numeric allowances). Read-only OGC API Features
+access is tracked in [#522](https://github.com/opengeos/terrio/pull/522), with
+supported scope and reference comparisons in the CLI and testing documentation.
+Overview refresh tooling remains a follow-up. Avoid prioritizing proprietary
 drivers and core database connections: the current roadmap explicitly excludes
 them and provides an optional GDAL backend for the long tail.
 
@@ -191,3 +212,7 @@ conformance suite, and JavaScript tests of the WebAssembly build. The separate
 `terrio.rio` compatibility CLI still rejects `fillnodata`; the new operation is
 available through `terrio.fill_nodata` and `terrio fill-nodata`. Effort, demand and
 performance benefits for the remaining recommendations are estimates.
+
+Cumulative viewshed uses optional observer coordinates in the CLI. Python and
+JavaScript retain the existing required positional coordinates; pass `0, 0`
+for `ACCUM`, which ignores them.

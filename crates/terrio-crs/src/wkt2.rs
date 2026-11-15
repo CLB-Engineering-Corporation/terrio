@@ -11,7 +11,7 @@
 //! projected CS's unit. Methods and parameters are named as in EPSG, and identified by their
 //! EPSG codes when the WKT gives them.
 
-use super::wkt1::{Arg, Converted, Node, norm};
+use super::wkt1::{Arg, BoundTo, Converted, Node, norm};
 use crate::{Error, Result};
 
 /// The keywords of the WKT 2 CRSs this reader converts.
@@ -32,17 +32,30 @@ pub(crate) fn handles(root: &Node) -> bool {
     PROJECTED.contains(&key.as_str())
 }
 
-/// Converts a WKT 2 geographic or projected CRS, or a `BOUNDCRS` to WGS 84 of one, into a PROJ
-/// string. Fails on what it cannot convert faithfully: an unknown method, or an unknown
-/// parameter.
+/// Converts a WKT 2 geographic or projected CRS, or a `BOUNDCRS` of one, into a PROJ string,
+/// with a `BOUNDCRS`'s Helmert transformation as `+towgs84` when it is to WGS 84, else as
+/// [`Converted::bound`]. Fails on what it cannot convert faithfully: an unknown method, or an
+/// unknown parameter.
 pub(crate) fn to_proj(root: &Node) -> Result<Converted> {
     let key = root.key.to_ascii_uppercase();
     if key == "BOUNDCRS" {
         let source = root.child("SOURCECRS").and_then(first_node).ok_or_else(|| bad("a BOUNDCRS without its SOURCECRS"))?;
         let mut c = to_proj(source)?;
-        if let Some(t) = towgs84(root)? {
-            c.proj = format!("{} +towgs84={}", c.proj, t.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(","));
-            c.geog = None;
+        // A Helmert transformation terrio cannot read fails, whatever its target; one to a CRS
+        // terrio cannot convert is left out, as terrio did before it read those.
+        match helmert_shift(root)? {
+            Some((t, true)) => {
+                c.proj = format!("{} +towgs84={}", c.proj, t.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(","));
+            }
+            // To another CRS (ED50): the shift to it, then its own transformations to WGS 84, as
+            // PROJ chains them.
+            Some((t, false)) => {
+                let target = root.child("TARGETCRS").and_then(first_node).filter(|t| handles(t));
+                if let Some(target) = target.and_then(|t| to_proj(t).ok()) {
+                    c.bound = Some(Box::new(BoundTo { target, shift: t }));
+                }
+            }
+            None => {}
         }
         return Ok(c);
     }
@@ -236,6 +249,27 @@ pub(crate) fn to_proj(root: &Node) -> Result<Converted> {
         push("lat_ts", Some(ts));
         push("lon_0", lon_0());
         "stere"
+    } else if is(&["polarstereographicvariantc"], &[9830]) {
+        // Variant B on the same standard parallel, with its false origin moved to the pole.
+        let ts = p
+            .get(LAT_TS)
+            .filter(|v| v.is_finite() && v.abs() <= 90.0)
+            .ok_or_else(|| bad("Polar Stereographic (variant C) without a valid standard parallel"))?;
+        let lon =
+            lon_0().filter(|v| v.is_finite()).ok_or_else(|| bad("Polar Stereographic (variant C) without its longitude of origin"))?;
+        fe = p
+            .get(FE)
+            .filter(|v| v.is_finite())
+            .ok_or_else(|| bad("Polar Stereographic (variant C) without its easting at false origin"))?;
+        fn_ = p
+            .get(FN)
+            .filter(|v| v.is_finite())
+            .ok_or_else(|| bad("Polar Stereographic (variant C) without its northing at false origin"))?;
+        push("lat_0", Some(if ts < 0.0 { -90.0 } else { 90.0 }));
+        push("lat_ts", Some(ts));
+        push("lon_0", Some(lon));
+        fn_ = super::wkt1::variant_c_pole_northing(geog.a, geog.rf, ts, fn_);
+        "stere"
     } else if is(&["obliquestereographic"], &[9809]) {
         push("lat_0", lat_0());
         push("lon_0", lon_0());
@@ -353,8 +387,9 @@ pub(crate) fn to_proj(root: &Node) -> Result<Converted> {
         push("h", Some(p.get(SAT_HEIGHT).ok_or_else(|| bad("Geostationary Satellite without its Satellite Height"))?));
         sweep = Some(if name == "geostationarysatellitesweepx" { "x" } else { "y" });
         "geos"
-    } else if is(&["krovaknorthorientated"], &[1041]) {
-        // As PROJ, whose Krovak fixes the pseudo standard parallel and writes none.
+    } else if is(&["krovaknorthorientated", "krovak"], &[1041, 9819]) {
+        // As PROJ, whose Krovak fixes the pseudo standard parallel and writes none. Krovak
+        // (EPSG 9819) and its north-orientated form differ in their axes, which the CS gives.
         p.get(LAT_PSEUDO_SP);
         push("lat_0", p.get(LAT_CENTRE).or_else(lat_0));
         push("lon_0", lon_0());
@@ -427,8 +462,11 @@ pub(crate) fn to_proj(root: &Node) -> Result<Converted> {
         proj_str.push(format!("+sweep={s}"));
     }
     proj_str.append(&mut out);
+    // South-orientated Transverse Mercator is west and south but for a north-east CS, which GDAL
+    // and PROJ read south then west (as for its WKT 1).
     if south_orientated {
-        proj_str.push("+axis=wsu".into());
+        let north_east = directions.len() >= 2 && directions[0] == "north" && directions[1] == "east";
+        proj_str.push(if north_east { "+axis=swu" } else { "+axis=wsu" }.into());
     } else if let Some(axis) = axis(&directions) {
         proj_str.push(format!("+axis={axis}"));
     }
@@ -622,9 +660,24 @@ const WORLD: [(&str, &str); 27] = [
 ];
 
 /// The axis order of a projected CS as PROJ's `+axis`, when not east then north. As GDAL's
-/// traditional GIS order, a north-east CS is read east-north: only west and south change the
-/// coordinates.
+/// traditional GIS order, north-east is read east-north. Other direction pairs retain their
+/// declared order, including north-west and south-east.
 fn axis(directions: &[String]) -> Option<String> {
+    let letter = |d: &str| match d {
+        "east" => Some('e'),
+        "west" => Some('w'),
+        "north" => Some('n'),
+        "south" => Some('s'),
+        _ => None,
+    };
+    // Two axes along east-west and north-south: in their order, as GDAL 3.10 and PROJ 9.8.1
+    // (`always_xy`) read them, but for northing then easting, read as easting then northing.
+    if let [a, b] = directions.get(..2).unwrap_or_default()
+        && let (Some(a), Some(b)) = (letter(a), letter(b))
+        && matches!(a, 'e' | 'w') != matches!(b, 'e' | 'w')
+    {
+        return (!matches!((a, b), ('e', 'n') | ('n', 'e'))).then(|| format!("{a}{b}u"));
+    }
     let has = |d: &str| directions.iter().any(|x| x == d);
     let (e, n) = (if has("west") { 'w' } else { 'e' }, if has("south") { 's' } else { 'n' });
     (e != 'e' || n != 'n').then(|| format!("{e}{n}u"))
@@ -672,13 +725,28 @@ impl Geodetic {
             .or_else(|| if root { n.children("AXIS").find_map(|a| a.child("ANGLEUNIT").or_else(|| a.child("UNIT"))) } else { None })
             .or_else(|| n.child("PRIMEM").and_then(|p| p.child("ANGLEUNIT").or_else(|| p.child("UNIT"))));
         let ang = unit.and_then(|u| u.num(1)).map(degrees).unwrap_or(1.0);
+        // The prime meridian in its own unit, else the CRS's, else degrees, and with PROJ 9.8.1's
+        // corrections (Paris in degrees in grads, meridians it knows by name in degrees or EPSG's
+        // sexagesimal degrees), as it reads WKT 2 too (`buildPrimeMeridian`). The CRS's unit is
+        // its `ANGLEUNIT`, or a `UNIT` named `degree` or `grad`, which PROJ takes for angular,
+        // and none beside a `LENGTHUNIT`; never its axes'.
         let pm = match n.child("PRIMEM") {
             Some(p) => {
-                let v = p.num(1).unwrap_or(0.0);
-                match p.child("ANGLEUNIT").or_else(|| p.child("UNIT")).and_then(|u| u.num(1)) {
-                    Some(r) => v * degrees(r),
-                    None => v * ang,
-                }
+                let crs_unit = if n.child("LENGTHUNIT").is_some() {
+                    None
+                } else {
+                    n.child("ANGLEUNIT").or_else(|| {
+                        n.child("UNIT")
+                            .filter(|u| u.name().is_some_and(|s| s.eq_ignore_ascii_case("degree") || s.eq_ignore_ascii_case("grad")))
+                    })
+                };
+                // PROJ refuses a unit without its size ("not enough children").
+                let unit = match p.child("ANGLEUNIT").or_else(|| p.child("UNIT")) {
+                    Some(u) => Some(u.num(1).ok_or_else(|| bad("a prime meridian's unit without its size"))?),
+                    None => crs_unit.and_then(|u| u.num(1)),
+                };
+                let unit = unit.map_or(1.0, degrees);
+                super::wkt1::prime_meridian_degrees(p.name().unwrap_or(""), p.num(1).unwrap_or(0.0), unit)
             }
             None => 0.0,
         };
@@ -730,7 +798,7 @@ impl Geodetic {
             self.rf,
             self.pm
         );
-        Converted { proj, geogcs: self.node.clone(), geog: self.geog, geogcs_wkt1: Some(geogcs_wkt1) }
+        Converted { proj, geogcs: self.node.clone(), geog: self.geog, geogcs_wkt1: Some(geogcs_wkt1), bound: None }
     }
 }
 
@@ -913,23 +981,22 @@ impl Params {
     }
 }
 
-/// The 3 or 7 `+towgs84` parameters of a `BOUNDCRS`'s transformation to WGS 84: `None` when
-/// it is to another CRS or is not a supported Helmert operation.
-fn towgs84(root: &Node) -> Result<Option<Vec<f64>>> {
-    let target = root.child("TARGETCRS").and_then(first_node);
-    let to_wgs84 = target.is_some_and(|t| {
-        t.epsg() == Some(4326)
-            || ["DATUM", "ENSEMBLE"]
+/// Whether a `BOUNDCRS`'s target is WGS 84.
+fn bound_to_wgs84(root: &Node) -> bool {
+    root.child("TARGETCRS").and_then(first_node).is_some_and(|t| {
+        matches!(t.epsg(), Some(4326 | 4979))
+            || ["DATUM", "GEODETICDATUM", "TRF", "ENSEMBLE"]
                 .iter()
                 .filter_map(|k| t.child(k))
                 .any(|d| d.epsg() == Some(6326) || norm(d.name().unwrap_or("")).starts_with("worldgeodeticsystem1984"))
-    });
+    })
+}
+
+/// The 3 or 7 parameters (as `+towgs84`'s) of a `BOUNDCRS`'s Helmert transformation, and
+/// whether it is to WGS 84: `None` when it is not a supported Helmert operation.
+fn helmert_shift(root: &Node) -> Result<Option<(Vec<f64>, bool)>> {
+    let to_wgs84 = bound_to_wgs84(root);
     let Some(t) = root.child("ABRIDGEDTRANSFORMATION") else { return Ok(None) };
-    // A transformation to another CRS has no `+towgs84`: the source CRS is kept, and its datum
-    // identified as without a BOUNDCRS (GDAL, too, reads the source CRS of such a BOUNDCRS).
-    if !to_wgs84 {
-        return Ok(None);
-    }
     let method = t.child("METHOD").map(|m| (norm(m.name().unwrap_or("")), m.epsg())).unwrap_or_default();
     // So is one that is not a 3 or 7 parameter Helmert transformation (a grid's, NTv2 or
     // NADCON, whose file is a PARAMETERFILE): geocentric translations, position vector and
@@ -962,9 +1029,11 @@ fn towgs84(root: &Node) -> Result<Option<Vec<f64>>> {
             0..=2 => x * unit.unwrap_or(1.0),
             // Arc-seconds, and parts per million.
             3..=5 => x * unit.map(|r| r.to_degrees() * 3600.0).unwrap_or(1.0) * if frame { -1.0 } else { 1.0 },
-            // A scale difference in its unit, or without one as the ratio PROJ writes
-            // (1.0000067 for 6.7 ppm): any other unit-less value is ambiguous.
+            // A scale difference as the ratio PROJ writes, in unity (1.0000067 for 6.7 ppm), or
+            // without a unit; in another unit (parts per million), in that unit, which PROJ 9.8.1
+            // would read as a ratio too. Any other unit-less value is ambiguous.
             _ => match unit {
+                Some(1.0) => (x - 1.0) * 1e6,
                 Some(u) => x * u * 1e6,
                 None if (x - 1.0).abs() < 0.01 => (x - 1.0) * 1e6,
                 None => return Err(bad("a scale difference without its unit")),
@@ -974,5 +1043,5 @@ fn towgs84(root: &Node) -> Result<Option<Vec<f64>>> {
     }
     // Even zero parameters declare a Cartesian datum operation. Keeping it is
     // necessary when the source and destination ellipsoids differ.
-    Ok(Some(if seven { v.to_vec() } else { v[..3].to_vec() }))
+    Ok(Some((if seven { v.to_vec() } else { v[..3].to_vec() }, to_wgs84)))
 }

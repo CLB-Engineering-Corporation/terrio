@@ -218,8 +218,9 @@ impl std::fmt::Debug for PointCloudReader {
 }
 
 /// Refuses a point cloud `driver` is about to open when the allow-list of point clouds leaves the
-/// driver out: `TERRIO_ALLOWED_DRIVERS`, which applies to every kind (point clouds have no list of
-/// their own, see [`crate::formats::allowed_drivers`]), as a de-registered driver opens nothing.
+/// driver out: the process-wide list set for point clouds or for every kind, and
+/// `TERRIO_ALLOWED_DRIVERS`, which applies to every kind (see
+/// [`crate::formats::allowed_drivers`]), as a de-registered driver opens nothing.
 pub(super) fn check_driver(driver: &str, name: &str) -> Result<()> {
     crate::formats::check_driver_allowed(driver, name, crate::formats::Kind::PointCloud)
 }
@@ -227,12 +228,8 @@ pub(super) fn check_driver(driver: &str, name: &str) -> Result<()> {
 /// Reads the header (with its VLRs) of a file of the LAS family, which LAS, LAZ and COPC share:
 /// only if the allow-list of point clouds has one of them, and then refused unless it has the one
 /// the header shows (COPC, by its information record; LAZ, by its compressed points; else LAS).
-fn read_las_header<R: Read + Seek>(r: &mut R, name: &str) -> Result<LasHeader> {
-    if let Some(list) = crate::formats::allowed_drivers(Some(crate::formats::Kind::PointCloud))
-        && !["LAS", "LAZ", "COPC"].iter().any(|d| list.iter().any(|a| a == d))
-    {
-        check_driver("LAS", name)?;
-    }
+pub(super) fn read_las_header<R: Read + Seek>(r: &mut R, name: &str) -> Result<LasHeader> {
+    check_las_allowed(name)?;
     let header = LasHeader::read(r)?;
     check_driver(
         if Copc::is_copc(&header) {
@@ -245,6 +242,16 @@ fn read_las_header<R: Read + Seek>(r: &mut R, name: &str) -> Result<LasHeader> {
         name,
     )?;
     Ok(header)
+}
+
+/// Refuses the LAS-family parser before reading a header when none of its drivers is allowed.
+pub(super) fn check_las_allowed(name: &str) -> Result<()> {
+    if let Some(list) = crate::formats::allowed_drivers(Some(crate::formats::Kind::PointCloud))
+        && !["LAS", "LAZ", "COPC"].iter().any(|d| list.iter().any(|a| a == d))
+    {
+        check_driver("LAS", name)?;
+    }
+    Ok(())
 }
 
 /// The point cloud format of a path, by its name: `ept.json` (or an `ept://` path) is EPT,
@@ -272,6 +279,20 @@ fn format_of(path: &str) -> &'static str {
 /// read; other remote files are downloaded first.
 pub fn open_points(path: &str) -> Result<PointCloudReader> {
     let location = crate::vfs::Location::parse(path);
+    // A folder reaching File::open looks like a permission failure on Windows.
+    // Validate before format dispatch so every point-cloud reader reports the
+    // same actionable error, while remote range reads stay unchanged.
+    let local = match &location {
+        crate::vfs::Location::Local(file) => Some(file),
+        crate::vfs::Location::Zip { archive, inner: None } => match archive.as_ref() {
+            crate::vfs::Location::Local(file) => Some(file),
+            _ => None,
+        },
+        _ => None,
+    };
+    if !path.starts_with("ept://") && local.is_some_and(|file| file.is_dir()) {
+        return Err(Error::InvalidArgument(format!("'{path}' is a directory; select a point-cloud file (for EPT, select ept.json)")));
+    }
     let name = location.file_name();
     let inner: Box<dyn FormatReader> = match format_of(path) {
         "EPT" => Box::new(super::ept::EptReader::open(path)?),
@@ -304,6 +325,17 @@ pub fn open_points_bytes(bytes: Vec<u8>, name: &str) -> Result<PointCloudReader>
         let header = read_las_header(&mut source, name)?;
         Box::new(LasReader::new(source, header, None, None)?)
     };
+    Ok(PointCloudReader { inner, name: name.to_string() })
+}
+
+/// Opens LAS records terrio has just encoded from points it holds, for the EPT writer, which reads
+/// them back to describe or convert them. They are not a dataset from outside, so the allow-list
+/// of point clouds (see [`check_driver`]) does not apply: a list that leaves the LAS family out
+/// does not stop a dataset of another format from being written.
+pub(super) fn open_encoded_las(bytes: Vec<u8>, name: &str) -> Result<PointCloudReader> {
+    let mut source = Source::Memory(Cursor::new(bytes));
+    let header = LasHeader::read(&mut source)?;
+    let inner: Box<dyn FormatReader> = Box::new(LasReader::new(source, header, None, None)?);
     Ok(PointCloudReader { inner, name: name.to_string() })
 }
 
@@ -825,4 +857,28 @@ pub(crate) fn made_up_header(
     }
     h.point_record_length = super::las::standard_record_length(h.point_format) as u16;
     h
+}
+
+#[cfg(test)]
+mod tests {
+    use super::open_points;
+
+    #[test]
+    fn directory_inputs_report_that_a_point_cloud_file_is_required() {
+        let temp = tempfile::tempdir().unwrap();
+        for name in ["Downloads", "directory.las", "directory.laz", "directory.copc.laz", "directory.ply", "directory.e57", "directory.zip"]
+        {
+            let path = temp.path().join(name);
+            std::fs::create_dir(&path).unwrap();
+            let error = open_points(path.to_str().unwrap()).unwrap_err();
+            assert!(matches!(error, crate::Error::InvalidArgument(_)), "{name}: {error:?}");
+            let message = error.to_string();
+            assert!(message.contains("directory") && message.contains("point-cloud file"), "{name}: {message}");
+            assert!(message.contains(path.to_str().unwrap()), "{name}: {message}");
+            assert!(!message.contains("denied") && !message.contains("os error"), "{name}: {message}");
+        }
+        let missing = temp.path().join("missing.las");
+        let error = open_points(missing.to_str().unwrap()).unwrap_err();
+        assert!(matches!(error, crate::Error::Io(ref e) if e.kind() == std::io::ErrorKind::NotFound), "{error:?}");
+    }
 }

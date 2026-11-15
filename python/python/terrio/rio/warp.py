@@ -15,6 +15,7 @@ Rasters are warped by terrio's `warp`, which follows GDAL's warper (the default 
 
 from __future__ import annotations
 
+import re
 import warnings
 from collections.abc import Mapping
 from math import ceil, floor
@@ -24,6 +25,7 @@ import numpy as np
 from affine import Affine
 
 from terrio import _terrio
+from terrio.errors import CRSError as TerrioCRSError
 from terrio.rio.crs import CRS
 from terrio.rio.dtypes import _gdal_typename
 from terrio.rio.enums import Resampling
@@ -80,8 +82,17 @@ def _crs_text(crs: Any) -> str:
     if crs is None:
         raise CRSError("A CRS is required")
     c = CRS.from_user_input(crs)
+    if c._database is not None:
+        return c._database
+    # Keep authority-based operation selection for ordinary WKT and dataset CRSs.
+    # Explicit WKT1/2 bound transformations belong to the caller's definition.
+    explicit = re.search(
+        r"\b(?:TOWGS84|BOUNDCRS|ABRIDGEDTRANSFORMATION)\s*[\[(]",
+        c.wkt,
+        re.IGNORECASE,
+    )
     code = c.to_epsg()
-    return f"EPSG:{code}" if code is not None else c.to_wkt()
+    return f"EPSG:{code}" if code is not None and not explicit else c.to_wkt()
 
 
 def _transform_arrays(
@@ -99,17 +110,11 @@ def _transform_arrays(
         tuple: The transformed coordinates.
     """
     try:
-        return _terrio.transform_points(xs, ys, src, dst)
-    except Exception:
-        ox = np.full(len(xs), np.inf)
-        oy = np.full(len(ys), np.inf)
-        for i, (x, y) in enumerate(zip(xs, ys, strict=False)):
-            try:
-                a, b = _terrio.transform_points([x], [y], src, dst)
-                ox[i], oy[i] = a[0], b[0]
-            except Exception:
-                pass
-        return ox, oy
+        return _terrio.transform_points(xs, ys, src, dst, errcheck=False)
+    except TerrioCRSError:
+        # A batch setup failure affects every point. Preserve the existing infinite
+        # result without rebuilding the same failed operation once per coordinate.
+        return np.full(len(xs), np.inf), np.full(len(ys), np.inf)
 
 
 def transform(src_crs: Any, dst_crs: Any, xs: Any, ys: Any, zs: Any = None) -> Any:
@@ -347,7 +352,7 @@ def transform_bounds(
         bottom: The bottom bound.
         right: The right bound.
         top: The top bound.
-        densify_pts: Points added along each edge.
+        densify_pts: Points added along each edge, at most 65,536.
 
     Returns:
         tuple: `(left, bottom, right, top)` in the target CRS.
@@ -356,17 +361,10 @@ def transform_bounds(
         CRSError: If no point can be transformed.
     """
     src, dst = _crs_text(src_crs), _crs_text(dst_crs)
-    n = max(densify_pts, 0) + 2
-    t = np.linspace(0.0, 1.0, n)
-    xs_h = left + (right - left) * t
-    ys_v = bottom + (top - bottom) * t
-    xs = np.concatenate([xs_h, xs_h, np.full(n, left), np.full(n, right)])
-    ys = np.concatenate([np.full(n, bottom), np.full(n, top), ys_v, ys_v])
-    ox, oy = _transform_arrays(src, dst, xs, ys)
-    ok = np.isfinite(ox) & np.isfinite(oy)
-    if not ok.any():
-        raise CRSError("Unable to transform bounds")
-    return float(ox[ok].min()), float(oy[ok].min()), float(ox[ok].max()), float(oy[ok].max())
+    try:
+        return _terrio.transform_bounds(src, dst, (left, bottom, right, top), max(densify_pts, 0))
+    except TerrioCRSError as exc:
+        raise CRSError(str(exc)) from exc
 
 
 def _gcp_args(gcps: Any, kwargs: dict[str, Any]) -> dict[str, Any]:
@@ -690,6 +688,7 @@ def reproject(
     tolerance: float = 0.125,
     warp_mem_limit: int = 0,
     src_geoloc_array: Any = None,
+    grid_invariant: bool | None = None,
     **kwargs: Any,
 ) -> tuple[Any, Affine]:
     """Reprojects a raster array (or band) into another grid.
@@ -697,6 +696,8 @@ def reproject(
     Args:
         source: A 2-D or 3-D array, a `Band` (`terrio.rio.band(dataset, bidx)`) or a dataset.
             A masked array is warped with its mask as an alpha band, as rasterio does.
+            With `sum`, each pixel of a dataset opened at an overview level (`overview_level`)
+            counts for the full-resolution pixels it stands for.
         destination: A 2-D or 3-D array (or a `Band` of a writer) to fill; created when None.
             For a masked array, a new masked array over its data is returned, masked where
             nothing was warped, as rasterio does.
@@ -725,6 +726,8 @@ def reproject(
         tolerance: The approximate transformer's maximum error, in pixels.
         warp_mem_limit: Unused.
         src_geoloc_array: Unsupported.
+        grid_invariant: Keep values independent of tiles (default); False selects GDAL's
+            chunk-dependent sampling. None follows TERRIO_WARP_GRID.
         **kwargs: GDAL transformer options: `MAX_GCP_ORDER` and `SRC_METHOD` (`GCP_POLYNOMIAL`,
             `GCP_TPS` or `GCP_HOMOGRAPHY`) with GCPs; `RPC_HEIGHT`, `RPC_HEIGHT_SCALE`, `RPC_DEM`
             (warped with exact transformations, as rasterio), `RPC_DEMINTERPOLATION`,
@@ -736,9 +739,11 @@ def reproject(
 
     Raises:
         ValueError: If the arguments conflict or are not supported.
+        ResourceLimitError: If a `sum` of a band or dataset would hold more than
+            `TERRIO_WARP_SUM_MAX_BYTES` (4 GiB by default); it is raised before the bands are read.
     """
     from terrio.rio import Band
-    from terrio.rio.io import DatasetBase
+    from terrio.rio.io import DatasetBase, _sum_scale
 
     if sum(p is not None for p in (src_transform, gcps, rpcs, src_geoloc_array)) > 1:
         raise ValueError(
@@ -760,11 +765,17 @@ def reproject(
     if destination is None and dst_transform is not None:
         raise ValueError("Must provide destination if dst_transform is provided.")
 
-    # The source pixels and grid.
+    # The source pixels and grid. With `sum`, the full-resolution pixels each pixel stands for.
+    sum_scale = 1.0
     if isinstance(source, DatasetBase):
         source = Band(source, list(source.indexes), source.dtypes[0], source.shape)
     if isinstance(source, Band):
         ds, bidx = source.ds, source.bidx
+        if rs == Resampling.sum:
+            # Refused before the bands are read when their memory would exceed the budget.
+            count = len(bidx) if isinstance(bidx, (list, tuple)) else 1
+            _terrio._check_sum_window(ds.width * ds.height, np.dtype(source.dtype).itemsize * count)
+            sum_scale = _sum_scale(ds, ds.width, ds.height)
         arr = ds.read(bidx)
         src_transform = ds.transform
         src_crs = src_crs or ds.crs
@@ -924,6 +935,7 @@ def reproject(
         # As rasterio: exact transformations with an RPC DEM.
         et=0.0 if "to" in rpc_kw and "RPC_DEM" in rpc_kw["to"] else tolerance,
         wo=_warp_extras(kwargs),
+        grid_invariant=grid_invariant,
         **gcp_kw,
         **rpc_kw,
     )
@@ -935,6 +947,7 @@ def reproject(
         dstnodata=dstnd,
         ot=ot,
         init=initial,
+        _sum_scale=sum_scale,
         **common,
     )
     res = np.asarray(out.read())

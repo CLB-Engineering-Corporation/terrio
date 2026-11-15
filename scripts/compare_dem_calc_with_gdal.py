@@ -78,6 +78,20 @@ def read(path):
     }
 
 
+def check_cumulative_metadata(reference, actual):
+    """Require equivalent CRS and exact masks in addition to the pixel comparison."""
+    expected, got = gdal.Open(reference), gdal.Open(actual)
+    gt, actual_gt = expected.GetGeoTransform(), got.GetGeoTransform()
+    pixel_size = abs(gt[1]) or 1.0
+    if max(abs(a - b) for a, b in zip(gt, actual_gt, strict=True)) / pixel_size > 1e-8:
+        raise AssertionError("cumulative output geotransform differs")
+    if not expected.GetSpatialRef().IsSame(got.GetSpatialRef()):
+        raise AssertionError("cumulative output CRS differs")
+    if not np.array_equal(expected.GetRasterBand(1).GetMaskBand().ReadAsArray(),
+                          got.GetRasterBand(1).GetMaskBand().ReadAsArray()):
+        raise AssertionError("cumulative output mask differs")
+
+
 def same_value(a, b):
     """Whether two optional numbers are equal, NaN equal to NaN.
 
@@ -144,6 +158,27 @@ def compare(gdal_path, terrio_path, tol, radius=None):
     res["max_diff"] = float(finite.max()) if finite.size else 0.0
     res["inf_diff"] = int(np.isinf(diff).sum())
     return res
+
+
+def calc_window_cases(tmp, calc):
+    """Register disjoint-input window fills against GDAL 3.13.3's calc behavior."""
+    for nodata in (None, -99):
+        paths = []
+        for name, left, value in (("a", 0, 1), ("b", 10, 2)):
+            path = os.path.join(tmp, f"window_{name}_{nodata}.tif")
+            dataset = gdal.GetDriverByName("GTiff").Create(path, 2, 2, 1, gdal.GDT_Float32)
+            dataset.SetGeoTransform((left, 1, 0, 2, 0, -1))
+            band = dataset.GetRasterBand(1)
+            band.Fill(value)
+            if nodata is not None:
+                band.SetNoDataValue(nodata)
+            band = None
+            dataset = None
+            paths.append(path)
+        calc(
+            f"projwin disjoint input nodata={nodata}",
+            ["-A", paths[0], "-B", paths[1], "--calc", "A+B", "--projwin", "0", "2", "2", "0", "--NoDataValue", "-9999"],
+        )
 
 
 def cases(d, tmp):
@@ -257,6 +292,8 @@ def cases(d, tmp):
     def calc(name, args, tol=0.0):
         add(f"calc {name}", ["gdal_calc.py", "--quiet", "--overwrite", "--outfile", "{out}", *args], ["calc", "--outfile", "{out}", *args], tol)
 
+    calc_window_cases(tmp, calc)
+
     red = ["-A", landsat, "--A_band", "3"]
     nir = ["-B", landsat, "--B_band", "4"]
     calc("landsat NDVI Float32", [*red, *nir, "--calc", "(B.astype(float32) - A) / (B.astype(float32) + A)", "--type", "Float32"])
@@ -358,6 +395,23 @@ def cases(d, tmp):
             ["viewshed", projected, "{out}", *[{"-ox": "--ox", "-oy": "--oy", "-cc": "--cc", "-oz": "--oz", "-tz": "--tz", "-md": "--md", "-ov": "--ov", "-om": "--om"}.get(v, v) for v in shared]], 1e-9)
         if label == "outside radius":
             case["radius"] = (gt[0] + int(col + 0.5) * gt[1], gt[3] + int(row + 0.5) * gt[5], 10000, 7)
+    for label, opts in [
+        ("default", []),
+        ("spacing 17", ["-os", "17"]),
+        ("single observer", ["-os", "1000"]),
+        ("flat target", ["-os", "13", "-cc", "0", "-oz", "8", "-tz", "10"]),
+        ("curvature", ["-os", "19", "-cc", "1"]),
+    ]:
+        shared = ["-om", "ACCUM", *opts]
+        mapping = {v: "-" + v for v in ["-om", "-os", "-cc", "-oz", "-tz", "-md", "-ov"]}
+        case = add(f"viewshed cumulative {label}", ["gdal_viewshed", "-q", *shared, projected, "{out}"],
+            ["viewshed", projected, "{out}", *[mapping.get(v, v) for v in shared]])
+        case["cumulative"] = {"input": projected, "options": {
+            shared[i].lstrip("-"): shared[i + 1] if shared[i] == "-om" else float(shared[i + 1])
+            for i in range(0, len(shared), 2)
+        }}
+        if "os" in case["cumulative"]["options"]:
+            case["cumulative"]["options"]["os"] = int(case["cumulative"]["options"]["os"])
     feet = os.path.join(tmp, "viewshed_feet.tif")
     feet_ds = gdal.Warp(feet, usgs, dstSRS="EPSG:2232", width=103, height=97)
     feet_gt = feet_ds.GetGeoTransform()
@@ -434,6 +488,9 @@ def main():
     ap.add_argument("--terrio", default=os.path.join(os.path.dirname(__file__), "..", "target", "release", "terrio"))
     ap.add_argument("--only", help="only cases whose name contains this")
     ap.add_argument("--json", action="store_true", help="print JSON")
+    ap.add_argument("--skip-cumulative", action="store_true", help="leave cumulative cases to their dedicated suite")
+    ap.add_argument("--bindings", action="store_true", help="compare cumulative Python bindings too")
+    ap.add_argument("--node-package", help="also compare cumulative Node/WASM with this built package")
     ap.add_argument("--keep", help="keep the outputs in this directory")
     a = ap.parse_args()
     tmp = a.keep or tempfile.mkdtemp(prefix="terrio_dem_calc_")
@@ -442,6 +499,8 @@ def main():
         print(f"GDAL {gdal.__version__} (terrio reproduces GDAL 3.12's arithmetic)\n")
     results = []
     for i, c in enumerate(cases(os.path.abspath(a.data), tmp)):
+        if a.skip_cumulative and c.get("cumulative"):
+            continue
         if a.only and a.only not in c["name"]:
             continue
         ext = c.get("ext", "tif")
@@ -455,6 +514,8 @@ def main():
             run([x.replace("{out}", gout) for x in c["gdal"]])
             run([a.terrio] + [x.replace("{out}", tout).replace("{gout}", gout) for x in c["terrio"]])
             r = compare(gout, tout, c["tol"], c.get("radius"))
+            if "viewshed cumulative" in c["name"]:
+                check_cumulative_metadata(gout, tout)
             if c.get("preserve_valid"):
                 source = read(c["preserve_valid"])["data"]
                 valid = np.isfinite(source)
@@ -468,6 +529,29 @@ def main():
         results.append(r)
         if not a.json:
             print(format_row(r), flush=True)
+        if c.get("cumulative") and (a.bindings or a.node_package):
+            for api in (["Python"] if a.bindings else []) + (["Node/WASM"] if a.node_package else []):
+                output = os.path.join(tmp, f"case{i}_{api.split('/')[0]}.tif")
+                try:
+                    args = c["cumulative"]
+                    if api == "Python":
+                        import terrio
+                        terrio.viewshed(args["input"], 0, 0, output, **args["options"])
+                    else:
+                        run(["node", "-e", """
+const fs = require('node:fs');
+const t = require(process.argv[1]);
+const result = t.viewshed(fs.readFileSync(process.argv[2]), 0, 0, JSON.parse(process.argv[4]));
+fs.writeFileSync(process.argv[3], result.toBytes('output.tif'));
+""", os.path.abspath(a.node_package), args["input"], output, json.dumps(args["options"])])
+                    check_cumulative_metadata(gout, output)
+                    result = compare(gout, output, 0)
+                except Exception as e:  # noqa: BLE001 - report and continue
+                    result = {"error": str(e).strip().splitlines()[-1][:200]}
+                result["name"] = f"{c['name']} {api}"
+                results.append(result)
+                if not a.json:
+                    print(format_row(result), flush=True)
     if a.json:
         print(json.dumps(results, indent=2))
     else:

@@ -1,8 +1,9 @@
 //! External overviews: the images of a GDAL `.ovr` file next to a GeoTIFF without overviews of
 //! its own are its overviews, as GDAL reads them.
 
+use std::collections::HashMap;
 use terrio::raster::RasterData;
-use terrio::{DataType, RasterConfig, RasterDataset, RasterWriteOptions, Window, WindowOptions};
+use terrio::{DataType, RasterConfig, RasterDataset, RasterWriteOptions, ResampledReadOptions, Window, WindowOptions};
 
 fn write(path: &std::path::Path, cols: usize, rows: usize, value: impl Fn(usize) -> u8, overviews: Vec<usize>) {
     let cfg = RasterConfig { cols, rows, bands: 1, data_type: DataType::U8, ..Default::default() };
@@ -141,4 +142,156 @@ fn external_mask_policy_is_independent_of_the_base_tiff() {
         r.file_list().unwrap(),
         ["img.tif", "img.tif.ovr", "img.tif.ovr.msk"].map(|name| dir.path().join(name).to_string_lossy().into_owned())
     );
+}
+
+/// Under `TERRIO_DISABLE_READDIR_ON_OPEN=EMPTY_DIR`, or `GDAL_DISABLE_READDIR_ON_OPEN=EMPTY_DIR`,
+/// nothing beside the GeoTIFF is read: its `.ovr` gives it no overviews, a reduced read takes the
+/// GeoTIFF's own pixels, and the GeoTIFF is the only file listed.
+#[test]
+fn an_ovr_is_not_read_under_empty_dir() {
+    let dir = tempfile::tempdir().unwrap();
+    let tif = dir.path().join("img.tif");
+    write(&tif, 70, 50, |_| 1, Vec::new());
+    write(&dir.path().join("ovr.tif"), 35, 25, |_| 2, Vec::new());
+    std::fs::rename(dir.path().join("ovr.tif"), dir.path().join("img.tif.ovr")).unwrap();
+    let name = tif.to_str().unwrap();
+    let reduced = ResampledReadOptions { size: (7, 5), ..Default::default() };
+    // Without the option, the `.ovr` is the GeoTIFF's overview and serves the reduced read.
+    let mut r = terrio::open_raster_lazy(name).unwrap();
+    assert_eq!(r.overviews(), [(35, 25)]);
+    assert_eq!(r.read_resampled(&reduced).unwrap().raster.data.to_f64_vec(), [2.0; 35]);
+    for key in ["TERRIO_DISABLE_READDIR_ON_OPEN", "GDAL_DISABLE_READDIR_ON_OPEN"] {
+        terrio::config::push_scope(HashMap::from([(key.to_string(), Some("EMPTY_DIR".to_string()))]));
+        let read = terrio::open_raster_lazy(name).and_then(|mut r| Ok((r.overviews(), r.file_list()?, r.read_resampled(&reduced)?)));
+        terrio::config::pop_scope();
+        let (overviews, files, small) = read.unwrap();
+        assert!(overviews.is_empty(), "{key}: {overviews:?}");
+        assert_eq!(files, [name], "{key}");
+        assert_eq!(small.raster.data.to_f64_vec(), [1.0; 35], "{key}");
+    }
+}
+
+/// Rewrites one classic TIFF directory with a NewSubfileType value, keeping its image data.
+fn mark_image(path: &std::path::Path, index: usize, subfile: u32) {
+    let mut bytes = std::fs::read(path).unwrap();
+    assert_eq!(&bytes[..4], b"II*\0");
+    let u16_at = |b: &[u8], i: usize| u16::from_le_bytes(b[i..i + 2].try_into().unwrap()) as usize;
+    let u32_at = |b: &[u8], i: usize| u32::from_le_bytes(b[i..i + 4].try_into().unwrap()) as usize;
+    let mut pointer = 4;
+    for _ in 0..index {
+        let offset = u32_at(&bytes, pointer);
+        pointer = offset + 2 + 12 * u16_at(&bytes, offset);
+    }
+    let offset = u32_at(&bytes, pointer);
+    let count = u16_at(&bytes, offset);
+    let mut entries: Vec<Vec<u8>> = bytes[offset + 2..offset + 2 + 12 * count].as_chunks::<12>().0.iter().map(|e| e.to_vec()).collect();
+    let next = bytes[offset + 2 + 12 * count..offset + 6 + 12 * count].to_vec();
+    entries.retain(|entry| u16_at(entry, 0) != 254);
+    let mut tag = vec![254, 0, 4, 0, 1, 0, 0, 0];
+    tag.extend(subfile.to_le_bytes());
+    entries.push(tag);
+    entries.sort_by_key(|entry| u16_at(entry, 0));
+    if !bytes.len().is_multiple_of(2) {
+        bytes.push(0);
+    }
+    let rewritten = (bytes.len() as u32).to_le_bytes();
+    bytes[pointer..pointer + 4].copy_from_slice(&rewritten);
+    bytes.extend((entries.len() as u16).to_le_bytes());
+    for entry in entries {
+        bytes.extend(entry);
+    }
+    bytes.extend(next);
+    std::fs::write(path, bytes).unwrap();
+}
+
+#[test]
+fn reduced_first_images_keep_their_masks_and_fallbacks() {
+    // TIFF 6.0: mask association follows the image's own reduced-resolution bit.
+    // GDAL 3.13.3 controls use ordinary first-image flags (see the Python comparison).
+    for (reduced, mask_reduced) in [(false, false), (true, true), (true, false)] {
+        for own_overview_mask in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let base = dir.path().join("image.tif");
+            write(&base, 64, 48, |_| 9, Vec::new());
+            let level = dir.path().join("image.tif.ovr");
+            let cfg = RasterConfig { cols: 32, rows: 24, bands: 1, data_type: DataType::U8, ..Default::default() };
+            let data = terrio::Raster::from_data_native(cfg, RasterData::U8(vec![7; 32 * 24])).unwrap();
+            let mask: Vec<u8> = (0..32 * 24).map(|i| if i % 32 < 12 { 0 } else { 255 }).collect();
+            let options = RasterWriteOptions {
+                driver: Some(terrio::formats::RasterDriver::GTiff),
+                mask: Some(mask.clone()),
+                overviews: vec![2],
+                ..Default::default()
+            };
+            terrio::write_raster_dataset(&RasterDataset::new(data, false), level.to_str().unwrap(), &options).unwrap();
+            mark_image(&level, 0, u32::from(reduced));
+            mark_image(&level, 1, 4 | u32::from(mask_reduced));
+            if !own_overview_mask {
+                mark_image(&level, 3, 0);
+            }
+            let mut standalone = terrio::open_raster_lazy(level.to_str().unwrap()).unwrap();
+            assert!(standalone.has_mask());
+            assert_eq!(standalone.read_mask(Window::new(0, 0, 32, 24), None).unwrap().unwrap(), mask);
+            assert_eq!(standalone.level_has_own_mask(0), own_overview_mask);
+            assert_eq!(standalone.read_level_mask(Window::new(0, 0, 16, 12), Some(0)).unwrap().is_some(), own_overview_mask);
+            let fallback = standalone.read_mask(Window::new(0, 0, 16, 12), Some(0)).unwrap().unwrap();
+            assert_eq!(fallback.iter().filter(|&&v| v == 0).count(), 6 * 12);
+            let mut attached = terrio::open_raster_lazy(base.to_str().unwrap()).unwrap();
+            assert!(attached.level_has_own_mask(0));
+            assert_eq!(attached.read_mask(Window::new(0, 0, 32, 24), Some(0)).unwrap().unwrap(), mask);
+            assert_eq!(attached.level_has_own_mask(1), own_overview_mask);
+        }
+    }
+}
+
+#[test]
+fn unreduced_first_images_ignore_reduced_masks_and_keep_nodata() {
+    use terrio::ops::overview::OverviewSelection;
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().join("image.tif");
+    write(&base, 64, 48, |_| 9, Vec::new());
+    let level = dir.path().join("image.tif.ovr");
+    let cfg = RasterConfig { cols: 32, rows: 24, bands: 1, data_type: DataType::U8, nodata: 255.0, ..Default::default() };
+    let values: Vec<u8> = (0..32 * 24).map(|i| if i % 32 < 12 { 255 } else { 7 }).collect();
+    let raster = terrio::Raster::from_data_native(cfg, RasterData::U8(values)).unwrap();
+    let options =
+        RasterWriteOptions { driver: Some(terrio::formats::RasterDriver::GTiff), mask: Some(vec![0; 32 * 24]), ..Default::default() };
+    terrio::write_raster_dataset(&RasterDataset::new(raster, true), level.to_str().unwrap(), &options).unwrap();
+    mark_image(&level, 0, 0);
+    mark_image(&level, 1, 5);
+    let expected: Vec<u8> = (0..32 * 24).map(|i| if i % 32 < 12 { 0 } else { 255 }).collect();
+    for (path, overview) in [(&level, None), (&base, Some(0))] {
+        let mut r = terrio::open_raster_lazy(path.to_str().unwrap()).unwrap();
+        assert!(!r.has_mask());
+        assert!(r.read_mask(Window::full(32, 24), overview).unwrap().is_none());
+        if let Some(level) = overview {
+            assert!(!r.level_has_own_mask(level));
+        }
+        let options = ResampledReadOptions {
+            size: (32, 24),
+            overview: overview.map_or(OverviewSelection::None, OverviewSelection::Level),
+            ..Default::default()
+        };
+        assert_eq!(r.read_resampled_masks(&options).unwrap(), expected);
+    }
+}
+
+#[test]
+fn an_unreadable_first_image_subfile_type_keeps_ordinary_decoding() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("image.tif");
+    write(&path, 8, 6, |_| 7, Vec::new());
+    mark_image(&path, 0, 0);
+    let mut bytes = std::fs::read(&path).unwrap();
+    let ifd = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
+    let count = u16::from_le_bytes(bytes[ifd..ifd + 2].try_into().unwrap()) as usize;
+    let tag = (0..count).map(|i| ifd + 2 + 12 * i).find(|&i| bytes[i..i + 2] == 254u16.to_le_bytes()).unwrap();
+    // An ASCII tag is a valid TIFF field but cannot be read as an unsigned flag.
+    bytes[tag + 2..tag + 4].copy_from_slice(&2u16.to_le_bytes());
+    bytes[tag + 4..tag + 8].copy_from_slice(&2u32.to_le_bytes());
+    bytes[tag + 8..tag + 12].copy_from_slice(b"x\0\0\0");
+    std::fs::write(&path, bytes).unwrap();
+    let mut raster = terrio::open_raster_lazy(path.to_str().unwrap()).unwrap();
+    let read = raster.read_window(Window::full(8, 6), &WindowOptions::default()).unwrap();
+    assert_eq!(read.raster.data.to_f64_vec(), vec![7.0; 48]);
 }

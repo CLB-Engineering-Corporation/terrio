@@ -204,11 +204,10 @@ fn complex_mem_dataset(r: &wbraster::Raster) -> Result<GdalDataset> {
     }
 }
 
-/// Reads the complex bands of a GDAL dataset as pairs of real and imaginary bands of the part
-/// type (`Int16` for `CInt16`...).
-fn read_complex(ds: &GdalDataset, t: gdal_sys::GDALDataType::Type, cols: usize, rows: usize, bands: usize) -> Result<RasterData> {
+/// The GDAL read type and stored component type, including Float16 promotion to Float32.
+fn complex_read_type(t: gdal_sys::GDALDataType::Type) -> (gdal_sys::GDALDataType::Type, wbraster::DataType) {
     use gdal_sys::GDALDataType::*;
-    let (ct, part) = if t == GDT_CInt16 {
+    if t == GDT_CInt16 {
         (GDT_CInt16, wbraster::DataType::I16)
     } else if t == GDT_CInt32 {
         (GDT_CInt32, wbraster::DataType::I32)
@@ -217,7 +216,12 @@ fn read_complex(ds: &GdalDataset, t: gdal_sys::GDALDataType::Type, cols: usize, 
     } else {
         // CFloat16 too, read as CFloat32.
         (GDT_CFloat32, wbraster::DataType::F32)
-    };
+    }
+}
+
+/// Reads complex samples in the component type selected by [`complex_read_type`].
+fn read_complex(ds: &GdalDataset, t: gdal_sys::GDALDataType::Type, cols: usize, rows: usize, bands: usize) -> Result<RasterData> {
+    let (ct, part) = complex_read_type(t);
     let size = part.size_bytes();
     let n = cols * rows;
     let mut raw = vec![0u8; n * 2 * size];
@@ -342,7 +346,7 @@ fn finish_copy(
     let crs = crate::crs::SpatialRef::from_raster_crs(&r.crs);
     let srs = match crs.epsg {
         Some(code) => gdal::spatial_ref::SpatialRef::from_epsg(code).ok(),
-        None => crs.to_wkt().and_then(|wkt| gdal::spatial_ref::SpatialRef::from_wkt(&wkt).ok()),
+        None => crs.to_file_wkt().and_then(|wkt| gdal::spatial_ref::SpatialRef::from_wkt(&wkt).ok()),
     };
     if let Some(srs) = srs {
         mem.set_spatial_ref(&srs).map_err(gdal_err)?;
@@ -807,7 +811,21 @@ fn gdal_name(path: &str) -> String {
     name(&Location::parse(path)).unwrap_or_else(|| path.to_string())
 }
 
+/// GDAL's opaque nested reads cannot enforce the native origin-only redirect policy.
+pub(crate) fn check_redirect_policy() -> Result<()> {
+    if crate::config::get("TERRIO_HTTP_FOLLOW_CROSS_ORIGIN")
+        .is_some_and(|v| !v.trim().is_empty() && !matches!(v.trim().to_ascii_uppercase().as_str(), "YES" | "TRUE" | "ON" | "1"))
+    {
+        return Err(Error::InvalidArgument(
+            "TERRIO_HTTP_FOLLOW_CROSS_ORIGIN: GDAL reads cannot enforce origin-only redirects; use a native reader or enable cross-origin redirects".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn gdal_open(path: &str, flags: GdalOpenFlags) -> Result<GdalDataset> {
+    check_redirect_policy()?;
+    crate::stac::check_gdal_asset_read()?;
     // Every dataset GDAL opens (a `GDAL:` name, the fallback for what terrio's drivers cannot read,
     // bytes through `/vsimem/`) is opened by the GDAL backend, whose own drivers pick the format:
     // only if the process-wide allow-list of each kind asked for has the GDAL driver.
@@ -863,7 +881,15 @@ fn raster_from(ds: &GdalDataset, path: &str) -> Result<RasterDataset> {
     let first = ds.rasterband(1).map_err(gdal_err)?;
     // SAFETY: plain queries of a valid band handle and a data type.
     let raw_type = unsafe { gdal_sys::GDALGetRasterDataType(first.c_rasterband()) };
-    if unsafe { gdal_sys::GDALDataTypeIsComplex(raw_type) } != 0 {
+    // What the dataset declares, before its bands are read: a complex band is two parts of half
+    // its size (`GDALGetDataTypeSizeBytes` counts both).
+    // SAFETY: plain queries of a data type.
+    let (complex, size) = unsafe { (gdal_sys::GDALDataTypeIsComplex(raw_type) != 0, gdal_sys::GDALGetDataTypeSizeBytes(raw_type)) };
+    let size = usize::try_from(size).unwrap_or(0);
+    let parts = if complex { 2 } else { 1 };
+    let sample_bytes = if complex { complex_read_type(raw_type).1.size_bytes() } else { size };
+    crate::declared::check_bytes(cols, rows, bands * parts, sample_bytes, complex)?;
+    if complex {
         return complex_raster_from(ds, &first, raw_type, path);
     }
     let band_type = first.band_type();
@@ -949,6 +975,7 @@ fn finish_raster(
     }
     let mut out = RasterDataset::with_driver(raster, RasterDriver::Gdal, has_nodata);
     out.complex = complex;
+    out.geotransform_present = Some(ds.geo_transform().is_ok());
     let geolocation: Vec<(String, String)> = ds
         .metadata_domain("GEOLOCATION")
         .unwrap_or_default()
@@ -974,11 +1001,8 @@ fn srs_to_crs(srs: &gdal::spatial_ref::SpatialRef) -> Option<wbraster::CrsInfo> 
     };
     Some(match code {
         Some(code) => {
-            let mut info = wbraster::CrsInfo::from_epsg(code);
-            if info.wkt.is_none() {
-                info.wkt = Some(wkt);
-            }
-            info
+            let stored = wbraster::CrsInfo { epsg: Some(code), wkt: Some(wkt), proj4: None };
+            wbraster::CrsInfo { wkt: crate::crs::raster_crs_wkt(&stored), ..stored }
         }
         None => common::crs_from_text(&wkt).unwrap_or_else(|| wbraster::CrsInfo { wkt: Some(wkt), ..Default::default() }),
     })
@@ -1020,19 +1044,20 @@ fn vector_from(ds: GdalDataset, path: &str, options: &VectorOpenOptions) -> Resu
     if names.is_empty() {
         return Err(Error::Unsupported(format!("'{path}' has no vector layers")));
     }
+    let available: Vec<&str> = names.iter().map(String::as_str).collect();
+    let selected = crate::dataset::layer_selection(&options.layers, &available, Some(strip_prefix(path).unwrap_or(path)), false)?;
     let mut layers = Vec::new();
-    for mut layer in ds.layers() {
+    for (mut layer, keep) in ds.layers().zip(selected) {
         let name = layer.name();
-        if !options.layers.is_empty() && !options.layers.contains(&name) {
+        if !keep {
             continue;
         }
         if let Some((x0, y0, x1, y1)) = options.spatial_filter {
             layer.set_spatial_filter_rect(x0, y0, x1, y1);
         }
-        layers.push(layer_from(&mut layer, &name, &mut budget)?);
-    }
-    if layers.is_empty() {
-        return Err(Error::InvalidArgument(format!("no layer named {} (layers: {})", options.layers.join(", "), names.join(", "))));
+        let mut output = layer_from(&mut layer, &name, &mut budget)?;
+        options.keep_range(&mut output);
+        layers.push(output);
     }
     // `finish_vector` names unnamed layers after the file: use the path without GDAL's syntax.
     Ok(finish_vector(layers, strip_prefix(path).unwrap_or(path), VectorDriver::Gdal))
@@ -1128,10 +1153,14 @@ fn layer_from(layer: &mut gdal::vector::Layer, name: &str, budget: &mut VectorBu
         let mut attributes = Vec::new();
         attributes.try_reserve_exact(kinds.len()).map_err(|_| Error::ResourceLimit("GDAL: cannot allocate feature attributes".into()))?;
         for (k, kind) in kinds.iter().enumerate() {
-            let value = match feature.field(k) {
-                Ok(Some(v)) => value_from(v),
-                Ok(None) if *kind == OGRFieldType::OFTBinary => binary_field(&feature, k),
-                _ => FieldValue::Null,
+            let value = if *kind == OGRFieldType::OFTDateTime {
+                datetime_field(&feature, k)
+            } else {
+                match feature.field(k) {
+                    Ok(Some(v)) => value_from(v),
+                    Ok(None) if *kind == OGRFieldType::OFTBinary => binary_field(&feature, k),
+                    _ => FieldValue::Null,
+                }
             };
             let bytes = match &value {
                 FieldValue::Text(s) | FieldValue::Date(s) | FieldValue::DateTime(s) => s.len(),
@@ -1238,19 +1267,55 @@ fn value_from(v: GdalValue) -> FieldValue {
         GdalValue::RealValue(x) => FieldValue::Float(x),
         GdalValue::StringValue(s) => FieldValue::Text(s),
         GdalValue::DateValue(d) => FieldValue::Date(d.to_string()),
-        GdalValue::DateTimeValue(t) => {
-            // GDAL reports times without a time zone as UTC: keep them without one.
-            if t.offset().local_minus_utc() == 0 {
-                FieldValue::DateTime(t.naive_local().format("%Y-%m-%dT%H:%M:%S%.f").to_string())
-            } else {
-                FieldValue::DateTime(t.to_rfc3339())
-            }
-        }
+        // layer_from intercepts every OFTDateTime before this converted-value match:
+        // only the original feature retains the timezone flag datetime_field needs.
+        GdalValue::DateTimeValue(t) => FieldValue::DateTime(t.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true)),
         GdalValue::IntegerListValue(v) => json(v.into_iter().map(Into::into).collect()),
         GdalValue::Integer64ListValue(v) => json(v.into_iter().map(Into::into).collect()),
         GdalValue::RealListValue(v) => json(v.into_iter().map(Into::into).collect()),
         GdalValue::StringListValue(v) => json(v.into_iter().map(Into::into).collect()),
     }
+}
+
+/// Retain milliseconds and the raw timezone flag using GDAL's DateTimeEx API.
+/// Reference validation: GDAL 3.13.3; this API also exists in earlier GDAL releases.
+/// The gdal crate's DateTime conversion truncates seconds and conflates unknown zones with UTC.
+fn datetime_field(feature: &gdal::vector::Feature, field: usize) -> FieldValue {
+    let Ok(index) = i32::try_from(field) else { return FieldValue::Null };
+    let (mut year, mut month, mut day, mut hour, mut minute, mut zone) = (0, 0, 0, 0, 0, 0);
+    let mut second = 0.0;
+    // SAFETY: feature owns the live handle, index comes from its field definition,
+    // and all output pointers refer to initialized values for the duration of the call.
+    let success = unsafe {
+        let handle = feature.c_feature();
+        if gdal_sys::OGR_F_IsFieldSetAndNotNull(handle, index) == 0 {
+            return FieldValue::Null;
+        }
+        gdal_sys::OGR_F_GetFieldAsDateTimeEx(handle, index, &mut year, &mut month, &mut day, &mut hour, &mut minute, &mut second, &mut zone)
+    };
+    if success == 0 || !(0.0..61.0).contains(&second) {
+        return FieldValue::Null;
+    }
+    let Some(date) = chrono::NaiveDate::from_ymd_opt(year, month as u32, day as u32) else { return FieldValue::Null };
+    let Some(time) = date.and_hms_opt(hour as u32, minute as u32, 0) else { return FieldValue::Null };
+    // GDAL exposes float seconds with millisecond accuracy. Round away float noise;
+    // adding to the minute also handles a fractional value rounding into the next minute.
+    let milliseconds = (f64::from(second) * 1000.0).round() as i64;
+    let Some(time) = time.checked_add_signed(chrono::TimeDelta::milliseconds(milliseconds)) else { return FieldValue::Null };
+    let pattern = if milliseconds % 1000 == 0 { "%Y-%m-%dT%H:%M:%S" } else { "%Y-%m-%dT%H:%M:%S%.3f" };
+    let mut text = time.format(pattern).to_string();
+    match zone {
+        0 | 1 => (), // unknown or local time: neither asserts UTC
+        100 => text.push('Z'),
+        _ => {
+            let minutes = (zone - 100) * 15;
+            if chrono::FixedOffset::east_opt(minutes * 60).is_none() {
+                return FieldValue::Null;
+            }
+            text.push_str(&format!("{}{:02}:{:02}", if minutes < 0 { '-' } else { '+' }, minutes.abs() / 60, minutes.abs() % 60));
+        }
+    }
+    FieldValue::DateTime(text)
 }
 
 fn binary_field(feature: &gdal::vector::Feature, field: usize) -> FieldValue {
@@ -1373,5 +1438,64 @@ mod limits_tests {
         let mut budget = VectorBudget { remaining: 16_384, limit: 16_384 };
         assert!(layer_from(&mut layer, "first", &mut budget).is_ok());
         assert!(matches!(layer_from(&mut layer, "second", &mut budget), Err(Error::ResourceLimit(_))));
+    }
+}
+
+#[cfg(test)]
+mod crs_tests {
+    /// GDAL 3.13.3 preserves explicit WKT even when its root identifies a known EPSG code.
+    #[test]
+    fn supplied_definition_is_kept_with_identified_code() {
+        let registry = crate::crs::SpatialRef::from_epsg(4979).unwrap().to_wkt().unwrap();
+        let custom = registry.replacen("WGS 84", "Custom WGS 84", 1);
+        let srs = gdal::spatial_ref::SpatialRef::from_wkt(&custom).unwrap();
+        let expected = srs.to_wkt().unwrap();
+        assert!(expected.contains("Custom WGS 84"));
+        let actual = super::srs_to_crs(&srs).unwrap();
+        assert_eq!(actual.epsg, Some(4979));
+        assert_eq!(actual.wkt, Some(expected));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// GDAL 3.13.3 keeps local/unknown flags distinct from explicit UTC in memory.
+    #[test]
+    fn datetime_field_keeps_gdal_timezone_flags() {
+        use gdal::vector::{LayerAccess, LayerOptions, OGRFieldType};
+        let mut dataset = gdal::DriverManager::get_driver_by_name("Memory").unwrap().create_vector_only("").unwrap();
+        let layer = dataset.create_layer(LayerOptions::default()).unwrap();
+        layer.create_defn_fields(&[("time", OGRFieldType::OFTDateTime)]).unwrap();
+        let mut feature = gdal::vector::Feature::new(layer.defn()).unwrap();
+        assert_eq!(super::datetime_field(&feature, 0), crate::FieldValue::Null);
+        for (zone, suffix) in [(0, ""), (1, ""), (100, "Z"), (114, "+03:30"), (86, "-03:30")] {
+            // SAFETY: feature is live and owns a DateTime field at index zero.
+            unsafe { gdal_sys::OGR_F_SetFieldDateTimeEx(feature.c_feature(), 0, 2024, 3, 15, 10, 30, 5.25, zone) };
+            assert_eq!(super::datetime_field(&feature, 0), crate::FieldValue::DateTime(format!("2024-03-15T10:30:05.250{suffix}")));
+        }
+        feature.set_field_null(0).unwrap();
+        assert_eq!(super::datetime_field(&feature, 0), crate::FieldValue::Null);
+    }
+
+    #[test]
+    fn memory_file_cleanup_removes_only_the_calls_directory() {
+        // Keep another directory alive so a failed or empty root listing cannot pass vacuously.
+        super::with_mem_file(vec![9], "sentinel.bin", |sentinel| {
+            for fail in [false, true] {
+                let mut directory = String::new();
+                let result = super::with_mem_file(vec![1, 2, 3], "input.bin", |path| {
+                    directory = path.rsplit_once('/').unwrap().0.to_string();
+                    gdal::vsi::create_mem_file(format!("{path}.aux.xml"), vec![4, 5]).unwrap();
+                    if fail { Err(crate::Error::InvalidArgument("test refusal".into())) } else { Ok(()) }
+                });
+                assert_eq!(result.is_err(), fail);
+                let name = directory.rsplit_once('/').unwrap().1;
+                assert!(gdal::vsi::read_dir("/vsimem/", false).unwrap().iter().all(|p| p.to_string_lossy() != name));
+                let parent = sentinel.rsplit_once('/').unwrap().0;
+                assert!(gdal::vsi::read_dir(parent, false).unwrap().iter().any(|p| p.to_string_lossy() == "sentinel.bin"));
+            }
+            Ok(())
+        })
+        .unwrap();
     }
 }

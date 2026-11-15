@@ -52,6 +52,7 @@ Every command, in alphabetical order. `terrio --help` prints this list, and
 | [`is-valid`](#vector-topology) | Report the validity of each feature's geometry |
 | [`layer-algebra`](#vector-topology) | Polygon, line and point layer algebra (seven operations) |
 | [`lineref`](#lineref) | Linear referencing (like ogrlineref) |
+| [`list-crs`](#list-crs) | List the registry CRSs terrio resolves |
 | [`make-point`](#make-point) | Make point geometries from coordinate fields |
 | [`make-valid`](#vector-topology) | Repair invalid geometries |
 | [`mcp`](#mcp) | Serve these commands to AI agents over MCP |
@@ -72,6 +73,7 @@ Every command, in alphabetical order. `terrio --help` prints this list, and
 | [`pipeline`](#pipelines) | Chain raster and vector operations |
 | [`pixel-info`](#pixel-info) | Query pixel values at given positions |
 | [`polygonize`](#polygonize) | Turn a raster band into polygons |
+| [`preview`](#preview) | Draw a raster or vector dataset as a PNG or in the terminal |
 | [`proximity`](#proximity) | Compute the distance to the nearest target pixel |
 | [`raster-index`](#rastervector-indexes-and-gti-creation) | Create a raster footprint index, with optional GTI metadata |
 | [`rasterize`](#rasterize) | Burn vector geometries into a raster |
@@ -102,7 +104,8 @@ Every command, in alphabetical order. `terrio --help` prints this list, and
 | [`vector-grid`](#vector-grid) | Grid scattered vector points into a raster |
 | [`vector-index`](#rastervector-indexes-and-gti-creation) | Create a vector envelope index of vector dataset layers |
 | [`vertices`](#geometry-operations) | Extract vertices as points |
-| [`viewshed`](#viewshed) | Single-observer visibility or minimum visible height |
+| [`view`](#view) | Pan and zoom a raster or vector dataset in your browser |
+| [`viewshed`](#viewshed) | Single or cumulative viewsheds and minimum visible height |
 | [`vsi`](#vsi) | Manage local, in-memory, cloud and archive files |
 | [`warp`](#warp) | Reproject and resample rasters (like gdalwarp) |
 | [`xyz`](#xyz) | Write raster pixels as XYZ text (like gdal2xyz.py) |
@@ -135,6 +138,20 @@ line; MCP clients pass the inputs as arguments instead. Lists mix with paths giv
 ```sh
 terrio mosaic @filelist.txt naip.vrt
 terrio warp @filelist.txt extra.tif out.tif --t-srs EPSG:3857
+```
+
+These commands also expand wildcards in an input's file name themselves, as GDAL's `gdal raster
+mosaic` does, for [`terrio ui`](#ui), MCP clients and Windows shells, which pass them on unexpanded:
+`*` stands for any run of characters and `?` for one. The input is replaced by the files of its
+folder that match, sorted by name. Folders do not match (name a folder dataset such as a Zarr store
+directly); names beginning with `.` match only a pattern that does too, and case is ignored on
+Windows. Wildcards in folder names are not expanded, nor are URLs, `/vsi` paths or
+an input that exists as written, and a pattern that matches nothing is an error. Quote the pattern
+in a POSIX shell to have terrio expand it, or leave it unquoted to have the shell do so:
+
+```sh
+terrio mosaic 'tiles/*.tif' mosaic.tif
+terrio mosaic 'scenes/LC08_*_B4.TIF' extra.tif b4.vrt
 ```
 
 ## identify
@@ -278,7 +295,7 @@ terrio formats [--json]
 ## crs
 
 ```sh
-terrio crs CRS [--wkt] [--projjson]
+terrio crs CRS [--wkt] [--projjson | --proj4 | --wkt1-strict]
 terrio crs SRC --to DST [--s_coord_epoch YEAR] [--t_coord_epoch YEAR] X Y [X Y ...]
 echo "X Y [Z [T]]" | terrio crs SRC --to DST [--s_coord_epoch YEAR] [--t_coord_epoch YEAR]
 ```
@@ -289,6 +306,30 @@ year) use it for time-dependent transformations, and a point that cannot be tran
 [Coordinate Systems](crs.md#datum-shift-grids)). `--projjson` prints only the CRS as PROJJSON, so that
 `terrio crs CRS --projjson > crs.json` writes a PROJJSON file (see
 [Writing PROJJSON](crs.md#writing-projjson)); it cannot be combined with `--to` or `--wkt`.
+`--proj4` prints only the PROJ string, as `projinfo -o PROJ` writes it, which leaves out the
+datum transformation of an EPSG CRS (see [Writing PROJ strings](crs.md#writing-proj-strings)).
+`--wkt1-strict` prints only the WKT 1 without GDAL's PROJ4 extension, for a `.prj` file whose
+readers ignore it, and fails where WKT 1 needs the extension or PROJ writes none (see
+[Writing strict WKT 1](crs.md#writing-strict-wkt-1)).
+
+## list-crs
+
+```sh
+terrio list-crs albers --authority EPSG --kind projected   # EPSG:3577 "GDA94 / Australian Albers"...
+terrio list-crs 3577 --json
+terrio list-crs --kind geographic_2d --include-deprecated
+```
+
+Lists the CRSs of the registries terrio carries, one per line as `projinfo --list-crs` prints
+them (`EPSG:3577 "GDA94 / Australian Albers"`, then ` [deprecated]`), without network or PROJ.
+Words filter by name or code (each must be in the name or begin the code or `AUTHORITY:CODE`),
+`--authority` (`EPSG`, `ESRI`, `IAU_2015`) and `--kind` (`geographic_2d`, `geographic_3d`,
+`geocentric`, `projected`, `vertical`, `compound`, `other`) are repeatable, and deprecated CRSs
+are left out unless `--include-deprecated`. `--json` prints each CRS's name, kind, deprecation,
+area of use and its bounds, projection method and celestial body, as GDAL's
+`OSRGetCRSInfoListFromDatabase` gives them. For MCP calls, supply search words and/or
+authority/kind filters: an unfiltered listing exceeds the server's 100,000-byte output cap
+and is truncated. See [Listing registry CRSs](crs.md#listing-registry-crss).
 
 ## pixel-info
 
@@ -303,7 +344,7 @@ terrio pixel-info --position-dataset sites.gpkg dem.tif -o values.gpkg
 ```
 
 Pixel values at positions, as `gdal raster pixel-info` and `gdallocationinfo` (`locationinfo`
-is an alias). Positions are pairs of arguments (`X Y` or `X,Y`), `-p X,Y`, lines of standard
+is an alias). Positions are pairs of arguments (`X Y` or `X,Y`), `-p X,Y` (`--position`), lines of standard
 input (an `X Y` pair, then any text, reported as extra content; GDAL's tokenizing, quotes
 kept together) or the points of a vector dataset with `--position-dataset` (GDAL 3.13; centroids
 of other geometries, `-l` for the layer, `--include-field NAME|ALL|NONE`). `--position-crs` is
@@ -526,6 +567,38 @@ payloads. See [validation details and known differences](testing.md#geopackage-s
 
 ## convert
 
+```sh
+terrio convert INPUT OUTPUT [-f FORMAT] [options]
+```
+
+COG conversion that streams strips uses [temporary tile spools](#mosaic) beside the output;
+`TERRIO_TMPDIR` or `CPL_TMPDIR` selects another directory.
+
+| Option | Applies to | Meaning |
+|---|---|---|
+| `-f`, `--format`, `--of` | both | Output driver short name (`GTiff`, `COG`, `GPKG`, `ESRI Shapefile`...) |
+| `--t-srs CRS` | both | Reproject |
+| `--ct-opt KEY=VALUE` | both | Coordinate operation options (`ALLOW_BALLPARK=NO`, `ONLY_BEST=YES`, `PROMOTE_TO_3D=YES`) |
+| `--compress`, `--tile-size`, `--bigtiff` | rasters | GeoTIFF/COG creation options |
+| `--srcwin X Y W H`, `--overview N` | rasters | Read a window or an overview level |
+| `-l`, `--layer` | vectors | Only these layers |
+| `--where EXPR` | vectors | OGR SQL attribute filter |
+| `--spat XMIN YMIN XMAX YMAX`, `--spat-srs` | vectors | Spatial filter |
+| `--select FIELDS`, `--limit N` | vectors | Fields to keep, number of features |
+| `--sql STATEMENT` | vectors | `SELECT ... FROM ... WHERE ... ORDER BY ... LIMIT` |
+| `--nln NAME`, `--nlt TYPE` | vectors | New layer name, geometry type (`PROMOTE_TO_MULTI`...) |
+| `--explodecollections` | vectors | One feature per part |
+| `--simplify TOL`, `--segmentize MAX_LEN` | vectors | Simplify geometries or bound segment lengths before reprojection |
+| `--s-srs`, `--a-srs` | vectors | Override or assign the CRS |
+| `--append`, `--overwrite` | vectors, rasters (`--append`) | Add to or replace layers of an existing GeoPackage or vector tile archive; add a raster to a PMTiles or MBTiles archive of image tiles |
+| `--oo KEY=VALUE` | vectors | Open options (`X_POSSIBLE_NAMES=...` for CSV/XLSX; `HEADERS`, `FIELD_TYPES`, `HEADER_ROWS`, `FIRST_ROW`, `RANGE` for XLSX; `ZOOM_LEVEL`, `CLIP` for tiles; `WFS_*`; `DATETIME`, `CRS`, `PAGE_SIZE`, `IGNORE_SCHEMA` and `OAPIF_*` limits for OAPIF...) |
+| `--lco KEY=VALUE` | vectors | Layer creation options (`RFC7946=YES` for GeoJSON; `GEOMETRY=AS_WKT\|AS_XY` for CSV; `GEOMETRY=AS_XY\|AS_WKT\|NONE`, `HEADER_STYLE=BOLD`, `FREEZE_HEADER=YES`, `AUTOFILTER=YES`, `COLUMN_WIDTH=AUTO\|<n>`, `DATE_FORMAT`, `DATETIME_FORMAT`, `CREATION_TIME` for XLSX...) |
+| `--co KEY=VALUE` | rasters | Creation options (GeoTIFF and COG: `ZLEVEL`, `ZSTD_LEVEL`...; PNG: `ZLEVEL`; Zarr; netCDF: `FORMAT=NC4`, `COMPRESS=DEFLATE`, `ZLEVEL`, `CHUNKING`; PMTiles and MBTiles: `TILE_FORMAT=WEBP`...) |
+| `--minzoom N`, `--maxzoom N` | both | Zoom levels of PMTiles, MBTiles and MVT outputs |
+| `--kmz-resource PATH[=FILE]` | vectors | Pack an icon or companion file into a KMZ archive |
+| `--cityjson-version 1.1\|2.0` | vectors | CityJSON output version (default `2.0`) |
+| `--citygml-version 2.0\|3.0`, `--citygml-lod0-surface footprint\|roof-edge` | vectors | CityGML output version (default `3.0`) and 2.0 LoD 0 building surface |
+
 CityJSON output defaults to 2.0. Select 1.1 with `--cityjson-version 1.1`; use
 `.city.json`/`.cityjson` or `--format CityJSON`. See [CityJSON](formats.md#cityjson)
 for the flat model and coordinate quantization limits.
@@ -537,29 +610,6 @@ For an unclassified 2.0 building LoD 0 surface, choose
 Native class/LoD/geometry restrictions are checked before the output is written.
 The flat view writes native geometry and generic JSON annotations; solids,
 appearance and implicit templates are not reconstructed.
-
-```sh
-terrio convert INPUT OUTPUT [-f FORMAT] [options]
-```
-
-| Option | Applies to | Meaning |
-|---|---|---|
-| `-f`, `--format`, `--of` | both | Output driver short name (`GTiff`, `COG`, `GPKG`, `ESRI Shapefile`...) |
-| `--t-srs CRS` | both | Reproject |
-| `--compress`, `--tile-size`, `--bigtiff` | rasters | GeoTIFF/COG creation options |
-| `--srcwin X Y W H`, `--overview N` | rasters | Read a window or an overview level |
-| `-l`, `--layer` | vectors | Only these layers |
-| `--where EXPR` | vectors | OGR SQL attribute filter |
-| `--spat XMIN YMIN XMAX YMAX`, `--spat-srs` | vectors | Spatial filter |
-| `--select FIELDS`, `--limit N` | vectors | Fields to keep, number of features |
-| `--sql STATEMENT` | vectors | `SELECT ... FROM ... WHERE ... ORDER BY ... LIMIT` |
-| `--nln NAME`, `--nlt TYPE` | vectors | New layer name, geometry type (`PROMOTE_TO_MULTI`...) |
-| `--explodecollections` | vectors | One feature per part |
-| `--s-srs`, `--a-srs` | vectors | Override or assign the CRS |
-| `--append`, `--overwrite` | vectors, rasters (`--append`) | Add to or replace layers of an existing GeoPackage or vector tile archive; add a raster to a PMTiles or MBTiles archive of image tiles |
-| `--oo`, `--lco KEY=VALUE` | vectors | Open and layer creation options (`RFC7946=YES`...) |
-| `--co KEY=VALUE` | rasters | Creation options (Zarr; netCDF: `FORMAT=NC4`, `COMPRESS=DEFLATE`, `ZLEVEL`, `CHUNKING`; PMTiles and MBTiles: `TILE_FORMAT=WEBP`...) |
-| `--minzoom N`, `--maxzoom N` | both | Zoom levels of PMTiles, MBTiles and MVT outputs |
 
 GeoTIFF/COG WebP output accepts `--compress WEBP --co WEBP_LOSSLESS=YES` or
 `--co WEBP_LEVEL=0..100` for lossy quality. Supported inputs are Byte RGB/RGBA;
@@ -782,7 +832,7 @@ Linux, macOS and Windows. Counting makes a discovery pass before the removal pas
 `deleted` reflects that discovery count, which requires an unchanged tree to be exact.
 
 `-q` prints nothing, `--json` prints what was done (`copied`, `bytes`, `unchanged`, `deleted`,
-`errors`), `--stats` the HTTP requests and bytes received.
+`errors`), `--stats` the HTTP requests, and the bytes received and sent.
 
 VSI moves replace existing destination files, as GDAL does, and refuse existing
 destination directories. Local filesystem renames preserve native links and names;
@@ -952,9 +1002,51 @@ terrio translate INPUT OUTPUT [options]
 ```
 
 `--srcwin`, `--projwin` (+ `--projwin-srs`), `-b` (repeatable), `--ot`, `--scale [SRC_MIN SRC_MAX
-[DST_MIN DST_MAX]]`, `--exponent`, `--outsize W H` (pixels or `%`), `--tr`, `-r`, `--a-nodata`,
-`--a-srs`, `--a-ullr`, and the output format options. Type conversion rounds and clamps as GDAL
-does.
+[DST_MIN DST_MAX]]`, `--exponent`, `--outsize W H` (pixels or `%`), `--tr`, `-r`, `--overview`
+(`--ovr`), `--a-nodata`, `--a-srs`, `--a-ullr`, and the output format options. Type conversion
+rounds and clamps as GDAL does.
+
+A window read at its own size is copied pixel for pixel only on whole-pixel offsets, or by
+`nearest` from the pixel holding each output pixel's centre (a `--projwin` read by `nearest` starts
+on a whole pixel). At a fractional offset it is resampled there by `-r`, its kernels and areas
+reaching the pixels around it, whether the input is read whole (a format such as an Esri ASCII
+grid) or by window.
+
+An input without a geotransform of its own (an unreferenced GeoTIFF or JPEG 2000 file) gives an
+output without one, unless `--a-ullr` assigns bounds: a GeoTIFF or COG without a tie point, a JPEG
+2000 file without a GeoJP2 box, and a PNG, JPEG or WebP file without a world file. A CRS alone
+(`--a-srs`) is still written, in a JPEG 2000 file's GeoJP2 box or beside a world file. `convert`
+(unless `--t-srs` reprojects) and pipelines write such inputs the same way. An unreferenced
+PNG, JPEG or WebP write removes any existing `<stem>.wld` after the image is successfully written,
+including a world file shared with a sibling image of the same stem. Failure to remove it reports
+an error after the image write; an image write that fails leaves the world file alone.
+
+A raster read by window (GeoTIFF/COG, Zarr, virtual rasters) is read for the output alone, as
+`gdal_translate` reads it: the tiles of its window, of its bands, and, resized, from the overview
+GDAL's `RasterIO` chooses for the output's size (`--overview AUTO`, the default), or from the level
+`--overview AUTO-n`, `NONE` or a level number reads alone, as `gdal_translate -ovr` does. Without
+`--outsize` or `--tr`, an explicit level number sets the output's resolution; `AUTO-n` keeps
+the full-resolution output size, even when reading a coarser level. `AUTO-0` is equivalent
+to `AUTO`. Rescaling (`--scale`,
+`--exponent`), `--ot` with resampling other than nearest neighbour (which GDAL resamples in the
+output type) and windows past the raster's edges read the window from the whole raster at full
+resolution (or the level read alone).
+
+A GeoTIFF or COG output of such a raster is read, converted and written a strip of rows at a time,
+as `gdal_translate` copies its output in chunks, so that neither the output nor the input is held
+whole: a mosaic larger than memory can be translated. This covers outputs that copy a window of the
+input (with `-b`, `--ot`, `--a-nodata`, `--a-srs` or `--a-ullr`) and those resized by nearest
+neighbour, `bilinear`, `cubic` or `cubicspline` from the overview `--overview AUTO` chooses.
+These are made whole before being written: outputs resized by `average`, `rms`, `mode` or `lanczos`
+(a strip of them read alone differs from the whole output where it starts inside a source row),
+resized from a level read alone (`--overview NONE` or a level number), of complex bands, or that
+replace one of the input's files. A VRT is read by strips when its sources are GeoTIFFs or other
+files read by window, copied or picked by nearest neighbour; other VRTs are read whole.
+A strip holds about 64 MB of values (counted as 64-bit values), and a few strips are in flight. A
+copy starting on a row of the source's tiles is read in strips of whole rows of tiles, so that each
+tile is decoded once, when a row of tiles holds at most 2 GB of values: such a strip is larger than
+64 MB on a wide tiled raster (1.2 GB for a 98304-pixel-wide RGB mosaic of 512-row tiles). Other
+copies, and sources with taller rows of tiles, decode again the tiles a strip edge splits.
 
 ## warp
 
@@ -966,7 +1058,8 @@ terrio warp INPUT... OUTPUT [options]
 `cubic`, `cubicspline`, `lanczos`, `average`, `rms`, `mode`, `min`, `max`, `med`, `q1`, `q3`,
 `sum`), `--srcnodata`, `--dstnodata`, `--ot`, `--cutline` (+ `--crop-to-cutline`), `--et`,
 `--order`, `--tps`, `--rpc`, `--to` and `--wo`. Several inputs are mosaicked into one output. The default output grid
-follows GDAL's `GDALSuggestedWarpOutput2`; `--dst-transform X0 A B Y0 D E` with `--ts` sets any
+follows GDAL's `GDALSuggestedWarpOutput2`, whose size `-r sum` rounds up as `gdalwarp` does, so
+that the output covers the whole source (also with `--ts` or `--tr` alone, without `--te`); `--dst-transform X0 A B Y0 D E` with `--ts` sets any
 affine output grid instead, rotated ones included (GDAL's warper API, which `gdalwarp` does not
 expose). Rotated and south-up inputs are warped through their
 geotransform; a GeoTIFF georeferenced by GCPs is warped with GDAL's GCP transformers: a
@@ -994,6 +1087,77 @@ terrio warp scene.tif scene_4326.tif --rpc --to RPC_HEIGHT=120
 terrio warp scene.tif scene_utm.tif --rpc --to RPC_DEM=dem.tif --t-srs EPSG:32720 -r bilinear
 ```
 
+With `-r sum`, each output pixel adds the valid source pixels it overlaps, each weighted by the
+share of its area inside the output pixel. The corners that outline those shares are transformed
+exactly, whatever `--et` is. Source windows include these exact corners as well as the
+sampled bounds: a 256 × 256
+tile reprojected from UTM to Web Mercator at the source's resolution totals the integral of the
+source over it within a relative error of 10⁻⁹. Transforming every corner and bounding its footprint takes additional work;
+see [validation and measured costs](testing.md#exact-sum-footprints). A footprint across the
+antimeridian adds the source on both sides of it, as the area methods below take it.
+
+With `-r average`, `rms`, `mode`, `min`, `max`, `med`, `q1` or `q3`, each output pixel takes the
+valid source pixels inside its footprint on the source grid: where the footprint runs past the
+source's edges, only its part inside the source counts, and `average`, `rms` and `mode` weigh each
+source pixel by its area inside that part. A footprint counts within the source window that its
+chunk of the output reads, and an output pixel is left empty only when no valid source pixel of
+that window lies inside it or a required footprint corner cannot be transformed.
+An unrotated geographic source warped into another CRS uses a polygonal footprint
+through all four exactly transformed corners. A corner on a projected point pole
+has separate longitude limits along its two incident edges, so the pole's arbitrary
+inverse longitude cannot select another sector. Source-cell overlap areas provide
+the weights, and both grid policies plan reads from the same polygons. Other source
+grids retain their diagonal-corner rectangular footprints. These polygonal
+approximations can differ from GDAL's diagonal rectangles, especially near poles.
+For floating-point `mode`, a newly encountered value can become the leader when
+its overlap exceeds the current leader's accumulated overlap. Equal weights keep
+the first value in source traversal order. This rule also applies to nonpolar warps.
+It intentionally differs from GDAL 3.12.1's floating-mode insertion rule: for
+three distinct values with overlaps 0.1, 1.0 and 0.1, Terrio selects the middle
+value while GDAL selects the first.
+On a geographic source with an unrotated grid, warped into another
+CRS, a footprint across the antimeridian takes the source on both sides of it, as one across any
+other meridian does: near both edges of a source of every longitude, and its part on the source's
+side of one that ends at the antimeridian. A footprint counts as across it when its corners lie
+more than half a turn of longitude apart on the source grid and the source position of its centre
+lies outside them. Any other footprint keeps its corners: a coarse pixel's, whose centre lies
+between them, and that of a pixel more than half a turn wide, whose corners lie less than half a
+turn apart, which takes the source between them.
+
+For an unrotated geographic source covering exactly one longitude turn, the stored grid's
+edges are periodic wherever its origin lies. Sources stored from 0° to 360° and from 180° W to
+180° E therefore sample the same geographic field, including warps within the source CRS.
+Point samples and interpolation neighbors wrap by the source's longitude period. Area methods
+and `sum` include both stored edges when a footprint crosses that cut, including a cut at 0°.
+This does not wrap latitude or extend a regional source beyond its right edge.
+Interpolation halos are periodic too. A coarse bilinear filter accumulates the weights of
+every periodic image inside its support; it does not clip the filter at the stored cut.
+This source-extension rule applies under both grid policies and can differ from GDAL's
+finite-edge clipping for coarse global filters.
+
+Regional geographic sources also accept a longitude a whole turn away when it falls inside
+their stored columns. A source from 160° E to 200° E therefore covers 180° to 160° W.
+The shift uses the CRS's angular period, rather than the regional raster's width. A source
+ending at 180° E keeps its excluded right edge; a source starting at 180° W owns that meridian.
+A nearly full world keeps its actual uncovered gap, including when cell sizes are rounded.
+These rules apply to point samples and area footprints under both grid policies. They do not
+make regional interpolation halos periodic or change placement of sources wider than a turn.
+
+The geographic area kernels described above bound all their polygonal footprints
+before reading source data. For other kernels, the window holds the footprints
+of its chunk unless a strongly curved
+transformation takes one past the points the window is sampled from: such a footprint is shortened,
+and its pixel can then differ with the chunks the warp splits the output grid into.
+With chunk-dependent sampling, the sampled source window can also omit one side of an
+antimeridian-crossing footprint; default stable sampling avoids that window-selection gap.
+With chunk-dependent sampling, the source window of a kernel other than `sum` also reaches a pole
+of the source's CRS that lies inside or beside its chunk, which the points sampled along the
+chunk's edges do not bound.
+For a source wider than one longitude turn, repeated longitudes are read at the single placement
+with the greatest overlap. If no single placement covers the footprint, the part beyond the
+other edge is omitted. Covering that remainder without counting repeated longitudes twice is
+tracked in [#884](https://github.com/opengeos/terrio/issues/884).
+
 ### Warp source overviews
 
 ```sh
@@ -1007,6 +1171,60 @@ Overview selection changes which stored pixels are resampled; the final grid rem
 based on the full-resolution source. Use `NONE` when the source pyramids were built
 with a filter unsuitable for the analysis. Mosaics select a level independently for
 each source. GCP/RPC transformations retain their full-resolution coordinate meaning.
+
+With `-r sum`, an overview has one pixel per block of the source's pixels, which counts for
+the source pixels it stands for, `(W / w) × (H / h)` for a `w × h` overview of a `W × H`
+source (exact ratios), so that the sum estimates the source's total at the overview's cost:
+`AUTO`, `AUTO-n` and `--overview n` read an overview so, and `--overview NONE` sums the full
+resolution exactly. The estimate is the exact total, up to floating-point rounding, where the
+overview holds the means of the pixels it covers (an `average` overview of a floating-point
+source without nodata), when the requested footprint covers complete overview cells. A crop
+through overview cells makes even the total approximate: a 2 × 2 block [100, 0; 0, 0] has mean
+25, so a crop containing only the 100-valued source pixel estimates 25 instead of 100 from that
+overview. It is also approximate where those means were rounded to an integer type,
+where a block is partly nodata (its mean counts for the whole block, so the estimate exceeds
+the sum of the valid pixels there; a block wholly nodata stays nodata), and where the overview
+was resampled otherwise than by average (a `nearest` overview gives an estimate from a sample of
+the pixels). Per output pixel, it is approximate where an output pixel cuts overview pixels,
+whose values it shares by area. Over 256 × 256 outputs of a 16384 × 16384 raster with average
+overviews, at 16, 32 and 64 times its pixel size, the totals were within 2 × 10⁻⁷ of the source's
+for Float32 and Float64 data, 0.4% to 0.6% above them for UInt16 data, whose averages are
+rounded at each level, and 1.4% to 2.6% above them for Float32 data 7% nodata, in two corners
+and in holes 40 pixels wide. These measurements are not an error bound: nodata holes smaller
+than an overview cell can disappear into its valid-pixel mean. For example, a block with one
+valid value 100 and three nodata pixels has mean 100; counting it over the whole block
+estimates 400 instead of the valid total 100. An internal mask has the same limitation when
+its overview records only valid/invalid, without the fraction of valid source pixels.
+
+For nonnegative data and complete overview cells holding exact area-weighted valid-pixel
+means (without integer rounding), the excess is each partly valid cell's mean times the
+area of its invalid portions in source-pixel units, summed over those cells. With a constant positive valid value
+and invalid fraction `p` entirely in partly valid cells, the estimate is `1 / (1 - p)`
+times the valid total: 7.9% nodata can give about 8.6% excess relative to that total.
+Variable values, integer rounding and cropped cells prevent treating the nodata fraction
+alone as a general bound. A separate 4096 × 4096 Float32 example in
+[#707](https://github.com/opengeos/terrio/issues/707), with 7.9% nodata in corners and
+40-pixel holes, overcounts by 7.1% at ×64, but only 0.03% at ×8, where the holes align
+with complete overview cells. Overview sums can also mark output pixels valid where
+full-resolution sums have no valid source contribution. Choose a finer stored level with
+`--overview n` (zero is the first and finest overview), or `AUTO-n`, which can reduce this effect.
+The improvement is not monotonic for variable values and independently built overviews.
+Use `--overview NONE` when valid totals and full-resolution nodata coverage are
+required.
+
+A sum outgrows small integer types: a `UInt16` output stores 65535
+for any larger sum, so give a coarse `sum` `--ot Float32` or `--ot Float64`.
+
+A `sum` of one source without a cutline holds the source window of an output chunk, which the
+warp's working memory (64 MiB) bounds: a coarse output, such as `--ts 1 1`, is a chunk too small
+to split, whose window, often the whole source, is read and summed a strip of rows at a time,
+with the same output. A strip holds as many rows as the working memory does, at least one, and
+the next strip is read while one is summed, so two are held at once. A `sum` with several
+sources or a cutline holds every source (or the overview read) whole. Either way, the shares of
+each output pixel's footprint are computed a few rows at a time. When the source pixels a `sum`
+would hold at once (4 bytes per pixel for one Float32 band) exceed 4 GiB, the `sum` is refused
+before its source is read; set `TERRIO_WARP_SUM_MAX_BYTES` to a positive integer byte count to
+change the budget, or sum a level with `--overview n`. Invalid settings are argument errors.
 
 Forced GCP overviews can give slightly different automatically suggested bounds than GDAL,
 which refits GCPs at the selected resolution. Specify `--te` and `--ts` for an identical
@@ -1069,12 +1287,63 @@ datum transformations change them, as GDAL does after `PromoteTo3D` on both CRSs
 Point-cloud reprojection currently rejects `--ct-opt` because it does not support
 these controls.
 
+Warp sampling defaults to a grid-invariant policy: aligned tiles, VRT windows and
+memory chunks use the same coordinate approximation spans and local kernel footprints.
+This applies to all resamplers, including with the default approximation threshold.
+It changes values where GDAL's chunk-dependent approximation or kernel scales would
+change them. It does not promise pixel-identical results with GDAL's default warper.
+The shared warper also uses this default for reprojection inside tiles, retile,
+mosaic, catalogs and update operations. Those paths use `TERRIO_WARP_GRID=GDAL`
+to select the historical sampling policy.
+
+Stable sampling spends additional CPU on local source-support planning. It recomputes
+bounded row scratch rather than retaining a scale matrix for a whole working chunk.
+For a 3612×3612 USGS DEM reprojected to 3121×4044 Float64 Web Mercator pixels,
+reading all 208 windows of up to 256×256 pixels through `WarpedVRT` took median
+process CPU times of 4.61 s stable versus 1.60 s reproduction for bilinear, and
+4.17/1.74 s for cubic. These are single-thread optimized local measurements at
+approximation threshold 0.125, after one warmup and over three measured runs;
+other grids, kernels and storage can have different costs.
+
 GDAL 3.13 changed warp kernel scales and the bilinear/cubic downsampling threshold.
-Use `warp --kernel-version 3.13` to reproduce that behavior. The default `3.12`
-retains Terrio's earlier results and the repository's GDAL 3.12 conformance baseline.
-Both modes keep lazy window/overview reads. Versioned kernels and explicit
-coordinate-operation policies currently require materialized output rather than
-serialized warped VRTs.
+`warp --kernel-version 3.13` selects that arithmetic; without the option, warp follows
+`TERRIO_GDAL_COMPAT` (`3.12` or `3.13`), else `3.12`. To reproduce the corresponding
+GDAL chunk-dependent sampling, also pass `--grid-invariant false`, or set
+`TERRIO_WARP_GRID=GDAL`. An explicit `--grid-invariant true` overrides that setting.
+Terrio's chunk-dependent source windows of kernels other than `sum` also reach a pole of the
+source's CRS inside or beside their chunk, which the points sampled along the chunk's edges do not
+bound, so that a grid holding a pole is written up to it. Values in such a chunk can therefore
+differ from those of a window bounded by those points alone.
+Both kernel-version selectors apply Terrio's periodic global-source boundaries and the
+pole-window extension described above; these policies can differ from GDAL's finite-edge
+or edge-only window planning even with chunk-dependent sampling selected.
+Both policies retain lazy window/overview reads. Python's `warp` and `WarpedVRT`
+accept `grid_invariant=True|False`; JavaScript's `warp` accepts `gridInvariant`.
+
+A serialized warped VRT uses the reader's configured kernel version and grid policy.
+VRT creation rejects per-call policies that differ from the current configuration.
+Materialize output to preserve those choices across readers with different settings.
+The native `TERRIO_WARP_GRID` selector accepts `GDAL` or `STABLE`, ignoring case;
+an unknown value records a warning and selects stable sampling.
+
+`TERRIO_GDAL_COMPAT=3.13` reproduces the other GDAL 3.13 behaviors terrio follows
+where releases differ:
+
+- warp working types start from the source's type (an Int8 source stays Int8);
+- resampled reads and overviews give NaN pixels of masked floating-point chunks no weight;
+- netCDF rows follow the `GDAL` global attribute when a `GeoTransform` agrees with the
+  coordinates;
+- the WebP driver's refusal of non-Byte data uses GDAL 3.13's wording;
+- the Python rasterio and pyogrio compatibility layers report `LAYOUT=COG` for COG-shaped
+  TIFFs opened read-only and write GeoJSON features without spaces.
+
+Terrain arithmetic (`dem --kernel-version`) stays explicit: its 3.13 profile covers slope
+and standard hillshade only.
+
+Every netCDF file terrio writes, whatever `TERRIO_GDAL_COMPAT` is, carries a `GDAL` global
+attribute (`GDAL 3.12 conventions, written by terrio`) declaring GDAL's row order (south to
+north under a north-up `GeoTransform`): GDAL 3.13 reads the rows of a file without it upside
+down, and GDAL 3.12 reads the file as before.
 
 GeoTIFF and COG translation and warping preserve `AREA_OR_POINT=Point`, including
 point tie points and rotated affine transforms, without moving pixel corners.
@@ -1116,7 +1385,21 @@ terrio mosaic @filelist.txt OUTPUT [options]    # inputs listed in a file, one p
 
 `--resolution highest|lowest|average|user`, `--tr`, `--te`, `--tap`, `--separate`, `-b`,
 `--nodata`, `--srcnodata`, `--dstnodata`, `-r`, `--t-srs`. A `.vrt` output writes a GDAL VRT that
-references the inputs; other outputs hold the mosaicked pixels.
+references the inputs; other outputs hold the mosaicked pixels. Each input is its whole raster
+(`SrcRect`), placed where it falls on the mosaic's grid (`DstRect`), past the mosaic's edges where
+the input extends past them, so that a resampling kernel at the edges of a `--te` extent still reads
+the input's pixels beyond it.
+
+Local inputs are read in place, not copied. A COG written a strip at a time keeps its compressed tiles in unnamed
+temporary files next to the output until it is laid out, as GDAL's COG driver does, so these tile
+spools need no space on the system drive. The output's drive needs room for them, about the size
+of the COG, as well as the COG while it is written, and a slow or network drive writes them at its
+speed. `TERRIO_TMPDIR` (or `CPL_TMPDIR`) names another directory for them. An output through a
+symbolic link, or a `/dev/stdout` redirected to a file, spools beside the file it names; a pipe or
+device spools in the system's temporary directory. Other temporary storage still uses the system's
+temporary directory: zip members extracted to be read and remote inputs downloaded whole.
+The spool directory must be writable even when replacing an existing writable output file;
+choose an override directory when the output directory does not permit creating files.
 
 A GeoTIFF or COG output is written a strip of rows at a time, and its inputs read by window: the
 output is the mosaic computed in memory, bit for bit. Inputs in the output's CRS and resolution,
@@ -1148,6 +1431,17 @@ a `.aux.xml` sidecar when nodata differs between bands or a Float32 nodata
 value needs its original double precision; keep that sidecar with the TIFF. A standalone TIFF byte buffer has only the shared embedded nodata tag.
 Raster creation options (compression, tiles, masks, overviews and metadata overrides)
 are rejected for a serialized warp; set the warp grid through the warp options.
+With `sum`, each output pixel is the sum of the valid source pixels it overlaps,
+each weighted by the share of its area inside the output pixel, so that a grid
+covering the source keeps its total, up to floating-point rounding, in a
+floating-point output; an integer output also rounds each pixel to a whole number
+and clamps it to its type's range (a Byte output stores 255 for a sum of 400).
+A `sum` whose source dataset is opened at an overview level (`OVERVIEW_LEVEL`, which
+`terrio warp` writes for the overview it reads) counts each of its pixels for the source
+pixels it stands for, as `terrio warp -r sum` counts the overview it reads.
+Its memory budget is that of `terrio warp -r sum` (`TERRIO_WARP_SUM_MAX_BYTES`), and a
+window converted to another working type counts what the conversion holds at once: the
+window in its source type, as f64 values and, unless that type is Float64, in the working type.
 GDAL 3.12's generic `sum` polygon path can lose overlap area on pixel boundaries,
 including when a redundant identity CRS transformer disables its affine fast path.
 Terrio preserves conservative affine overlap sums; its results match GDAL's affine
@@ -1172,6 +1466,31 @@ can be larger odd squares, matching GDAL. Their work per pixel grows with the
 number of coefficients. Explicit dataset masks, `SourceBand mask,N`
 and `ComplexSource` with `UseMaskBand` are read lazily.
 
+A source reads only the pixels that meet its `SrcRect` and writes only inside its `DstRect`,
+whatever their offsets. Its window is copied one for one only at the same scale and on whole-pixel
+offsets; otherwise it is resampled by the source's method, `nearest` taking the pixel nearest each
+output pixel's centre (`terrio mosaic` writes fractional offsets when its grid is a fraction of a
+pixel off a source's). A method sampling a point (`nearest`, `bilinear`, `cubic`, `cubicspline`,
+`lanczos`) writes an output pixel only if its centre is inside the `DstRect`, its kernel weighted
+over the pixels that meet the `SrcRect`, as at the source's edge. An area method (`average`, `rms`,
+`mode`, `min`, `max`, `med`, `q1`, `q3`, `sum`) gives an output pixel partly inside the `DstRect`
+the part of the source inside it, so a `sum` source adds its `SrcRect`'s total, a pixel cut by its
+edges counted for its part inside. A `KernelFilteredSource` filters its band before the window is
+taken: its kernel reads the pixels around the `SrcRect`.
+
+A VRT has the overviews of its first source (the first source of the first band that has one), at
+the VRT's own scale, so a reduced read of it (`terrio translate --outsize`, `terrio warp` with
+`--overview AUTO`, `read_resampled` and `out_shape` in Python) reads its sources' overviews rather
+than their full resolution. An overview of the VRT reads each source from the source's own
+overview of the same scale, with its `SrcRect` and `DstRect` scaled to it. A source without one is
+read from its nearest finer level, full resolution at worst, and its method resamples that to the
+VRT's level, so it costs a finer read; a mosaic whose sources share their overviews reads each
+from its own. The first source alone is opened to list the overviews, for its header; a read opens
+the sources in its window. A VRT with a `KernelFilteredSource`, whose kernel spans full-resolution
+pixels, has none, nor have warped and pansharpened VRTs. The listing is fixed for the lifetime
+of the open VRT, including an empty listing if its first source cannot be opened. After a
+transient source failure, reopen the VRT to discover its overviews.
+
 Mixed native band types use a common numeric buffer selected with GDAL-style
 `DataTypeUnion` promotion, preserving Float64 precision. Plain and derived bands
 round to their declared type before entering that buffer. A selected lazy band
@@ -1184,14 +1503,22 @@ alone converts to its native integer type. Python GDAL's default `ReadAsArray`
 chooses Float32 for any mixed dataset; use its explicit `buf_type` argument to
 compare a promoted Float64 buffer.
 
-VRT references use the caller’s normal file and network access. Supplied source maps
-override matching names; unresolved names are opened by the usual drivers.
+VRT files opened by path use the caller’s normal file and network access.
+Python `open_vrt(xml, sources)`, JavaScript `openVrt`, and Rust `into_lazy`
+require every source reference, including masks and RPC DEMs, in the supplied map.
+Missing entries are refused before source reads. Map keys match stored references
+exactly; Python map values may explicitly authorize paths or supply bytes.
+A supplied VRT document is resolved against the same map (Rust
+`VirtualRaster::open_supplied`); supplied STAC, STACTA and STACIT documents are
+refused, because they name further datasets.
 For heterogeneous plain/derived bands, a shared buffer uses the common numeric
 type needed by its requested bands. Each band's declared rounding is retained;
 a leading Byte band does not truncate later floating-point bands.
 
 The Rust `VirtualRaster` API parses and serializes these descriptions. Its
-`into_lazy` source map also permits filesystem-free reads in WebAssembly.
+`into_lazy` source map supports filesystem-free reads in WebAssembly. Rust callers
+that deliberately trust an XML description can opt into `into_lazy_with_files`
+to resolve missing map entries against the filesystem or network.
 
 Warped VRT block evaluation is limited to 8,388,608 samples across all bands per
 declared block. Larger blocks return an unsupported error, including for small
@@ -1213,9 +1540,18 @@ terrio update-raster replacement.tif filled.tif --resampling bilinear
 terrio overviews filled.tif --clean
 ```
 
-Overview methods are nearest, average, min, max and mode. Existing unrequested
+`edit-raster` also sets the georeferencing with `--crs`, `--bbox`, `--geotransform` (six
+comma-separated values, GDAL's `-a_gt`) or a repeatable `--gcp pixel,line,x,y[,z]`, and removes
+values with `--unset-nodata`, `--unset-metadata KEY` (repeatable), `--unset-all-metadata`
+(`-unsetmd`) and `--unset-stats`. `--approx-stats` stores statistics computed from an overview or
+sampled blocks rather than every pixel, and `--hist` stores histograms.
+
+Overview methods are nearest, average, min, max and mode. Without factors or `--levels`, automatic
+levels stop at the first overview that fits in `--min-size` pixels (256). Existing unrequested
 levels are retained. `--external` manages the supplied filename's `.ovr` sidecar,
-including when that filename is a symlink. Explicit compression applies to
+including when that filename is a symlink, and reads that `.ovr` under
+`TERRIO_DISABLE_READDIR_ON_OPEN=EMPTY_DIR` too, where other opens do not (the `.msk`, `.aux.xml`
+and `.ovr.msk` beside the GeoTIFF still follow the option). Explicit compression applies to
 requested rebuilt levels. Updates retain destination pixels outside valid source
 coverage and refresh affected overviews unless `--no-update-overviews` is set.
 Georeferencing moves change the affine transform and CRS without resampling;
@@ -1224,7 +1560,10 @@ A raster without a geotransform of its own (unreferenced, or georeferenced by
 ground control points) cannot be moved. With `--like`, a template without a
 geotransform gives its GCPs, or no georeferencing, instead of a unit-pixel grid.
 
-In-place operations require writable little-endian GeoTIFFs. Updating a COG
+In-place operations require writable little-endian GeoTIFFs. `overviews --external` writes only
+the `.ovr` sidecar, so the GeoTIFF may be read-only, as with `gdaladdo -ro`; its directory must be
+writable. A new sidecar is a BigTIFF when its images take more than about 4 GiB, and an
+existing classic TIFF sidecar that would grow past 4 GiB is refused. Updating a COG
 requires `--ignore-cog-layout-break` and can invalidate its optimized layout.
 Edits use a temporary file and rename; a failure before replacement preserves
 the original. A tag of a field type the TIFF specification does not define is
@@ -1366,7 +1705,10 @@ omits the suffix. `--source-layer-name` and zero-based `--source-layer-index` ar
 repeatable and select their union across all inputs without renumbering layers.
 A selector absent from one input is allowed; absence from every input is an error. Different
 vector schemas/CRSs are skipped with warnings unless accepted with the corresponding
-flags; an explicit `--output-crs` reprojects corners. Empty vector layers are skipped.
+flags (`--accept-different-schemas`, `--accept-different-crs`); an explicit `--output-crs`
+reprojects corners. Empty vector layers are skipped. `--min-pixel-size` and `--max-pixel-size` on
+`raster-index` and `gti-create` skip sources whose pixel size, `sqrt(envelope area / pixel count)`
+in index coordinates, falls outside the range.
 
 Inputs can be files, local directories, explicitly slash-terminated VSI directories,
 or `@FILE` lists. Directory scanning supports `--recursive` and repeatable case-sensitive
@@ -1451,17 +1793,23 @@ longitude/latitude with two columns at zoom zero, and `--tiling-scheme raster`
 retains a north-up source grid. `--convention tms` reverses filename rows while
 retaining the same pixel grids. `--tile-size`, `--min-zoom`, `--max-zoom` and
 `--min-x/--max-x/--min-y/--max-y` restrict generation. Coordinate restrictions
-use top-origin coordinates at the maximum zoom, including with TMS filenames.
+use top-origin coordinates at the maximum zoom, including with TMS filenames. Restrictions that do
+not intersect the input are an error unless `--no-intersection-ok` allows an empty result.
 
 ```sh
 terrio tile rgb.tif tiles --min-zoom 5 --max-zoom 8 --resampling nearest
 terrio tile dem.tif dem-tiles --tiling-scheme raster --format GTiff --tile-size 512
 terrio tile rgb.tif tiles --resume
 terrio tile rgb.tif ignored --dry-run
+terrio mosaic --nodata 0 @files.txt mosaic.vrt
+terrio tile mosaic.vrt tiles --format WEBP --min-zoom 0 --max-zoom 18 --convention tms
 ```
 
-PNG requires Byte gray/RGB/palette input, optionally with alpha; scale other
-inputs first, or select `--format GTiff` to retain their types and bands.
+PNG and WebP (`--format WEBP`, lossless) require Byte gray/RGB/palette input,
+optionally with alpha; scale other inputs first, or select `--format GTiff` to
+retain their types and bands. WebP stores gray tiles as RGB, and omits the alpha
+band of a fully opaque tile, so `--add-alpha` is refused with WebP. KML publication refuses
+WebP tiles, which Google Earth ground overlays do not display.
 PNG tiles get alpha for nodata, dataset masks and padded edges. Each color
 channel's nodata is excluded before interpolation; the pixel remains opaque when
 other channels are valid. GeoTIFF outputs without alpha retain dataset masks and
@@ -1500,13 +1848,27 @@ alpha fractions are retained in typed GeoTIFF tiles; GDAL 3.13.3's tile writer
 can quantize such alpha samples to integers.
 
 Maximum-zoom resampling defaults to cubic; `--overview-resampling` selects the
-method at lower zooms. Every zoom is rendered directly from the source (using
-its stored overviews when appropriate), rather than downsampling previously
-encoded tiles. This can differ from GDAL's generated-image pyramid. Image/alpha
+method at lower zooms. The maximum zoom is rendered from the source, and by
+default (`--overview-source tiles`) each lower-zoom tile resamples the four tiles
+below it, as GDAL builds its overview tiles. Tiles are generated depth first, so
+at most four tiles per zoom level are held in memory, and every source window is
+the size of one maximum-zoom tile: a mosaic without overviews (such as a VRT of
+thousands of files) can be tiled from zoom 0. The exception is a resumed run that
+rebuilds a missing parent from the source (see `--resume` below), whose window
+is the parent's full footprint. A tile at a resampling-kernel's
+edge sees only its four children, not their neighbors. Children outside the plan
+count as invalid, including those that `--min-x/--max-x/--min-y/--max-y` exclude, so a
+parent straddling a coordinate limit is partly transparent, as in GDAL; select
+`--overview-source source` to render such parents from the full source. `--overview-source source`
+renders every zoom directly from the source (using its stored overviews when
+appropriate), whose source windows grow fourfold per zoom level without
+overviews and can exceed the 64 MiB window budget. Image/alpha
 tiles support nearest, bilinear, cubic, cubicspline, lanczos and average;
 plain GeoTIFF tiles also support the warp engine's statistical methods.
 Interpolating kernels use premultiplied alpha; exact GDAL agreement is currently
-validated for nearest-neighbor tiling. Affine georeferencing is required;
+validated for nearest-neighbor tiling, including pyramids built from tiles. With
+bilinear resampling, lower zooms built from tiles differ from GDAL 3.13.3's by up
+to a few levels on some pixels. Affine georeferencing is required;
 global schemes also require a known source CRS;
 image/alpha tiles refuse Int64/UInt64 input to avoid float conversion losses;
 additional GDAL matrix sets are not currently implemented. Publication companions
@@ -1533,6 +1895,11 @@ filesystem confinement. Atomic publication requires hard-link support on the
 output filesystem; unsupported filesystems return an I/O error. File contents
 are synced before publication; power-loss durability of directory entries is
 not guaranteed.
+
+On resume, tiles missing below an existing tile are filled too. A missing
+lower-zoom tile is rebuilt from the existing tiles below it (decoded from their
+files), or from the source when their files do not record which pixels are valid:
+tiles without alpha, including plain GeoTIFF tiles, whose padding is not data.
 
 Directory writes require a native filesystem; WebAssembly callers use the
 incremental tile sink instead. The command is also the MCP `tile` tool. Rust callers use
@@ -1564,9 +1931,9 @@ terrio tile input.tif published --webviewer all --kml \
 
 `--webviewer` accepts `none` (default), `all`, `leaflet`, `openlayers`, `mapml`
 or `stac`. `all` selects the companions applicable to the chosen grid. Leaflet
-requires a global PNG grid; OpenLayers supports PNG grids, including raster
+requires a global PNG or WebP grid; OpenLayers supports PNG and WebP grids, including raster
 grids with unequal X/Y resolution. MapML requires global XYZ tiles. STACTA
-(`stacta.json`) requires XYZ, a known CRS, square pixels and blank tiles retained, and can be reopened
+(`stacta.json`) requires XYZ, a known CRS, square pixels, blank tiles retained and PNG or GTiff tiles, and can be reopened
 as a raster. Leaflet/OpenLayers pages fetch pinned public library distributions.
 Serve the generated directory over HTTP to view it in a browser.
 
@@ -1861,7 +2228,9 @@ terrio reclassify dem.tif zones.tif -m "NO_DATA=0;[0,1500)=1;[1500,inf)=2" --ot 
 terrio reclassify nlcd.tif groups.tif -m @mapping.txt
 ```
 
-As `gdal raster reclassify`, with GDAL's mapping syntax: `from=to` entries separated by `;`.
+Mapping files must be regular files; directories, FIFOs and pipe-based process substitution are refused.
+
+As `gdal raster reclassify`, with GDAL's mapping syntax in `-m`/`--mapping`: `from=to` entries separated by `;`.
 `from` is a value, an interval (`[a,b)`, `(a,b]`, `(-inf,b]`, `[a,inf)`...), `NO_DATA` (the
 band's nodata value), `NAN` or `DEFAULT` (any other value); `to` is a value, `NO_DATA` or
 `PASS_THROUGH` (the value unchanged). Intervals must not overlap. `@file` reads one entry per
@@ -2077,7 +2446,7 @@ terrio pansharpen pan.tif rgbnir.tif rgb.tif --band 1 --band 2 --band 3 --bitdep
 ```
 
 GDAL-compatible weighted Brovey: `spectral * pan / sum(weight * spectral)` at the pan
-resolution. Inputs must have the same CRS (or all omit it) and north-up geotransforms. Spectral inputs may
+resolution. `--pan-band` picks the panchromatic file's band (1). Inputs must have the same CRS (or all omit it) and north-up geotransforms. Spectral inputs may
 be multiband files or `PATH,band=N`; `--band` selects/reorders outputs in their flattened
 input order. Every spectral input contributes intensity, including unselected output bands.
 Weights default to equal weights and are used as provided, without normalization.
@@ -2125,9 +2494,9 @@ terrio dem MODE INPUT [COLOR_FILE] OUTPUT [options]
 `MODE` is `hillshade`, `slope`, `aspect`, `color-relief` (which takes a color file), `TRI`, `TPI`
 or `roughness`. The additional `shaded-relief` mode takes a color file and combines color
 relief and hillshade in one pass. Options: `-b`, `--compute-edges`, `--alg Horn|ZevenbergenThorne` (hillshade,
-slope, aspect) or `--alg Riley|Wilson` (TRI); for hillshade `-z`, `-s` (`111120` for a geographic
+slope, aspect) or `--alg Riley|Wilson` (TRI); for hillshade `-z`/`--z-factor`, `-s` (`111120` for a geographic
 DEM in metres), `--xscale`/`--yscale`, `--az`, `--alt`, `--combined`, `--multidirectional`,
-`--igor`; `-p` (slope in percent); `--trigonometric`, `--zero-for-flat` (aspect); `--alpha`,
+`--igor`; `-p`/`--percent` (slope in percent); `--trigonometric`, `--zero-for-flat` (aspect); `--alpha`,
 `--exact-color-entry`, `--nearest-color-entry` (color relief). Without `-s`, geographic DEMs are
 scaled from the ellipsoid at their centre latitude, as `gdaldem` does since GDAL 3.11. Color files
 are GDAL's: `value R G B [A]` or `value colorname [A]`, where the value may be `nv` (the nodata
@@ -2167,6 +2536,7 @@ products. Shaded relief cannot be written as a VRT.
 ```sh
 terrio viewshed dem_utm.tif visible.tif --ox 500000 --oy 4400000 --oz 2 --tz 0 --md 5000
 terrio viewshed dem_utm.tif height.tif --ox 500000 --oy 4400000 --om GROUND --cc 0
+terrio viewshed dem_utm.tif cumulative.tif --om ACCUM --os 10
 ```
 
 Single-observer viewshed using GDAL's default edge recurrence. `--om NORMAL` produces Byte
@@ -2186,8 +2556,24 @@ coefficient, equal to 1 minus the atmospheric refraction coefficient: 0 gives a 
 
 Like GDAL, numeric nodata values are treated as elevations and masks are ignored; this can
 produce misleading occlusion. Nonfinite elevations in the processed rectangle produce an
-error. Fill or crop missing elevations before use. Output has no nodata marker. Cumulative
-visibility is not supported. The command is also an MCP tool.
+error. Fill or crop missing elevations before use. Output has no nodata marker. The command
+is also an MCP tool.
+
+`--om ACCUM` places observers at pixel (0, 0), then every `--os` pixels along both
+axes (default 10; must be positive). Observer coordinates are ignored and may be omitted.
+The output covers the complete DEM; `--md` must be zero, as GDAL disallows a
+maximum distance in cumulative mode. Each visible pixel contributes 1 and each hidden
+pixel 0. The sums
+are normalized to Byte with `floor((255 / maximum_sum) * sum)`, matching GDAL 3.13.3.
+Binary64 rounding can map the maximum to 254 (for example, when the maximum count
+is 25); the formula is retained for reference agreement.
+Observer and target heights apply to every observer. Curvature is disabled in ACCUM,
+including when `--cc` is supplied: GDAL 3.13.3 computes cumulative viewsheds in
+temporary rasters without a CRS, so its curvature adjustment is zero. Terrio matches
+that behavior; single-observer modes still apply curvature. Terrio honors `--band`;
+GDAL 3.13.3 cumulative mode always reads band 1. Execution is sequential and uses
+O(pixels) working memory; runtime grows with observers × pixels. Use wider spacing
+or crop the DEM for large inputs. Counter overflow is rejected before computation.
 
 Terrio applies the radius mask deterministically. GDAL 3.12 can race its left/right row jobs
 for an outside observer, occasionally leaving an out-of-range boundary pixel visible. The
@@ -2314,7 +2700,7 @@ as GDAL's NumPy conversion does.
 ```sh
 terrio sample sites.gpkg samples.gpkg --raster dem.tif --raster rain.tif
 terrio sample sites.gpkg samples.gpkg --raster image.tif --band 1,2,3 --prefix image
-terrio point-sample sites.gpkg samples.gpkg --raster dem.tif --raster rain.tif \
+terrio sample sites.gpkg samples.gpkg --raster dem.tif --raster rain.tif \
   --t-srs EPSG:3857 --decimal-places 2
 ```
 
@@ -2372,21 +2758,51 @@ terrio zonal-stats counties.gpkg stats.gpkg --raster image.tif --band 1,2 --pref
   --stats count,min,max,mean,sum,stddev,median --all-touched
 terrio zonal-stats counties.gpkg stats.gpkg --raster dem.tif \
   --t-srs EPSG:3857 --decimal-places 2
+terrio zonal-stats fields.gpkg stats.fgb --inputs s2.csv \
+  --stats count,mean,stddev,quantile_25,median,quantile_75,mode
+```
+
+`s2.csv` labels each input with a date and band, as Sentinel-2 assets (one single-band COG per
+band and date) need:
+
+```text
+path,time,label
+s3://bucket/S2A_20240701/B04.tif,2024-07-01,B04
+s3://bucket/S2A_20240701/B08.tif,2024-07-01,B08
+s3://bucket/S2B_20240711/B04.tif,2024-07-11,B04
 ```
 
 `zonal-stats` (alias `zonal`) adds statistics independently for each polygon or multipolygon.
-Repeat `--raster` for multiple rasters and use `--band` for comma-separated bands from each.
-Default statistics are `count,min,max,mean,sum,stddev`; `median` is available explicitly.
-Standard deviation uses the population definition. Fields are `FILE_STEM_bN_STATISTIC`, or
-`PREFIX_bN_STATISTIC` when one `--prefix` is supplied per raster. Name collisions get `_2`,
-`_3`, etc. `count` is an integer; the other statistics use 64-bit floats.
+Repeat `--raster` for multiple rasters (or give `--raster @FILE`, a list of paths one per line)
+and use `--band` for comma-separated bands from each. `--inputs FILE` reads a CSV table with a
+header: `path` (required), and optional `time`, `label` and `band` (a band number; by default
+each `--band`); quote fields that contain commas (RFC 4180 quoting; a row with more fields than
+the header is an error). Table rows naming the same path (as written) share one source, which a
+`--raster` of that path also joins; a `--raster` given twice is two sources. A source is read
+again for each band group (see the memory notes below). Over MCP, `--inputs` tables and `@FILE`
+lists are refused: pass each raster as a `--raster` argument (labelled rows are not available
+there).
+Default statistics are `count,min,max,mean,sum,stddev`. Also available: `variance`, `cv`
+(standard deviation over mean, null when the mean is 0), `median`, `quantile_P` for a
+percentage P from 0 to 100 (`quantile_25`, `quantile_2.5`), `mode` (alias `majority`: the value
+covering most of the zone, ties to the larger value), `minority` (ties to the smaller value)
+and `variety` (the number of distinct values). Quantiles interpolate linearly between the
+closest ranks, as numpy's default, so `quantile_50` equals `median`. Standard deviation and
+variance use the population definition. Fields are `FILE_STEM_bN_STATISTIC`,
+`PREFIX_bN_STATISTIC` when one `--prefix` is supplied per raster, or `TIME_LABEL_STATISTIC`
+for labelled `--inputs` rows (characters other than letters, digits and `_` become `_`:
+`2024_07_01_B04_mean`); a labelled row without `band` that takes several `--band` names each
+`TIME_LABEL_bN_STATISTIC`. Name collisions get `_2`, `_3`, etc. `count` and `variety` are
+integers; the other statistics use 64-bit floats. GeoPackage tables hold at most 2000 columns:
+a request that would exceed it fails before reading rasters; write FlatGeobuf or Parquet for
+more.
 
 By default, a pixel contributes when its centre lies in the zone, following GDAL's rasterization
 boundary rules. `--all-touched` includes every touched pixel. Holes are excluded. Overlapping
 zones are evaluated independently, so a pixel can contribute to multiple zones. Declared nodata
 and non-finite values are excluded; alpha bands and external masks are not applied implicitly.
 With no valid contributing pixels, including null/empty geometries and zones outside the raster,
-`count` is 0 and every other statistic is null. Source geometry, Z/M, attributes and CRS remain
+`count` and `variety` are 0 and every other statistic is null. Source geometry, Z/M, attributes and CRS remain
 unchanged by default. All non-null geometries must be polygons or multipolygons.
 
 `--t-srs CRS` reprojects output zones after statistics are computed, so it does not change
@@ -2400,10 +2816,84 @@ are subject to floating-point representation. For point inputs, use `sample`/`po
 Rasters may use different resolutions, CRSs, rotated grids or south-up grids. Boundaries are
 transformed for each raster; a boundary transformation failure is an error. Missing CRSs are
 accepted only when both the zones and the raster have no CRS. Reprojection transforms stored
-vertices without densifying curved edges. The rasters are loaded into memory; masks cover only
-each zone's intersecting window and are shared by requested bands of the same raster. Median
-needs extra memory for a zone's contributing values. Integers above 2⁵³ can lose precision.
+vertices without densifying curved edges. Zones are computed once per distinct grid (size,
+geotransform and CRS) and shared by every raster on it, so many dates of one Sentinel-2 tile
+cost one zone computation per resolution. Rasters are read lazily, local or remote, in strips of
+block rows (about 8 MB of values), only the strips that zones cover, each over the columns from
+its leftmost to its rightmost zone pixel; rasters are
+processed in parallel (`RAYON_NUM_THREADS` sets the number of threads). Memory follows the
+strip size and the number of threads, not the raster size: each raster being reduced holds up
+to five strips of about 8 MB of its bands, or of a whole row of blocks when that is larger (a
+row of 1024-row blocks of ten UInt16 bands 10,980 columns wide is 225 MB), and one raster is
+reduced per thread. Median, quantiles, mode, minority and variety also keep each zone's values
+from the strip of its first row to that of its last: 8 bytes per pixel and band (16 with
+`--fractional`), and while a zone finishes, one band's values binned by value (16 bytes per
+distinct value, or per pixel with `--fractional`, plus 8 for the ranks of a binary median or
+quantile). Of an 8- or 16-bit integer band, a zone of at least as many pixels as the type has
+values (256 or 65,536) counts them in a histogram (2 or 512 KiB) instead, so all the bands of such a raster
+are usually reduced at once. Results are the same, but with `--fractional`: such a zone sums its
+coverages in another order, so their rounding can change its quantiles in the last digits, or which
+of two values whose coverage sums tie within rounding is its mode or minority.
+The rasters reduced at once keep at most 1 GiB of values together: a
+raster's bands are reduced in groups that fit, one band at a time when one band's take more (a
+zone covering a whole multi-band float raster), each group reading the raster again, and a group
+waits while others hold the budget. The zones of each grid are held as
+spans of covered pixels until every raster is reduced: 24 bytes per covered run of a row,
+and per partially covered cell with `--fractional`. Building a zone takes a mask of its bounding
+box for a moment, a byte per pixel (8 with `--fractional`). Integers above 2⁵³ can lose precision.
 Complex bands and geolocation arrays are unsupported. Standard vector input/output options apply.
+
+### Fractional coverage and weighting rasters
+
+```sh
+terrio zonal-stats zones.gpkg output.gpkg --raster dem.tif --fractional \
+  --weights population.tif --weight-band 1 \
+  --stats count,mean,sum,stddev,median,weighted_mean,weighted_sum,weighted_stddev
+```
+
+`--fractional` computes the polygon/cell intersection area in affine pixel coordinates:
+coverage `c` ranges from 0 to 1, holes are subtracted, and boundary-only contact contributes
+zero. It is incompatible with `--all-touched`. Count becomes a Real field equal to `sum(c)`;
+sum is `sum(value*c)`, mean divides that sum by count, and population standard deviation
+uses coverage weights. Min/max use any positive-coverage valid pixel. Median uses
+exactextract's interpolated coverage-weighted histogram. Integer center/all-touched counts
+and the existing unweighted defaults are retained.
+
+`--weights` supplies a second raster for `weighted_mean`, `weighted_sum` and
+`weighted_stddev` (`weighted_stdev` is an accepted alias). These statistics use weight
+`c * weighting_value`; other statistics ignore the weighting raster. Without `--fractional`,
+`c` is the existing binary center/all-touched membership. Select weighted statistics
+explicitly in `--stats`. The weighting band defaults to 1. Every value raster must have
+exactly the same dimensions, affine grid and equivalent CRS as the weighting raster;
+align differing grids before analysis. Finite negative contributing weights are errors.
+Zero weights contribute nothing. A nodata/nonfinite weight under a valid contributing
+value makes that zone's weighted statistics null, without changing its unweighted statistics.
+All-zero weights give weighted sum 0 and null weighted mean/standard deviation.
+
+Values use each selected band's nodata in all modes, fixing the previous use of
+band 1's nodata for every band; nonfinite values are excluded. Empty zones retain
+count zero and null other statistics, including sums (exactextract/GDAL return zero sums
+for empty zones). All statistics use binary64 arithmetic; overflow in weighted accumulation is an error. Explicit decimal rounding applies
+to fractional counts as well as other new Real fields; integer counts and source attributes
+are unchanged. Valid polygons/multipolygons are required for fractional overlay. Coverage is
+planar in the raster grid, including rotated grids; geographic pixels are not weighted by
+spherical area. Rasters are read in strips as above; dataset masks are not applied. Numeric
+nodata remains available; use a nodata/NaN raster when mask-band validity must affect this
+operation.
+
+
+A weighting raster is opened and validated only when a weighted statistic is
+requested; unweighted-only requests ignore it.
+
+Fractional coverage masks use eight bytes per cell of the zone window, compared
+with one byte for binary masks. On a complete 966×731 real NLCD window (706,146
+pixels), three local count-only runs used peak RSS 44.2–44.7 MiB for binary and
+49.6–50.6 MiB for fractional membership; median times were 0.068 and 0.080 s.
+These measurements include process overhead and are not portable thresholds.
+Requesting `median` additionally keeps each zone's values (8 bytes per zone pixel
+and band, 16 with `--fractional`, as above), unless the zone is counted in a
+histogram (a zone of an 8- or 16-bit integer band with at least as many pixels as
+the type has values, see above).
 
 ## Vector datasets
 
@@ -2580,7 +3070,8 @@ terrio edit data.gpkg edited.gpkg --active-layer roads --geometry-type LINESTRIN
 ```
 
 Assigns CRS without reprojecting, changes declared geometry type (including Z/M), or
-sets/removes dataset and layer metadata. Metadata edits and Z/M declarations require
+sets/removes dataset and layer metadata (`--metadata`, `--unset-metadata`, `--layer-metadata`,
+`--unset-layer-metadata`, each repeatable). Metadata edits and Z/M declarations require
 GeoPackage outputs; other output formats reject those options. `--active-layer` selects one
 layer, matching exact names first and otherwise ignoring ASCII case. Default CRS and
 geometry edits skip attribute-only tables. `--crs none` removes a CRS. `--unset-fid`
@@ -2619,10 +3110,14 @@ terrio sql countries.gpkg selected.gpkg --query \
   "SELECT ADMIN, POP_EST AS population FROM countries WHERE POP_EST > 10000000 ORDER BY POP_EST DESC LIMIT 10"
 ```
 
-Runs the read-only [OGR SQL subset](sql.md). `FROM` must name an input layer,
+Runs the read-only [SQL subset](sql.md). `FROM` must name an input layer,
 matched case-insensitively; `--layer` can restrict the available layers. Supports computed
 columns, aliases, single-field `DISTINCT`, `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`, and attribute
 `LEFT JOIN` within the input dataset, plus `WHERE`, one primary `ORDER BY` field and `LIMIT`.
+Grouped queries support attribute `GROUP BY` and ordering by a selected output column
+or alias. The shared engine also supports the documented planar/EPSG spatial functions
+in SELECT expressions and that SELECT's WHERE clause; standalone `--where` filters
+remain attribute-only.
 
 ```sh
 terrio sql countries.gpkg population.gpkg --query \
@@ -3122,6 +3617,17 @@ terrio rasterize INPUT OUTPUT (--burn VALUE | -a FIELD) (--tr X Y | --ts W H | -
 `-l`, `--sql`, `--where`, `--te`, `--tap`, `--ot`, `--init`, `--a-nodata`, `--at` (all touched),
 `--add`, `--a-srs`. Points, lines and polygons are burned with GDAL's algorithms, pixel for pixel.
 
+Without `--init`, the background starts at `--a-nodata` when given, otherwise at 0.
+Explicit `--init` values take precedence, including 0. This matches GDAL's new GeoTIFF
+background. Terrio uses this policy for all output formats and in-memory rasters; GDAL's
+initialization is driver-dependent (for example, its ENVI output defaults to 0).
+Additive burns (`--add`) start from this background: nodata -1 plus a burn of 7 yields 6.
+Use `--init 0` to accumulate from zero. Integer output types require a finite, integral
+nodata value within the type's range; unrepresentable nodata is refused. Finite Float32 nodata
+outside the Float32 range is also refused, before it can overflow or lose its validity mask.
+With a saturating integer background or NaN nodata, additive burns can remain at nodata;
+use `--init 0` to accumulate from zero.
+
 ## vector-grid
 
 ```sh
@@ -3429,7 +3935,6 @@ offset, units and nodata. Numeric integer/float metadata compares by value.
 
 An array present in only some inputs is retained; regions belonging to other
 inputs use that array's nodata value, or zero when it has none.
->
 
 ## grid
 
@@ -3541,8 +4046,9 @@ assigns sequential IDs when the schema has no explicit `fid` field; GDAL can
 retain source IDs instead. The pipeline conformance suite identifies this
 discrete writer-policy difference in its case details and checks the native
 sequence independently. Source identifiers needed as data should be retained in
-an ordinary attribute field. Writer option parity remains
-part of [#288](https://github.com/opengeos/terrio/issues/288).
+an ordinary attribute field. Writer option parity is not yet implemented. It is outside
+GDAL parity round 2 ([#288](https://github.com/opengeos/terrio/issues/288)) and is an open
+item of the [roadmap](https://github.com/opengeos/terrio/blob/main/ROADMAP.md).
 
 A saved definition used as a nested `read` input contributes its evaluated dataset;
 its checkpoint and write artifacts are discarded. Execute a definition directly
@@ -3591,7 +4097,13 @@ terrio ui --port 8080 --no-open
 
 Serves a page with a form for every command, generated from the
 [command catalog](#machine-readable-command-catalog), so it always matches this binary. Pick files
-with the built-in file browser, which lists the disk of the computer running terrio; the page shows
+with the built-in file browser, which lists the disk of the computer running terrio: type the start of
+a name to jump to it, and repeat a letter to step through the names that start with it. On Windows,
+**Up** from the root of a drive or of a network share lists the drives. For the inputs that take
+`@FILE` lists and wildcards (those of `mosaic`, `warp`, `concat`, `raster-index` and others; see
+[Commands](#commands)), **Add matching files** adds every file of the listed folder that matches a
+pattern, such as `*.tif`, as one `folder/*.tif` line that the command expands when it runs; the
+browser shows how many files match. The page shows
 the equivalent command line, quoted for a POSIX shell, to copy into a script. Relative paths are
 taken from the directory `terrio ui` started in. **Cancel**, or closing the tab, stops a running command, which can leave a
 partial output file; Ctrl-C stops the server. This works through both the `terrio` binary and the
@@ -3602,17 +4114,126 @@ Option | Description
 `--port` | Port on 127.0.0.1; by default a free one
 `--no-open` | Print the address without opening a browser
 
+The `preview` form shows the image it draws below the command's output, and its **Open map**
+button opens the dataset in a [map](#view) in a new tab, drawn with the form's `--bands`,
+`--colormap`, `--stretch`, `--layer` and `--attribute`; the size options do not apply to a map.
+
 The server runs commands with your permissions, including those that overwrite or delete files, so
 it listens on the loopback interface only and each API request must carry a random token, which is
-part of the printed address: treat the address as a password. The token is briefly on the command
-line of the process that opens the browser, where other users of a shared computer could read it;
-use `--no-open` there and paste the address yourself. To use it on another computer, forward the
+part of the printed address: treat the address as a password. Browser launchers receive a private
+HTML redirect file's path, so the token stays out of process arguments. On Unix, the file has
+permissions 0600 inside a 0700 temporary directory. Sandboxed browsers, including some Snap
+packages, may be unable to read it; paste the printed address manually if automatic opening
+fails, or use `--no-open`. The same launch behavior applies to `terrio view`.
+The server runs until process termination and has no graceful shutdown. Each successful browser
+launch leaves a private `terrio-ui-*` directory in the system temporary directory when the server
+stops, including with Ctrl-C. Its token expires when the server stops; remove the directory afterward.
+To use it on another computer, forward the
 port (`ssh -L 8080:127.0.0.1:8080 host`, then `terrio ui --port 8080 --no-open` on the host).
 
 As with [MCP tools](#mcp), a run returns up to 100,000 bytes of output when the command ends, a
 non-zero status for a query's result (`compare`, `pixel-info`) is not a failure, and `@FILE` lists
-are refused: enter the paths one per line instead. The page has no map or preview; for that use the
+are refused: enter the paths one per line instead, or a wildcard line such as `tiles/*.tif`, which
+the command expands. To try terrio without installing it, see the
 [Playground](playground.md).
+
+## preview
+
+```sh
+terrio preview dem.tif                                   # in the terminal
+terrio preview dem.tif -o dem.png -c terrain -s p2,p98
+terrio preview https://example.com/scene.tif -o rgb.png -b 4,3,2 --width 1024
+terrio preview countries.gpkg -o population.png -a POP_EST -c viridis
+terrio preview dem.tif -o - | other-program              # PNG bytes on standard output
+```
+
+Draws a raster or vector dataset as an RGBA PNG, or in the terminal when there is no `-o`. A raster
+is read from its coarsest overview that still has the pixels the image needs; without a fitting
+overview, a level of more than 4 million pixels (4,194,304) is read by its sampled rows, those in
+one row of the file's blocks together, so each block is read and decoded once. A preview of a large
+remote COG therefore transfers a small part of it: 400 pixels across from a 51.5 MB 3612 x 3612
+Float32 COG with three overviews took 720,896 bytes in two GETs; the default 1024 pixels read its
+1806 x 1806 overview, 10.1 MB.
+
+Pixels are drawn in the raster's own grid, without reprojecting or applying a rotation in its
+geotransform. Shrinking averages the valid pixels under each output pixel, weighted by alpha when
+there is an alpha band (paletted rasters take the nearest one); a level read by sampled rows takes
+the nearest pixel instead. Images have at most 16,777,216 pixels (4096 x 4096), and up to 16,384 on
+a side. Nodata, masked pixels and an alpha band of 0 are transparent. An alpha band is opaque at
+GDAL's warper maximum (`SRC_ALPHA_MAX`): 2^NBITS - 1 for packed samples, 65535 for UInt16, 32767
+for Int16 and 255 for every other type, floating point included, so a Float32 alpha of 0 to 1 is
+drawn almost transparent, as GDAL 3.13 warps it. Vector layers are burned with `rasterize`'s burner
+(every pixel a feature touches), north up, in one color or by a numeric field's values; points are
+drawn three pixels wide. A map view indexes the features once, so that each tile burns only the
+features near it. A raster wider than 4,194,304 pixels with no overview to read from is refused:
+build overviews first. Without overviews, a preview reads every row of blocks its sampled rows fall
+in, which for most sizes is the whole level: a 16.8 MB 4000 x 4000 Byte GeoTIFF in 256-pixel tiles
+drawn 240 pixels wide took 16 GETs, one a row of tiles, and its whole size, so build overviews for
+remote previews.
+
+Without `--bands`, the red, green and blue bands are drawn when the color interpretation names
+them, else the first three bands of a Byte raster without a palette, else band 1, through the
+raster's own palette when it has one. Color interpretations are the file's, overridden by those of
+a local `.aux.xml` sidecar (its `ColorInterp`, an `Alpha` band for example), as GDAL reads them.
+`--stretch auto` draws Byte red, green and blue as stored and stretches everything else from its
+2nd to its 98th percentile, measured on the pixels drawn.
+
+Option | Description
+--- | ---
+`-o`, `--output` | PNG file, or `-` for its bytes on standard output; without it, draw in the terminal
+`--overwrite` | Replace an existing output file
+`--width`, `--height` | Image size; with one of them the other keeps the aspect ratio
+`--max-size` | Longest side when no size is given (1024); images are not enlarged to reach it
+`-b`, `--bands` | One band, or three as red,green,blue
+`-c`, `--colormap` | `gray`, `viridis`, `magma`, `inferno`, `plasma`, `terrain`, `rdbu` or `rdylgn`; `_r` reverses
+`-s`, `--stretch` | `auto`, `minmax`, `pLOW,pHIGH` (percentiles) or `LOW,HIGH` (values as stored, before a band's scale and offset); `minmax` and percentiles are measured on the drawn pixels, so a shrunk image's averaging can narrow them
+`-l`, `--layer` | Vector: draw this layer (repeatable); by default all, which must share a CRS
+`-a`, `--attribute` | Vector: color features by this numeric field (viridis unless `-c`); the stretch is measured on the features' values
+`--display` | `auto`, `kitty`, `iterm`, `sixel` or `blocks`; refused with `-o`
+
+In the terminal, `auto` picks Kitty's graphics protocol in Kitty and Ghostty, iTerm2 inline images
+in iTerm2 and WezTerm, sixels where `TERM` names foot, mlterm or sixel, and otherwise colored
+Unicode half blocks, two pixels to a character cell, as wide as the terminal. Inside tmux or
+screen, which do not pass graphics on without configuration, it is half blocks. With `auto`, a
+standard output that is not a terminal is refused rather than filled with escape codes; name a
+`--display` to write them anyway. `-o -` is refused when standard output is a terminal. Sixels use a fixed palette of 216 colors.
+
+Through [MCP](mcp.md), a preview's result carries the PNG as image content, so that an agent sees
+it. Without `-o` the PNG goes to a private temporary directory, removed after the call; `-o -` is
+refused there. Images over 8 MiB are not attached.
+
+The colormap stops are sampled from matplotlib's viridis, magma, inferno and plasma (CC0) and
+ColorBrewer's RdBu and RdYlGn (Apache-2.0); see `NOTICE`.
+
+## view
+
+```sh
+terrio view dem.tif -c terrain
+terrio view https://example.com/scene.tif -b 4,3,2 --port 8080 --no-open
+terrio view parcels.gpkg -a value
+```
+
+Serves a map of one dataset on 127.0.0.1 and opens it in your browser: drag or use the arrow keys
+to pan, scroll or press `+` and `-` to zoom, and `0` to fit. Tiles of 256 screen pixels are drawn
+on request from the overview each zoom level needs, with the [preview](#preview) code, so large and
+remote datasets stay quick. Colors stay the same across tiles: a stretch is measured once, on a
+sample of up to 512 pixels across. The footer shows the column, row and coordinates under the
+pointer.
+
+The map shows the data alone, in the raster's own grid (a vector dataset's CRS, north up), with no
+basemap, so it works offline and for any CRS. The page and its script are built into terrio; it
+loads nothing from elsewhere. As with [`terrio ui`](#ui), the server listens on the loopback
+interface only and every tile request needs the session's random token; unlike it, it serves the
+map alone, not the forms that run commands. Tiles are drawn one at a time, since they share one
+reader of the dataset. A vector tile burns the features that touch it, found through a grid index
+built once a view; features spanning more than 64 of its cells are checked for every tile. It takes
+the `preview`
+options `--bands`, `--colormap`, `--stretch`, `--layer` and `--attribute`, plus:
+
+Option | Description
+--- | ---
+`--port` | Port on 127.0.0.1; by default a free one
+`--no-open` | Print the address without opening a browser
 
 ## Machine-readable command catalog
 
@@ -3623,27 +4244,148 @@ for one command and its descendants. Required dataset arguments may be omitted;
 metadata requests open no datasets or output files. The Python package supports
 identical requests with `python -m terrio`.
 
-The payload has `schema_version: "0.1"`, `unstable: true`, the program/version,
+The payload has `schema_version: "0.1.6"`, `unstable: true`, the program/version,
 and a recursive `command` object. Each command records its canonical name/path,
 aliases, description, arguments and subcommands. Arguments include flags and
 aliases, positional index, type, raw default tokens, choices, required status,
 per-occurrence `num_args` bounds, action, hidden status, delimiter and value names. An unbounded
-maximum is `null`. Types are `string`, `integer`, `number`, `boolean`, `path` or
+maximum is `null`. `num_args` counts the values of one occurrence, not the total
+across repeats. `repeatable` is `true` only when clap accepts the option more than
+once (`append` and `count` actions); `set`, `set_true` and `set_false` options are
+not repeatable in clap terms, and a second occurrence is an error. For positional
+arguments (such as `warp`'s `paths`), `repeatable: true` reflects variadic operand
+collection via clap's `append` action. terrio sets
+neither `args_override_self` nor `overrides_with`, so no option is made repeatable
+by an override. For example, `warp --tr 0.02 0.02 --tr 0.05 0.05` is accepted, but
+the command uses only the first pair (`0.02 0.02`); the catalog reports `--tr` as
+`repeatable: true` with `num_args` 2, so it does not promise that later pairs apply.
+Types are `string`, `integer`, `number`, `boolean`, `path` or
 `unknown`; dataset locations represented as strings are tagged as paths. Custom
 parsers whose result type is not recognized report `unknown`.
 
+`conflicts_with` lists the `name` values (clap argument ids) of the other arguments
+of the same command that clap rejects together with this one, including arguments
+mutually exclusive through an exclusive argument group (such as `vector-clip`'s
+`bbox`, `geometry` and `like`). Match it against `name`, not `long`: the two differ
+for many flags (`name` `dst_crs`, `long` `dst-crs`). Each declared pair is listed on
+both sides, so `rasterize` `tr` and `ts` each name the other.
+Known limits: `requires` is not reported, because clap 4.6 exposes no public
+accessor for it, and a hand-written table would drift from the clap definitions
+(deferred until clap exposes an accessor or a dedicated relation tracker is added).
+Predicate requirements (such as `viewshed`'s `required_if_eq_any`) and conditional
+rules (`requires_if`) are also not reported. Relations are descriptive only, and
+parsing rules do not change.
+
 The [v0.1 JSON Schema](https://github.com/opengeos/terrio/blob/main/schemas/cli-usage-v0.1.schema.json)
-describes the payload. This initial schema is unstable: consumers should check
+describes the payload (the schema file retains the `v0.1` name across the `0.1.x` series).
+This initial schema is unstable: consumers should check
 `schema_version`. `required` describes unconditional clap requirements; conditional
-requirements, conflicts, mutation/idempotency rules and pipeline-step semantics
+requirements, mutation/idempotency rules and pipeline-step semantics
 are outside this version. Choices list only those registered in clap; additional
 numeric ranges and runtime parser constraints remain enforced by the CLI. The catalog includes accepted hidden options, including `--json-usage` itself and
 `calc` compatibility flags, even when ordinary `--help` omits them.
 
 The catalog shares the MCP command tree and excludes
-`mcp`, `ui` and the generated `help` subcommand; MCP tool arguments remain `args: string[]`.
+`mcp`, `ui`, `view` and the generated `help` subcommand; MCP tool arguments remain `args: string[]`.
 
 Clap distinguishes the metadata flag from literal values. For example,
 `terrio info -- --json-usage` treats `--json-usage` as the dataset name, and
 `--srcnodata --json-usage` treats it as the nodata argument's value. For the
 pipeline's trailing expression, put the metadata flag before expression tokens.
+
+### Catalog stability policy
+
+- The catalog is versioned by `schema_version`.
+- The canonical digest (`CATALOG_SHA256` in `crates/terrio-cli/tests/usage_golden.rs`)
+  guards the full catalog, including arguments, subcommands, and help descriptions
+  (excluding only the top-level package `version`).
+- Every change to catalog contents or structure bumps the patch version (`0.1.x`),
+  and unreleased catalog changes share the next patch version until merged to `main`.
+- The `usage_golden` test fails on any catalog change without an updated digest in
+  the same commit. Required CI also compares the version and recorded digest with
+  the pull request's protected base commit, rejecting a digest-only update. Because the
+  digest is computed from sorted canonical JSON, the repository holds no generated catalog file.
+
+## OGC API Features
+
+`OAPIF:https://service/collections` opens a read-only OGC API Features catalog,
+a collection URL or an items URL. The explicit prefix avoids probing ordinary
+HTTP files. `info` and layer listing read collection metadata without fetching
+features; unknown counts and schemas remain unknown until a data read.
+
+```sh
+terrio info OAPIF:https://demo.pygeoapi.io/master/collections/lakes --json
+terrio convert OAPIF:https://demo.pygeoapi.io/master/collections/lakes lakes.gpkg --limit 4 --oo PAGE_SIZE=3
+```
+
+The same commands are available through MCP. `--layer` selects collections and
+`--spat` sends a bounding box. Plain conversion limits stop paging early; with
+SQL or attribute filters, the limit is applied after local filtering. `--spat`
+also disables source-limit pushdown: combining it with `--limit` does not bound
+network paging, and the reader can consume the entire bbox match set before
+applying the final limit. Open
+options include `PAGE_SIZE` (1000), `DATETIME`, `CRS`, `PREFERRED_CRS`,
+`SERVER_FEATURE_AXIS_ORDER=AUTHORITY_COMPLIANT|GIS_FRIENDLY`, `IGNORE_SCHEMA=YES`,
+and `URL` for a bare `OAPIF:` name. `CRS` must be advertised; `PREFERRED_CRS`
+falls back to storage CRS or CRS84. Output coordinates use GIS X/Y order;
+server bounding boxes from API options follow the selected CRS axis order. URL
+`bbox` and `bbox-crs` values are passed through in server order (CRS84 by default
+when `bbox-crs` is absent); they are not interpreted as API X/Y bounds. Terrio
+recognizes these URL option names case-insensitively and sends canonical names.
+
+Reads follow same-origin relative next links and reject cycles, repeated feature
+IDs and external schema references. A missing next page is detected only when
+`numberMatched` exceeds the number read; without that count, a final page with no
+next link ends the read. Native HTTP follows only
+same-origin redirects. Limits are `OAPIF_MAX_PAGES` (10000),
+`OAPIF_MAX_VECTOR_BYTES` (1 GiB conservative cumulative work budget), and
+16 MiB per response, further bounded by the HTTP JSON size setting.
+The aggregate budget charges all response bytes across all collections at 32×,
+even after decoding, plus retained typed cells. It is not a current-heap limit;
+the default therefore allows at most about 32 MiB of cumulative response bodies.
+`OAPIF_MAX_FEATURES` and `OAPIF_SKIP_FEATURES` set the per-collection range.
+
+JSON Schema scalar types are honored, including absent nullable fields. Without
+a usable JSON schema, fields are inferred across all fetched pages. Nested
+objects/arrays remain JSON text rather than GDAL's flattened fields; a schema
+string without a date format remains text. XML schema, external JSON references,
+CQL/filter languages, transactions and streaming feature iteration are outside
+this reader's scope. Pages are accumulated within the allocation budget.
+
+Signed numeric source IDs, or string IDs that conflict with a source `id`
+property, are preserved as serialized JSON in `_oapif_id` text (with an extra leading underscore
+if that field already exists); generated unsigned FIDs then follow row order.
+
+Non-null values incompatible with an advertised scalar type fail explicitly,
+including empty-string dates. Use `IGNORE_SCHEMA=YES` to infer types from the
+source values instead. Schema fetch or parse failures also fail the read;
+`IGNORE_SCHEMA=YES` bypasses schema discovery. Schemas without property definitions fall back to inference.
+OAPIF-specific open options are rejected on other vector sources, even when their
+value equals the default.
+
+`URL` supplies a bare `OAPIF:` only for APIs accepting open options (such as
+`open_vector` and conversion). Metadata-only `info` and layer listing require
+the complete prefixed service URL. Mixed numeric/string source IDs are preserved
+as serialized JSON in `_oapif_id` text, retaining the distinction between `1`
+and `"1"`.
+
+Metadata discovery retains collections whose CRS cannot be read, reporting their
+CRS as unknown. A CRS error is returned when that collection is selected for
+feature reading. Synthetic `_oapif_id` values always contain serialized JSON;
+null or absent identifiers remain null. A schema's nested `properties` map is
+unwrapped only when its `type` field explicitly identifies a GeoJSON Feature.
+
+CRS references supplied by a service are parsed as literal definitions, without
+opening local files named by that metadata. Explicit caller CRS options retain
+the normal user-input parser.
+
+OAPIF items URLs honor `offset` and use URL `crs` as an explicit CRS selector;
+combining URL `crs` with `CRS`/`PREFERRED_CRS` options is rejected. Paging preserves
+active bbox/datetime/CRS selectors when next links omit them.
+
+OAPIF metadata extents that cross the antimeridian are reported as unknown.
+A zero-feature range returns empty layers without schema or item requests.
+
+When string feature identifiers coexist with a source or schema `id` field,
+the identifiers use `_oapif_id` so source `id` values and nulls remain intact.
+Empty pages with advancing next links are followed within the same page budget.

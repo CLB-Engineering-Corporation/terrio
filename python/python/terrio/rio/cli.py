@@ -41,6 +41,8 @@ from contextlib import ExitStack
 from itertools import zip_longest
 from typing import IO, Any, NamedTuple
 
+from terrio._terrio import _redact_diagnostic_location as _redact
+
 logger = logging.getLogger("terrio.rio.cli")
 
 PROG = "terrio-rio"
@@ -2378,7 +2380,7 @@ def cmd_stack(args: argparse.Namespace, env: Any) -> None:
 
     bounds = parse_bounds(args.bounds)
     nodata = parse_nodata(args.nodata)
-    key_val(args.creation_options)
+    dst_kwds: dict[str, Any] = key_val(args.creation_options)
     files = [file_in(f) for f in args.files[:-1]] + args.files[-1:]
     output, inputs = resolve_inout(files=files, output=args.output, overwrite=args.overwrite)
     output_count = 0
@@ -2397,7 +2399,6 @@ def cmd_stack(args: argparse.Namespace, env: Any) -> None:
             parts = [int(x) for x in item.split(",")]
             indexes.append(parts[0] if len(parts) == 1 else parts)
             output_count += len(parts)
-    dst_kwds: dict[str, Any] = {}
     if args.driver:
         dst_kwds["driver"] = args.driver
     if args.photometric:
@@ -2770,7 +2771,7 @@ def cmd_gcps(args: argparse.Namespace, env: Any) -> None:
     with env, rasterio.open(file_in(args.input)) as src:
         gcps, crs = src.gcps
         if not gcps or crs is None:
-            raise CommandError(f"{args.input} has no ground control points with a CRS")
+            raise CommandError(f"{_redact(args.input)} has no ground control points with a CRS")
         proj = crs.to_string()
         proj = proj.split("=")[1].upper() if proj.startswith("+init=epsg") else proj
 
@@ -3770,12 +3771,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         args.func(args, env)
     except UsageError as e:
         sub.print_usage(sys.stderr)
-        print(f"{PROG} {name}: error: {e}", file=sys.stderr)
+        print(f"{PROG} {name}: error: {_redact(str(e))}", file=sys.stderr)
         return 2
     except BrokenPipeError:
         return 0
     except Exception as e:
-        print(f"{PROG} {name}: error: {e}", file=sys.stderr)
+        print(f"{PROG} {name}: error: {_redact(str(e))}", file=sys.stderr)
         if verbosity > 0:
             import traceback
 

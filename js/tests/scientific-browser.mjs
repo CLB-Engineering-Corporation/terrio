@@ -12,6 +12,11 @@ const modulePath = resolve(process.argv[2] ?? resolve(root, "pkg/terrio.js"));
 const wasmPath = resolve(process.argv[3] ?? modulePath.replace(/\.js$/, "_bg.wasm"));
 // Fail immediately for missing build artifacts; no implicit build or skip.
 readFileSync(modulePath); readFileSync(wasmPath);
+const coldSamples = Number(process.env.SCIENTIFIC_COLD_SAMPLES ?? 5);
+const warmSamples = Number(process.env.SCIENTIFIC_WARM_SAMPLES ?? 20);
+for (const n of [coldSamples, warmSamples]) {
+  if (!Number.isSafeInteger(n) || n < 2 || n > 1000) throw new Error("sample counts must be integers in [2, 1000]");
+}
 const require = createRequire(resolve(process.cwd(), "package.json"));
 const playwright = require(process.env.PLAYWRIGHT_MODULE ?? "playwright");
 const server = createServer((req, res) => {
@@ -34,7 +39,7 @@ try {
     try {
       const page = await browser.newPage();
       await page.goto(`http://127.0.0.1:${server.address().port}/`);
-      const result = await page.evaluate(async () => {
+      const result = await page.evaluate(async ({ coldSamples, warmSamples }) => {
         const { conformance } = await import("/tests/scientific-conformance.mjs");
         const initStart = performance.now();
         const terrio = await import("/module.js");
@@ -74,8 +79,34 @@ try {
         const copied = await workerRun("/tests/scientific-worker.mjs");
         await workerRun("/examples/scientific-worker.mjs", true);
         if (copied.some((v, i) => v !== expected[i])) throw new Error("copy after termination");
-        return { isolated: crossOriginIsolated, initializationMs, fixtureBytes: bytes.length, elapsedMs: direct.elapsedMs, growth: direct.growth, workerCycles: 6 };
-      });
+        const lifecycle = [];
+        for (let i = 0; i < coldSamples; i++) {
+          const worker = new Worker("/tests/scientific-lifecycle.mjs", { type: "module" });
+          try {
+            lifecycle.push(await new Promise((resolve, reject) => {
+              const timer = setTimeout(() => reject(new Error("lifecycle timeout")), 60000);
+              worker.onerror = (e) => { clearTimeout(timer); reject(new Error(e.message)); };
+              worker.onmessage = ({ data }) => {
+                clearTimeout(timer);
+                if (data.error) reject(new Error(data.error)); else resolve(data);
+              };
+              worker.postMessage({ moduleUrl: new URL("/module.js", location.href).href,
+                wasmUrl: new URL("/module_bg.wasm", location.href).href, bytes, runs: warmSamples + 1 });
+            }));
+          } finally { worker.terminate(); }
+        }
+        const summary = (values) => {
+          const sorted = [...values].sort((a, b) => a - b);
+          const n = sorted.length;
+          return { count: n, medianMs: (sorted[Math.floor((n - 1) / 2)] + sorted[Math.floor(n / 2)]) / 2,
+            p95Ms: sorted[Math.ceil(n * 0.95) - 1], maxMs: sorted[n - 1] };
+        };
+        const benchmark = { initialization: summary(lifecycle.map((r) => r.initializationMs)),
+          warmInitialization: summary(lifecycle.flatMap((r) => r.warmInitializationMs)),
+          firstDecode: summary(lifecycle.map((r) => r.samples[0])),
+          warmDecode: summary(lifecycle.flatMap((r) => r.samples.slice(1))), raw: lifecycle };
+        return { isolated: crossOriginIsolated, initializationMs, fixtureBytes: bytes.length, elapsedMs: direct.elapsedMs, growth: direct.growth, workerCycles: 6, benchmark };
+      }, { coldSamples, warmSamples });
       assert.equal(result.isolated, false);
       assert.equal(result.growth, true);
       console.log(name, JSON.stringify(result));

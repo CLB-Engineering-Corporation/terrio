@@ -76,9 +76,21 @@ pub struct MosaicSource<'a> {
     pub ds: &'a RasterDataset,
 }
 
-/// Builds a virtual mosaic of rasters in the same CRS, as `gdalbuildvrt` does. Paths are written
-/// relative to `vrt_dir` when they are inside it.
+/// Builds a virtual mosaic of rasters in the same CRS. Paths are written relative to
+/// `vrt_dir` when they are inside it. Unlike GDAL 3.13.3 `gdalbuildvrt`, this rejects
+/// mismatched band counts without band selection in ordinary mode, and target extents
+/// intersecting no source, rather than warning and skipping inputs or writing an empty VRT.
 pub fn build_vrt(sources: &[MosaicSource], o: &MosaicOptions, vrt_dir: Option<&Path>) -> Result<VrtDataset> {
+    build_vrt_impl(sources, o, vrt_dir, false)
+}
+
+/// [`build_vrt`] of an input aligned to a window it may lie wholly outside (see
+/// [`mosaic_allow_empty`]).
+pub(super) fn build_vrt_allow_empty(sources: &[MosaicSource], o: &MosaicOptions) -> Result<VrtDataset> {
+    build_vrt_impl(sources, o, None, true)
+}
+
+fn build_vrt_impl(sources: &[MosaicSource], o: &MosaicOptions, vrt_dir: Option<&Path>, allow_empty: bool) -> Result<VrtDataset> {
     let first = sources.first().ok_or_else(|| Error::InvalidArgument("no source rasters".into()))?;
     let srs = first.ds.crs();
     for s in sources {
@@ -127,7 +139,12 @@ pub fn build_vrt(sources: &[MosaicSource], o: &MosaicOptions, vrt_dir: Option<&P
                     ns = ns.min(gt[5]);
                 }
             }
-            ResolutionStrategy::User(x, y) => (we, ns) = (x, -y),
+            ResolutionStrategy::User(x, y) => {
+                if !(x > 0.0 && y > 0.0 && x.is_finite() && y.is_finite()) {
+                    return Err(Error::InvalidArgument("user resolution must be finite and positive".into()));
+                }
+                (we, ns) = (x, -y);
+            }
         }
     }
     if let Some(e) = o.extent {
@@ -155,7 +172,18 @@ pub fn build_vrt(sources: &[MosaicSource], o: &MosaicOptions, vrt_dir: Option<&P
         }
     };
     let nbands = band_list(first.ds).len();
-    if !o.separate && sources.iter().any(|s| band_list(s.ds).iter().any(|b| *b > s.ds.raster.bands)) {
+    if !o.separate {
+        if nbands == 0 {
+            return Err(Error::InvalidArgument("a source has no bands".into()));
+        }
+        // As in GDAL 3.13's `gdalbuildvrt` (`apps/gdalbuildvrt_lib.cpp`), when `-separate` is
+        // false and `-b` is not specified, every source must have the same band count as the
+        // first source.
+        if o.bands.is_empty() && sources.iter().any(|s| s.ds.raster.bands != nbands) {
+            return Err(Error::InvalidArgument("sources have different band counts".into()));
+        }
+    }
+    if sources.iter().any(|s| band_list(s.ds).iter().any(|b| *b == 0 || *b > s.ds.raster.bands)) {
         return Err(Error::InvalidArgument("a source lacks one of the requested bands".into()));
     }
     let src_nodata = |s: &MosaicSource, b: usize, band: usize| match &o.src_nodata {
@@ -183,7 +211,7 @@ pub fn build_vrt(sources: &[MosaicSource], o: &MosaicOptions, vrt_dir: Option<&P
         }
     }
     for s in sources {
-        let Some((src_rect, dst_rect)) = src_dst_window(s.ds, we, ns, (min_x, min_y, max_x, max_y), width, height) else { continue };
+        let Some((src_rect, dst_rect)) = src_dst_window(s.ds, we, ns, (min_x, min_y, max_x, max_y)) else { continue };
         let (path, relative) = source_path(&s.path, vrt_dir);
         for (k, &b) in band_list(s.ds).iter().enumerate() {
             if b == 0 || b > s.ds.raster.bands {
@@ -216,34 +244,29 @@ pub fn build_vrt(sources: &[MosaicSource], o: &MosaicOptions, vrt_dir: Option<&P
             }
         }
     }
+    // Both `separate: true` (no bands pushed) and `separate: false` (pre-allocated bands with
+    // no overlapping sources) fail consistently when no source intersects the target extent.
+    if !allow_empty && bands.iter().all(|b| b.sources.is_empty()) {
+        return Err(Error::InvalidArgument("no source rasters intersect the target extent".into()));
+    }
     let srs = (!srs.is_unknown()).then_some(srs);
     Ok(VrtDataset { width, height, geo_transform: Some([min_x, we, 0.0, max_y, 0.0, ns]), srs, bands })
 }
 
-/// `gdalbuildvrt`'s `GetSrcDstWin()`: where a source falls in the mosaic.
-fn src_dst_window(ds: &RasterDataset, we: f64, ns: f64, ext: (f64, f64, f64, f64), tw: usize, th: usize) -> Option<([f64; 4], [f64; 4])> {
+/// Where a source falls in the mosaic, after `gdalbuildvrt`'s `GetSrcDstWin()` but without its
+/// cropping to the extent: its whole window, and the output pixels it covers, which can run past
+/// the mosaic's edges (a read clips them). Cropping the window to the extent would leave a
+/// resampling kernel at the mosaic's edges without the source's pixels past them.
+fn src_dst_window(ds: &RasterDataset, we: f64, ns: f64, ext: (f64, f64, f64, f64)) -> Option<([f64; 4], [f64; 4])> {
     let gt = ds.geo_transform();
     let (w, h) = (ds.raster.cols as f64, ds.raster.rows as f64);
     let (min_x, min_y, max_x, max_y) = ext;
     if gt[0] + w * gt[1] <= min_x || gt[0] >= max_x || gt[3] + h * gt[5] >= max_y || gt[3] <= min_y {
         return None;
     }
-    let (sxo, dxo) = if gt[0] < min_x { ((min_x - gt[0]) / gt[1], 0.0) } else { (0.0, (gt[0] - min_x) / we) };
-    let (syo, dyo) = if max_y < gt[3] { ((gt[3] - max_y) / -gt[5], 0.0) } else { (0.0, (max_y - gt[3]) / -ns) };
-    let mut sxs = w - sxo.max(0.0);
-    let mut sys = h - syo.max(0.0);
     let (rx, ry) = (gt[1] / we, gt[5] / ns);
-    let mut dxs = sxs * rx;
-    let mut dys = sys * ry;
-    if dxo + dxs > tw as f64 {
-        dxs = tw as f64 - dxo;
-        sxs = dxs / rx;
-    }
-    if dyo + dys > th as f64 {
-        dys = th as f64 - dyo;
-        sys = dys / ry;
-    }
-    (sxs > 0.0 && dxs > 0.0 && sys > 0.0 && dys > 0.0).then_some(([sxo, syo, sxs, sys], [dxo, dyo, dxs, dys]))
+    let dst_rect = [(gt[0] - min_x) / we, (max_y - gt[3]) / -ns, w * rx, h * ry];
+    (dst_rect[2] > 0.0 && dst_rect[3] > 0.0).then_some(([0.0, 0.0, w, h], dst_rect))
 }
 
 /// The path to write in a VRT, relative to the VRT's directory when inside it.
@@ -267,7 +290,9 @@ fn absolute(path: &str) -> String {
 
 /// Mosaics rasters into one, as `gdal_merge.py` (or `gdalbuildvrt` followed by
 /// `gdal_translate`) does. When a source's CRS differs from the output's, all sources are
-/// reprojected with [`warp`] instead.
+/// reprojected with [`warp`] instead. Without an explicit band selection, non-separate inputs
+/// must have equal band counts. Unlike GDAL 3.13.3 `gdalbuildvrt`, which warns and skips a
+/// mismatched input, this operation returns an error rather than silently omitting a source.
 pub fn mosaic(sources: &[MosaicSource], o: &MosaicOptions) -> Result<RasterDataset> {
     let first = sources.first().ok_or_else(|| Error::InvalidArgument("no source rasters".into()))?;
     let dst = o.dst_srs.clone().unwrap_or_else(|| first.ds.crs());
@@ -298,6 +323,13 @@ fn reprojecting(o: &MosaicOptions, dst: SpatialRef) -> WarpOptions {
         dst_nodata: o.dst_nodata.clone(),
         ..Default::default()
     }
+}
+
+/// Calc aligns every input to its requested window, including inputs wholly outside it.
+/// Such inputs must retain the VRT's normal nodata/zero fill instead of failing as an empty mosaic.
+pub(super) fn mosaic_allow_empty(sources: &[MosaicSource], o: &MosaicOptions) -> Result<RasterDataset> {
+    let vrt = build_vrt_impl(sources, o, None, true)?;
+    vrt_from_memory(&vrt, sources)
 }
 
 /// Whether the sources are reprojected: some are in another CRS than the output's.
@@ -388,7 +420,7 @@ fn resampled_in_strips(
         },
         |i, reads| {
             let (y0, y1) = span(i);
-            out.write(strips.draw(&reads, y0..y1), y1 - y0)
+            out.write(strips.draw(&reads, y0..y1)?, y1 - y0)
         },
     )?;
     out.finish()
@@ -451,6 +483,7 @@ impl<'a> Strips<'a> {
             resampling: src.resampling,
             working_float: src.complex,
             invalid_value: None,
+            within_rects: true,
         }
     }
 
@@ -468,7 +501,7 @@ impl<'a> Strips<'a> {
 
     /// The mosaic rows `rows`, drawn from `reads` ([`Self::read`]): the bands drawn, one after the
     /// other, in the mosaic's data type.
-    pub(crate) fn draw(&self, reads: &[StripRead], rows: std::ops::Range<usize>) -> RasterData {
+    pub(crate) fn draw(&self, reads: &[StripRead], rows: std::ops::Range<usize>) -> Result<RasterData> {
         let w = self.vrt.width;
         let n = w * rows.len();
         let data_type = self.vrt.bands[0].data_type;
@@ -486,10 +519,10 @@ impl<'a> Strips<'a> {
             let valid: Option<Vec<bool>> = src.nodata.map(|nd| values.valid(nd));
             let read = super::vrt::SourceRead { values, valid: valid.as_deref(), row0: *row0, ..self.geometry(i, src) };
             crate::pixel::with_data!(&mut data, v => {
-                read.read_rows(w, self.vrt.height, rows.clone(), &mut v[k * n..(k + 1) * n], |x| super::convert_value(x, data_type) as _);
-            });
+                read.read_rows(w, self.vrt.height, rows.clone(), &mut v[k * n..(k + 1) * n], 0, |x| super::convert_value(x, data_type) as _)
+            })?;
         }
-        data
+        Ok(data)
     }
 }
 
@@ -597,6 +630,7 @@ fn copy_plan(sources: &[MosaicSource], o: &MosaicOptions) -> Result<Option<(VrtD
                 resampling: src.resampling,
                 working_float: src.complex,
                 invalid_value: None,
+                within_rects: true,
             };
             match read.plain_copy(vrt.width, vrt.height) {
                 Ok(Some(copy)) => copies.push(Copy { source, band: src.band, out_band: b, nodata: src.nodata, copy }),
@@ -640,9 +674,10 @@ fn vrt_from_memory(vrt: &VrtDataset, sources: &[MosaicSource]) -> Result<RasterD
                 resampling: src.resampling,
                 working_float: src.complex,
                 invalid_value: None,
+                within_rects: true,
             };
             crate::pixel::with_data!(&mut out, v => {
-                read.read(vrt.width, vrt.height, &mut v[b * n..(b + 1) * n], |x| super::convert_value(x, data_type) as _);
+                read.read(vrt.width, vrt.height, &mut v[b * n..(b + 1) * n], |x| super::convert_value(x, data_type) as _)?;
             });
         }
     }
@@ -978,5 +1013,114 @@ mod tests {
         let out = mosaic(&srcs, &MosaicOptions { separate: true, ..Default::default() }).unwrap();
         assert_eq!(out.raster.bands, 2);
         assert_eq!(out.raster.data.to_f64_vec()[16 + 5], 2.0);
+    }
+
+    #[test]
+    fn rejects_mismatched_band_counts_disjoint_separate_extent_and_bad_resolution() {
+        let a = tile(0.0, 4.0, 1.0);
+        let grid = Grid { width: 4, height: 4, geo_transform: [0.0, 1.0, 0.0, 4.0, 0.0, -1.0] };
+        let b = super::super::build_raster(grid, vec![vec![1.0; 16], vec![2.0; 16]], DataType::F32, None, &SpatialRef::default(), |x, _| x)
+            .unwrap();
+        let srcs = [MosaicSource { path: "a.tif".into(), ds: &a }, MosaicSource { path: "b.tif".into(), ds: &b }];
+        assert!(mosaic(&srcs, &MosaicOptions::default()).is_err());
+
+        let single = [MosaicSource { path: "a.tif".into(), ds: &a }];
+        for separate in [false, true] {
+            assert!(
+                mosaic(&single, &MosaicOptions { separate, extent: Some((100.0, 100.0, 110.0, 110.0)), ..Default::default() }).is_err()
+            );
+        }
+        assert!(
+            build_vrt(
+                &[MosaicSource { path: "b.tif".into(), ds: &b }, MosaicSource { path: "a.tif".into(), ds: &a }],
+                &MosaicOptions { separate: true, bands: vec![2], extent: Some((0.0, 0.0, 4.0, 4.0)), ..Default::default() },
+                None,
+            )
+            .is_err()
+        );
+        assert!(mosaic(&single, &MosaicOptions { resolution: ResolutionStrategy::User(0.0, 1.0), ..Default::default() }).is_err());
+    }
+
+    /// A mosaic onto its source's pixels a quarter pixel east resamples the source by its method:
+    /// `bilinear` and `average` give the ramp a quarter pixel on, and `nearest` the nearest pixels,
+    /// copied a strip at a time. The mosaic, the mosaic written and the VRT written agree.
+    #[test]
+    fn a_grid_a_fraction_of_a_pixel_off_is_resampled() {
+        let dir = tempfile::tempdir().unwrap();
+        // 8 x 4 pixels of 1 m, a ramp in x: 0, 10, ..., 70.
+        let grid = Grid { width: 8, height: 4, geo_transform: [0.0, 1.0, 0.0, 4.0, 0.0, -1.0] };
+        let ramp = (0..32).map(|i| f64::from(i % 8) * 10.0).collect();
+        let ds = super::super::build_raster(grid, vec![ramp], DataType::F32, None, &SpatialRef::default(), |x, _| x).unwrap();
+        let path = dir.path().join("a.tif").to_string_lossy().into_owned();
+        crate::write_raster_dataset(&ds, &path, &Default::default()).unwrap();
+        let sources = [MosaicSource { path: path.clone(), ds: &ds }];
+        let shifted: Vec<f64> = (0..7).map(|c| f64::from(c) * 10.0 + 2.5).collect();
+        for (resampling, row) in [
+            (Resampling::Nearest, (0..7).map(|c| f64::from(c) * 10.0).collect()),
+            (Resampling::Bilinear, shifted.clone()),
+            (Resampling::Average, shifted),
+        ] {
+            let o = MosaicOptions { extent: Some((0.25, 0.0, 7.25, 4.0)), resampling, ..Default::default() };
+            let rows = row.repeat(4);
+            assert_eq!(mosaic(&sources, &o).unwrap().raster.data.to_f64_vec(), rows, "{resampling:?}");
+            assert_eq!(copy_plan(&sources, &o).unwrap().is_some(), resampling == Resampling::Nearest, "{resampling:?}");
+            let [written, vrt] = ["m.tif", "m.vrt"].map(|name| dir.path().join(name).to_string_lossy().into_owned());
+            mosaic_to_path(std::slice::from_ref(&path), &o, &written, &Default::default()).unwrap();
+            build_vrt(&sources, &o, Some(dir.path())).unwrap().write(&vrt).unwrap();
+            for name in [&written, &vrt] {
+                assert_eq!(crate::open_raster(name).unwrap().raster.data.to_f64_vec(), rows, "{resampling:?} {name}");
+            }
+        }
+    }
+
+    /// A mosaic whose extent cuts through a source keeps the source's pixels past the extent
+    /// within reach of a resampling kernel at its edges. Onto 0.5 m pixels from x = 2 to 6 of the
+    /// 1 m ramp `0, 10, ..., 70`, `bilinear` and `cubic` give the row `warp` gives onto the same
+    /// grid, `17.5, 22.5, ..., 52.5`, within 1e-4: in the mosaic, the mosaic written a strip at a
+    /// time, and the VRT written, read whole and by windows of one pixel. The VRT places the whole
+    /// source from x = -4 output pixels.
+    #[test]
+    fn a_kernel_at_an_edge_of_the_extent_reads_the_source_past_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let grid = Grid { width: 8, height: 4, geo_transform: [0.0, 1.0, 0.0, 4.0, 0.0, -1.0] };
+        let ramp = (0..32).map(|i| f64::from(i % 8) * 10.0).collect();
+        let ds = super::super::build_raster(grid, vec![ramp], DataType::F32, None, &SpatialRef::default(), |x, _| x).unwrap();
+        let path = dir.path().join("a.tif").to_string_lossy().into_owned();
+        crate::write_raster_dataset(&ds, &path, &Default::default()).unwrap();
+        let sources = [MosaicSource { path: path.clone(), ds: &ds }];
+        let row: Vec<f64> = (0..8).map(|c| 17.5 + 5.0 * f64::from(c)).collect();
+        let near =
+            |got: &[f64], expected: &[f64]| got.len() == expected.len() && got.iter().zip(expected).all(|(a, b)| (a - b).abs() <= 1e-4);
+        for resampling in [Resampling::Bilinear, Resampling::Cubic] {
+            let (extent, resolution) = ((2.0, 0.0, 6.0, 4.0), (0.5, 0.5));
+            let warped =
+                warp(&[&ds], &WarpOptions { extent: Some(extent), resolution: Some(resolution), resampling, ..Default::default() })
+                    .unwrap()
+                    .raster
+                    .data
+                    .to_f64_vec();
+            assert!(near(&warped, &row.repeat(8)), "{resampling:?} warp: {warped:?}");
+            let o =
+                MosaicOptions { extent: Some(extent), resolution: ResolutionStrategy::User(0.5, 0.5), resampling, ..Default::default() };
+            let built = build_vrt(&sources, &o, Some(dir.path())).unwrap();
+            let [written, vrt] = ["m.tif", "m.vrt"].map(|name| dir.path().join(name).to_string_lossy().into_owned());
+            mosaic_to_path(std::slice::from_ref(&path), &o, &written, &Default::default()).unwrap();
+            built.write(&vrt).unwrap();
+            assert_eq!(VrtDataset::from_xml(&std::fs::read_to_string(&vrt).unwrap()).unwrap().bands, built.bands);
+            let mut lazy = crate::open_raster_lazy(&vrt).unwrap();
+            let by_pixel: Vec<f64> = (0..64)
+                .map(|i| lazy.read_window(crate::Window::new(i % 8, i / 8, 1, 1), &Default::default()).unwrap().raster.data.to_f64_vec()[0])
+                .collect();
+            for (how, got) in [
+                ("mosaic", mosaic(&sources, &o).unwrap().raster.data.to_f64_vec()),
+                ("written", crate::open_raster(&written).unwrap().raster.data.to_f64_vec()),
+                ("VRT", crate::open_raster(&vrt).unwrap().raster.data.to_f64_vec()),
+                ("VRT by windows", by_pixel),
+            ] {
+                assert!(near(&got, &warped), "{resampling:?} {how}: {got:?}");
+            }
+            let source = &built.bands[0].sources[0];
+            assert_eq!((source.src_rect, source.dst_rect), ([0.0, 0.0, 8.0, 4.0], [-4.0, 0.0, 16.0, 8.0]));
+        }
     }
 }

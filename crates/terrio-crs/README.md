@@ -11,20 +11,31 @@ and its projected CRS 49911 uses westing then northing.
 ```rust
 use terrio_crs::{SpatialRef, Transformer};
 
-let source = SpatialRef::parse("EPSG:4326")?;
+let source = SpatialRef::parse("EPSG:4326")?; // or parse_literal to refuse file paths
 let target = SpatialRef::parse("EPSG:3857")?;
 let transformer = Transformer::new(&source, &target)?;
 let (x, y) = transformer.transform(-100.0, 40.0)?;
 # Ok::<(), terrio_crs::Error>(())
 ```
 
+`list_crs` lists the EPSG (v12.029), ESRI and IAU_2015 CRSs the crate resolves, with their
+names, kinds, deprecation, areas of use and projection methods, for searchable CRS pickers:
+
+```rust
+use terrio_crs::{CrsQuery, list_crs};
+
+let found = list_crs(&CrsQuery { text: Some("australian albers".into()), ..Default::default() });
+assert_eq!(found[0].authority_code(), "EPSG:3577");
+```
+
 ## Features and supported scope
 
 The default configuration works offline and uses the native projection engine.
-In the checked-in 117-method PROJ conformance inventory it supports 42 methods;
-`wbprojection-fallback` adds 46 methods, including Hammer, Aitoff and Eckert.
+In the checked-in 117-method PROJ conformance inventory it supports 45 methods,
+including Eckert IV and Natural Earth; `wbprojection-fallback` adds 44 methods,
+including Hammer, Aitoff and the other Eckerts.
 The inventory is a test corpus, not an exhaustive list of EPSG CRSs. The remaining
-29 methods are explicitly refused. Known Krovak inverse differences off Bessel's
+28 methods are explicitly refused. Known Krovak inverse differences off Bessel's
 ellipsoid are recorded in the conformance tests.
 
 | Feature | Default | Effect |

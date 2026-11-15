@@ -12,6 +12,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import pytest
@@ -21,10 +22,54 @@ import terrio.rio as rio
 from terrio.rio.windows import Window
 
 
+class HttpTestServer(http.server.ThreadingHTTPServer):
+    """Handle TLS handshakes in workers so a stalled peer cannot block accepts."""
+
+    def __init__(self, address, handler, tls_context=None):
+        """Configure an optional TLS context before serving requests.
+
+        Args:
+            address: Loopback host and port.
+            handler: HTTP request handler class.
+            tls_context: Server certificate context, or plain HTTP when absent.
+        """
+        self.tls_context = tls_context
+        super().__init__(address, handler)
+
+    def get_request(self):
+        """Accept without performing a blocking TLS handshake.
+
+        Returns:
+            tuple: Accepted socket and client address.
+        """
+        connection, address = super().get_request()
+        if self.tls_context is not None:
+            connection.settimeout(5)
+            connection = self.tls_context.wrap_socket(
+                connection, server_side=True, do_handshake_on_connect=False
+            )
+        return connection, address
+
+    def finish_request(self, request, client_address):
+        """Complete TLS in the request worker before reading HTTP.
+
+        Args:
+            request: Accepted socket.
+            client_address: Client host and port.
+        """
+        if self.tls_context is not None:
+            try:
+                request.do_handshake()
+            except OSError:
+                request.close()
+                return
+        super().finish_request(request, client_address)
+
+
 class Server:
     """A loopback server of the files in a directory, logging every request."""
 
-    def __init__(self, root, ranges=True, failures=0):
+    def __init__(self, root, ranges=True, failures=0, tls_context=None):
         self.root, self.ranges, self.failures = root, ranges, failures
         self.log = []
         server = self
@@ -82,10 +127,11 @@ class Server:
                 except (BrokenPipeError, ConnectionResetError):
                     self.close_connection = True
 
-        self.httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.httpd = HttpTestServer(("127.0.0.1", 0), Handler, tls_context)
         self.httpd.daemon_threads = True
         threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
-        self.url = f"http://127.0.0.1:{self.httpd.server_address[1]}"
+        scheme = "https" if tls_context is not None else "http"
+        self.url = f"{scheme}://127.0.0.1:{self.httpd.server_address[1]}"
 
     def bytes_sent(self):
         return sum(row[3] for row in self.log)
@@ -220,6 +266,27 @@ def test_a_reopened_file_is_read_from_the_process_wide_cache(tmp_path, serve):
             with rio.open(f"{server.url}/raster.tif") as ds:
                 assert ds.read(1).tolist() == [[1] * 4] * 4
     assert [row[2] for row in server.log if row[0] == "GET"] == [503, 200]
+
+
+def test_one_raster_read_from_threads_at_once_requests_its_header_once(tmp_path, serve):
+    """Reads that overlap open more readers of the file, from the process-wide cache: its first
+    bytes are requested once, and every window reads the file's pixels."""
+    pixels = write_cog(tmp_path / "cog.tif")
+    server = serve()
+    raster = terrio.open_raster(f"{server.url}/cog.tif", lazy=True)
+    windows = [(x, y, 256, 256) for y in range(0, 1024, 256) for x in range(0, 1024, 256)]
+    start = threading.Barrier(4, timeout=30)
+
+    def read(w):
+        start.wait()  # four reads at a time, started together
+        return raster.read(band=1, window=w)
+
+    with ThreadPoolExecutor(4) as ex:
+        got = list(ex.map(read, windows))
+    for (x, y, w, h), a in zip(windows, got, strict=True):
+        np.testing.assert_array_equal(a, pixels[0, y : y + h, x : x + w])
+    first_reads = [row for row in server.log if (row[1] or "").startswith("bytes=0-")]
+    assert len(first_reads) == 1, server.log
 
 
 def test_env_headers_add_no_request(tmp_path, serve):
@@ -372,6 +439,97 @@ def test_a_stac_looking_geojson_reaches_no_host_its_links_choose(tmp_path, serve
     assert "private-sentinel" not in result["text"]
     assert internal.log == []
     assert len(server.log) == 1, server.log
+
+
+QUERY_CHILD = r"""
+import json, sys
+import terrio
+for kind, allowed in json.loads(sys.argv[1]):
+    terrio.set_allowed_drivers(allowed, kind=kind)
+outcomes = []
+for url in sys.argv[2:]:
+    for call in (terrio.open_vector, terrio.list_layers, terrio.open, terrio.info):
+        before = terrio.network_stats()["request_count"]
+        try:
+            call(url)
+            outcome = "opened"
+        except Exception as error:
+            outcome = f"{type(error).__name__}: {error}"
+        outcomes.append([call.__name__, terrio.network_stats()["request_count"] - before, outcome])
+print(json.dumps(outcomes))
+"""
+
+
+def query_outcomes(lists, urls):
+    """`[call, requests, outcome]` of `open_vector`, `list_layers`, `open` and `info` on each URL,
+    in a child process whose allowed drivers are `lists` (`[kind, drivers]` pairs)."""
+    child = subprocess.run(
+        [sys.executable, "-c", QUERY_CHILD, json.dumps(lists), *urls],
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    assert child.returncode == 0, child.stderr
+    return json.loads(child.stdout)
+
+
+@pytest.mark.parametrize(
+    "lists",
+    [
+        [["vector", []]],
+        [["vector", []], ["raster", []]],
+        [["vector", ["ESRIJSON"]]],
+        [["raster", ["GTiff"]]],
+    ],
+)
+def test_a_query_no_allowed_driver_could_read_is_not_requested(tmp_path, serve, lists):
+    """A feature-service query (`f=json`) and a WFS GetFeature request are answered for the
+    ESRIJSON, ESRIPBF, GeoJSON or GML driver. With none of them allowed, `open_vector` and
+    `list_layers` refuse both without a request, and so do `open` and `info` once no raster driver
+    is allowed either, as they read a raster answer as a raster. With ESRI JSON allowed, or a list
+    of raster drivers only, the query is read."""
+    page = {
+        "geometryType": "esriGeometryPoint",
+        "fields": [{"name": "A", "type": "esriFieldTypeString"}],
+        "features": [{"attributes": {"A": "x"}, "geometry": {"x": 1, "y": 2}}],
+    }
+    (tmp_path / "FeatureServer" / "0").mkdir(parents=True)
+    (tmp_path / "FeatureServer" / "0" / "query").write_text(json.dumps(page))
+    (tmp_path / "wfs").write_text(json.dumps(page))
+    server = serve()
+    urls = [
+        f"{server.url}/FeatureServer/0/query?where=1%3D1&f=json",
+        f"{server.url}/wfs?service=WFS&request=GetFeature&typeNames=x",
+    ]
+    outcomes = query_outcomes(lists, urls)
+    allowed = dict(lists)
+    if allowed.get("vector") == []:
+        for call, requests, outcome in outcomes:
+            assert outcome.startswith("UnsupportedError") and "not allowed" in outcome, outcome
+            unrequested = call in ("open_vector", "list_layers") or allowed.get("raster") == []
+            assert (requests == 0) == unrequested, (call, requests, outcome)
+        assert (server.log == []) == (allowed.get("raster") == []), server.log
+    else:
+        assert [outcome for _, _, outcome in outcomes[:4]] == ["opened"] * 4, outcomes
+        assert server.log
+
+
+def test_info_reads_a_raster_answer_to_a_query_url_with_no_vector_driver_allowed(tmp_path, serve):
+    """A URL with the signs of a feature-service query may answer a raster, which `info` reads as
+    one: with no vector driver allowed, `info` still requests and reads it, while `open_vector` and
+    `list_layers` refuse it without a request."""
+    (tmp_path / "FeatureServer" / "0").mkdir(parents=True)
+    write_cog(tmp_path / "FeatureServer" / "0" / "query", size=64, tile=32)
+    server = serve()
+    url = f"{server.url}/FeatureServer/0/query?where=1%3D1&f=json"
+    outcomes = {
+        call: (requests, outcome)
+        for call, requests, outcome in query_outcomes([["vector", []]], [url])
+    }
+    assert outcomes["info"][1] == "opened", outcomes
+    for call in ("open_vector", "list_layers"):
+        requests, outcome = outcomes[call]
+        assert requests == 0 and "not allowed" in outcome, (call, requests, outcome)
 
 
 def test_a_remote_json_opened_as_a_raster_is_refused_after_its_first_bytes(tmp_path, serve):
@@ -540,15 +698,31 @@ SRTM_NAMES = [
 ]
 
 
+def _tile_requests(length, block=64 << 10, least=1 << 20, slots=8):
+    """The requests a lazy read of a whole remote tile makes, sorted: its first 16,384 bytes,
+    then the rest of its blocks (terrio's default 64 KiB) as one run split into near-equal pieces
+    of 1 MiB at least (``SPLIT_RUN_BYTES``), 8 at most (``PARALLEL_RUNS``)."""
+    blocks = -(-length // block)
+    pieces = min(max(blocks // -(-least // block), 1), slots)
+    size, longer = divmod(blocks, pieces)
+    out = ["bytes=0-16383"]
+    for k in range(pieces):
+        first = k * size + min(k, longer)
+        end = first + size + (k < longer)
+        out.append(f"bytes={max(first * block, 16384)}-{min(end * block, length) - 1}")
+    return sorted(out)
+
+
 def test_a_remote_srtm_tile_is_known_by_its_name_and_size(tmp_path, serve):
     """A remote SRTM tile named for Imagine (``N37W120.img``, as NASADEM names its tiles) was
     refused after its first 16,384 bytes, which show no Imagine header, and one named ``.hgts``,
     ``.err``, ``.num``, ``.swb`` or ``.raw`` after them too, where GDAL reads them all: a tile is
     known by its name and size, as GDAL's SRTMHGT driver knows one (``VSIStatL``). Under every
-    name it opens as its local copy does, read in two requests (GDAL: a HEAD and eight, the same
-    bytes). A file so named without a tile's size is refused after its first request (at most
-    16,384 bytes), where one named ``.hgt`` was fetched whole before the reader refused it; and
-    ``driver=`` without SRTMHGT refuses the tile named ``.img`` after its first request."""
+    name it opens as its local copy does, read by its first 16,384 bytes, then the rest in pieces
+    of 1 MiB fetched in parallel (GDAL: a HEAD and eight requests, the same bytes). A file so
+    named without a tile's size is refused after its first request (at most 16,384 bytes), where
+    one named ``.hgt`` was fetched whole before the reader refused it; and ``driver=`` without
+    SRTMHGT refuses the tile named ``.img`` after its first request."""
     samples = (np.arange(1201 * 1201) % 3000).astype(">i2")
     samples[0] = -32768
     tile = samples.tobytes()
@@ -565,8 +739,8 @@ def test_a_remote_srtm_tile_is_known_by_its_name_and_size(tmp_path, serve):
         with rio.open(f"{server.url}/{name}") as ds:
             assert ds.profile == profile, name
             np.testing.assert_array_equal(ds.read(1), pixels)
-        ranges = [row[1] for row in server.log]
-        assert ranges == ["bytes=0-16383", f"bytes=16384-{len(tile) - 1}"], (name, server.log)
+        ranges = sorted(row[1] for row in server.log)
+        assert ranges == _tile_requests(len(tile)), (name, server.log)
         assert server.bytes_sent() == len(tile)
         terrio.clear_http_cache()
         server = serve(root=tmp_path / "wrong")
@@ -578,12 +752,16 @@ def test_a_remote_srtm_tile_is_known_by_its_name_and_size(tmp_path, serve):
     terrio.clear_http_cache()
     server = serve(root=tmp_path / "tile")
     url = f"{server.url}/N37W120.img"
-    with pytest.raises(Exception, match="holds SRTMHGT data, and the SRTMHGT driver is not allowed"):
+    with pytest.raises(
+        Exception, match="holds SRTMHGT data, and the SRTMHGT driver is not allowed"
+    ):
         rio.open(url, driver="HFA")
     assert len(server.log) == 1, server.log
     with rio.open(url) as ds:
         np.testing.assert_array_equal(ds.read(1), pixels)
-    assert len(server.log) == 2 and server.bytes_sent() == len(tile), server.log
+    # the rest of the tile, in pieces fetched in parallel
+    assert len(server.log) == len(_tile_requests(len(tile))), server.log
+    assert server.bytes_sent() == len(tile), server.log
 
 
 def test_a_remote_imagine_file_is_read_under_a_tile_name_too(tmp_path, serve):
@@ -623,4 +801,37 @@ def test_a_remote_file_under_a_tile_extension_not_named_as_a_tile_is_refused(tmp
                 server = serve()
                 with pytest.raises(Exception, match="not recognized as being in a supported"):
                     open_as_raster(f"{server.url}/{kind}/{name}")
-                assert server.bytes_sent() <= 16384 and len(server.log) == 1, (kind, name, server.log)
+                assert server.bytes_sent() <= 16384 and len(server.log) == 1, (
+                    kind,
+                    name,
+                    server.log,
+                )
+
+
+def test_translate_reads_a_remote_window_by_range(tmp_path, serve):
+    """`translate` of a remote COG's 256 x 256 `srcwin` fetches the header and the one tile it
+    covers, not the whole file (as before, when the path was read whole)."""
+    rng = np.random.default_rng(3)
+    pixels = rng.integers(0, 65535, (1, 2048, 2048), dtype="uint16")
+    profile = dict(
+        driver="GTiff",
+        width=2048,
+        height=2048,
+        count=1,
+        dtype="uint16",
+        crs="EPSG:32631",
+        tiled=True,
+        blockxsize=256,
+        blockysize=256,
+        compress="deflate",
+        transform=rio.transform.from_origin(500000, 4600000, 10, 10),
+    )
+    with rio.open(tmp_path / "cog.tif", "w", **profile) as dst:
+        dst.write(pixels)
+    size = (tmp_path / "cog.tif").stat().st_size
+    server = serve()
+    out = terrio.translate(f"{server.url}/cog.tif", srcwin=(512, 256, 256, 256))
+    np.testing.assert_array_equal(out.read(1), pixels[0, 256:512, 512:768])
+    assert out.transform == pytest.approx((505120.0, 10.0, 0.0, 4597440.0, 0.0, -10.0))
+    # About 8.4 MB of noise; the window's tile is 1/64 of it, read in blocks of 16 KiB or more.
+    assert server.bytes_sent() < size / 16, (server.bytes_sent(), size, server.log)

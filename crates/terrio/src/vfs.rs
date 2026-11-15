@@ -22,9 +22,23 @@
 //! read: see [`crate::LazyRaster`].
 
 use crate::{Error, Result};
-#[cfg(not(target_arch = "wasm32"))]
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+
+/// Whether a name carries a URL scheme, GDAL subdataset prefix or `/vsi` prefix rather
+/// than naming a plain local file. Windows drive letters are part of local paths, including
+/// drive-relative names (`C:file`) and verbatim paths (`\\?\C:\dir`). No scheme or GDAL
+/// subdataset prefix is a single letter. This classification is independent of the host OS.
+#[doc(hidden)]
+pub fn is_gdal_name(name: &str) -> bool {
+    if name.starts_with("/vsi") {
+        return true;
+    }
+    let name = name.strip_prefix(r"\\?\").unwrap_or(name);
+    let bytes = name.as_bytes();
+    let rest = if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' { &name[2..] } else { name };
+    rest.contains(':')
+}
 
 /// Extensions of the files that make up a shapefile besides the `.shp` itself.
 #[cfg(remote)]
@@ -113,6 +127,14 @@ impl LocalPath {
     /// The local path as a string.
     pub fn as_str(&self) -> &str {
         self.path.to_str().unwrap_or_default()
+    }
+
+    /// The private directory containing a downloaded or extracted dataset and sidecars.
+    pub(crate) fn temporary_directory(&self) -> Option<&Path> {
+        #[cfg(not(target_family = "wasm"))]
+        return self._temp.as_ref().map(|directory| directory.path());
+        #[cfg(target_family = "wasm")]
+        None
     }
 
     fn local(path: PathBuf) -> Self {
@@ -456,11 +478,31 @@ impl Location {
 }
 
 #[cfg(remote)]
+fn download_file_name(name: &str) -> String {
+    // URI paths and object keys use '/', but their last component may still contain
+    // Windows roots, drive-relative paths, separators, devices, or alternate streams.
+    let name = name.rsplit(['/', '\\']).next().unwrap_or_default();
+    let name = name.rsplit(':').next().unwrap_or_default().trim_end_matches(['.', ' ']);
+    let name: String = name.chars().map(|c| if c.is_ascii_control() || "<>\"|?*".contains(c) { '_' } else { c }).collect();
+    if name.is_empty() {
+        return "download".into();
+    }
+    let stem = name.split('.').next().unwrap_or_default().trim_end_matches(' ').to_ascii_uppercase();
+    let numbered_device = ["COM", "LPT"].iter().any(|prefix| {
+        stem.strip_prefix(prefix).is_some_and(|n| matches!(n, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"))
+    });
+    if matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$") || numbered_device {
+        format!("download-{name}")
+    } else {
+        name
+    }
+}
+
+#[cfg(remote)]
 fn download(loc: &Location) -> Result<LocalPath> {
     let remote = loc.remote().ok_or_else(|| Error::InvalidArgument("not a remote location".into()))?;
     let temp = tempfile::Builder::new().prefix("terrio-").tempdir()?;
-    let name = loc.file_name();
-    let name = if name.is_empty() { "download".to_string() } else { name };
+    let name = download_file_name(&loc.file_name());
     let path = temp.path().join(&name);
     // By range, and refused after its first bytes when they, or its size, are not what its name
     // says (see `formats::check_remote_head`).
@@ -558,16 +600,13 @@ pub(crate) const MAX_DIRECTORY_BYTES: u64 = 64 << 20;
 
 /// The bytes at the end of an archive that hold its end of central directory record: the record
 /// and a comment of up to 65,535 bytes.
-#[cfg(not(target_arch = "wasm32"))]
 const TAIL_BYTES: u64 = 22 + 0xFFFF;
 
-#[cfg(not(target_arch = "wasm32"))]
 fn zip_error(message: impl std::fmt::Display) -> Error {
     Error::InvalidData(format!("zip: {message}"))
 }
 
 /// Where an archive's central directory is, from its end record.
-#[cfg(not(target_arch = "wasm32"))]
 struct Directory {
     /// The directory's position in the file.
     start: u64,
@@ -580,7 +619,6 @@ struct Directory {
 /// Checks what an archive's end of central directory record (zip64's, when there is one)
 /// declares, before the directory itself is read: its entry count against the limits, its size
 /// against the archive's.
-#[cfg(not(target_arch = "wasm32"))]
 fn check_directory<R: Read + Seek>(r: &mut R, limits: &ZipLimits) -> Result<Directory> {
     let len = r.seek(SeekFrom::End(0))?;
     let tail_len = len.min(TAIL_BYTES);
@@ -621,10 +659,206 @@ fn check_directory<R: Read + Seek>(r: &mut R, limits: &ZipLimits) -> Result<Dire
 }
 
 /// Opens an archive whose end record [`check_directory`] read.
-#[cfg(not(target_arch = "wasm32"))]
 fn open_archive<R: Read + Seek>(reader: R, directory: &Directory) -> Result<zip::ZipArchive<R>> {
     let config = zip::read::Config { archive_offset: zip::read::ArchiveOffset::Known(directory.archive_offset) };
-    Ok(zip::ZipArchive::with_config(config, reader)?)
+    let zip = zip::ZipArchive::with_config(config, reader)?;
+    check_unique_zip_names(&zip)?;
+    Ok(zip)
+}
+
+/// A duplicate-entry refusal is terminal, including for the optional GDAL backend.
+pub(crate) const AMBIGUOUS_ZIP: &str = "zip: the archive holds several entries with the same name, so its contents are ambiguous";
+
+/// Refuses ambiguous member names before reading or extracting any archive member.
+pub(crate) fn check_unique_zip_names<R: Read + Seek>(zip: &zip::ZipArchive<R>) -> Result<()> {
+    if zip.has_duplicate_names() {
+        return Err(Error::InvalidData(AMBIGUOUS_ZIP.into()));
+    }
+    Ok(())
+}
+
+/// A zip archive whose members are read into memory within the [`ZipLimits`], as `/vsizip/`
+/// extracts them: the archive's entry count is checked before its directory is read, each
+/// member's ratio before it is read, and the bytes of the members read together against
+/// `TERRIO_ZIP_MAX_SIZE` while they are decompressed, since a member's declared size can be wrong.
+///
+/// An archive opened while a member of another is being read (a zip inside a zip) shares what is
+/// left of the outer archive's `TERRIO_ZIP_MAX_SIZE` (see [`LimitedZip::nested`]).
+pub(crate) struct LimitedZip<R> {
+    zip: zip::ZipArchive<R>,
+    limits: ZipLimits,
+    /// The bytes read from the archive's members so far, and from archives nested in them.
+    total: u64,
+    /// The bytes its members may take: `TERRIO_ZIP_MAX_SIZE`, or what is left of the outer
+    /// archive's when it is nested.
+    budget: u64,
+    /// Whether this archive was opened inside another's member, whose budget its reads also take
+    /// from (see [`LimitedZip::nested`]).
+    nested: bool,
+}
+
+/// How deep archives may nest in one another's members (a zip in a zip in a zip ...).
+const MAX_NESTED_ZIPS: u32 = 8;
+
+thread_local! {
+    /// What is left of an outer archive's `TERRIO_ZIP_MAX_SIZE` while an archive in one of its
+    /// members is read (see [`LimitedZip::nested`]).
+    static NESTED_ZIP_BUDGET: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+    /// How many archives are being read, each in a member of the one before.
+    static NESTED_ZIP_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+impl<R: Read + Seek> LimitedZip<R> {
+    /// Opens an archive within the limits the options set.
+    ///
+    /// Args:
+    ///     reader: The archive's bytes.
+    ///
+    /// Returns:
+    ///     The archive, or `Error::ResourceLimit` when it lists more entries than allowed.
+    pub(crate) fn open(reader: R) -> Result<Self> {
+        if NESTED_ZIP_DEPTH.with(std::cell::Cell::get) >= MAX_NESTED_ZIPS {
+            return Err(Error::ResourceLimit(format!("zip: archives nest more than {MAX_NESTED_ZIPS} deep")));
+        }
+        let mut zip = Self::with_limits(reader, ZipLimits::from_config())?;
+        if let Some(left) = NESTED_ZIP_BUDGET.with(std::cell::Cell::get) {
+            zip.budget = zip.budget.min(left);
+            zip.nested = true;
+        }
+        Ok(zip)
+    }
+
+    /// Runs `f`, which may open archives held in this one's members, with what is left of this
+    /// archive's `TERRIO_ZIP_MAX_SIZE` as their budget, so nesting cannot multiply it.
+    ///
+    /// Args:
+    ///     f: The work that opens the nested archives.
+    ///
+    /// Returns:
+    ///     What `f` returns.
+    pub(crate) fn nested<T>(&mut self, f: impl FnOnce() -> T) -> T {
+        /// Puts back the outer budget and depth, even when `f` panics.
+        struct Restore(Option<u64>, u32);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                NESTED_ZIP_BUDGET.with(|b| b.set(self.0));
+                NESTED_ZIP_DEPTH.with(|d| d.set(self.1));
+            }
+        }
+        let left = self.budget.saturating_sub(self.total);
+        let depth = NESTED_ZIP_DEPTH.with(|d| d.replace(d.get() + 1));
+        let restore = Restore(NESTED_ZIP_BUDGET.with(|b| b.replace(Some(left))), depth);
+        let out = f();
+        // What the nested archives read, which they took from `left`, counts toward this one too.
+        let used = left.saturating_sub(NESTED_ZIP_BUDGET.with(std::cell::Cell::get).unwrap_or(left));
+        drop(restore);
+        self.charge(used);
+        out
+    }
+
+    /// Counts `n` bytes read toward this archive's total and, when it is nested, toward the outer
+    /// archive's budget.
+    fn charge(&mut self, n: u64) {
+        self.total = self.total.saturating_add(n);
+        if self.nested {
+            NESTED_ZIP_BUDGET.with(|b| b.set(b.get().map(|left| left.saturating_sub(n))));
+        }
+    }
+
+    /// Opens an archive within `limits`.
+    ///
+    /// Args:
+    ///     reader: The archive's bytes.
+    ///     limits: The limits its members are read within.
+    ///
+    /// Returns:
+    ///     The archive, or `Error::ResourceLimit` when it lists more entries than allowed.
+    pub(crate) fn with_limits(mut reader: R, limits: ZipLimits) -> Result<Self> {
+        let directory = check_directory(&mut reader, &limits)?;
+        let zip = open_archive(reader, &directory)?;
+        limits.check_entries("zip", zip.len() as u64)?;
+        Ok(Self { zip, budget: limits.max_size, limits, total: 0, nested: false })
+    }
+
+    /// The archive itself, for its entries' names. It is shared, so members can only be read
+    /// through [`Self::read_index`], within the limits.
+    pub(crate) fn archive(&self) -> &zip::ZipArchive<R> {
+        &self.zip
+    }
+
+    /// The member at `index`: its name, the size it declares, and whether it is a file.
+    pub(crate) fn entry(&mut self, index: usize) -> Result<(String, u64, bool)> {
+        let e = self.zip.by_index_raw(index)?;
+        Ok((e.name()?.to_string(), e.size(), e.is_file()))
+    }
+
+    /// Reads the member at `index`, decompressing at most `cap + 1` bytes: a caller with its own
+    /// budget tells a member that does not fit it from one that just does by the length.
+    ///
+    /// Args:
+    ///     index: The member's index in the archive.
+    ///     cap: The most bytes the caller wants; `u64::MAX` for the whole member.
+    ///
+    /// Returns:
+    ///     The member's bytes, at most `cap + 1` of them. `Error::ResourceLimit` when the member's
+    ///     ratio is above the one allowed, when the members read hold more than
+    ///     `TERRIO_ZIP_MAX_SIZE`, or when the member inflates past the size it declares, which the
+    ///     limits were checked against.
+    pub(crate) fn read_index(&mut self, index: usize, cap: u64) -> Result<Vec<u8>> {
+        let member = self.zip.by_index(index)?;
+        let name = member.name().unwrap_or_default().to_string();
+        let (declared, packed) = (member.size(), member.compressed_size());
+        self.limits.check_ratio("zip", &name, declared, packed)?;
+        // A member declaring more than is left is refused before it is read.
+        Self::check_total(&self.limits, self.budget, self.nested, &name, self.total.saturating_add(declared.min(cap.saturating_add(1))))?;
+        let remaining = self.budget.saturating_sub(self.total);
+        // One byte past the smallest bound tells a member exceeding it from one that just fits.
+        // The zip crate fails a read past the declared size itself (`InvalidData`, "larger than its
+        // declared uncompressed size"); either way it is the same refusal.
+        let past_declared = || Error::ResourceLimit(format!("zip: '{name}' holds more than the {declared} bytes it declares"));
+        let mut bytes = Vec::new();
+        let result = member.take(cap.min(remaining).min(declared).saturating_add(1)).read_to_end(&mut bytes);
+        if let Err(e) = result {
+            // What was decompressed before the error counts, so failing reads cannot add up past
+            // the limit.
+            let refusal = if is_past_declared(&e) { past_declared() } else { e.into() };
+            self.charge(bytes.len() as u64);
+            return Err(refusal);
+        }
+        let read = bytes.len() as u64;
+        if read > declared {
+            return Err(past_declared());
+        }
+        Self::check_total(&self.limits, self.budget, self.nested, &name, self.total.saturating_add(read))?;
+        self.charge(read);
+        Ok(bytes)
+    }
+
+    /// Refuses `total` bytes read with `name`, past `budget`. The message names the configured
+    /// `TERRIO_ZIP_MAX_SIZE`, which a nested archive shares with the one it is in.
+    fn check_total(limits: &ZipLimits, budget: u64, nested: bool, name: &str, total: u64) -> Result<()> {
+        if total <= budget {
+            return Ok(());
+        }
+        let shared = if nested { ", shared with the archives it is in" } else { "" };
+        Err(Error::ResourceLimit(format!(
+            "zip: '{name}' and its files hold more than the {} bytes allowed (TERRIO_ZIP_MAX_SIZE){shared}",
+            limits.max_size
+        )))
+    }
+
+    /// [`Self::read_index`] for the member named `name`.
+    pub(crate) fn read_name(&mut self, name: &str, cap: u64) -> Result<Vec<u8>> {
+        let index = self.zip.index_for_name(name).ok_or_else(|| zip_error(format!("'{name}' is not in the archive")))?;
+        self.read_index(index, cap)
+    }
+}
+
+/// Whether a read error is the zip crate's refusal of a member inflating past the size it declares.
+/// zip 9 has no typed error for it: it is an `InvalidData` error, the kind a CRC failure at the
+/// same position has too, so only its message tells them apart. Tests pin the message.
+fn is_past_declared(e: &std::io::Error) -> bool {
+    e.kind() == std::io::ErrorKind::InvalidData && e.to_string().contains("declared uncompressed size")
 }
 
 /// The names of an archive's entries, with `/` separators.
@@ -704,7 +938,7 @@ fn extract_from<R: Read + Seek>(
     }
     let names = entry_names(&zip);
     let member = match inner {
-        Some(inner) => inner.trim_matches('/').to_string(),
+        Some(inner) => inner.trim_end_matches('/').to_string(),
         None => main_member(&names).ok_or_else(|| Error::Unsupported(format!("no dataset found in '{}'", archive.file_name())))?,
     };
     let selected = select_entries(&names, &member)
@@ -712,15 +946,35 @@ fn extract_from<R: Read + Seek>(
     // Every entry is checked before any is read.
     let mut total = 0u64;
     let mut ranges = Vec::with_capacity(selected.len());
+    let mut paths = std::collections::HashMap::new();
+    let mut destinations = std::collections::HashSet::new();
+    let mut main_path = None;
     for &i in &selected {
         let e = zip.by_index_data(i)?;
         let name = &names[i];
         if e.is_symlink() {
             return Err(Error::Unsupported(format!("zip: '{name}' is a symbolic link")));
         }
-        if e.enclosed_name().is_none() {
-            return Err(zip_error(format!("'{name}' is not a relative path within the archive")));
+        let relative = e.enclosed_name().ok_or_else(|| zip_error(format!("'{name}' is not a relative path within the archive")))?;
+        if relative.is_absolute() || !destinations.insert(relative.clone()) {
+            return Err(zip_error("multiple members resolve to the same extracted path, or an extracted path is not relative"));
         }
+        if name == &member {
+            main_path = Some(relative.clone());
+        } else if let Some(tail) = name.strip_prefix(&format!("{member}/")) {
+            let tail = crate::memfs::relative_name(tail)?;
+            let mut root = relative.clone();
+            for _ in Path::new(&tail).components() {
+                if !root.pop() {
+                    return Err(zip_error("member is outside the selected store root"));
+                }
+            }
+            if main_path.as_ref().is_some_and(|old| *old != root) {
+                return Err(zip_error("members do not share one extracted store root"));
+            }
+            main_path = Some(root);
+        }
+        paths.insert(i, relative);
         let (size, packed) = (e.size(), e.compressed_size());
         limits.check_ratio("zip", name, size, packed)?;
         total = total.saturating_add(size);
@@ -733,19 +987,27 @@ fn extract_from<R: Read + Seek>(
     let temp = tempfile::Builder::new().prefix("terrio-").tempdir()?;
     for &i in &selected {
         let mut e = zip.by_index(i)?;
-        let path = temp.path().join(e.enclosed_name().ok_or_else(|| zip_error("unsafe member path"))?);
+        let path = temp.path().join(&paths[&i]);
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
         let declared = e.size();
-        let mut out = std::fs::File::create(&path)?;
+        let mut out = std::fs::OpenOptions::new().write(true).create_new(true).open(&path)?;
         // A member is cut at the size it declares, which the limits were checked against.
-        let copied = std::io::copy(&mut (&mut e).take(declared.saturating_add(1)), &mut out)?;
+        let past_declared = || Error::ResourceLimit(format!("zip: '{}' holds more than the {declared} bytes it declares", names[i]));
+        // The zip crate fails a read past the declared size itself, as in `LimitedZip::read_index`.
+        let copied = std::io::copy(&mut (&mut e).take(declared.saturating_add(1)), &mut out)
+            .map_err(|e| if is_past_declared(&e) { past_declared() } else { e.into() })?;
         if copied > declared {
-            return Err(zip_error(format!("'{}' holds more than the {declared} bytes it declares", names[i])));
+            return Err(past_declared());
         }
     }
-    Ok(LocalPath { path: temp.path().join(&member), _temp: Some(temp) })
+    let path = temp.path().join(main_path.ok_or_else(|| zip_error("selected member has no extracted path"))?);
+    let path = path.canonicalize()?;
+    if !path.starts_with(temp.path().canonicalize()?) {
+        return Err(zip_error("extracted dataset is outside its temporary directory"));
+    }
+    Ok(LocalPath { path, _temp: Some(temp) })
 }
 
 /// The Blob Storage endpoint `az://` and `/vsiaz/` paths resolve to, without a trailing slash, as
@@ -871,6 +1133,98 @@ impl Seek for RemoteArchive {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(remote)]
+    #[test]
+    fn remote_download_names_are_portable_single_components() {
+        for (input, expected) in [
+            (r"C:\Users\Public\map.gpkg", "map.gpkg"),
+            (r"..\..\map.gpkg", "map.gpkg"),
+            (r"\server\share\map.gpkg", "map.gpkg"),
+            ("C:map.gpkg", "map.gpkg"),
+            ("map:stream.gpkg", "stream.gpkg"),
+            ("..", "download"),
+            (".", "download"),
+            ("", "download"),
+            ("NUL.gpkg", "download-NUL.gpkg"),
+            ("COM1.tif", "download-COM1.tif"),
+            ("COM¹.tif", "download-COM¹.tif"),
+            ("CONIN$", "download-CONIN$"),
+            ("normal.gpkg", "normal.gpkg"),
+        ] {
+            let name = download_file_name(input);
+            assert_eq!(name, expected, "{input}");
+            assert_eq!(Path::new(&name).components().count(), 1);
+            assert!(!Path::new(&name).is_absolute());
+        }
+        for input in [r"https://example.test/..\..\map.gpkg", r"s3://bucket/C:\Users\map.gpkg"] {
+            let location = Location::parse(input);
+            assert_eq!(download_file_name(&location.file_name()), "map.gpkg");
+        }
+    }
+
+    #[cfg(remote)]
+    #[test]
+    fn remote_downloads_stay_in_their_owned_directory() {
+        use std::io::{BufRead, BufReader};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let worker = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            loop {
+                line.clear();
+                if reader.read_line(&mut line).unwrap() == 0 || line == "\r\n" {
+                    break;
+                }
+            }
+            let data = br#"{"type":"FeatureCollection","features":[]}"#;
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", data.len()).unwrap();
+            stream.write_all(data).unwrap();
+        });
+        let location = Location::Url(format!(r"http://{address}/C:\Users\Public\outside.geojson"));
+        let local = download(&location).unwrap();
+        let root = local._temp.as_ref().unwrap().path().canonicalize().unwrap();
+        assert!(local.path().canonicalize().unwrap().starts_with(root));
+        assert_eq!(local.path().file_name().unwrap(), "outside.geojson");
+        assert!(std::fs::read(local.path()).unwrap().starts_with(b"{\"type\""));
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn local_paths_are_not_gdal_names() {
+        for name in [
+            "",
+            "missing.tif",
+            "/tmp/missing.tif",
+            r"C:\data\missing.tif",
+            "C:/data/missing.tif",
+            "C:missing.tif",
+            r"\\?\C:\data\missing.tif",
+            r"\\server\share\missing.tif",
+            r"\\?\UNC\server\share\missing.tif",
+        ] {
+            assert!(!super::is_gdal_name(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn vsi_schemes_and_subdatasets_are_gdal_names() {
+        for name in [
+            "/vsimem/example.grb",
+            "/vsizip/archive.zip/image.tif",
+            "/vsis3/bucket:key.tif",
+            "gdal:missing.tif",
+            "GDAL:C:/data/input.tif",
+            "HDF5:\"C:/data/input.h5\"://dataset",
+            "https://example.com/input.tif",
+            "s3://bucket/missing.tif",
+            "é:input.tif",
+        ] {
+            assert!(super::is_gdal_name(name), "{name}");
+        }
+    }
+
     #[test]
     fn query_component_escapes_require_two_hex_digits() {
         assert_eq!(super::decode_query_component("%+1-%G0-%1-%"), "% 1-%G0-%1-%");
@@ -973,6 +1327,29 @@ mod tests {
         out
     }
 
+    #[test]
+    fn rooted_members_resolve_to_their_extracted_copy() {
+        let host = tempfile::tempdir().unwrap();
+        let outside = host.path().join("outside.tif");
+        std::fs::write(&outside, b"host").unwrap();
+        for name in [outside.to_str().unwrap(), r"C:\Users\Public\outside.tif", r"\server\share\outside.tif"] {
+            let (_dir, zip) = archive(&[(name, b"archive", false)]);
+            let local = resolve(&zip).unwrap();
+            assert_eq!(std::fs::read(local.path()).unwrap(), b"archive");
+            assert_ne!(local.path(), outside);
+            assert_eq!(std::fs::read(&outside).unwrap(), b"host");
+        }
+    }
+
+    #[test]
+    fn extracted_store_members_cannot_alias_one_another() {
+        let (_dir, zip) = archive(&[("s.zarr/.zgroup", b"{}", false), ("s.zarr/a", b"first", false), ("s.zarr/./a", b"second", false)]);
+        assert!(resolve(&zip).unwrap_err().to_string().contains("same extracted path"));
+        let (_dir, zip) = archive(&[("/s.zarr/.zgroup", b"{}", false), ("/s.zarr/a/0", b"chunk", false)]);
+        let local = resolve(&zip).unwrap();
+        assert_eq!(std::fs::read(local.path().join("a/0")).unwrap(), b"chunk");
+    }
+
     fn files_under(dir: &Path) -> Vec<String> {
         let mut out = Vec::new();
         let mut stack = vec![dir.to_path_buf()];
@@ -1071,5 +1448,94 @@ mod tests {
         std::fs::write(&link, buf.into_inner()).unwrap();
         let err = resolve(&format!("/vsizip/{}/link.tif", link.display())).unwrap_err().to_string();
         assert!(err.contains("symbolic link"), "{err}");
+    }
+
+    /// An archive of deflated members, each of `len` bytes of `fill`.
+    fn deflated_members(members: &[(&str, usize)]) -> Vec<u8> {
+        let mut buf = std::io::Cursor::new(Vec::new());
+        let mut zip = zip::ZipWriter::new(&mut buf);
+        for (name, len) in members {
+            zip.start_file(*name, SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated)).unwrap();
+            zip.write_all(&vec![b'x'; *len]).unwrap();
+        }
+        zip.finish().unwrap();
+        buf.into_inner()
+    }
+
+    #[test]
+    fn duplicate_name_checks_do_not_read_or_seek_again() {
+        struct Metered {
+            bytes: std::io::Cursor<Vec<u8>>,
+            reads: std::rc::Rc<std::cell::Cell<usize>>,
+            seeks: std::rc::Rc<std::cell::Cell<usize>>,
+        }
+        impl Read for Metered {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                let count = self.bytes.read(buffer)?;
+                self.reads.set(self.reads.get() + count);
+                Ok(count)
+            }
+        }
+        impl Seek for Metered {
+            fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
+                self.seeks.set(self.seeks.get() + 1);
+                self.bytes.seek(position)
+            }
+        }
+        for (bytes, duplicate) in [
+            (deflated_members(&[("a", 600), ("b", 600)]), false),
+            (include_bytes!("../tests/data/zip/duplicate_members.zip").to_vec(), true),
+        ] {
+            let reads = std::rc::Rc::new(std::cell::Cell::new(0));
+            let seeks = std::rc::Rc::new(std::cell::Cell::new(0));
+            let reader = Metered { bytes: std::io::Cursor::new(bytes), reads: reads.clone(), seeks: seeks.clone() };
+            let zip = zip::ZipArchive::new(reader).unwrap();
+            let before = (reads.get(), seeks.get());
+            assert_eq!(check_unique_zip_names(&zip).is_err(), duplicate);
+            assert_eq!((reads.get(), seeks.get()), before, "uniqueness checks use the loaded directory");
+        }
+    }
+
+    #[test]
+    fn limited_zip_reads_members_within_the_size_limit() {
+        let bytes = deflated_members(&[("a", 600), ("b", 600)]);
+        let limits = ZipLimits { max_size: 1000, ..ZipLimits::default() };
+        let mut zip = LimitedZip::with_limits(std::io::Cursor::new(bytes.clone()), limits).unwrap();
+        // A cap below the member's size: one byte past it, so the caller can tell.
+        assert_eq!(zip.read_name("a", 99).unwrap().len(), 100);
+        assert_eq!(zip.read_name("a", u64::MAX).unwrap().len(), 600);
+        // The members read count together: 100 + 600 + 600 is past the 1,000 allowed.
+        let error = zip.read_name("b", u64::MAX).unwrap_err();
+        assert!(matches!(&error, Error::ResourceLimit(m) if m.contains("TERRIO_ZIP_MAX_SIZE")), "{error:?}");
+        let error = LimitedZip::with_limits(std::io::Cursor::new(bytes), ZipLimits { max_entries: 1, ..limits }).err().unwrap();
+        assert!(matches!(&error, Error::ResourceLimit(m) if m.contains("TERRIO_ZIP_MAX_ENTRIES")), "{error:?}");
+    }
+
+    #[test]
+    fn limited_zip_refuses_a_member_past_the_size_it_declares() {
+        // A member that declares 10 bytes in both headers but inflates to 4,096.
+        let mut bytes = deflated_members(&[("a", 4096)]);
+        let patch = |bytes: &mut Vec<u8>, signature: &[u8], at: usize| {
+            let start = bytes.windows(4).position(|w| w == signature).unwrap();
+            bytes[start + at..start + at + 4].copy_from_slice(&10u32.to_le_bytes());
+        };
+        patch(&mut bytes, b"PK\x03\x04", 22);
+        patch(&mut bytes, b"PK\x01\x02", 24);
+        let mut zip = LimitedZip::with_limits(std::io::Cursor::new(bytes), ZipLimits::default()).unwrap();
+        // A resource refusal, which is not retried with GDAL, unless the cap stops the read first.
+        for cap in [u64::MAX, 10] {
+            let error = zip.read_name("a", cap);
+            assert!(
+                matches!(&error, Err(Error::ResourceLimit(m)) if m == "zip: 'a' holds more than the 10 bytes it declares"),
+                "{cap}: {error:?}"
+            );
+        }
+        assert_eq!(zip.read_name("a", 5).unwrap(), b"xxxxxx");
+        // `/vsizip/` refuses it the same way, as a resource refusal not retried with GDAL.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.zip");
+        std::fs::write(&path, zip.archive().clone().into_inner().into_inner()).unwrap();
+        let error = resolve(&format!("/vsizip/{}/a", path.display())).err().unwrap();
+        assert!(matches!(&error, Error::ResourceLimit(m) if m == "zip: 'a' holds more than the 10 bytes it declares"), "{error:?}");
     }
 }

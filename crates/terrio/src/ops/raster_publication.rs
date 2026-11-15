@@ -6,6 +6,9 @@
 
 use super::raster_tile::{Convention, FolderSink, TileCell, TilePlan};
 use crate::crs::SpatialRef;
+// KML and HTML text here escape `'` too (`&apos;`), unlike GDAL's metadata XML
+// (`drivers::common::xml_escape`).
+use crate::drivers::vector::xml::escape as xml;
 use crate::{Error, RasterDataset, Result};
 use serde::Deserialize;
 use serde_json::json;
@@ -117,13 +120,18 @@ impl<'a> Publication<'a> {
         {
             return Err(invalid("publication URLs must be HTTP(S) or relative"));
         }
+        if options.kml && extension == "webp" {
+            // KML ground overlays (Google Earth) take PNG, JPEG, GIF, BMP, TIFF or TGA images.
+            return Err(invalid("KML ground overlays do not support WebP tiles"));
+        }
         let global = !scheme.eq_ignore_ascii_case("raster");
         let square = plan.levels.iter().all(|l| (l.matrix.resolution[0] / l.matrix.resolution[1] - 1.).abs() < 1e-12);
         let applicable = |name: &str| match name {
-            "leaflet" => global && extension == "png",
-            "openlayers" => extension == "png",
+            "leaflet" => global && matches!(extension, "png" | "webp"),
+            "openlayers" => matches!(extension, "png" | "webp"),
             "mapml" => global && convention == Convention::Xyz,
-            "stac" => convention == Convention::Xyz && plan.crs.is_some() && square && !skip_blank,
+            // WebP tiles omit an opaque alpha band, so their band counts vary.
+            "stac" => convention == Convention::Xyz && plan.crs.is_some() && square && !skip_blank && extension != "webp",
             _ => false,
         };
         let mut viewers = BTreeSet::new();
@@ -153,7 +161,7 @@ impl<'a> Publication<'a> {
         let bounds = plan.levels.last().map(level_bounds).unwrap_or([0.; 4]);
         let geographic = if !plan.levels.is_empty() && (options.kml || viewers.contains("stac") || viewers.contains("leaflet")) {
             let srs = match &plan.crs {
-                Some(definition) => SpatialRef::parse(definition)?,
+                Some(definition) => SpatialRef::parse_literal(definition)?,
                 None => source.crs(),
             };
             if srs.is_unknown() {
@@ -307,7 +315,7 @@ impl<'a> Publication<'a> {
     fn stac(&self, source: &RasterDataset) -> Result<String> {
         let bounds = self.geo_bounds(self.bounds)?;
         let crs = self.plan.crs.as_deref().ok_or_else(|| invalid("STAC requires a CRS"))?;
-        let srs = SpatialRef::parse(crs)?;
+        let srs = SpatialRef::parse_literal(crs)?;
         let meters = srs.metres_per_unit();
         if !meters.is_finite() || meters <= 0. {
             return Err(invalid("STAC needs a known unit conversion"));
@@ -339,7 +347,7 @@ impl<'a> Publication<'a> {
             })
             .collect();
         let bands: Vec<_> =
-            (0..source.raster.bands).map(|i| json!({"name":format!("Band{}",i+1),"data_type":dtype(source.raster.data_type)})).collect();
+            (0..source.raster.bands).map(|i| json!({"name":format!("Band{}",i+1),"data_type":source.raster.data_type.as_str()})).collect();
         let scheme = if self.scheme.eq_ignore_ascii_case("raster") { "raster" } else { self.scheme };
         let document = json!({
             "stac_version":"1.1.0", "type":"Feature", "id":if self.options.title.is_empty(){"tiles"}else{&self.options.title},
@@ -488,9 +496,6 @@ fn html(title: &str) -> String {
         xml(title)
     )
 }
-fn xml(text: &str) -> String {
-    text.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;").replace('\'', "&apos;")
-}
 fn js(value: &impl serde::Serialize) -> String {
     serde_json::to_string(value)
         .unwrap()
@@ -515,19 +520,4 @@ fn put(sink: &mut dyn FolderSink, name: &str, bytes: &[u8]) -> Result<()> {
         sink.put(name, bytes)?;
     }
     Ok(())
-}
-fn dtype(t: crate::DataType) -> &'static str {
-    use crate::DataType::*;
-    match t {
-        U8 => "uint8",
-        I8 => "int8",
-        U16 => "uint16",
-        I16 => "int16",
-        U32 => "uint32",
-        I32 => "int32",
-        U64 => "uint64",
-        I64 => "int64",
-        F32 => "float32",
-        F64 => "float64",
-    }
 }

@@ -5,7 +5,7 @@ WebAssembly for browsers and Node.js. Datasets are opened from bytes, with a fil
 format, and written back to bytes. Try it without installing anything on the [Playground](playground.md).
 
 ```js
-import init, { open, fromGeoJSON, fromArrowIPC, rasterFromArray, registerGrid, transformPoints, describeCrs } from "terrio-js";
+import init, { open, fromGeoJSON, fromArrowIPC, rasterFromArray, registerGrid, transformPoints, describeCrs, listCrs } from "terrio-js";
 import { tableFromIPC, tableToIPC } from "apache-arrow";
 
 await init(); // in Node.js: await init({ module_or_path: fs.readFileSync(wasmPath) })
@@ -16,6 +16,11 @@ dem.info();                       // the summary `terrio info --json` prints
 dem.width, dem.height, dem.count, dem.dtype, dem.crs, dem.transform, dem.nodata
 const band = dem.readBand(1);     // Float32Array, Uint8Array... row after row
 const tile = dem.readBand(1, [0, 0, 256, 256]);   // a window [col_off, row_off, width, height]
+// An output of another size, as GDAL's RasterIO reads it (gdal_translate -outsize), from the
+// overview it chooses: bands one after another. Also on remote datasets (openUrl), as promises.
+const small = dem.readResampled({ size: [256, 256], resampling: "average" });
+const masks = dem.readResampledMasks({ size: [256, 256], resampling: "average" }); // Uint8Array
+const { data, masks: valid } = dem.readResampledWithMasks({ size: [256, 256] }); // both at once
 const cog = dem.toBytes("dem_cog.tif", { format: "COG", compress: "DEFLATE" });
 
 const roads = open(geojsonBytes, "roads.geojson");
@@ -30,14 +35,16 @@ const [xs, ys] = transformPoints([-122.4], [37.8], "EPSG:4326", "EPSG:32610");
 registerGrid("us_nga_egm96_15.tif", new Uint8Array(await (await fetch(gridUrl)).arrayBuffer()));
 const [lon, lat, h] = transformPoints([-100], [40], "EPSG:4979", "EPSG:4326+5773", [100]);
 transformPoints([135], [-25], "EPSG:7912", "EPSG:7843", [0], { sCoordEpoch: 2010.0 });
+// The registry CRSs, for a CRS picker: [{ authority, code, name, kind, deprecated, area_name, bounds, ... }].
+const albers = listCrs("albers", { authority: "EPSG", kind: "projected" });
 ```
 
 In WebAssembly, these formats are read from and written to memory:
 
 | | Read | Write |
 |---|---|---|
-| Raster | GeoTIFF/COG (LZW, Deflate, PackBits, ZSTD, LZMA, JPEG, WebP, LERC, JPEG XL), JPEG 2000 (JP2 and J2K), GRIB 1 and 2 (read band by band), netCDF, HDF5, Zarr and GeoZarr (zipped, or with `openZarr`), Esri ASCII grid, GeoPackage, PMTiles and MBTiles (read by window, zoom levels as overviews) | GeoTIFF, COG (lossless compressions, ZSTD included), JPEG 2000, Esri ASCII grid, GeoPackage, PMTiles, MBTiles |
-| Vector | GeoJSON, TopoJSON, ESRIJSON, ESRIPBF, FlatGeobuf\*, GeoPackage, CSV, XLSX, GeoParquet, CityJSON, CityGML, KML, KMZ, GML, GPX, OSM (PBF and XML), PMTiles, MBTiles, MVT tiles, zip archives of these, and Shapefile and MapInfo (MIF and TAB) in zip archives, DWG, DXF | GeoJSON, TopoJSON, FlatGeobuf, GeoPackage, CSV, XLSX, GeoParquet, CityJSON (`cityjsonVersion`: `"1.1"` or `"2.0"`), DWG, DXF, Shapefile (`.shp.zip`), KML, KMZ (`kmzResources` packs icon images), GML, GPX, PMTiles, MBTiles (`minzoom`, `maxzoom` options) |
+| Raster | GeoTIFF/COG (LZW, Deflate, PackBits, ZSTD, LZMA, JPEG, WebP, LERC, JPEG XL), JPEG 2000 (JP2 and J2K), GRIB 1 and 2 (read band by band), netCDF, HDF5, Zarr and GeoZarr (zipped, with `openZarr`, or remote by window with `openUrl`), Esri ASCII grid, GeoPackage, PMTiles and MBTiles (read by window, zoom levels as overviews) | GeoTIFF, COG (lossless compressions, ZSTD included), JPEG 2000, Esri ASCII grid, GeoPackage, PMTiles, MBTiles |
+| Vector | GeoJSON, TopoJSON, ESRIJSON, ESRIPBF, FlatGeobuf\*, GeoPackage, CSV, XLSX, GeoParquet, CityJSON, CityGML, KML, KMZ, GML, GPX, OSM (PBF and XML), PMTiles, MBTiles, MVT tiles, zip archives of these, and Shapefile and MapInfo (MIF and TAB) in zip archives, DWG and DXF (full module), HEC-RAS (full module) | GeoJSON, TopoJSON, FlatGeobuf, GeoPackage, CSV, XLSX, GeoParquet, CityJSON (`cityjsonVersion`: `"1.1"` or `"2.0"`), CityGML (`citygmlVersion`: `"2.0"` or `"3.0"`, `citygmlLod0Surface`: `"footprint"` or `"roof-edge"`), DWG and DXF (full module), Shapefile (`.shp.zip`), KML, KMZ (`kmzResources` packs icon images), GML, GPX, PMTiles, MBTiles (`minzoom`, `maxzoom` options) |
 
 \* FlatGeobuf files are read by terrio's own driver, with 64-bit offsets. `open` decodes a layer
 whole, within WebAssembly's 4 GB of memory; with the file's bytes, that takes about four times the
@@ -45,7 +52,29 @@ file's size for lines and five for polygons (3.2 GB and 5.4 GB in native builds)
 2 million OpenStreetMap lines opens in about 3 seconds in Node.js, and a 1 GB file of 2.3 million
 polygons runs out of memory, but in the memory64 module (see below). `openUrl` reads files with a
 spatial index by bounding box, decoding only the features found; a file without one is still read
-whole.
+whole. `openOapif(url, options)` reads OGC API Features services over `fetch`.
+
+HTTP 403 fails by default. For anonymous stores returning 403 for absent metadata, explicitly
+set `allowMissingMetadata403: true`; this accepts ambiguous version/existence probes. Denied
+v2 `.zattrs` documents, chunks and shards always fail. A `zarr.json` 403 remains an
+ambiguous absent-version probe, including its embedded v3 attributes. This strict default
+is specific to the JavaScript fetch backend; native anonymous S3 reads retain their existing
+missing-object 403 policy.
+
+A remote Zarr store (v2 or v3, sharded or not) opens with `openUrl` too: the store or group at
+the URL (`.zarr`, or `format: "Zarr"`) and the array `array` within it, read as a raster by
+window. Opening fetches its metadata documents, and a window the shard indexes and chunks it
+needs, nearby inner chunks coalesced with a 1 MiB target (a single larger chunk is fetched
+whole), the indexes kept for later windows. A year of the TESSERA embeddings (128 bands of a
+192 x 192 window, 5 MB) reads in about 4 seconds after opening in Chrome from Europe.
+Opening plus reading takes about 5–6 seconds in that measurement. The TESSERA Zarr Explorer,
+which reads it with zarrita, takes about 9 seconds for the window:
+
+```js
+const store = "https://s3.us-west-2.amazonaws.com/us-west-2.opendata.source.coop/tessera/tessera/zarr/v1.1-dclimate/utm30";
+const emb = await openUrl(store, { format: "Zarr", array: "embeddings", allowMissingMetadata403: true }); // (time, band, y, x): 1152 bands
+const year2025 = await emb.read({ window: [45184, 360000, 192, 192], bands: Array.from({ length: 128 }, (_, i) => 1025 + i) });
+```
 
 HEC-RAS geometry and plan HDF files (the full module) open as vector layers with `open`, and with
 `openVector(bytes, filename, { layers, openOptions })` to join the results HEC-RAS stored
@@ -65,12 +94,13 @@ The package holds two WebAssembly modules with the same API. `terrio-js` has eve
 `terrio-js/core` leaves out the heaviest ones (GeoParquet and Arrow IPC, netCDF and HDF5, point
 clouds, JPEG 2000, GRIB, Zarr, AVIF tiles, OpenStreetMap, CAD and HEC-RAS) and keeps GeoTIFF/COG with all its
 compressions, GeoJSON and the other text formats, FlatGeobuf, GeoPackage, Shapefile, PMTiles and
-MBTiles, the CRS transformations and the operations, at about half the size:
+MBTiles, the CRS transformations and the operations, at about half the size (measured from the
+[CI package at `b371d79`](https://github.com/opengeos/terrio/actions/runs/40144408237), decimal MB):
 
 | Module | `.wasm` | gzip | Brotli |
 |---|---|---|---|
-| `terrio-js` | 16.9 MB | 5.9 MB | 4.3 MB |
-| `terrio-js/core` | 9.2 MB | 3.2 MB | 2.4 MB |
+| `terrio-js` | 22.10 MB | 7.71 MB | 5.67 MB |
+| `terrio-js/core` | 9.67 MB | 3.36 MB | 2.56 MB |
 
 ```js
 import init, { open, features } from "terrio-js/core";
@@ -88,9 +118,41 @@ is passed only to the functions of its own module.
 Both modules are built for size: whole-program LTO, the codecs optimized for speed and the rest
 for size, and wasm-opt -Oz. The full module's sizes are in the table above.
 
+## Zarr alone: `terrio-js/zarr`
+
+`terrio-js/zarr` is a third module, of its own API, that reads Zarr arrays over HTTP and nothing
+else: terrio's Zarr driver (v2 and v3, sharded or not, every codec terrio reads), the requests of
+`openUrl` (12 in flight, chunks kept between reads), and no CRS engine. It suits pages that only
+show Zarr data, such as embeddings or satellite image cubes.
+
+```js
+import init, { openZarr } from "terrio-js/zarr";
+
+await init();
+const a = await openZarr("https://example.com/cube.zarr", { array: "b04" });
+a.width, a.height, a.count, a.dtype, a.nodata, a.transform, a.epsg;
+a.attributes();                                   // the array's attributes
+const [red, nir] = await a.read({ window: [0, 0, 512, 512], bands: [3, 4] }); // typed arrays
+a.stats();                                        // { requests, bytes }
+```
+
+Its options are those of `openUrl` for Zarr: `array`, `cacheSize`, `fetch`, `headers` and
+`allowMissingMetadata403`. Without the CRS engine, `epsg` is the EPSG code the store names
+(`proj:code`, `proj:epsg`, a PROJJSON identifier, GDAL's `_CRS`); CF grid-mapping CRS parameters
+and GDAL's `pam.aux.xml` are not read. A grid mapping's `GeoTransform` can still supply the
+geotransform, and `attributes()` has the rest. It reads the full-resolution array:
+multiscale levels are other arrays of the store, opened by their `array` path.
+
+Measured from a local `wasm-release` build (wasm-opt `-Oz`; gzip 9, Brotli 11), not a recorded CI
+snapshot:
+
+| Module | `.wasm` | gzip | Brotli |
+|---|---|---|---|
+| `terrio-js/zarr` | 0.53 MB | 0.23 MB | 0.19 MB |
+
 ## Threads: `terrio-js/load` and `terrio-js/threads`
 
-A third module, `terrio-js/threads`, has every format and a thread pool of Web Workers (or
+A separate module, `terrio-js/threads`, has every format and a thread pool of Web Workers (or
 Node.js worker threads) over shared memory: GeoTIFF tiles and strips, JPEG 2000 tiles and Zarr
 chunks decode in parallel, and GeoTIFF/COG tiles, overviews and Zarr chunks are compressed in
 parallel, as natively. `terrio-js/load` picks it where WebAssembly threads run (Node.js 22 or
@@ -161,50 +223,98 @@ them (`target_arch = "wasm32"` read as `target_family = "wasm"`): `tar`, which w
 on, acadrust and `arrow-buffer`; getrandom, which seeds ahash's hash maps, has no wasm64 backend
 and is given one (`crypto.getRandomValues`).
 
-## Building
+## Operations
 
-```sh
-node js/build.mjs                         # the npm package in js/pkg: all modules, built for size
-node --test js/tests/package.test.mjs     # (threads and memory64 need the nightly js/build.mjs names)
-TERRIO_JS_LOAD=../pkg/load.js node --test js/tests/node.test.mjs   # the suite on the threaded module
-TERRIO_JS_LOAD=../pkg/load.js TERRIO_MEMORY64=1 TERRIO_LARGE_TESTS=1 node --test js/tests/node.test.mjs  # memory64, > 4 GB
-node js/tests/browser.mjs ../terrio-data  # in headless browsers (Playwright), timings included
-wasm-pack build js --release --target nodejs --out-dir pkg-node --out-name terrio
-node --test js/tests/node.test.mjs        # TERRIO_TEST_DATA=... adds real files checked against GDAL
-# terrio-js/core, and the tests of the formats it has:
-wasm-pack build js --release --target nodejs --out-dir pkg-node/core --out-name terrio --no-pack -- --no-default-features --features core
-TERRIO_JS_PKG=../pkg-node/core/terrio.js node --test js/tests/node.test.mjs
-node js/bench/bench.mjs ../terrio-data    # timings of decoding and writing real files
+`translate(src, options)`, `warp(src, options)`, `mosaic(srcs, options)`, `rasterize(src, options)`,
+`polygonize(src, options)`, `dem(src, processing, options)`, `calc(expression, inputs, options)`,
+`proximity(src, options)`, `sieve(src, options)`, `fillNodata(src, options)`,
+`contour(src, options)`, `footprint(src, options)`, `buffer(src, distance, options)`,
+`dissolve(src, options)` and `singlepart(src)` follow the matching [commands](cli.md), with
+camelCase options. So do `zonalStats`, `makeValid`, `checkGeometry`, `clipVector`, `layerAlgebra`,
+`checkCoverage`, `simplifyCoverage`, `cleanCoverage`, `blend`, `identify`, `checkDataset`,
+`pipeline`, `retile`, `planRetile`, `rasterIndex`, `vectorIndex`, `rpftocCreate` and `vsiStat`.
+`takeWarnings` returns the warnings collected so far.
+
+`translate` reads the rasters the lazy reader opens (GeoTIFFs, JPEG 2000, GRIB, tile archives, as
+a `Dataset` opened from bytes or the bytes) by window, for the output alone, from the stored
+resolution its `overview` option selects where the reader exposes overviews, as `warp`'s does and
+`gdal_translate -ovr`: `"AUTO"` (the default), `"AUTO-n"`, `"NONE"` or a level from 0. Rasters in
+memory, and formats read whole (ASCII grids, for instance), are translated at full resolution.
+
+### Raster management
+
+`createRaster(like, options)` returns a raster Dataset. Options include size,
+bandCount, ot, crs, bbox, nodata, unsetNodata, burn, metadata and copyMetadata.
+Encode it with `toBytes("output.tif")`; `addOverviews(bytes, options)`,
+`refreshOverviews(bytes, options)` and `deleteOverviews(bytes, options)` return
+updated GeoTIFF bytes. External overview files are unavailable for byte inputs.
+
+`editRaster(bytes, options)` changes CRS, geotransform, bbox, GCPs, nodata,
+metadata or statistics without resampling. Options use camelCase; GCPs are
+[pixel, line, x, y, z] arrays. Histogram storage needs a sidecar and is refused.
+`moveRaster(bytes, {tSrs, sSrs, errorThreshold, ignoreCogLayoutBreak})` returns
+{bytes, report}; report contains geotransform, corners, errors, maxError and
+updated. Without errorThreshold it reports the proposed affine change without
+applying it. `updateRaster(source, destinationBytes, options)` returns updated
+GeoTIFF bytes and supports resampling, clipping geometry and overview refresh.
+Byte inputs/results are materialized; large-file editing should use native APIs.
+`refreshOverviews` takes explicit `bbox` extents only: there is no `like` option,
+so compute a template's extent from its geotransform. `createRaster` returns an
+in-memory dataset, so the file-only `copyOverviews` option of the CLI and Python
+is unavailable; add overviews to the encoded bytes with `addOverviews`.
+
+### Separate raster tiles
+
+`planRasterTiles(src, options)` returns the grid and tile count without reading
+pixels and includes the destination `crs` (null when unknown). It validates
+metadata-based rendering options. `rasterTiles(src, options, callback)` sends each encoded tile to
+`callback(name, bytes)` and returns generation counts. Options include `tilingScheme`
+(`raster`, `WebMercatorQuad`, `WorldCRS84Quad`), `grid` (for example
+`{tileSize: 128, minZoom: 0, maxZoom: 2}`),
+`format` (`PNG` or `GTiff`), `resampling`, `overviewResampling`, `alpha`,
+`outputNodata`, `skipBlank` and `maxTiles`. The caller stores the emitted bytes.
+See the [CLI tiling reference](cli.md#separate-file-raster-tiles) for supported output
+and transparency policies.
+
+### Pictures of data
+
+`render(source, options)` draws a raster or vector dataset as `{width, height, data}`, `data` a
+`Uint8ClampedArray` of RGBA pixels for `new ImageData(data, width, height)`, and
+`renderPng(source, options)` returns PNG bytes. Sources are Datasets, uploaded bytes
+(`Uint8Array` or `{bytes, filename}`) or GeoJSON. Options: `width`, `height`, `maxSize` (1024),
+`bands`, `colormap`, `stretch`, `layers` and `attribute`, as in [`terrio preview`](cli.md#preview).
+Rasters are read from the coarsest overview that still has the pixels needed.
+See [Layer selection](#layer-selection) for filename aliases and selecting layers
+from materialized datasets.
+
+```js
+const { width, height, data } = render(dataset, { colormap: "terrain", maxSize: 512 });
+canvas.getContext("2d").putImageData(new ImageData(data, width, height), 0, 0);
 ```
 
-## Native multidimensional arrays
+### Indexed color conversion
 
-See [Native multidimensional arrays](multidim.md) for scientific groups, named dimensions,
-lazy coordinate arrays, time/depth slicing, transposition and netCDF/Zarr numeric snapshots.
+`rgbToPalette(source, {colorCount: 256, bitDepth: 5, dither: true, colorMap,
+outputNodata, mask})` returns an indexed Byte Dataset. Sources accept Dataset
+objects or uploaded raster bytes (`Uint8Array` or `{bytes, filename}`). `colorMap`
+accepts a palette Dataset/upload, color-file text, `{text, filename}`, or RGBA
+integer arrays; `mask` accepts a flat Uint8Array/array of validity bytes.
+`paletteToRgb(source, {rgba: true})` expands to RGBA (RGB by default), and
+`attachPalette(source, colorMap)` changes only the table.
+`readColorTable(source, filename)` reads integer RGBA entries from these same
+palette sources. Operations materialize the input/output. See
+[Palette conversion](cli.md#palette-conversion) for formats and validity rules.
 
-## Indexed raster catalogs
+Raster `toBytes` preserves dataset masks for GeoTIFF/COG without `tSrs`.
+Other formats omit separate dataset masks. Reprojecting a raster
+with a separate dataset mask is refused explicitly; use an alpha band instead.
 
-`openCatalog(index, sources, options)` opens an index `Dataset`, vector file bytes or GeoJSON,
-with a map of location strings to raster datasets or file bytes:
+Color-file text passed to palette APIs as a `Uint8Array` needs a filename hint
+or `{bytes, filename: "colors.txt"}`. Plain strings and `{text, filename}` also
+accept text tables. Tile-archive serialization rejects any raster with a
+dataset mask, including materialized palette results; use an explicit alpha band.
 
-```javascript
-const catalog = terrio.openCatalog(tileIndex, { "left.tif": left, "right.tif": right }, {
-  tr: [30, 30], sortField: "priority", cacheSize: 16,
-});
-const pixels = catalog.readBand(1, [100, 200, 256, 256]);
-```
-
-The index uses an in-memory R-tree in WASM; only selected sources enter the bounded cache.
-Supplied lazy datasets retain window/overview reads, and encoded files are opened only when
-selected. Existing dataset buffers/readers remain shared with the caller; freeing the original
-Dataset does not close the catalog's handle.
-Locations are keys in the supplied source map; WASM does not open filesystem paths or URLs.
-Options are `locationField`, `sortField`, `sortDescending`, `tr`, `te`, `srs`, `bands`, `ot`,
-`nodata`, `alphaBand`, `cacheSize` and `resampling`. Source masks/nodata and zero alpha are
-transparent; tiles in other CRSs are reprojected into the index CRS. See
-[CLI catalogs](cli.md#catalog) for the supported GTI subset.
-
-## Pansharpening
+### Pansharpening
 
 ```javascript
 const sharp = terrio.pansharpen(pan, rgbnir, { bands: [1, 2, 3], bitdepth: 12, nodata: 0 });
@@ -219,7 +329,7 @@ Inputs can be datasets or raster bytes. All spectral inputs contribute to intens
 `bands` selects/reorders output bands. See [pansharpen](cli.md#pansharpen) for working
 types, interpolation, nodata, bit depth and extent handling.
 
-## Focal statistics, collars and enhancement
+### Focal statistics, collars and enhancement
 
 ```javascript
 const max5 = terrio.neighbors(dem, { kernel: "equal", size: 5, method: "max" });
@@ -239,73 +349,7 @@ These are `terrio neighbors`, `clean-collar`, `nearblack` and `enhance` (see
 and an input's mask is not kept (use `addAlpha`). There is no in-place update; LUT files are
 passed and returned as text.
 
-## SQL queries
-
-`sql(src, query)` returns a `Dataset` using the shared [OGR SQL subset](sql.md).
-Inputs may be a `Dataset`, file bytes, `{ bytes, filename }`, or GeoJSON.
-
-```js
-const result = sql(countries, "SELECT ADMIN, POP_EST/1000000.0 AS millions FROM countries");
-const summary = sql(countries, "SELECT COUNT(*) AS n, SUM(POP_EST) AS population FROM countries");
-```
-
-Raw GeoJSON inputs use the layer name `layer`; use `Layer.from_geojson(..., name=...)`
-(Python) or `fromGeoJSON(src, name)` (JavaScript) to assign another name.
-
-## Vector geometry operations
-
-`simplify(src, tolerance)`, `segmentize(src, maxLength)`, `convexHull(src)`,
-`concaveHull(src, ratio, { allowHoles, tight })`, `swapXy(src)`, `setGeomType(src, {
-geometryType, multi, single, linear, dim, layerOnly, featureOnly, skip })`, `combine(src, {
-groupBy, keepNested, addExtraFields })` and `sort(src, { method })` run the
-[vector geometry commands](cli.md#vector-geometry-commands) on every layer of a `Dataset`,
-file bytes or GeoJSON, and return a `Dataset`.
-
-```js
-const hulls = concaveHull(combine(places, { groupBy: ["adm0_a3"] }), 0.3, { allowHoles: true });
-const simple = simplify(counties, 0.01);
-const sorted = sort(simple, { method: "hilbert" });
-```
-
-## Vector datasets
-
-```js
-const merged = terrio.concat([countries, { bytes: usBytes, filename: "us.gpkg" }], { mode: "single", sourceLayerFieldName: "source" });
-const parts = terrio.partition(counties, { fields: ["STATE"], format: "GPKG" }); // [{ path, bytes }]
-const typed = terrio.setFieldType(countries, "Integer64", { fieldName: "POP_EST" });
-const points = terrio.makePoint(trace, "longitude", "latitude", { crs: "EPSG:4326" });
-const schema = terrio.exportSchema(countries); // the OGR_SCHEMA object
-const empty = terrio.createVector("empty.gpkg", { schema }); // the new file's bytes
-```
-
-These are `terrio concat`, `partition`, `set-field-type`, `make-point`, `export-schema` and
-`create` (GDAL's `gdal vector` commands of the same names), in memory: `partition` returns the
-parts' relative paths and bytes, and `createVector` the bytes of the dataset, rather than
-writing files. `exportSchema` describes the layers read (GeoPackage column declarations are
-read only from files, by the command line, Python and Rust). See
-[Vector datasets](cli.md#vector-datasets) for the options and GDAL's rules.
-
-### Renaming and updating vector datasets
-
-`renameLayer(src, options)`, `editVector(src, options)` and
-`updateVector(src, dst, options)` return a new `Dataset`, preserving their inputs.
-Serialize the result with `toBytes` to persist it.
-
-```javascript
-const renamed = terrio.renameLayer(countries, {ascii: true, lowerCase: true});
-const assigned = terrio.editVector(renamed, {crs: "EPSG:4326"});
-const updated = terrio.updateVector(changes, renamed, {key: ["name"], mode: "merge"});
-```
-
-Rename accepts `inputLayer`, `outputLayer`, `ascii`, `lowerCase`,
-`filenameCompatible`, `reservedCharacters`, `replacementCharacter`, `maxLength`.
-Edit accepts `activeLayer`, `crs` (`"none"` removes it), `geometryType`, `unsetFid`.
-CRS assignment does not transform coordinates. Dataset metadata edits require the
-native path API because the memory model does not retain dataset metadata.
-Update accepts `inputLayer`, `outputLayer`, `key`, `mode` (`merge`, `update-only`,
-`append-only`); it matches feature IDs when `key` is omitted.
-
-## Viewshed
+### Viewshed
 
 ```javascript
 const visible = terrio.viewshed(dem, 500000, 4400000, { oz: 2, tz: 0, md: 5000 });
@@ -314,9 +358,12 @@ const height = terrio.viewshed(dem, 500000, 4400000, { om: "GROUND", cc: 0 });
 
 The input can be a dataset or raster bytes. `om` selects NORMAL visibility, DEM minimum
 visible elevation, or GROUND minimum height above the DEM. `cc` is 1 minus refraction.
+For cumulative visibility, pass `{ om: "ACCUM", os: 10 }`; `os` sets observer
+spacing in pixels (default 10). JavaScript retains positional coordinates:
+use `viewshed(dem, 0, 0, { om: "ACCUM", os: 10 })`; the CLI permits omitting them.
 See [viewshed](cli.md#viewshed) for units, curvature, radius cropping and nodata behavior.
 
-## Vector gridding and linear referencing
+### Vector gridding and linear referencing
 
 ```javascript
 const grid = terrio.vectorGrid(points, { algorithm: "invdistnn", zfield: "temp", radius: 50000, size: [200, 200] });
@@ -336,8 +383,7 @@ Linear reference lookups accept `{layer: "parts"}` to select a source layer.
 Reuse a Dataset, such as `terrio.open(bytes, "parts.gpkg")`, for repeated lookups; serialized
 bytes and GeoJSON are parsed on each call.
 
-
-## Compare, pixel info and XYZ
+### Compare, pixel info and XYZ
 
 ```javascript
 const report = terrio.compare(reference, output, { skipBinary: true });
@@ -362,8 +408,7 @@ separator between band values. For vector file bytes, pass the GeoJSON result to
 XYZ exports. Native Rust XYZ writers stream the output. Byte-based `compare` copies each
 input once and reuses that buffer for binary comparison and lazy reads.
 
-
-## Pixel-wise operations
+### Pixel-wise operations
 
 ```javascript
 const physical = terrio.unscale(packed, { ot: "Float64" });
@@ -383,7 +428,7 @@ For `nodataToAlpha`, non-finite overrides use the strings `"nan"`, `"inf"` or `"
 (as a scalar or in the nodata array). Raw JavaScript non-finite numbers and explicit null
 are rejected before JSON serialization, so they cannot silently become a default override.
 
-## Geolocation-array warping
+### Geolocation-array warping
 
 Pass longitude and latitude rasters explicitly when array datasets cannot be reopened from
 paths in WebAssembly. `x` and `y` accept a `Dataset`, file bytes, or `{ bytes, filename }`:
@@ -402,39 +447,180 @@ the explicit `geolocation` option supplies arrays for the first source. The oper
 pure Rust in full and core WASM builds. See [CLI warping](cli.md#warp) for invalid coordinates,
 antimeridian handling and boundary differences from GDAL.
 
-### Raster management
+## Vector datasets
 
-`createRaster(like, options)` returns a raster Dataset. Options include size,
-bandCount, ot, crs, bbox, nodata, unsetNodata, burn, metadata and copyMetadata.
-Encode it with `toBytes("output.tif")`; `addOverviews(bytes, options)`,
-`refreshOverviews(bytes, options)` and `deleteOverviews(bytes, options)` return
-updated GeoTIFF bytes. External overview files are unavailable for byte inputs.
+```js
+const merged = terrio.concat([countries, { bytes: usBytes, filename: "us.gpkg" }], { mode: "single", sourceLayerFieldName: "source" });
+const parts = terrio.partition(counties, { fields: ["STATE"], format: "GPKG" }); // [{ path, bytes }]
+const typed = terrio.setFieldType(countries, "Integer64", { fieldName: "POP_EST" });
+const points = terrio.makePoint(trace, "longitude", "latitude", { crs: "EPSG:4326" });
+const schema = terrio.exportSchema(countries); // the OGR_SCHEMA object
+const empty = terrio.createVector("empty.gpkg", { schema }); // the new file's bytes
+```
 
-`editRaster(bytes, options)` changes CRS, geotransform, bbox, GCPs, nodata,
-metadata or statistics without resampling. Options use camelCase; GCPs are
-[pixel, line, x, y, z] arrays. Histogram storage needs a sidecar and is refused.
-`moveRaster(bytes, {tSrs, sSrs, errorThreshold, ignoreCogLayoutBreak})` returns
-{bytes, report}; report contains geotransform, corners, errors, maxError and
-updated. Without errorThreshold it reports the proposed affine change without
-applying it. `updateRaster(source, destinationBytes, options)` returns updated
-GeoTIFF bytes and supports resampling, clipping geometry and overview refresh.
-Byte inputs/results are materialized; large-file editing should use native APIs.
-`refreshOverviews` takes explicit `bbox` extents only: there is no `like` option,
-so compute a template's extent from its geotransform. `createRaster` returns an
-in-memory dataset, so the file-only `copyOverviews` option of the CLI and Python
-is unavailable; add overviews to the encoded bytes with `addOverviews`.
+These are `terrio concat`, `partition`, `set-field-type`, `make-point`, `export-schema` and
+`create` (GDAL's `gdal vector` commands of the same names), in memory: `partition` returns the
+parts' relative paths and bytes, and `createVector` the bytes of the dataset, rather than
+writing files. `exportSchema` describes the layers read (GeoPackage column declarations are
+read only from files, by the command line, Python and Rust). See
+[Vector datasets](cli.md#vector-datasets) for the options and GDAL's rules.
 
-## Operations
+### Layer selection
 
-`translate(src, options)`, `warp(src, options)`, `mosaic(srcs, options)`, `rasterize(src, options)`,
-`polygonize(src, options)`, `dem(src, processing, options)`, `calc(expression, inputs, options)`,
-`proximity(src, options)`, `sieve(src, options)`, `fillNodata(src, options)`,
-`contour(src, options)`, `footprint(src, options)`, `buffer(src, distance, options)`,
-`dissolve(src, options)` and `singlepart(src)` follow the matching [commands](cli.md), with
-camelCase options. So do `zonalStats`, `makeValid`, `checkGeometry`, `clipVector`, `layerAlgebra`,
-`checkCoverage`, `simplifyCoverage`, `cleanCoverage`, `blend`, `identify`, `checkDataset`,
-`pipeline`, `retile`, `planRetile`, `rasterIndex`, `vectorIndex`, `rpftocCreate` and `vsiStat`.
-`takeWarnings` returns the warnings collected so far.
+An empty `layers` request keeps all layers. Duplicate requests do not duplicate
+output, and source order is retained. Every requested name must match; readers,
+rendering and filtering report `no layer named NAME (layers: AVAILABLE)` for a
+missing name. A file with exactly one layer also accepts the filename without its
+extension, without renaming the layer. This alias is a Terrio extension to GDAL
+3.13.3's layer-name lookup. Native GeoPackage table names remain case-insensitive.
+For ZIP archives, selection uses the main dataset member's filename (for example,
+`member` for `member.shp` inside `archive.zip`), rather than the archive's name.
+
+HEC-RAS, WFS and OAPIF retain their driver-specific selection rules and error
+messages. HEC-RAS requires stored layer names; it does not accept filename aliases.
+
+`openVector` also accepts `skipFeatures` and `maxFeatures`, applying the range
+once to each selected layer. `maxFeatures: 0` retains its schema with no features.
+The eager byte reader decodes the source before slicing; these options bound the
+returned features, not its peak decoding memory. In Python, ranges are available
+through the pyogrio facade; native `terrio.open_vector` retains its existing
+whole-dataset interface without range parameters.
+In-memory files refuse OAPIF service open options, including when their filename
+label starts with `OAPIF:`. Use `openOapif` for a service.
+
+`openVector(bytes, filename, {layers})` and operations receiving `{bytes, filename}`
+can use the filename alias. Bare `Uint8Array` inputs use the implicit filename
+`data`, so a single layer also answers to `data`; pass `{bytes, filename}` to give
+it a meaningful filename alias. A materialized `Dataset` does not retain its source
+filename, so subsequent operations use its actual layer names. For bytes from
+`map.geojson` containing one layer named `roads`:
+
+```js
+const ds = terrio.openVector(bytes, "map.geojson", { layers: ["map"] });
+terrio.render({ bytes, filename: "map.geojson" }, { layers: ["map"] });
+terrio.render(ds, { layers: ["roads"] });
+// terrio.render(ds, { layers: ["map"] }) throws: no layer named map (layers: roads)
+ds.free();
+```
+
+### Renaming and updating vector datasets
+
+`renameLayer(src, options)`, `editVector(src, options)` and
+`updateVector(src, dst, options)` return a new `Dataset`, preserving their inputs.
+Serialize the result with `toBytes` to persist it.
+
+```javascript
+const renamed = terrio.renameLayer(countries, {ascii: true, lowerCase: true});
+const assigned = terrio.editVector(renamed, {crs: "EPSG:4326"});
+const updated = terrio.updateVector(changes, renamed, {key: ["name"], mode: "merge"});
+```
+
+Rename accepts `inputLayer`, `outputLayer`, `ascii`, `lowerCase`,
+`filenameCompatible`, `reservedCharacters`, `replacementCharacter`, `maxLength`.
+Edit accepts `activeLayer`, `crs` (`"none"` removes it), `geometryType`, `unsetFid`.
+CRS assignment does not transform coordinates. Dataset metadata edits require the
+native path API because the memory model does not retain dataset metadata.
+Update accepts `inputLayer`, `outputLayer`, `key`, `mode` (`merge`, `update-only`,
+`append-only`); it matches feature IDs when `key` is omitted.
+
+### SQL queries
+
+`sql(src, query)` returns a `Dataset` using the shared [OGR SQL subset](sql.md).
+Inputs may be a `Dataset`, file bytes, `{ bytes, filename }`, or GeoJSON.
+
+```js
+const result = sql(countries, "SELECT ADMIN, POP_EST/1000000.0 AS millions FROM countries");
+const summary = sql(countries, "SELECT COUNT(*) AS n, SUM(POP_EST) AS population FROM countries");
+```
+
+Raw GeoJSON inputs use the layer name `layer`; use `Layer.from_geojson(..., name=...)`
+(Python) or `fromGeoJSON(src, name)` (JavaScript) to assign another name.
+
+### Vector geometry operations
+
+`simplify(src, tolerance)`, `segmentize(src, maxLength)`, `convexHull(src)`,
+`concaveHull(src, ratio, { allowHoles, tight })`, `swapXy(src)`, `setGeomType(src, {
+geometryType, multi, single, linear, dim, layerOnly, featureOnly, skip })`, `combine(src, {
+groupBy, keepNested, addExtraFields })` and `sort(src, { method })` run the
+[vector geometry commands](cli.md#vector-geometry-commands) on every layer of a `Dataset`,
+file bytes or GeoJSON, and return a `Dataset`.
+
+```js
+const hulls = concaveHull(combine(places, { groupBy: ["adm0_a3"] }), 0.3, { allowHoles: true });
+const simple = simplify(counties, 0.01);
+const sorted = sort(simple, { method: "hilbert" });
+```
+
+`zonalStats` also takes labelled objects `{raster, time, label, band}` among its rasters (fields
+`TIME_LABEL_STATISTIC`, or `TIME_LABEL_bN_STATISTIC` for a label over several `bands`; a `time`
+or `label` is a string, a number or a `Date`, written in ISO 8601), and the statistics of the [command](cli.md#zonal-stats), quantiles and
+mode included. It accepts `fractional: true`, `weights` as a dataset/upload, and optional
+`weightBand` (default 1). Select `weighted_mean`, `weighted_sum` or `weighted_stddev`
+in `stats` for a second aligned weighting raster; see the
+[formulas and limits](cli.md#fractional-coverage-and-weighting-rasters).
+
+`ZonalReducer` gives the results of `zonalStats` for arrays you compute yourself, a strip at a
+time, without building a raster first. Zones are computed once for the grid; `windows()` lists
+the `[x, y, width, height]` strips that hold zone pixels (`stripRows` rows each: by default
+terrio's strip size for one float64 band of this width; give a tiled source's block height to
+read each block once), and `stream()`
+reduces one band fed those strips in order, as typed arrays of `width * height` pixels, row after
+row:
+
+```js
+const reducer = new ZonalReducer(fields, width, height, transform, "EPSG:32631", { stats: ["mean", "median"] });
+const stream = reducer.stream();
+reducer.windows().forEach(([x, y, w, h], i) => {
+  const [red, nir] = readStrip(x, y, w, h); // Float64Arrays of w * h pixels
+  stream.add(i, nir.map((n, j) => (n - red[j]) / (n + red[j]))); // 0/0 is NaN, left out
+});
+const ndvi = stream.finish(); // { mean: Float64Array, median: Float64Array }, one value per field
+```
+
+`finish()` returns an object of one `Float64Array` per statistic, keyed by its name, NaN where a
+zone has no valid pixels (`count` and `variety` are then 0). Statistics that keep values (median,
+quantiles, mode, minority, variety) hold each open zone's values in each stream, 8 bytes per pixel
+(16 with `fractional`): feed streams one at a time to bound them. In a stream fed arrays of one 8-
+or 16-bit integer type, a zone of at least 256 or 65,536 pixels counts them in a histogram of 2 or
+512 KiB instead. It also takes `allTouched`, `fractional`, `layer` and `stripRows`; weighted
+statistics need `zonalStats`, and `tSrs` and `decimalPlaces` are not supported: the results are
+unrounded arrays, without geometries.
+
+## Native multidimensional arrays
+
+See [Native multidimensional arrays](multidim.md) for scientific groups, named dimensions,
+lazy coordinate arrays, time/depth slicing, transposition and netCDF/Zarr numeric snapshots.
+
+### Multidimensional mosaics
+
+`mosaicMultidim(sources, {arrays})` builds a lazy coordinate-aligned
+`MultidimDataset` from dataset handles or uploaded scientific inputs. `arrays`
+selects numeric arrays by path or unambiguous name. Source handles can be freed
+after construction; mosaic views keep the source data alive. See
+[Multidimensional mosaics](cli.md#multidimensional-mosaics) for alignment,
+priority, Int64/UInt64 handling and snapshot formats.
+
+## Indexed raster catalogs
+
+`openCatalog(index, sources, options)` opens an index `Dataset`, vector file bytes or GeoJSON,
+with a map of location strings to raster datasets or file bytes:
+
+```javascript
+const catalog = terrio.openCatalog(tileIndex, { "left.tif": left, "right.tif": right }, {
+  tr: [30, 30], sortField: "priority", cacheSize: 16,
+});
+const pixels = catalog.readBand(1, [100, 200, 256, 256]);
+```
+
+The index uses an in-memory R-tree in WASM; only selected sources enter the bounded cache.
+Supplied lazy datasets retain window/overview reads, and encoded files are opened only when
+selected. Existing dataset buffers/readers remain shared with the caller; freeing the original
+Dataset does not close the catalog's handle.
+Locations are keys in the supplied source map; WASM does not open filesystem paths or URLs.
+Options are `locationField`, `sortField`, `sortDescending`, `tr`, `te`, `srs`, `bands`, `ot`,
+`nodata`, `alphaBand`, `cacheSize` and `resampling`. Source masks/nodata and zero alpha are
+transparent; tiles in other CRSs are reprojected into the index CRS. See
+[CLI catalogs](cli.md#catalog) for the supported GTI subset.
 
 ## File management
 
@@ -456,7 +642,8 @@ it, and `listUrl` provides remote listings. WebAssembly has no local file system
 and no request signing: tar archives, local files, signed S3 requests and writes to object stores
 are available in the native CLI, Rust and Python only. `/vsimem/` files carry no dates, so
 `vsiSync` compares content when an in-memory endpoint lacks a timestamp. In browsers, a store must allow the
-page's origin (CORS) for `listUrl`.
+page's origin (CORS) for `listUrl`. Its optional `depth` must be a finite, non-negative
+integer; omit it (or pass `null`) for unlimited depth. Strings and `Infinity` are rejected.
 
 HTML index responses use a readable byte stream, a 4 KiB sniff prefix and a 4 MiB body
 limit, matching the native path. Binary/ordinary web content is refused; custom `fetch`
@@ -473,23 +660,6 @@ rules with full leader/trailer, row-order and interleaved-mask checks enabled
 for uploaded bytes unless `fullCheck: false` is supplied. External sidecars
 are unavailable for a standalone byte buffer.
 
-### GeoPackage maintenance
-
-`gpkgRepack(path)` compacts an uploaded `/vsimem/` GeoPackage in place and returns
-`bytes_before`, `bytes_after`, `page_size`, `pages_before` and `pages_after`.
-`gpkgRepackBytes(bytes)` returns a compacted `Uint8Array` copy of a self-contained image.
-Read the in-memory result with `vsiRead(path)`. Encoded records, indexes, rowids and schema SQL
-are retained. See [supported scope](cli.md#geopackage-repacking).
-
-### Multidimensional mosaics
-
-`mosaicMultidim(sources, {arrays})` builds a lazy coordinate-aligned
-`MultidimDataset` from dataset handles or uploaded scientific inputs. `arrays`
-selects numeric arrays by path or unambiguous name. Source handles can be freed
-after construction; mosaic views keep the source data alive. See
-[Multidimensional mosaics](cli.md#multidimensional-mosaics) for alignment,
-priority, Int64/UInt64 handling and snapshot formats.
-
 ### Seek-optimized ZIP archives
 
 ```javascript
@@ -505,7 +675,7 @@ Creation and optimization return `added`, `seek_optimized` and `bytes` counts;
 validation returns `valid`, `sozip_files`, `messages` and `errors`. See the
 [supported options and limitations](cli.md#vsi-sozip).
 
-## Dataset file management
+### Dataset file management
 
 `datasetFiles(path, {format})` returns the owned file set. `datasetCopy(source,
 destination, {format, overwrite, allowExternalReferences})` and `datasetRename(...)` return affected paths
@@ -516,7 +686,8 @@ VRT references stay in the source directory tree by default; enable
 `allowExternalReferences` only for trusted external assets. VRT deletion preserves
 referenced rasters. Reports contain `recovery_files`; leftovers indicate a committed
 operation whose staged cleanup needs attention. The CLI file-management section documents
-companion discovery, overwrite, staging and recovery behavior shared by these APIs.
+companion discovery, overwrite, staging and recovery behavior shared by these APIs; see
+[`dataset-copy`](cli.md#dataset-copy-dataset-rename-dataset-delete-dataset-files).
 
 `parquetCreateMetadata(inputs, output, {overwrite: false})` creates a metadata-only Parquet
 file from an array of uploaded `/vsimem/` partition paths. It returns `files`, `row_groups`,
@@ -525,27 +696,13 @@ Schemas and CRS must agree; GeoParquet bounds/types are merged and Arrow schema 
 is regenerated. Direct and referenced input partitions are protected from overwrite.
 See [CLI supported scope](cli.md#parquet-metadata-files); no data pages are validated.
 
-### Indexed color conversion
+### GeoPackage maintenance
 
-`rgbToPalette(source, {colorCount: 256, bitDepth: 5, dither: true, colorMap,
-outputNodata, mask})` returns an indexed Byte Dataset. Sources accept Dataset
-objects or uploaded raster bytes (`Uint8Array` or `{bytes, filename}`). `colorMap`
-accepts a palette Dataset/upload, color-file text, `{text, filename}`, or RGBA
-integer arrays; `mask` accepts a flat Uint8Array/array of validity bytes.
-`paletteToRgb(source, {rgba: true})` expands to RGBA (RGB by default), and
-`attachPalette(source, colorMap)` changes only the table.
-`readColorTable(source, filename)` reads integer RGBA entries from these same
-palette sources. Operations materialize the input/output. See
-[Palette conversion](cli.md#palette-conversion) for formats and validity rules.
-
-Raster `toBytes` preserves dataset masks for GeoTIFF/COG without `tSrs`.
-Other formats omit separate dataset masks. Reprojecting a raster
-with a separate dataset mask is refused explicitly; use an alpha band instead.
-
-Color-file text passed to palette APIs as a `Uint8Array` needs a filename hint
-or `{bytes, filename: "colors.txt"}`. Plain strings and `{text, filename}` also
-accept text tables. Tile-archive serialization rejects any raster with a
-dataset mask, including materialized palette results; use an explicit alpha band.
+`gpkgRepack(path)` compacts an uploaded `/vsimem/` GeoPackage in place and returns
+`bytes_before`, `bytes_after`, `page_size`, `pages_before` and `pages_after`.
+`gpkgRepackBytes(bytes)` returns a compacted `Uint8Array` copy of a self-contained image.
+Read the in-memory result with `vsiRead(path)`. Encoded records, indexes, rowids and schema SQL
+are retained. See [supported scope](cli.md#geopackage-repacking).
 
 ## GeoPackage validation
 
@@ -559,15 +716,76 @@ Both functions return `valid`, `complete`, `version`, `errors`, `warnings` and
 `unsupported_checks`. WebAssembly path inputs use `/vsimem/`; the bytes API accepts
 uploaded images directly. See the [supported rules and limitations](cli.md#geopackage-validation).
 
-### Separate raster tiles
+## Building
 
-`planRasterTiles(src, options)` returns the grid and tile count without reading
-pixels and includes the destination `crs` (null when unknown). It validates
-metadata-based rendering options. `rasterTiles(src, options, callback)` sends each encoded tile to
-`callback(name, bytes)` and returns generation counts. Options include `tilingScheme`
-(`raster`, `WebMercatorQuad`, `WorldCRS84Quad`), `grid` (for example
-`{tileSize: 128, minZoom: 0, maxZoom: 2}`),
-`format` (`PNG` or `GTiff`), `resampling`, `overviewResampling`, `alpha`,
-`outputNodata`, `skipBlank` and `maxTiles`. The caller stores the emitted bytes.
-See the [CLI tiling reference](cli.md#separate-file-raster-tiles) for supported output
-and transparency policies.
+```sh
+node js/build.mjs                         # the npm package in js/pkg: all modules, built for size
+node --test js/tests/package.test.mjs     # (threads and memory64 need the nightly js/build.mjs names)
+TERRIO_JS_LOAD=../pkg/load.js node --test js/tests/node.test.mjs   # the suite on the threaded module
+TERRIO_JS_LOAD=../pkg/load.js TERRIO_MEMORY64=1 TERRIO_LARGE_TESTS=1 node --test js/tests/node.test.mjs  # memory64, > 4 GB
+node js/tests/browser.mjs ../terrio-data  # in headless browsers (Playwright), timings included
+wasm-pack build js --release --target nodejs --out-dir pkg-node --out-name terrio
+node --test js/tests/node.test.mjs        # TERRIO_TEST_DATA=... adds real files checked against GDAL
+# terrio-js/core, and the tests of the formats it has:
+wasm-pack build js --release --target nodejs --out-dir pkg-node/core --out-name terrio --no-pack -- --no-default-features --features core
+TERRIO_JS_PKG=../pkg-node/core/terrio.js node --test js/tests/node.test.mjs
+node js/bench/bench.mjs ../terrio-data    # timings of decoding and writing real files
+```
+
+To build one module with only the scientific formats, see
+[Scientific WASM builds](scientific-wasm-build.md).
+
+## OGC API Features
+
+`await openOapif(url, options)` drives the shared Rust paging/schema reader over
+`fetch` and returns a vector Dataset:
+
+```javascript
+const lakes = await terrio.openOapif(
+  "https://demo.pygeoapi.io/master/collections/lakes",
+  { pageSize: 3, maxFeatures: 4 },
+);
+const geojson = lakes.toGeoJSON();
+lakes.free();
+```
+
+Options are `layers`, `bbox`, `pageSize`, `maxFeatures`, `skipFeatures`,
+`datetime`, `crs`, `preferredCrs`, `serverFeatureAxisOrder`, `ignoreSchema`,
+`maxVectorBytes` and `maxPages`. Optional `headers` and `fetch` support an
+authenticated same-origin service. `Accept` is reserved for the reader's
+JSON/GeoJSON content negotiation; omit it from caller-supplied headers. Other
+headers, including authentication headers, are forwarded. Browsers require
+server CORS permission.
+Fetch redirects are refused because browsers can conceal redirect destinations;
+open the canonical service URL. Response streams are bounded before allocation,
+and links must stay on the original origin. Native CLI/Python follow
+same-origin redirects. Native reads also retry HTTP 429, 500, 502, 503 and 504
+responses with backoff; `openOapif` does not retry, so a transient error status
+fails the read. Supply a retrying `fetch` when a service is unreliable. See the
+[CLI section](cli.md#ogc-api-features) for shared schema and CRS rules.
+
+Signed numeric source IDs, or string IDs that conflict with a source `id`
+property, are preserved in `_oapif_id` text (with an extra leading underscore
+if that field already exists); generated unsigned FIDs then follow row order.
+
+## Raster declaration budgets
+
+Use configuration scopes to refuse inputs that declare more work than a service accepts.
+The limits apply to byte opens, lazy constructors and source datasets opened while the scope is
+active, including WASM's in-memory codecs. With no scope, both limits are unset.
+
+```js
+terrio.pushConfig({ TERRIO_MAX_DECLARED_BYTES: "268435456", TERRIO_MAX_BANDS: "64" });
+try {
+  const dataset = terrio.open(bytes, "upload.tif");
+  const band = dataset.readBand(1);
+} finally {
+  terrio.popConfig();
+}
+```
+
+Values are positive integer strings; `null` unsets an option within a scope. Scopes nest and
+`popConfig()` restores the preceding values. A scope belongs to the module's calling thread
+and is shared by calls on that thread; avoid overlapping scopes across asynchronous tasks.
+The byte limit counts width × height × bands × sample bytes, with both components of complex
+samples included; the band limit counts a complex band once. A refusal names the limit.

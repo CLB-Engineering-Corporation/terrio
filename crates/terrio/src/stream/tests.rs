@@ -2,6 +2,66 @@ use super::*;
 use crate::ops::vector_filter::VectorTranslateOptions;
 use wbvector::{Coord, FieldDef, FieldType, FieldValue, Geometry};
 
+#[test]
+fn failed_shapefile_conversion_removes_only_normalized_components() {
+    for name in ["roads.v2.geojson", "roads.v2.SHP", "roads.v2"] {
+        let directory = tempfile::tempdir().unwrap();
+        let requested = directory.path().join(name);
+        let geometry = shapefile::output_path(requested.to_str().unwrap());
+        let unrelated = directory.path().join("roads.shp");
+        std::fs::write(&unrelated, b"neighbor").unwrap();
+        if requested != geometry {
+            std::fs::write(&requested, b"unrelated source").unwrap();
+        }
+        for path in std::iter::once(geometry.clone()).chain(["shx", "dbf", "prj", "cpg"].map(|ext| geometry.with_extension(ext))) {
+            std::fs::write(path, b"partial output").unwrap();
+        }
+        let result = remove_on_error(requested.to_str().unwrap(), VectorDriver::Shapefile, Err(Error::InvalidData("write failed".into())));
+        assert!(result.is_err());
+        assert!(!geometry.exists());
+        for ext in ["shx", "dbf", "prj", "cpg"] {
+            assert!(!geometry.with_extension(ext).exists());
+        }
+        assert_eq!(std::fs::read(unrelated).unwrap(), b"neighbor");
+        if requested != geometry {
+            assert_eq!(std::fs::read(requested).unwrap(), b"unrelated source");
+        }
+    }
+}
+
+#[test]
+fn range_source_stops_decoding_batches_at_its_limit() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct CountedSource {
+        batches: VecDeque<Vec<Feature>>,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl FeatureSource for CountedSource {
+        fn next_batch(&mut self) -> Result<Option<Vec<Feature>>> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            Ok(self.batches.pop_front())
+        }
+    }
+
+    for (skip, limit, expected_calls, expected_rows) in [(0, 0, 0, 0), (1, 2, 3, 2), (3, 1, 4, 1)] {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let rows = sample(10).features.into_iter().map(|feature| vec![feature]).collect();
+        let inner = CountedSource { batches: rows, calls: calls.clone() };
+        let mut source = RangedSource { inner: Box::new(inner), skip, remaining: Some(limit) };
+        let mut actual = Vec::new();
+        while let Some(batch) = source.next_batch().unwrap() {
+            actual.extend(batch);
+        }
+        assert_eq!(actual.len(), expected_rows);
+        assert_eq!(calls.load(Ordering::Relaxed), expected_calls);
+        assert!(source.next_batch().unwrap().is_none());
+        assert_eq!(calls.load(Ordering::Relaxed), expected_calls);
+    }
+}
+
 /// A layer with every field type, null values and geometries, empty geometries, Z and
 /// integers beyond 32 bits.
 fn sample(n: usize) -> Layer {
@@ -225,6 +285,37 @@ fn converts_as_streams_like_whole_conversions() {
         let b = crate::open_vector(&streamed, &Default::default()).unwrap().layers.remove(0);
         assert_eq!(a.features.len(), 150, "{ext}");
         same_content(&a, &b);
+    }
+}
+
+/// A conversion of GeoParquet with `-select` reads only the selected columns, and writes what a
+/// whole conversion writes: fields in the selection's order (into a GeoParquet output too, whose
+/// writer profiles the values), and `-where` on a field left out still filters.
+#[test]
+fn geoparquet_selections_convert_like_whole_conversions() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("src.parquet").to_string_lossy().into_owned();
+    crate::write_vector(&[sample(300)], &src, &Default::default()).unwrap();
+    let selections = [
+        VectorTranslateOptions { select: Some(vec!["d".into(), "I".into()]), ..Default::default() },
+        VectorTranslateOptions { select: Some(vec!["d".into()]), where_clause: Some("i > 100".into()), ..Default::default() },
+    ];
+    for translate in selections {
+        for ext in ["parquet", "geojson"] {
+            let streamed = dir.path().join(format!("s.{ext}")).to_string_lossy().into_owned();
+            let whole = dir.path().join(format!("w.{ext}")).to_string_lossy().into_owned();
+            let options = ConvertOptions { translate: translate.clone(), chunk_size: 16, ..Default::default() };
+            convert(&src, &streamed, &options).unwrap();
+            let layers =
+                crate::ops::vector_filter::translate(&crate::open_vector(&src, &Default::default()).unwrap().layers, &translate).unwrap();
+            crate::write_vector(&layers, &whole, &Default::default()).unwrap();
+            let a = crate::open_vector(&whole, &Default::default()).unwrap().layers.remove(0);
+            let b = crate::open_vector(&streamed, &Default::default()).unwrap().layers.remove(0);
+            let names = |l: &Layer| l.schema.fields().iter().map(|f| f.name.clone()).collect::<Vec<_>>();
+            assert_eq!(names(&b), names(&a), "{ext} {:?}", translate.select);
+            assert!(!a.features.is_empty() && a.features.len() <= 300, "{ext}");
+            same_content(&a, &b);
+        }
     }
 }
 
@@ -848,4 +939,50 @@ fn converting_kml_keeps_shared_styles_in_kml_and_resolves_them_elsewhere() {
     convert(&path("a.kml"), &path("o.geojson"), &Default::default()).unwrap();
     let written = std::fs::read_to_string(path("o.geojson")).unwrap();
     assert!(written.contains("PEN(c:#FF0000FF)") && !written.contains("@base"), "{written}");
+}
+
+#[test]
+fn selected_fields_keep_their_order_and_struct_members() {
+    let mut layer = Layer::new("t").with_epsg(4326);
+    for name in ["id", "names.primary", "names.common", "namesake", "height"] {
+        layer.add_field(FieldDef::new(name, FieldType::Text));
+    }
+    for k in 0..3u64 {
+        let attributes = (0..5).map(|i| FieldValue::Text(format!("{k}-{i}"))).collect();
+        layer.push(Feature { fid: k, geometry: Some(Geometry::point(k as f64, 0.0)), attributes });
+    }
+    let reader = |layer: &Layer| {
+        let mut l = layer.clone();
+        let source = MemorySource { features: std::mem::take(&mut l.features).into_iter(), batch: 2 };
+        FeatureReader::new(l, Box::new(source))
+    };
+    // a struct column by its name, its members kept in the layer's order, names without case
+    let mut r = reader(&layer).select_fields(&["HEIGHT".into(), "names".into()], 2).unwrap();
+    let names: Vec<&str> = r.layer().schema.fields().iter().map(|f| f.name.as_str()).collect();
+    assert_eq!(names, ["names.primary", "names.common", "height"]);
+    let chunk = r.read_chunk(DEFAULT_CHUNK).unwrap().unwrap();
+    assert_eq!(chunk.features.len(), 3);
+    assert_eq!(chunk.features[2].attributes, ["2-1", "2-2", "2-4"].map(|v| FieldValue::Text(v.into())));
+    assert_eq!(chunk.features[2].geometry, Some(Geometry::point(2.0, 0.0)));
+    let error = reader(&layer).select_fields(&["nope".into()], 2).err().unwrap().to_string();
+    assert!(error.contains("nope") && error.contains("namesake"), "{error}");
+}
+
+#[test]
+fn selected_fields_read_the_batches_asked_for() {
+    let mut layer = Layer::new("t").with_epsg(4326);
+    layer.add_field(FieldDef::new("i", FieldType::Integer));
+    layer.add_field(FieldDef::new("name", FieldType::Text));
+    for k in 0..5u64 {
+        let attributes = vec![FieldValue::Integer(k as i64), FieldValue::Text(format!("f{k}"))];
+        layer.push(Feature { fid: k, geometry: Some(Geometry::point(k as f64, 0.0)), attributes });
+    }
+    let mut l = layer.clone();
+    let source = MemorySource { features: std::mem::take(&mut l.features).into_iter(), batch: 2 };
+    let mut r = FeatureReader::new(l, Box::new(source)).select_fields(&["name".into()], 2).unwrap();
+    // a chunk of one feature reads one batch of two from the source, not all five
+    let chunk = r.read_chunk(1).unwrap().unwrap();
+    assert_eq!(chunk.features.len(), 1);
+    assert_eq!(chunk.features[0].attributes, [FieldValue::Text("f0".into())]);
+    assert_eq!(r.buffer.len(), 1);
 }

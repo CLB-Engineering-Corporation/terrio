@@ -14,7 +14,7 @@ WebAssembly for browsers and Node.js. Datasets are opened from bytes, with a fil
 format, and written back to bytes.
 
 ```js
-import init, { open, fromGeoJSON, rasterFromArray, transformPoints, describeCrs } from "terrio-js";
+import init, { open, fromGeoJSON, fromArrowIPC, rasterFromArray, registerGrid, transformPoints, describeCrs, listCrs, openPoints, pointsFromArrays } from "terrio-js";
 
 await init(); // in Node.js: await init({ module_or_path: fs.readFileSync(wasmPath) })
 
@@ -24,6 +24,11 @@ dem.info();                       // the summary `terrio info --json` prints
 dem.width, dem.height, dem.count, dem.dtype, dem.crs, dem.transform, dem.nodata
 const band = dem.readBand(1);     // Float32Array, Uint8Array... row after row
 const tile = dem.readBand(1, [0, 0, 256, 256]);   // a window [col_off, row_off, width, height]
+// An output of another size, as GDAL's RasterIO reads it (gdal_translate -outsize), from the
+// overview it chooses: bands one after another. Also on remote datasets (openUrl), as promises.
+const small = dem.readResampled({ size: [256, 256], resampling: "average" });
+const masks = dem.readResampledMasks({ size: [256, 256], resampling: "average" }); // Uint8Array
+const { data, masks: valid } = dem.readResampledWithMasks({ size: [256, 256] }); // both at once
 const cog = dem.toBytes("dem_cog.tif", { format: "COG", compress: "DEFLATE" });
 
 const roads = open(geojsonBytes, "roads.geojson");
@@ -35,6 +40,7 @@ const back = fromArrowIPC(ipc, "roads");
 const [xs, ys] = transformPoints([-122.4], [37.8], "EPSG:4326", "EPSG:32610");
 registerGrid("us_nga_egm96_15.tif", gridBytes);  // datum shift and geoid grids, from bytes
 const [lon, lat, h] = transformPoints([-100], [40], "EPSG:4979", "EPSG:4326+5773", [100]);
+const albers = listCrs("albers", { authority: "EPSG", kind: "projected" }); // registry CRSs, for a CRS picker
 
 // Point clouds: LAS, LAZ, COPC, PLY and E57.
 const lidar = openPoints(lazBytes, "tile.laz");
@@ -51,8 +57,8 @@ In WebAssembly, these formats are read from and written to memory:
 
 | | Read | Write |
 |---|---|---|
-| Raster | GeoTIFF/COG (LZW, Deflate, PackBits, ZSTD, LZMA, JPEG, WebP, LERC, JPEG XL), JPEG 2000 (JP2 and J2K), GRIB 1 and 2 (read band by band), netCDF, HDF5, Zarr and GeoZarr (zipped, or with `openZarr`), Esri ASCII grid, GeoPackage, PMTiles and MBTiles (read by window, zoom levels as overviews) | GeoTIFF, COG (lossless compressions, ZSTD included), JPEG 2000, Esri ASCII grid, GeoPackage, PMTiles, MBTiles |
-| Vector | GeoJSON, TopoJSON, ESRIJSON, ESRIPBF, FlatGeobuf\*, GeoPackage, GeoParquet, CSV, XLSX, KML, KMZ, GML, GPX, DWG and DXF (full module), OSM PBF, zip archives of these, Shapefile and MapInfo (MIF/MID) in zip archives | GeoJSON, TopoJSON, FlatGeobuf, GeoPackage, XLSX, KML, KMZ, GML, GPX, DWG and DXF (full module) |
+| Raster | GeoTIFF/COG (LZW, Deflate, PackBits, ZSTD, LZMA, JPEG, WebP, LERC, JPEG XL), JPEG 2000 (JP2 and J2K), GRIB 1 and 2 (read band by band), netCDF, HDF5, Zarr and GeoZarr (zipped, with `openZarr`, or remote by window with `openUrl`), Esri ASCII grid, GeoPackage, PMTiles and MBTiles (read by window, zoom levels as overviews) | GeoTIFF, COG (lossless compressions, ZSTD included), JPEG 2000, Esri ASCII grid, GeoPackage, PMTiles, MBTiles |
+| Vector | GeoJSON, TopoJSON, ESRIJSON, ESRIPBF, FlatGeobuf\*, GeoPackage, GeoParquet, CSV, XLSX, CityJSON, CityGML, KML, KMZ, GML, GPX, DWG and DXF (full module), OSM (PBF and XML), PMTiles, MBTiles, MVT tiles, zip archives of these, Shapefile and MapInfo (MIF and TAB) in zip archives, HEC-RAS (full module) | GeoJSON, TopoJSON, FlatGeobuf, GeoPackage, GeoParquet, CSV, XLSX, CityJSON, CityGML, Shapefile (`.shp.zip`), KML, KMZ, GML, GPX, PMTiles, MBTiles, DWG and DXF (full module) |
 | Point cloud | LAS, LAZ, COPC, PLY, E57 | LAS, LAZ, COPC, PLY, E57 |
 
 \* FlatGeobuf files are read by terrio's own driver, with 64-bit offsets. `open` decodes a layer
@@ -61,7 +67,31 @@ file's size for lines and five for polygons (3.2 GB and 5.4 GB in native builds)
 2 million OpenStreetMap lines opens in about 3 seconds in Node.js, and a 1 GB file of 2.3 million
 polygons runs out of memory, but in the memory64 module (see below). `openUrl` reads files with a
 spatial index by bounding box, decoding only the features found; a file without one is still read
-whole.
+whole. `openOapif(url, options)` reads OGC API Features services over `fetch`.
+
+Remote Zarr requests fail on HTTP 403 by default, including metadata. For anonymous object
+stores that return 403 for absent metadata keys, explicitly set `allowMissingMetadata403: true`.
+This accepts version/existence-probe ambiguity; use it only for known public stores.
+Denied v2 `.zattrs` documents, chunks and shards always fail, including with this option.
+The opt-in still treats `zarr.json` 403 responses as absent version probes, so callers accept
+that ambiguity for v3 metadata, including any attributes embedded in it. This strict default
+is specific to the JavaScript fetch backend; native anonymous S3 reads retain their existing
+missing-object 403 policy.
+
+A remote Zarr store (v2 or v3, sharded or not) opens with `openUrl` too: the store or group at
+the URL (`.zarr`, or `format: "Zarr"`) and the array `array` within it, read as a raster by
+window. Opening fetches its metadata documents, and a window the shard indexes and chunks it
+needs, nearby inner chunks coalesced with a 1 MiB target (a single larger chunk is fetched
+whole), the indexes kept for later windows. A year of the TESSERA embeddings (128 bands of a
+192 x 192 window, 5 MB) reads in about 4 seconds after opening in Chrome from Europe.
+Opening plus reading takes about 5–6 seconds in that measurement. The TESSERA Zarr Explorer,
+which reads it with zarrita, takes about 9 seconds for the window:
+
+```js
+const store = "https://s3.us-west-2.amazonaws.com/us-west-2.opendata.source.coop/tessera/tessera/zarr/v1.1-dclimate/utm30";
+const emb = await openUrl(store, { format: "Zarr", array: "embeddings", allowMissingMetadata403: true }); // (time, band, y, x): 1152 bands
+const year2025 = await emb.read({ window: [45184, 360000, 192, 192], bands: Array.from({ length: 128 }, (_, i) => 1025 + i) });
+```
 
 JPEG 2000 files decode with the codec of GDAL's JP2OpenJPEG driver (a Rust port of OpenJPEG), with
 their GeoJP2 or GMLJP2 georeferencing: a Sentinel-2 band (`T10SEG_..._B04.jp2`, 10980 x 10980)
@@ -74,11 +104,11 @@ archive of the `.jp2` file and the `.aux.xml` sidecar that holds the value, as G
 
 The package holds two WebAssembly modules with the same API. `terrio-js` has every format above;
 `terrio-js/core` leaves out the heaviest ones (GeoParquet and Arrow IPC, netCDF and HDF5, point
-clouds, JPEG 2000, GRIB, Zarr, AVIF tiles and OpenStreetMap) and keeps GeoTIFF/COG with all its
+clouds, JPEG 2000, GRIB, Zarr, AVIF tiles, OpenStreetMap, CAD and HEC-RAS) and keeps GeoTIFF/COG with all its
 compressions, GeoJSON and the other text formats, FlatGeobuf, GeoPackage, Shapefile, PMTiles and
 MBTiles, the CRS transformations and the operations, with a smaller download. The full module also
 includes DWG/DXF through the `cad` feature; the core module leaves CAD out. See the
-[CAD supported subset](../docs/formats.md#cad-drawings-dwg-and-dxf).
+[CAD supported subset](https://terrio.dev/formats/#cad-drawings-dwg-and-dxf).
 
 Measured from the optimized CAD-enabled [CI package at `b371d79`](https://github.com/opengeos/terrio/actions/runs/40144408237)
 (`wasm-release` profile, wasm-opt `-Oz`). MB are decimal (1,000,000 bytes); compression uses
@@ -106,9 +136,41 @@ is passed only to the functions of its own module.
 Both modules are built for size: whole-program LTO, the codecs optimized for speed and the rest
 for size, and wasm-opt -Oz.
 
+## Zarr alone: `terrio-js/zarr`
+
+`terrio-js/zarr` is a third module, of its own API, that reads Zarr arrays over HTTP and nothing
+else: terrio's Zarr driver (v2 and v3, sharded or not, every codec terrio reads), the requests of
+`openUrl` (12 in flight, chunks kept between reads), and no CRS engine. It suits pages that only
+show Zarr data, such as embeddings or satellite image cubes.
+
+```js
+import init, { openZarr } from "terrio-js/zarr";
+
+await init();
+const a = await openZarr("https://example.com/cube.zarr", { array: "b04" });
+a.width, a.height, a.count, a.dtype, a.nodata, a.transform, a.epsg;
+a.attributes();                                   // the array's attributes
+const [red, nir] = await a.read({ window: [0, 0, 512, 512], bands: [3, 4] }); // typed arrays
+a.stats();                                        // { requests, bytes }
+```
+
+Its options are those of `openUrl` for Zarr: `array`, `cacheSize`, `fetch`, `headers` and
+`allowMissingMetadata403`. Without the CRS engine, `epsg` is the EPSG code the store names
+(`proj:code`, `proj:epsg`, a PROJJSON identifier, GDAL's `_CRS`); CF grid-mapping CRS parameters
+and GDAL's `pam.aux.xml` are not read. A grid mapping's `GeoTransform` can still supply the
+geotransform, and `attributes()` has the rest. It reads the full-resolution array:
+multiscale levels are other arrays of the store, opened by their `array` path.
+
+Measured from a local `wasm-release` build (wasm-opt `-Oz`; gzip 9, Brotli 11), not a recorded CI
+snapshot:
+
+| Module | `.wasm` | gzip | Brotli |
+|---|---|---|---|
+| `terrio-js/zarr` | 0.53 MB | 0.23 MB | 0.19 MB |
+
 ## Threads: `terrio-js/load` and `terrio-js/threads`
 
-A third module, `terrio-js/threads`, has every format and a thread pool of Web Workers (or
+A separate module, `terrio-js/threads`, has every format and a thread pool of Web Workers (or
 Node.js worker threads) over shared memory: GeoTIFF tiles and strips, JPEG 2000 tiles and Zarr
 chunks decode in parallel, and GeoTIFF/COG tiles, overviews and Zarr chunks are compressed in
 parallel, as natively. `terrio-js/load` picks it where WebAssembly threads run (Node.js 22 or
@@ -223,7 +285,8 @@ const virtual = openVrt(xml, { "dem.tif": imageBytes });
 const crop = virtual.readBand(1, [32, 48, 128, 128]);
 ```
 
-`openVrt` resolves source names to `Uint8Array` bytes, retaining lazy GeoTIFF and
+`openVrt` resolves source names to `Uint8Array` bytes and never opens a name the
+map lacks; a mapped VRT document is resolved against the same map. It retains lazy GeoTIFF and
 VRT window reads in the browser and Node.js. It supports scalar built-in derived
 bands, full/separable kernel filters, mask sources and serialized warped VRTs
 (affine/reprojection, GCP/TPS/homography/RPC). External pixel functions, complex
@@ -235,7 +298,10 @@ buffers and serialized cutline/alpha/geolocation warps are unsupported.
 heights (GDAL's `PromoteTo3D`). Vector conversions transform existing Z values
 and preserve 2D geometries as 2D. Read diagnostics
 with `takeWarnings()` after an operation. `warp` also accepts `kernelVersion: "3.13"`
-for GDAL 3.13 resampling; `"3.12"` remains the default. GeoTIFF/COG outputs preserve
+for GDAL 3.13 kernel arithmetic; `"3.12"` remains the default. Sampling uses
+grid-invariant coordinates and local footprints by default, so aligned output tiles
+retain whole-grid values. Set `gridInvariant: false` to reproduce GDAL's
+chunk-dependent sampling instead. GeoTIFF/COG outputs preserve
 PixelIsPoint metadata and corner georeferencing.
 
 `blend(color, overlay, {operator: "multiply", opacity: 75})` composes same-sized
@@ -260,7 +326,7 @@ The source object maps stored locations to raster/vector Datasets, uploaded
 discovery is unavailable in WASM. `DatasetIndex` retains `count`, `metadata`,
 `layer()` and `toBytes(filename?, {format}?)`; keep this object to preserve GTI
 metadata when encoding GeoPackage/FlatGeobuf. `.shp.zip` encodes a Shapefile archive.
-Options use camelCase versions of the [CLI subset](../docs/cli.md#rastervector-indexes-and-gti-creation),
+Options use camelCase versions of the [CLI subset](https://terrio.dev/cli/#rastervector-indexes-and-gti-creation),
 including `locationName`, `sourceCrsFieldName`, `sourceCrsFormat`, `fetchMetadata`
 (triples), `minPixelSize`, `maxPixelSize`, `resolution`, `bbox`, `bandCount`, `ot`,
 `nodata`, `colorInterpretations`, `mask` and `metadata`. Vector selectors are
@@ -327,8 +393,11 @@ reprojection and 0–15 decimal rounding. Default prefixes are `raster1`, `raste
 producing `PREFIX_bN_STATISTIC`; the CLI instead defaults to each input path stem. Set
 explicit prefixes for identical field names. Explicit prefixes must be nonblank, one per
 raster. Field-name collisions, including repeated prefixes/bands or existing zone
-fields, receive `_2`, `_3`, etc. suffixes from the shared engine. Weighted/fractional
-statistics are unsupported.
+fields, receive `_2`, `_3`, etc. suffixes from the shared engine. For fractional coverage, set `fractional: true`; for weighted statistics, pass a
+weighting dataset/upload in `weights`, optional `weightBand` (default 1), and select
+`weighted_mean`, `weighted_sum` or `weighted_stddev` in `stats`. The weighting raster
+must match every value grid and CRS. Coverage count is Real; source geometry and
+attributes are retained. See the [CLI scope and formulas](https://terrio.dev/cli/#fractional-coverage-and-weighting-rasters).
 
 `singlepart` recursively splits collections/multipart geometry, preserving
 attributes, Z/M and CRS, and assigns sequential IDs from one per layer. Null and
@@ -407,13 +476,13 @@ Retile uses matching-CRS north-up inputs, recursive factor-two pyramids and
 one-based row/column filenames. Options accept camelCase or snake_case.
 `rasterTiles(input, {publication: {viewers: ["all"], kml: true}}, onFile)`
 adds applicable browser viewers, MapML, STACTA and KML files. The callback must
-save companion files as well as images. See the [CLI reference](../docs/cli.md#retile)
+save companion files as well as images. See the [CLI reference](https://terrio.dev/cli/#retile)
 for output layouts, supported options, limits and measured GDAL differences.
 
 ## Selective scientific package
 
 For a single-threaded NetCDF/HDF5 package using the existing `netcdf-hdf5`
-Cargo feature, see [Scientific WASM builds](../docs/scientific-wasm-build.md).
+Cargo feature, see [Scientific WASM builds](https://terrio.dev/scientific-wasm-build/).
 `node js/build.mjs --no-default-features --features netcdf-hdf5 --out-dir pkg-scientific`
 builds only that module, with generated declarations and project license notices.
 Use a fresh output directory. This is a custom feature selection, not another

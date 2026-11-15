@@ -4,19 +4,15 @@
 //! The files live outside the repository: set `TERRIO_TEST_DATA` to their directory (see
 //! `scripts/fetch_test_data.sh`). Without it, these tests pass without checking anything.
 
-use std::path::PathBuf;
 use terrio::crs::SpatialRef;
 use terrio::ops::mosaic::{MosaicOptions, MosaicSource, build_vrt, mosaic};
 use terrio::ops::translate::{TranslateOptions, translate};
 use terrio::ops::warp::{WarpOptions, warp};
 use terrio::ops::{Resampling, vrt::VrtDataset};
 
-fn data(name: &str) -> Option<String> {
-    let dir = PathBuf::from(std::env::var_os("TERRIO_TEST_DATA")?);
-    let p = dir.join(name);
-    assert!(p.exists(), "{} is missing from TERRIO_TEST_DATA", p.display());
-    Some(p.to_string_lossy().into_owned())
-}
+#[path = "common/test_data.rs"]
+mod test_data;
+use test_data::data;
 
 /// Asserts that two geotransforms agree to a small fraction of a pixel.
 fn assert_gt(a: [f64; 6], b: [f64; 6], tol_px: f64) {
@@ -33,7 +29,7 @@ fn value(ds: &terrio::RasterDataset, row: usize, col: usize) -> f64 {
 fn warp_nad83_dem_to_utm() {
     let Some(p) = data("usgs_dem.tif") else { return };
     let ds = terrio::open_raster(&p).unwrap();
-    let o = WarpOptions { dst_srs: Some(SpatialRef::from_epsg(32613).unwrap()), ..Default::default() };
+    let o = WarpOptions { grid_invariant: false, dst_srs: Some(SpatialRef::from_epsg(32613).unwrap()), ..Default::default() };
     let out = warp(&[&ds], &o).unwrap();
     assert_eq!((out.raster.cols, out.raster.rows), (3151, 4055));
     assert_gt(out.geo_transform(), [413260.9626369694, 27.575389108661362, 0.0, 4428422.65095158, 0.0, -27.575389108661362], 1e-4);
@@ -54,7 +50,7 @@ fn warp_nad83_dem_to_utm() {
 fn warp_utm_to_geographic() {
     let Some(p) = data("ECOv002_L2T_LSTE_26860_001_10SGD_20230401T203733_0710_01_LST.tif") else { return };
     let ds = terrio::open_raster(&p).unwrap();
-    let o = WarpOptions { dst_srs: Some(SpatialRef::parse("EPSG:4326").unwrap()), ..Default::default() };
+    let o = WarpOptions { grid_invariant: false, dst_srs: Some(SpatialRef::parse("EPSG:4326").unwrap()), ..Default::default() };
     let out = warp(&[&ds], &o).unwrap();
     assert_eq!((out.raster.cols, out.raster.rows), (1766, 1458));
     assert_gt(

@@ -4,10 +4,15 @@
 // No code is translated from these sources.
 
 //! Dataset identification from bounded headers, with explicit deeper inspection.
-#[cfg(not(target_family = "wasm"))]
+#[cfg(fs)]
 use crate::Result;
 use crate::formats::{Kind, RasterDriver, VectorDriver};
 use serde::Serialize;
+
+/// Whether a SQLite header declares a standard or legacy GeoPackage application id.
+pub(crate) fn is_geopackage_header(bytes: &[u8]) -> bool {
+    bytes.starts_with(b"SQLite format 3\0") && matches!(bytes.get(68..72), Some(b"GPKG" | b"GP10" | b"GP11"))
+}
 
 /// Bytes inspected by the header-only identifier.
 pub const IDENTIFICATION_HEADER_BYTES: usize = 16 * 1024;
@@ -29,9 +34,9 @@ pub struct Identification {
 /// is the counterpart of de-registering the drivers it leaves out (`formats::set_allowed_drivers`),
 /// so a disallowed driver identifies nothing. A dataset's kind is not known before it is
 /// identified: a driver must be allowed by the list of each kind it belongs to, as `open` judges a
-/// dataset (`formats::allowed_drivers(None)`); a point-cloud driver by `TERRIO_ALLOWED_DRIVERS`,
-/// the only list that restricts them. The public functions return judged identifications; the
-/// content check dispatches on unjudged ones and opens with the openers, which judge the list.
+/// dataset (`formats::allowed_drivers(None)`); a point-cloud driver by the list of point clouds,
+/// as its reader judges it. The public functions return judged identifications; the content check
+/// dispatches on unjudged ones and opens with the openers, which judge the list.
 fn judged(found: Option<Identification>) -> Option<Identification> {
     let kind = |found: &Identification| (found.kinds == [Kind::PointCloud]).then_some(Kind::PointCloud);
     found.filter(|found| {
@@ -133,7 +138,7 @@ fn identify_header(bytes: &[u8], name: &str, length: Option<u64>) -> Option<Iden
         return raster(RasterDriver::PMTiles);
     }
     if bytes.starts_with(b"SQLite format 3\0") {
-        if ext == "gpkg" || matches!(bytes.get(68..72), Some(b"GPKG" | b"GP10")) {
+        if ext == "gpkg" || is_geopackage_header(bytes) {
             return raster(RasterDriver::GPKG);
         }
         if ext == "mbtiles" {
@@ -338,13 +343,13 @@ pub(crate) fn root_json_type(text: &str) -> Option<String> {
 /// Identifies a local/HTTP/S3 dataset from a bounded header. `deep` permits
 /// existing dataset readers as a fallback for formats requiring companion files.
 /// Those fallback readers may materialize formats without lazy metadata support.
-#[cfg(not(target_family = "wasm"))]
+#[cfg(fs)]
 pub fn identify(path: &str, deep: bool) -> Result<Option<Identification>> {
     Ok(judged(identify_unjudged(path, deep)?))
 }
 /// [`identify`] whatever the allow-list says (for the content check, which then opens
 /// with the openers, each judging the list; the deeper fallback's opens judge it too).
-#[cfg(not(target_family = "wasm"))]
+#[cfg(fs)]
 pub(crate) fn identify_unjudged(path: &str, deep: bool) -> Result<Option<Identification>> {
     use std::io::Read;
     if let Some(target) = crate::drivers::vector::wfs::service_target(path) {
@@ -481,7 +486,7 @@ impl IdentifyRecord {
 /// Recognized directories are emitted once and skipped unless force-recursive
 /// scanning is requested. Directory symlinks are never followed during traversal.
 /// Remote inputs are individual objects; remote directory traversal is not supported.
-#[cfg(not(target_family = "wasm"))]
+#[cfg(fs)]
 pub fn identify_many(paths: &[String], options: &IdentifyOptions) -> Vec<IdentifyRecord> {
     use std::collections::BTreeSet;
     let mut pending: Vec<_> = paths.iter().rev().map(|path| (path.clone(), false)).collect();

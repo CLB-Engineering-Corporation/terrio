@@ -2,7 +2,7 @@
 
 ```toml
 [dependencies]
-terrio = "0.6"
+terrio = "0.9"
 ```
 
 The API reference, with an example on each entry point, is on [docs.rs](https://docs.rs/terrio);
@@ -38,6 +38,42 @@ println!("{}", terrio::info::info(&ds, &Default::default()).to_text());
 `has_nodata` / `raster.nodata` fields, including explicit `None` entries. Read
 nodata with `band_nodata(band)` (one-based) or `nodata()` (band 1). To replace it
 with one shared value, clear the per-band vector and update both shared fields.
+
+## Raster buffer layout
+
+`RasterData` buffers passed to `Raster::from_data_native` must contain complete bands
+one after another: `[band0_plane, band1_plane, ...]`. Within each band, pixels are
+row-major, from the top row, with columns varying fastest. For zero-based indices:
+
+```text
+index = band * (rows * cols) + row * cols + col
+```
+
+The constructor does not deinterleave pixel-interleaved RGB/RGBA input. Convert it
+before constructing the raster; see the runnable
+[RGBA conversion example](https://docs.rs/terrio/latest/terrio/#raster-buffer-layout)
+in the crate documentation.
+
+`LazyRaster::read_window` returns the same band-major layout for both pixel-interleaved
+and separate-plane files, at full resolution and at internal or external `.ovr`
+overview levels. Use the **returned window's** dimensions in the index formula; output
+planes follow the requested band order (band selectors are one-based).
+`read_window_f32` and `read_window_f64` also return band-major, row-major values.
+For one band, the index is simply `row * width + col`; there is no row/column transpose.
+`ops::warp::warp` borrows band-major source rasters and returns a band-major raster,
+so a window result can be passed directly as a source without reordering its pixels.
+`LazyRaster::read_window` does not retain the dataset mask, so masked-out sample
+values may be treated as valid by `warp`. Floating-point window reads apply the mask
+as NaN. When the mask is needed separately, use `LazyRaster::read_mask` with the same
+window and overview selection. This layout note does not describe a masked-warp workflow.
+
+The in-memory layout is independent of TIFF storage. The current native GTiff writer
+used by `write_raster_dataset` defaults to `INTERLEAVE=PIXEL`
+(`PlanarConfiguration=1`, chunky). Set
+`creation_options: vec![("INTERLEAVE".into(), "BAND".into())]` in `RasterWriteOptions`
+for separate planes in multiband rasters (`PlanarConfiguration=2`), or explicitly
+request `PIXEL`. Single-band output uses `PlanarConfiguration=1` with either option.
+Both choices take the same band-major input buffer; the writer packs it for the file.
 
 ## Writing
 
@@ -361,6 +397,61 @@ comparison happens before: an `Int32` -2147483646 stays valid next to a nodata v
 -2147483647, although both read as -2147483648 in `f32`. Unscaled values are computed in `f64`,
 then rounded to `f32` once. Complex bands are refused.
 
+### Resampled windows
+
+`LazyRaster::read_resampled` reads a window of some bands into an output of another size as GDAL's
+`RasterIO` reads it, which `gdal_translate -outsize` and rasterio's
+`read(window=..., out_shape=..., resampling=...)` do: from the overview GDAL would choose, the
+window rounded to it as GDAL rounds it, then sampled by nearest neighbour (reading only the blocks
+holding the sampled pixels) or resampled with the kernels of `RasterIOResampled`, a strip of the
+source at a time. `ResampledReadOptions` takes the bands, the window in full-resolution pixels
+(possibly fractional), the output size, the resampling (nearest neighbour, bilinear, cubic, cubic
+spline, Lanczos, average, RMS or mode) and the overview, as `gdal_translate -ovr` takes it.
+
+```rust,no_run
+use terrio::ResampledReadOptions;
+use terrio::ops::Resampling;
+
+let mut cog = terrio::open_raster_lazy("https://example.com/cog.tif")?;
+let options = ResampledReadOptions {
+    window: Some((1024.0, 2048.0, 8192.0, 8192.0)),
+    size: (512, 512),
+    resampling: Resampling::Average,
+    ..Default::default()
+};
+let small = cog.read_resampled(&options)?; // the 512 x 512 overview's tiles, georeferenced
+# Ok::<(), terrio::Error>(())
+```
+
+- `OverviewSelection::Auto` (the default) chooses as `GDALBandGetBestOverviewLevel2`: when the
+  output is smaller than the window, the least reduced axis sets the desired reduction, and full
+  resolution then each overview is a candidate below that times 1.2 for nearest neighbour or 1.0
+  otherwise (`GDAL_OVERVIEW_OVERSAMPLING_THRESHOLD`), plus 0.1, the search stopping within 0.1 of
+  it. Candidates marked `AVERAGE_BIT2*` are excluded individually, for both internal and
+  external overviews, following GDAL 3.13.3. Unmarked levels remain eligible. When that is the
+  first image of an external `.ovr`, it chooses again among the file's other images, as GDAL's
+  band of that image has them as overviews. `AutoOffset(0)` is `Auto` in every resampled read;
+  positive `AutoOffset(n)`, `None` and `Level(i)` read a level alone, as `gdal_translate -ovr` does.
+  A positive offset beyond the available finer levels, or on an image without overviews,
+  falls back to `Auto`.
+- Invalid pixels carry no weight: those the level's mask band masks (the dataset's mask, an
+  overview's own; an overview without one is all valid, as in GDAL), their band's nodata value
+  (NaN for NaN, nothing outside the type's range) or the alpha band of a two- or four-band raster.
+  Bands sharing a mask are resampled together by the bilinear, cubic, cubic spline and Lanczos
+  kernels, as `GDALDataset::RasterIOResampled` does. Paletted bands are read by nearest neighbour
+  with those kernels at full resolution; their average and RMS reads there are refused (GDAL
+  averages their colors). Overviews, which GDAL's GeoTIFF reader reports without a color table,
+  are resampled like other bands.
+- `read_resampled_masks` reads the bands' mask bands the same way, as `GetMaskBand()->RasterIO()`:
+  0 for invalid pixels, 255 for valid ones, values between where a kernel resampled them;
+  `read_resampled_with_masks` reads both, the nodata masks computed from the pixels read.
+- The output's geotransform covers the window at the output's size, its GCPs scaled with it. A
+  raster in memory (`LazyRaster::from(dataset)`) is read the same way, without overviews.
+
+Windows past the raster's edges are refused (but for less than an output pixel past its right or
+bottom edge, as GDAL's virtual datasets request), as are the methods only warps use (min, max,
+median, quartiles, sum), Gauss, and complex bands with methods other than nearest neighbour.
+
 ## Bytes in memory
 
 ```rust,no_run
@@ -378,9 +469,14 @@ rasters; `vector_filter` (with the `sql` parser), `rasterize` and `polygonize`; 
 options struct mirroring the command-line options.
 
 Other modules follow the matching sections of the [CLI reference](cli.md): `ops::{blend,
-fill_nodata, edit, update, overview, layer_algebra, coverage, coverage_clean, coverage_simplify,
-pipeline, raster_tile, raster_retile, tile_index, rpftoc, vector_clip}` and the top-level
-`dataset_files`, `gpkg_maintenance`, `parquet_metadata`, `inspection`, `catalog` and `check`.
+compare, contour, coverage, coverage_clean, coverage_simplify, edit, fill_nodata, layer_algebra,
+lineref, overview, palette, pansharpen, pipeline, pixel_info, raster_retile, raster_tile, render,
+rpftoc, tile_index, topology, update, vector_clip, vector_geom, vector_grid, viewshed, xyz, zonal}`
+and the top-level `dataset_files`, `gpkg_maintenance`, `parquet_metadata`, `inspection`, `catalog`
+and `check`. `ops::render::{render_raster, render_vector}` draws a `LazyRaster` or vector
+`Layer`s into an RGBA `Image` (`width`, `height`, `rgba`, and `Image::to_png()` for PNG bytes)
+from `RenderOptions` (`width`, `height`, `max_size`, `bands`, `colormap`, `stretch`, `attribute`),
+reading a `LazyRaster` from the coarsest fitting overview.
 
 `ops::neighbors::{neighbors, neighbors_to_path}` computes focal statistics (`gdal raster
 neighbors`) from `NeighborsOptions` (kernels, `NeighborMethod`s, size, band, output type and
@@ -410,14 +506,24 @@ available in the core crate, including WebAssembly builds, without additional fe
 
 `ops::contour::contour` accepts a raster and `ContourOptions` (interval/fixed levels, band,
 nodata override and optional Z coordinates), returning a line layer with IDs and elevations.
-`ops::zonal::zonal_stats` accepts a polygon layer, `ZonalInput` raster bands and `ZonalOptions`
-(statistics, pixel inclusion, optional `dst_srs` and `decimal_places`); the result retains the
+`ops::zonal::zonal_stats` accepts a polygon layer, `ZonalSource`s (a `ZonalRaster` and its
+`ZonalBand`s) and `ZonalOptions`. A `ZonalRaster` is an open `LazyRaster` or a path
+(`ZonalRaster::Path`) opened only while it is read, so thousands of files stay within the
+open-file limit. A path is opened and read under the options set for the calling thread
+(`config::push_scope`), a driver allow-list among them, on whatever thread reads it.
+`ZonalOptions` holds the statistics, pixel inclusion, and optional `dst_srs`
+and `decimal_places`. The result retains the
 source features and adds statistic fields. Output reprojection occurs after analysis, and
 rounding (0–15 decimal places, ties away from zero after binary64 scaling) leaves source
-attributes and counts intact. Zonal statistics reuse a cropped membership mask across
-bands of the same raster.
-`ops::sql::query` runs the [documented OGR SQL subset](sql.md), including computed columns,
-DISTINCT, summaries and attribute joins, with strict input-layer lookup. These operations
+attributes and integer counts intact. `ZonalOptions::fractional` enables coverage fractions;
+`ZonalOptions::weights` accepts a `ZonalWeight` (`ZonalWeight::new(lazy_raster, band)`) for weighted statistics.
+Weight grids must match every value raster. Fractional counts are Real and are rounded
+when requested. See [the formulas and scope](cli.md#fractional-coverage-and-weighting-rasters).
+Zones are computed once per distinct grid and shared by every source on it; rasters are read
+lazily in strips of block rows, skipping strips without zones.
+`ops::sql::query` runs the [documented SQL subset](sql.md), including computed columns,
+DISTINCT, grouped summaries, attribute joins and the documented spatial functions,
+with strict input-layer lookup. These operations
 are also available in the core crate without extra features.
 
 `ops::topology` provides `buffer` (`BufferOptions`), `overlay` (`OverlayOperation`),
@@ -573,7 +679,6 @@ let pos = position(&parts, -1.4345, 51.9497)?;
 `grid_points` grids coordinate arrays directly; `coordinates` and `subline` are the other
 lookups. See [vector-grid](cli.md#vector-grid) and [lineref](cli.md#lineref).
 
-
 ### Compare, pixel info and XYZ
 
 ```rust,no_run
@@ -641,6 +746,16 @@ let pixels = as_features(&nlcd, &AsFeaturesOptions { geometry: PixelGeometry::Po
 [nodata-to-alpha](cli.md#nodata-to-alpha), [reclassify](cli.md#reclassify) and
 [as-features](cli.md#as-features).
 
+### Indexed color conversion
+
+`terrio::ops::palette` exposes `rgb_to_palette` with `PaletteOptions`,
+`palette_to_rgb`, `attach_palette` and their lazy-source variants. The lazy
+variants retain dataset validity masks, while the conversions materialize the
+pixels. `parse_color_table`, `color_table_from_bytes` and native
+`read_color_table` accept indexed text/QGIS tables or raster palettes. See
+[Palette conversion](cli.md#palette-conversion) for channel selection,
+quantization settings, supported formats and GDAL differences.
+
 ## File management
 
 ```rust,no_run
@@ -694,113 +809,10 @@ let (x, y) = Transformer::new(&src, &dst)?.transform(-105.5, 39.5)?;
 `terrio::pointcloud` reads LAS, LAZ and COPC into columns, writes them and grids them into
 rasters: see [Point Clouds](point-clouds.md).
 
-## Features
-
-Every driver is on by default. A program that needs only part of terrio turns the default
-features off and names the ones it uses, for a smaller dependency tree, faster builds and a
-smaller WebAssembly module. A COG writer, say:
-
-```toml
-terrio = { version = "0.6", default-features = false, features = ["geotiff"] }
-```
-
-The core, always built, is GeoTIFF and COG (deflate, LZW, PackBits, ZSTD, WebP, JPEG and JPEG
-XL), the raw and ASCII rasters (AAIGrid, EHdr, ENVI, ERS, HFA, RST, SAGA, GSBG, XYZ...), PNG,
-JPEG, VRT, STAC, GeoJSON, TopoJSON, Shapefile, KML/KMZ, GML, GPX, CSV, MapInfo, the CRS engine,
-the operations and the streams. The other drivers are features:
-
-| Feature | Default | What it adds |
-|---|---|---|
-| `geotiff` | on | GeoTIFF and COG: always built, the feature exists so that `features = ["geotiff"]` says what a build needs. |
-| `parquet` | on | GeoParquet, the `arrow` module and Arrow streams of vector layers (arrow, parquet). |
-| `remote` | on | URLs, `s3://`, `gs://` and `az://` objects, range reads of remote COGs, COPC, PMTiles and Zarr, and datum grids from the PROJ CDN (native builds only). HTTPS is `rustls` with `ring`, which needs a C compiler (CLB fork). Not part of `drivers`. |
-| `netcdf-hdf5` | on | NetCDF, HDF5 and HDF-EOS reading, netCDF writing. |
-| `sqlite` | on | GeoPackage (vector and raster tiles) and SQLite/SpatiaLite. |
-| `tiles` | on | MBTiles, PMTiles and MVT, raster and vector (the `tiles` module's archives; needs `sqlite`). |
-| `avif` | on | AVIF tiles of tile archives (needs `tiles`). |
-| `zarr` | on | Zarr v2 and v3. |
-| `jp2` | on | JPEG 2000. |
-| `grib` | on | GRIB1 and GRIB2 reading and GRIB2 writing (pure Rust, CCSDS packing with `rust-aec`; JPEG 2000 packing needs `jp2`). |
-| `flatgeobuf` | on | FlatGeobuf. |
-| `osm` | on | OpenStreetMap PBF and XML. |
-| `pointcloud` | on | LAS, LAZ, COPC, EPT, PLY and E57 (the `pointcloud` module). |
-| `lerc` | on | LERC-compressed GeoTIFFs, read and written. |
-| `lzma` | on | LZMA-compressed GeoTIFFs. |
-| `hecras` | on | HEC-RAS geometry and plan HDF files as vector layers, read only (the `HECRAS` driver and the `hecras` module, through the `ras-commander-fast-hdf` engine; needs `netcdf-hdf5`). See [HEC-RAS](hecras.md). |
-| `filegdb` | on | Esri File Geodatabases as vector layers, read only, in pure Rust (the `OpenFileGDB` driver, through the `filegdb` module, which writes them too; native builds only, as a geodatabase is a directory). See [Formats](formats.md#other-vector-formats). |
-| `gdal` | off | The optional GDAL backend: formats terrio has no driver for, through GDAL (needs GDAL installed). See [the GDAL backend](gdal.md#the-optional-gdal-backend). |
-| `ndarray` | off | Raster pixels as `ndarray` arrays, without copying them: views, owned transfers and the masks of lazy reads, with the crate re-exported as `terrio::ndarray`; floating-point windows as owned arrays, bands first or last. See [ndarray](#ndarray). |
-| `cad` | on | DWG and DXF, read and written, through acadrust. See [CAD drawings](formats.md#cad-drawings-dwg-and-dxf). |
-| `drivers` | on | Every driver above that is on by default: the default features but `remote`. `default-features = false, features = ["drivers"]` builds them all without a C compiler. |
-| `libzstd-geotiff` | off | GeoTIFF/COG Zstandard (ZSTD and LERC_ZSTD chunks written, ZSTD chunks read) through the zstd C library, natively: the C library's bytes at each of its 22 levels, written in 0.7 to 1.15 of the time on one thread. Without it (the default), and always in WebAssembly, GeoTIFF Zstandard is the pure-Rust `ruzstd` (the `zstd-rust` crate), which reads these as fast and writes them to within about 3% of the size at levels 1 to 9; levels 10 and up are its `Best`, up to 23.5% larger than the C library's level 19 and 3.5 to 5 times faster (see [Testing](testing.md), "Zstandard: pure Rust against the C library"). Needs a C compiler. |
-| `libzstd-ept` | off | EPT tiles' Zstandard through the zstd C library, natively. |
-| `libzstd-geoparquet` | off | The Zstandard of the GeoParquet pages terrio compresses and decompresses itself through the zstd C library, natively: then the same bytes as `parquet-zstd`'s. |
-| `libzstd` | off | `libzstd-geotiff`, `libzstd-ept` and `libzstd-geoparquet`: every Zstandard path but Zarr's through the zstd C library. |
-| `parquet-zstd` | off | ZSTD GeoParquet pages written by the `parquet` crate's own codec, the zstd C library. Without it terrio compresses the pages in pure Rust (or with `libzstd-geoparquet`), to the same pages. |
-
-The drivers stay in the API whatever the features (`formats::RasterDriver`,
-`formats::VectorDriver`): those a build leaves out are listed as neither read nor written, and
-opening or writing their files fails with "built without the `zarr` feature". Modules and types
-that belong to one feature (`terrio::arrow`, `terrio::pointcloud`, `terrio::http`,
-`terrio::s3`, `tiles::TileArchive`, `terrio::ndarray`, `RasterArrayExt`, `BandLayout`) exist
-only with it.
-
-The `geotiff` build still pulls the JPEG XL decoder and encoder (`jxl-oxide`, `zune-jpegxl`):
-`wbraster`, terrio's raster data model, depends on them through its GeoTIFF reader.
-
-## API stability
-
-terrio is heading for a stable 1.0 API. What to rely on, and the decisions behind it:
-
-- **The data model is `wbraster`'s and `wbvector`'s.** Rasters are `wbraster::Raster`s and vector
-  layers `wbvector::Layer`s, re-exported by terrio (`terrio::Raster`, `terrio::Layer`,
-  `terrio::raster::RasterData`, `terrio::vector::Coord`...). Wrapping them in terrio types would
-  copy every pixel and coordinate through the bindings and the operations for no gain, so terrio
-  exposes them as they are: they are part of terrio's API, and a breaking release of either crate
-  that terrio adopts is a breaking release of terrio. Use them through terrio's re-exports rather
-  than depending on those crates yourself, so that the versions always match.
-- **Options structs** (`RasterWriteOptions`, `WarpOptions`, `PointReadOptions`...) all implement
-  `Default`: build them with `..Default::default()`. New options are added as new fields with a
-  default that keeps the old behaviour, which is not considered a breaking change.
-- **Enums that grow** (`Error`, `formats::RasterDriver`, `formats::VectorDriver`,
-  `formats::Kind`) are `#[non_exhaustive]`: match them with a wildcard arm.
-- **Errors** carry a message for display; `Error::Raster` and `Error::Vector` wrap the format
-  libraries' errors.
-- **Minimum supported Rust version**: 1.90, raised only when needed, never to a release less
-  than six months old (see [Contributing](contributing.md#minimum-supported-rust-version)).
-
-## WebAssembly
-
-The library builds for `wasm32-unknown-unknown`, with any features; network access and
-temporary files are native only. No C compiler is needed: Zstandard is pure Rust (the
-opt-in `libzstd-*` features apply to native builds only). JPEG 2000 (the `jp2` feature) works there too, with two settings in the program that is built: the global
-allocator `terrio::NullSafeAllocator` (the OpenJPEG port releases null pointers, which the
-WebAssembly allocator does not tolerate), and the link flag `-C link-arg=--allow-undefined` for
-`wasm32-unknown-unknown`, as in the repository's `.cargo/config.toml` (the port is built as a C
-library too, whose C allocator calls terrio defines):
-
-```rust
-#[global_allocator]
-static ALLOCATOR: terrio::NullSafeAllocator = terrio::NullSafeAllocator;
-```
-
-API documentation: [docs.rs/terrio](https://docs.rs/terrio), or `cargo doc -p terrio --open` in
-the repository.
-
 ## Native multidimensional arrays
 
 See [Native multidimensional arrays](multidim.md) for scientific groups, named dimensions,
 lazy coordinate arrays, time/depth slicing, transposition and netCDF/Zarr numeric snapshots.
-
-### Indexed color conversion
-
-`terrio::ops::palette` exposes `rgb_to_palette` with `PaletteOptions`,
-`palette_to_rgb`, `attach_palette` and their lazy-source variants. The lazy
-variants retain dataset validity masks, while the conversions materialize the
-pixels. `parse_color_table`, `color_table_from_bytes` and native
-`read_color_table` accept indexed text/QGIS tables or raster palettes. See
-[Palette conversion](cli.md#palette-conversion) for channel selection,
-quantization settings, supported formats and GDAL differences.
 
 ## GeoPackage validation
 
@@ -885,3 +897,146 @@ output is not a substitute for an application's geometryless analytical table.
 No event identity, valuation, or application-specific row schema belongs in the
 sampling API. Existing `terrio sample --lazy` also writes normal vector formats,
 including GeoParquet, and retains its options and eager default.
+
+## Features
+
+Every driver is on by default. A program that needs only part of terrio turns the default
+features off and names the ones it uses, for a smaller dependency tree, faster builds and a
+smaller WebAssembly module. A COG writer, say:
+
+```toml
+terrio = { version = "0.9", default-features = false, features = ["geotiff"] }
+```
+
+The core, always built, is GeoTIFF and COG (deflate, LZW, PackBits, ZSTD, WebP, JPEG and JPEG
+XL), the raw and ASCII rasters (AAIGrid, EHdr, ENVI, ERS, HFA, RST, SAGA, GSBG, XYZ...), PNG,
+JPEG, VRT, STAC, GeoJSON, TopoJSON, Shapefile, KML/KMZ, GML, GPX, CSV, MapInfo, the CRS engine,
+the operations and the streams. The other drivers are features:
+
+| Feature | Default | What it adds |
+|---|---|---|
+| `geotiff` | on | GeoTIFF and COG: always built, the feature exists so that `features = ["geotiff"]` says what a build needs. |
+| `parquet` | on | GeoParquet, the `arrow` module and Arrow streams of vector layers (arrow, parquet). |
+| `remote` | on | URLs, `s3://`, `gs://` and `az://` objects, range reads of remote COGs, COPC, PMTiles and Zarr, and datum grids from the PROJ CDN (native builds only). HTTPS is `rustls` with `ring`, which needs a C compiler (CLB fork). Not part of `drivers`. |
+| `netcdf-hdf5` | on | NetCDF, HDF5 and HDF-EOS reading, netCDF writing. |
+| `sqlite` | on | GeoPackage (vector and raster tiles) and SQLite/SpatiaLite. |
+| `tiles` | on | MBTiles, PMTiles and MVT, raster and vector (the `tiles` module's archives; needs `sqlite`). |
+| `avif` | on | AVIF tiles of tile archives (needs `tiles`). |
+| `zarr` | on | Zarr v2 and v3. |
+| `jp2` | on | JPEG 2000. |
+| `grib` | on | GRIB1 and GRIB2 reading and GRIB2 writing (pure Rust, CCSDS packing with `rust-aec`; JPEG 2000 packing needs `jp2`). |
+| `flatgeobuf` | on | FlatGeobuf. |
+| `xlsx` | on | XLSX and XLSM workbooks as vector layers and the `terrio::xlsx` workbook model, in pure Rust. |
+| `osm` | on | OpenStreetMap PBF and XML. |
+| `pointcloud` | on | LAS, LAZ, COPC, EPT, PLY and E57 (the `pointcloud` module). |
+| `lerc` | on | LERC-compressed GeoTIFFs, read and written. |
+| `lzma` | on | LZMA-compressed GeoTIFFs. |
+| `hecras` | on | HEC-RAS geometry and plan HDF files as vector layers, read only (the `HECRAS` driver and the `hecras` module, through the `ras-commander-fast-hdf` engine; needs `netcdf-hdf5`). See [HEC-RAS](hecras.md). |
+| `filegdb` | on | Esri File Geodatabases as vector layers, read only, in pure Rust (the `OpenFileGDB` driver, through the `filegdb` module, which writes them too; native builds only, as a geodatabase is a directory). See [Formats](formats.md#other-vector-formats). |
+| `gdal` | off | The optional GDAL backend: formats terrio has no driver for, through GDAL (needs GDAL installed). See [the GDAL backend](gdal.md#the-optional-gdal-backend). |
+| `ndarray` | off | Raster pixels as `ndarray` arrays, without copying them: views, owned transfers and the masks of lazy reads, with the crate re-exported as `terrio::ndarray`; floating-point windows as owned arrays, bands first or last. See [ndarray](#ndarray). |
+| `cad` | on | DWG and DXF, read and written, through acadrust. See [CAD drawings](formats.md#cad-drawings-dwg-and-dxf). |
+| `drivers` | on | Every driver above that is on by default: the default features but `remote`. `default-features = false, features = ["drivers"]` builds them all without a C compiler. |
+| `libzstd-geotiff` | off | GeoTIFF/COG Zstandard (ZSTD and LERC_ZSTD chunks written, ZSTD chunks read) through the zstd C library, natively: the C library's bytes at each of its 22 levels, written in 0.7 to 1.15 of the time on one thread. Without it (the default), and always in WebAssembly, GeoTIFF Zstandard is the pure-Rust `ruzstd` (the `zstd-rust` crate), which reads these as fast and writes them to within about 3% of the size at levels 1 to 9; levels 10 and up are its `Best`, up to 23.5% larger than the C library's level 19 and 3.5 to 5 times faster (see [Testing](testing.md), "Zstandard: pure Rust against the C library"). Needs a C compiler. |
+| `libzstd-ept` | off | EPT tiles' Zstandard through the zstd C library, natively. |
+| `libzstd-geoparquet` | off | The Zstandard of the GeoParquet pages terrio compresses and decompresses itself through the zstd C library, natively: then the same bytes as `parquet-zstd`'s. |
+| `libzstd` | off | `libzstd-geotiff`, `libzstd-ept` and `libzstd-geoparquet`: every Zstandard path but Zarr's through the zstd C library. |
+| `parquet-zstd` | off | ZSTD GeoParquet pages written by the `parquet` crate's own codec, the zstd C library. Without it terrio compresses the pages in pure Rust (or with `libzstd-geoparquet`), to the same pages. |
+
+The drivers stay in the API whatever the features (`formats::RasterDriver`,
+`formats::VectorDriver`): those a build leaves out are listed as neither read nor written, and
+opening or writing their files fails with "built without the `zarr` feature". Modules and types
+that belong to one feature (`terrio::arrow`, `terrio::pointcloud`, `terrio::http`,
+`terrio::s3`, `tiles::TileArchive`, `terrio::ndarray`, `RasterArrayExt`, `BandLayout`) exist
+only with it.
+
+The `geotiff` build still pulls the JPEG XL decoder and encoder (`jxl-oxide`, `zune-jpegxl`):
+`wbraster`, terrio's raster data model, depends on them through its GeoTIFF reader.
+
+## API stability
+
+terrio is heading for a stable 1.0 API. What to rely on, and the decisions behind it:
+
+- **The data model is `wbraster`'s and `wbvector`'s.** Rasters are `wbraster::Raster`s and vector
+  layers `wbvector::Layer`s, re-exported by terrio (`terrio::Raster`, `terrio::Layer`,
+  `terrio::raster::RasterData`, `terrio::vector::Coord`...). Wrapping them in terrio types would
+  copy every pixel and coordinate through the bindings and the operations for no gain, so terrio
+  exposes them as they are: they are part of terrio's API, and a breaking release of either crate
+  that terrio adopts is a breaking release of terrio. Use them through terrio's re-exports rather
+  than depending on those crates yourself, so that the versions always match.
+- **Options structs** (`RasterWriteOptions`, `WarpOptions`, `PointReadOptions`...) all implement
+  `Default`: build them with `..Default::default()`. New options are added as new fields with a
+  default that keeps the old behaviour, which is not considered a breaking change.
+- **Enums that grow** (`Error`, `formats::RasterDriver`, `formats::VectorDriver`,
+  `formats::Kind`) are `#[non_exhaustive]`: match them with a wildcard arm.
+- **Errors** carry a message for display; `Error::Raster` and `Error::Vector` wrap the format
+  libraries' errors.
+- **Minimum supported Rust version**: 1.90, raised only when needed, never to a release less
+  than six months old (see [Contributing](contributing.md#minimum-supported-rust-version)).
+
+## WebAssembly
+
+The library builds for `wasm32-unknown-unknown`, with any features; network access and
+temporary files are native only. No C compiler is needed: Zstandard is pure Rust (the
+opt-in `libzstd-*` features apply to native builds only). JPEG 2000 (the `jp2` feature) works there too, with two settings in the program that is built: the global
+allocator `terrio::NullSafeAllocator` (the OpenJPEG port releases null pointers, which the
+WebAssembly allocator does not tolerate), and the link flag `-C link-arg=--allow-undefined` for
+`wasm32-unknown-unknown`, as in the repository's `.cargo/config.toml` (the port is built as a C
+library too, whose C allocator calls terrio defines):
+
+```rust
+#[global_allocator]
+static ALLOCATOR: terrio::NullSafeAllocator = terrio::NullSafeAllocator;
+```
+
+API documentation: [docs.rs/terrio](https://docs.rs/terrio), or `cargo doc -p terrio --open` in
+the repository.
+
+## OGC API Features
+
+`open_vector("OAPIF:https://service/collections", &options)` supports read-only
+OGC API Features with `VectorOpenOptions::oapif` (`OapifOpenOptions`).
+Collection selection, spatial_filter and max_features/skip_features are shared
+with other vector sources. The portable `oapif::Reader` exposes bounded
+`next_request` / `accept_response` steps; native HTTP and JavaScript fetch use
+the same state machine. GDAL 3.13.3 is the behavior reference. See the
+[CLI section](cli.md#ogc-api-features) for scope, CRS/axis handling, schema inference and
+allocation limits.
+
+## XLSX workbooks
+
+With the `xlsx` feature, `terrio::xlsx::Workbook` creates workbooks or opens
+`.xlsx` and `.xlsm` packages for editing. Cell addresses use Excel's A1 notation:
+
+```rust
+use terrio::xlsx::{Format, Workbook};
+
+fn main() -> terrio::Result<()> {
+    let mut book = Workbook::new();
+    book.set_creation_time("2024-01-02T03:04:05Z")?;
+    let sheet = book.add_sheet("Summary")?;
+    sheet.write("B1", "Quantity", &Format::new().bold())?;
+    sheet.write("B2", 9.0, &Format::new().num_format("#,##0"))?;
+    book.save("report.xlsx")?;
+    Ok(())
+}
+```
+
+The model supports typed cells, formula expressions with supplied cached values,
+styles, merged ranges, row and column dimensions, sheet order and visibility,
+views, filters, list validation, hyperlinks, comments and print settings.
+[The workbook example](https://github.com/opengeos/terrio/blob/main/crates/terrio/examples/xlsx_workbook.rs) demonstrates
+these controls. Formulas are stored rather than evaluated.
+
+`Workbook::open` and `open_bytes` preserve unmodeled XML and package parts,
+including charts and macros, when saving edits. Unsupported shared-formula edits
+return an error. Opening holds the decompressed package in memory: compressed
+input and total decompressed parts are bounded at 8 GiB, each part at 2 GiB,
+with additional cell/model memory accounting. These are safety limits rather
+than recommended workbook sizes.
+
+`layer(sheet, &XlsxOptions)` projects a sheet into Terrio's vector model;
+`add_layer` imports a vector layer’s fields and features, applying only the
+`GEOMETRY` option. Layout options are ignored; arrange the returned sheet with
+its methods. The layer projection currently serializes and rereads the
+workbook, so it has additional memory and processing costs.

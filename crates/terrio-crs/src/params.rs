@@ -5,11 +5,54 @@
 
 //! The `+key=value` parameters of a PROJ string.
 
+/// Boolean switches consumed by the CRS reader; numeric parameters keep presence semantics.
+const FLAGS: &[&str] = &[
+    "south",
+    "no_defs",
+    "wktext",
+    "over",
+    "approx",
+    "geoc",
+    "R_A",
+    "R_C",
+    "R_V",
+    "R_a",
+    "R_g",
+    "R_h",
+    "no_rot",
+    "no_uoff",
+    "no_off",
+    "czech",
+    "guam",
+    "hyperbolic",
+    "exact",
+    "transpose",
+    "no_z_transform",
+    "inv",
+    "omit_fwd",
+    "omit_inv",
+];
+
+fn flag_value(value: Option<&str>) -> Option<bool> {
+    match value.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+        None | Some("true" | "t" | "yes" | "y" | "on" | "1") => Some(true),
+        Some("false" | "f" | "no" | "n" | "off" | "0") => Some(false),
+        _ => None,
+    }
+}
+
+/// Parameters every method reads, which PROJ checks only for the methods its CRS parser maps them
+/// for (`+lat_0=abc` is refused for `tmerc` and ignored for `robin`): an unreadable value is
+/// still read as absent. The scale factor's own check is in `Def::from_params`.
+const LENIENT: [&str; 6] = ["lat_0", "lon_0", "x_0", "y_0", "k_0", "k"];
+
 /// The parameters of a PROJ string, in order.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Params {
     items: Vec<(String, Option<String>)>,
     unterminated_quote: bool,
+    /// The parameters read as a number or an angle whose values are neither, in reading order.
+    invalid: std::cell::RefCell<Vec<String>>,
 }
 
 impl Params {
@@ -27,7 +70,7 @@ impl Params {
                 })
             })
             .collect();
-        Self { items, unterminated_quote }
+        Self { items, unterminated_quote, invalid: Default::default() }
     }
 
     /// Refuses a quoted value that would swallow the rest of a definition.
@@ -38,9 +81,38 @@ impl Params {
         Ok(())
     }
 
-    /// Whether the parameter is present.
+    /// Refuses non-boolean values on recognized switches rather than treating them as enabled.
+    pub fn validate_flags(&self) -> crate::Result<()> {
+        for (key, value) in &self.items {
+            if FLAGS.contains(&key.as_str()) && flag_value(value.as_deref()).is_none() {
+                return Err(crate::Error::Crs(format!("+{key} needs a boolean flag value")));
+            }
+        }
+        if self.str("init").is_some() && self.keys().any(|key| FLAGS.contains(&key) && !matches!(key, "no_defs" | "wktext")) {
+            return Err(crate::Error::Crs(
+                "boolean overrides combined with +init are not supported; use an expanded +proj definition".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Recognized boolean parameters, in definition order, with their normalized values.
+    pub fn boolean_parameters(&self) -> Vec<(String, bool)> {
+        let mut seen = std::collections::HashSet::new();
+        self.items
+            .iter()
+            .filter(|(key, _)| FLAGS.contains(&key.as_str()) && seen.insert(key.as_str()))
+            .filter_map(|(key, value)| flag_value(value.as_deref()).map(|value| (key.clone(), value)))
+            .collect()
+    }
+
+    /// Whether a parameter is present, or a recognized boolean switch is enabled.
+    /// Call `validate_flags` first: invalid switch values otherwise read as disabled.
     pub fn has(&self, key: &str) -> bool {
-        self.items.iter().any(|(k, _)| k == key)
+        self.items
+            .iter()
+            .find(|(k, _)| k == key)
+            .is_some_and(|(_, value)| !FLAGS.contains(&key) || flag_value(value.as_deref()).unwrap_or(false))
     }
 
     /// The parameters' names, in order.
@@ -53,19 +125,44 @@ impl Params {
         self.items.iter().find(|(k, _)| k == key).and_then(|(_, v)| v.as_deref())
     }
 
-    /// The parameter's numeric value.
-    pub fn f64(&self, key: &str) -> Option<f64> {
-        self.str(key).and_then(|v| v.trim().parse().ok())
+    /// Reads a parameter's value. A value present but not read (`abc`, or an empty `+key=`) is
+    /// remembered for [`Self::invalid`] and read as absent.
+    fn read<T>(&self, key: &str, parse: impl FnOnce(&str) -> Option<T>) -> Option<T> {
+        let value = self.str(key)?;
+        let v = parse(value);
+        if v.is_none() && !LENIENT.contains(&key) && !self.invalid.borrow().iter().any(|k| k == key) {
+            self.invalid.borrow_mut().push(key.to_string());
+        }
+        v
     }
 
-    /// The parameter as an angle, in radians: decimal degrees or PROJ's DMS (`40d30'15"N`).
+    /// The parameters read as a number or an angle without being one, in reading order: PROJ
+    /// refuses a CRS with such a value ("invalid value for lat_ts"). Only parameters read count,
+    /// as PROJ only checks those its method uses, and not those of [`LENIENT`].
+    /// Call after all numeric and angular reads: this is a snapshot of failures recorded so far.
+    pub fn invalid(&self) -> Vec<String> {
+        self.invalid.borrow().clone()
+    }
+
+    /// The parameter's numeric value.
+    pub fn f64(&self, key: &str) -> Option<f64> {
+        self.read(key, |v| v.trim().parse().ok())
+    }
+
+    /// The parameter as an angle, in radians: decimal degrees, PROJ's DMS (`40d30'15"N`), or
+    /// radians (`0.5r`).
     pub fn angle(&self, key: &str) -> Option<f64> {
-        self.str(key).and_then(parse_dms).map(f64::to_radians)
+        self.read(key, parse_dms).map(f64::to_radians)
+    }
+
+    /// The parameter as an angle in degrees, as [`Self::angle`] reads it.
+    pub fn degrees(&self, key: &str) -> Option<f64> {
+        self.read(key, parse_dms)
     }
 
     /// The parameter as a comma-separated list of numbers.
     pub fn list(&self, key: &str) -> Option<Vec<f64>> {
-        self.str(key).map(|v| v.split(',').filter_map(|x| x.trim().parse().ok()).collect())
+        self.read(key, |v| v.split(',').map(|x| x.trim().parse().ok()).collect())
     }
 }
 
@@ -90,11 +187,16 @@ fn tokens(s: &str) -> (Vec<String>, bool) {
     (out, quoted)
 }
 
-/// Parses decimal degrees or PROJ's DMS notation into degrees.
-fn parse_dms(s: &str) -> Option<f64> {
+/// Parses decimal degrees, PROJ's DMS notation or radians (`0.5r`, as PROJ's `dmstor`) into
+/// degrees.
+pub(crate) fn parse_dms(s: &str) -> Option<f64> {
     let s = s.trim();
     if let Ok(v) = s.parse() {
         return Some(v);
+    }
+    // Radians, as PROJ's `dmstor` reads a number ending in `r` or `R`.
+    if let Some(v) = s.strip_suffix(['r', 'R']).and_then(|v| v.parse::<f64>().ok()) {
+        return Some(v.to_degrees());
     }
     let (body, sign) = match s.chars().last()? {
         'N' | 'n' | 'E' | 'e' => (&s[..s.len() - 1], 1.0),
@@ -117,15 +219,49 @@ fn parse_dms(s: &str) -> Option<f64> {
         } else {
             1.0
         };
-        deg += rest.trim().parse::<f64>().ok()? / div;
+        deg += rest.trim().parse::<f64>().ok()?.abs() / div;
     }
-    let negative = body.trim_start().starts_with('-');
+    // A hemisphere letter gives the sign, a minus sign only without one, as PROJ reads them
+    // (`-52d30'10"S` is south, `-52d30'10"N` north).
+    let lettered = body.len() < s.len();
+    let negative = !lettered && body.trim_start().starts_with('-');
     Some(sign * if negative { -deg } else { deg })
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_hemisphere_letter_gives_the_sign_over_a_minus() {
+        // As PROJ 9.8.1 reads them (`+lat_0=-52.5S` is -52.5, `-52.5N` 52.5).
+        let near = |s: &str, v: f64| (super::parse_dms(s).unwrap() - v).abs() < 1e-12;
+        let dms = 52.0 + 30.0 / 60.0 + 10.0 / 3600.0;
+        for (s, v) in [("-52.5S", -52.5), ("-52.5N", 52.5), ("52.5S", -52.5), ("-52.5", -52.5), ("-5W", -5.0), ("-5E", 5.0)] {
+            assert!(near(s, v), "{s}");
+        }
+        for (s, v) in [("-52d30'10\"S", -dms), ("-52d30'10\"N", dms), ("52d30'10\"S", -dms), ("-52d30'10\"", -dms)] {
+            assert!(near(s, v), "{s}");
+        }
+    }
+
     use super::*;
+
+    #[test]
+    fn boolean_switches_keep_numeric_parameter_presence() {
+        for value in ["False", "false", "F", "f", "NO", "off", "0"] {
+            let p = Params::parse(&format!("+south={value} +lat_0=0 +zone=0"));
+            p.validate_flags().unwrap();
+            assert!(!p.has("south"));
+            assert!(p.has("lat_0") && p.has("zone"));
+        }
+        for value in ["True", "true", "T", "YES", "on", "1"] {
+            let p = Params::parse(&format!("+south={value}"));
+            p.validate_flags().unwrap();
+            assert!(p.has("south"));
+        }
+        for value in ["", "maybe", "2", "NaN"] {
+            assert!(Params::parse(&format!("+south={value}")).validate_flags().is_err());
+        }
+    }
 
     #[test]
     fn parses_tokens_and_angles() {

@@ -4,7 +4,7 @@
 //! WebAssembly has no local file system and no signed requests: local paths fail, and writes to
 //! object stores are not available (`listUrl` lists public buckets and SAS-token URLs).
 
-use crate::{js_err, parse_options, to_js};
+use crate::{js_err, js_error, parse_options, to_js};
 use serde::Deserialize;
 use terrio::vsi::{self, CopyOptions, ListOptions, RemoteLister, SyncOptions};
 use wasm_bindgen::prelude::*;
@@ -128,11 +128,6 @@ fn get(v: &JsValue, key: &str) -> JsValue {
     js_sys::Reflect::get(v, &JsValue::from_str(key)).unwrap_or(JsValue::UNDEFINED)
 }
 
-fn js_error(e: JsValue) -> JsError {
-    let msg = e.dyn_ref::<js_sys::Error>().map(|e| String::from(e.message())).or_else(|| e.as_string()).unwrap_or_else(|| format!("{e:?}"));
-    JsError::new(&msg)
-}
-
 fn cancel_body(value: &JsValue) {
     if let Ok(cancel) = get(value, "cancel").dyn_into::<js_sys::Function>() {
         let _ = cancel.call0(value);
@@ -205,9 +200,18 @@ async fn listing_body(response: &JsValue, lister: &RemoteLister) -> Result<Vec<u
 /// checked with a 4 KiB sniff prefix and limited to 4 MiB; custom fetch must return a Response.
 #[wasm_bindgen(js_name = listUrl)]
 pub async fn list_url(url: String, options: JsValue) -> Result<JsValue, JsError> {
+    if !options.is_undefined() && !options.is_null() && !options.is_object() {
+        return Err(JsError::new("options must be an object"));
+    }
     let opt = |k: &str| if options.is_object() { get(&options, k) } else { JsValue::UNDEFINED };
     let recursive = opt("recursive").as_bool().unwrap_or(false);
-    let depth = opt("depth").as_f64().map(|d| d as usize);
+    let depth = match opt("depth") {
+        v if v.is_undefined() || v.is_null() => None,
+        v => match v.as_f64() {
+            Some(d) if d.is_finite() && d >= 0.0 && d.fract() == 0.0 && d <= usize::MAX as f64 => Some(d as usize),
+            _ => return Err(JsError::new("depth must be a non-negative integer")),
+        },
+    };
     let headers = opt("headers");
     let fetch: js_sys::Function = match opt("fetch") {
         f if f.is_function() => f.unchecked_into(),

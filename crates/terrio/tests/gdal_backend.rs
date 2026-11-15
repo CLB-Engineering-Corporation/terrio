@@ -7,17 +7,13 @@
 #![cfg(feature = "gdal")]
 
 use gdal::vector::{LayerAccess, LayerOptions, OGRFieldType, OGRwkbGeometryType};
-use std::path::PathBuf;
 use terrio::formats::{RasterDriver, VectorDriver};
 use terrio::raster::RasterData;
 use terrio::{FieldValue, Raster, RasterConfig, RasterDataset};
 
-fn data(name: &str) -> Option<String> {
-    let dir = PathBuf::from(std::env::var_os("TERRIO_TEST_DATA")?);
-    let p = dir.join(name);
-    assert!(p.exists(), "{} is missing from TERRIO_TEST_DATA", p.display());
-    Some(p.to_string_lossy().into_owned())
-}
+#[path = "common/test_data.rs"]
+mod test_data;
+use test_data::data;
 
 /// A small georeferenced Int16 raster with a nodata value.
 fn sample() -> RasterDataset {
@@ -50,6 +46,44 @@ fn assert_same_raster(a: &RasterDataset, b: &RasterDataset, what: &str) {
     assert_eq!(differing, 0, "{what}: {differing} pixels differ");
 }
 
+/// GDAL 3.12.1 CFloat16 TIFF: native lazy decoding refuses it; GDAL reads its two components.
+/// Generated with GTiff.Create(16, 8, 1, GDT_CFloat16), real=0..127, imag=-real-1,
+/// transform=[500000,30,0,4100000,0,-30], EPSG:32613. All values fit Float16 exactly.
+#[test]
+fn translate_input_policy_falls_back_to_whole_gdal_reads() {
+    use terrio::ops::overview::OverviewSelection;
+    use terrio::ops::translate::{TranslateOptions, translate, translate_bytes, translate_path, translate_path_to_file};
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/translate_complex_half.tif");
+    assert!(terrio::open_raster_lazy(path).is_err(), "fixture must exercise the whole-read fallback");
+    let original = terrio::gdal_backend::open_raster(path).unwrap();
+    assert!(original.complex);
+    let options = TranslateOptions { src_win: Some((2.0, 1.0, 5.0, 4.0)), ..Default::default() };
+    let expected = translate(&original, &options).unwrap();
+    for overview in [OverviewSelection::Auto, OverviewSelection::AutoOffset(0), OverviewSelection::None] {
+        for source in [path.to_string(), format!("GDAL:{path}")] {
+            let actual = translate_path(&source, &options, overview).unwrap();
+            assert_same_raster(&actual, &expected, "whole path translation");
+            assert_eq!(actual.complex, expected.complex);
+        }
+        let actual = translate_bytes(std::fs::read(path).unwrap(), "input.tif", &options, overview).unwrap();
+        assert_same_raster(&actual, &expected, "whole byte translation");
+        assert_eq!(actual.complex, expected.complex);
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let output = dir.path().join("output.tif");
+    translate_path_to_file(path, &options, OverviewSelection::Auto, output.to_str().unwrap(), &Default::default()).unwrap();
+    assert_same_raster(&terrio::open_raster(output.to_str().unwrap()).unwrap(), &expected, "whole translation written to file");
+    for overview in [OverviewSelection::Level(0), OverviewSelection::AutoOffset(1)] {
+        let result = translate_path(path, &options, overview);
+        assert!(matches!(result, Err(terrio::Error::Unsupported(message)) if message.contains("is read whole")));
+        let result = translate_bytes(std::fs::read(path).unwrap(), "input.tif", &options, overview);
+        assert!(matches!(result, Err(terrio::Error::Unsupported(message)) if message.contains("is read whole")));
+    }
+    // The original public type and function remain compatible after policy consolidation.
+    let legacy = terrio::memory::open_raster_lazy_bytes_or_whole(std::fs::read(path).unwrap(), "input.tif").unwrap();
+    assert!(matches!(legacy, terrio::memory::OpenedRasterBytes::Whole(_)));
+}
+
 #[test]
 fn gdal_driver_listed() {
     assert_eq!(RasterDriver::from_name("gdal"), Some(RasterDriver::Gdal));
@@ -60,6 +94,36 @@ fn gdal_driver_listed() {
     assert!(!terrio::gdal_backend::has_driver("NoSuchDriver"));
     assert_eq!(terrio::gdal_backend::strip_prefix("gdal:x.hdf"), Some("x.hdf"));
     assert_eq!(terrio::gdal_backend::strip_prefix("x.hdf"), None);
+}
+
+/// GDAL 3.12.1 identifies TIFF content under a /vsimem GRIB name without its optional GRIB driver.
+/// The GRIB name sends the native lazy opener to the filesystem, where it returns NotFound.
+#[cfg(feature = "grib")]
+#[test]
+fn translate_input_policy_reads_vsimem_through_gdal() {
+    use terrio::ops::overview::OverviewSelection;
+    use terrio::ops::translate::{TranslateOptions, translate, translate_path};
+
+    let mut bytes = include_bytes!("data/translate_complex_half.tif").to_vec();
+    let path = "/vsimem/terrio_translate_input_policy.grb";
+    let _file = gdal::vsi::create_mem_file_from_ref(path, &mut bytes).unwrap();
+    let Err(error) = terrio::open_raster_lazy(path) else {
+        panic!("VSI input must need a whole-read fallback");
+    };
+    assert!(matches!(&error, terrio::Error::Io(e) if e.kind() == std::io::ErrorKind::NotFound), "{error}");
+    let original = terrio::gdal_backend::open_raster(path).unwrap();
+    let options = TranslateOptions::default();
+    let expected = translate(&original, &options).unwrap();
+    for overview in [OverviewSelection::Auto, OverviewSelection::AutoOffset(0), OverviewSelection::None] {
+        let actual = translate_path(path, &options, overview).unwrap();
+        assert_same_raster(&actual, &expected, "VSI whole translation");
+        assert_eq!(actual.complex, expected.complex);
+    }
+    for overview in [OverviewSelection::Level(0), OverviewSelection::AutoOffset(1)] {
+        assert!(
+            matches!(translate_path(path, &options, overview), Err(terrio::Error::Unsupported(message)) if message.contains("is read whole"))
+        );
+    }
 }
 
 /// Formats terrio cannot read or write itself: written with GDAL's drivers, then read back
@@ -223,6 +287,40 @@ fn subdatasets_through_gdal() {
         .filter(|(a, b)| a.to_bits() != b.to_bits() && !(a.is_nan() && b.is_nan()))
         .count();
     assert_eq!(differing, 0);
+}
+
+/// GDAL 3.13.3 feature ranges follow spatial filtering for paths and in-memory inputs.
+#[test]
+fn vector_ranges_follow_filtered_order() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("ordered.geojson");
+    let features: Vec<_> = (0..5)
+        .map(
+            |i| serde_json::json!({"type": "Feature", "properties": {"sequence": i}, "geometry": {"type": "Point", "coordinates": [i, 0]}}),
+        )
+        .collect();
+    let bytes = serde_json::to_vec(&serde_json::json!({"type": "FeatureCollection", "features": features})).unwrap();
+    std::fs::write(&path, &bytes).unwrap();
+    let name = path.to_str().unwrap();
+    let base = terrio::VectorOpenOptions { spatial_filter: Some((1.5, -1.0, 4.5, 1.0)), ..Default::default() };
+    let full = terrio::gdal_backend::open_vector(name, &base).unwrap();
+    assert_eq!(full.layers[0].features.len(), 3);
+    for (skip, limit) in [(0, Some(0)), (1, Some(1)), (2, None), (9, Some(2))] {
+        let options = terrio::VectorOpenOptions { skip_features: skip, max_features: limit, ..base.clone() };
+        let start = skip.min(full.layers[0].features.len());
+        let end = limit.map_or(full.layers[0].features.len(), |n| (start + n).min(full.layers[0].features.len()));
+        let expected = &full.layers[0].features[start..end];
+        for result in [
+            terrio::open_vector(&format!("GDAL:{name}"), &options).unwrap(),
+            terrio::gdal_backend::open_vector_bytes(bytes.clone(), "ordered.geojson", &options).unwrap(),
+        ] {
+            assert_eq!(result.layers[0].features.len(), expected.len());
+            for (actual, expected) in result.layers[0].features.iter().zip(expected) {
+                assert_eq!(actual.geometry, expected.geometry);
+                assert_eq!(actual.fid, expected.fid);
+            }
+        }
+    }
 }
 
 /// Vector datasets terrio reads itself, read again through GDAL.
@@ -515,6 +613,99 @@ fn bytes_through_gdal() {
     // terrio's own formats still read with terrio's drivers.
     let tif = terrio::memory::write_raster_bytes(&sample(), "s.tif", &Default::default()).unwrap();
     assert_eq!(terrio::memory::open_raster_bytes(tif, "s.tif").unwrap().driver, RasterDriver::GTiff);
-    // Nothing is left in /vsimem/.
-    assert!(gdal::vsi::read_dir("/vsimem/", false).unwrap_or_default().iter().all(|p| !p.to_string_lossy().starts_with("terrio-")));
+    // Per-call /vsimem/ cleanup is checked in the backend unit test. Other tests may
+    // still be using their own directories here.
+}
+
+/// A misspelled layer name beside a valid one is refused through GDAL too, before any layer is
+/// read.
+#[test]
+fn a_misspelled_layer_name_is_refused_through_gdal() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("points.geojson");
+    std::fs::write(
+        &path,
+        r#"{"type":"FeatureCollection","features":[{"type":"Feature","properties":{},"geometry":{"type":"Point","coordinates":[1,2]}}]}"#,
+    )
+    .unwrap();
+    let source = format!("GDAL:{}", path.to_str().unwrap());
+    let names = |n: &[&str]| terrio::VectorOpenOptions { layers: n.iter().map(|s| s.to_string()).collect(), ..Default::default() };
+    assert_eq!(terrio::open_vector(&source, &names(&["points"])).unwrap().layers.len(), 1);
+    let error = terrio::open_vector(&source, &names(&["points", "pionts"])).unwrap_err();
+    assert!(error.to_string().contains("no layer named pionts"), "{error}");
+}
+
+/// Selection is shared with native/WASM readers; the file-stem alias is a Terrio extension
+/// to GDAL 3.13.3's exact layer-name lookup.
+#[test]
+fn a_named_layer_answers_to_the_file_stem_through_gdal() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("map.geojson");
+    std::fs::write(&path, r#"{"type":"FeatureCollection","name":"roads","features":[{"type":"Feature","properties":{},"geometry":{"type":"Point","coordinates":[1,2]}}]}"#).unwrap();
+    let source = format!("GDAL:{}", path.display());
+    let options = |n: &[&str]| terrio::VectorOpenOptions { layers: n.iter().map(|s| s.to_string()).collect(), ..Default::default() };
+    for names in [vec![], vec!["map"], vec!["roads"], vec!["map", "roads", "map"]] {
+        let ds = terrio::open_vector(&source, &options(&names)).unwrap();
+        assert_eq!(ds.layers.len(), 1);
+        assert_eq!(ds.layers[0].name, "roads");
+        assert_eq!(ds.layers[0].features.len(), 1);
+    }
+    let bytes = std::fs::read(&path).unwrap();
+    let ds = terrio::gdal_backend::open_vector_bytes(bytes, "map.geojson", &options(&["map"])).unwrap();
+    assert_eq!(ds.layers.len(), 1);
+    assert_eq!(ds.layers[0].name, "roads");
+    assert_eq!(
+        terrio::open_vector(&source, &options(&["map", "missing"])).unwrap_err().to_string(),
+        "no layer named missing (layers: roads)"
+    );
+}
+
+/// Date-time fields read through the backend become ISO 8601 text: `Z` for UTC, their offset
+/// otherwise, and no zone when they have none. The `gdal` feature alone formats them too
+/// (`--no-default-features --features gdal`). Checked with GDAL 3.12.2.
+#[test]
+fn date_time_fields_read_as_iso_8601_with_their_zone_or_none() {
+    let geojson = r#"{"type":"FeatureCollection","features":[{"type":"Feature","geometry":{"type":"Point","coordinates":[1,2]},
+        "properties":{"plain":"2024-03-15T10:30:05","east":"2024-03-15T10:30:05+02:00","west":"1999-12-31T23:59:59-03:30"}}]}"#;
+    let ds = terrio::gdal_backend::open_vector_bytes(geojson.as_bytes().to_vec(), "times.geojson", &Default::default()).unwrap();
+    let layer = &ds.layers[0];
+    let fields: Vec<_> = layer.schema.fields().iter().map(|f| (f.name.as_str(), f.field_type)).collect();
+    let date_time = terrio::FieldType::DateTime;
+    assert_eq!(fields, [("plain", date_time), ("east", date_time), ("west", date_time)]);
+    let text = |s: &str| FieldValue::DateTime(s.to_string());
+    assert_eq!(
+        layer.features[0].attributes,
+        [text("2024-03-15T10:30:05"), text("2024-03-15T10:30:05+02:00"), text("1999-12-31T23:59:59-03:30")]
+    );
+}
+
+/// GDAL 3.13.3 DateTime values retain millisecond precision and distinguish UTC
+/// from an unspecified zone. Both byte and prefixed-path entry points share this reader.
+#[test]
+fn date_time_fields_keep_milliseconds_and_explicit_utc() {
+    let geojson = r#"{"type":"FeatureCollection","features":[{"type":"Feature","geometry":{"type":"Point","coordinates":[1,2]},
+        "properties":{"east":"2024-03-15T10:30:05.250+02:00","z":"2024-03-15T10:30:05Z","utc":"2024-03-15T10:30:05+00:00","plain":"2024-03-15T10:30:05.001","west":"1999-12-31T23:59:59.999-03:30","quarter":"2024-03-15T10:30:05.125+05:45"}},
+        {"type":"Feature","geometry":null,"properties":{"east":null,"z":null,"utc":null,"plain":null,"west":null,"quarter":null}}]}"#;
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("times.geojson");
+    std::fs::write(&path, geojson).unwrap();
+    let from_bytes = terrio::gdal_backend::open_vector_bytes(geojson.as_bytes().to_vec(), "times.geojson", &Default::default()).unwrap();
+    let from_path = terrio::open_vector(&format!("GDAL:{}", path.display()), &Default::default()).unwrap();
+    for dataset in [from_bytes, from_path] {
+        let layer = &dataset.layers[0];
+        assert!(layer.schema.fields().iter().all(|field| field.field_type == terrio::FieldType::DateTime));
+        let text = |s: &str| FieldValue::DateTime(s.to_string());
+        assert_eq!(
+            layer.features[0].attributes,
+            [
+                text("2024-03-15T10:30:05.250+02:00"),
+                text("2024-03-15T10:30:05Z"),
+                text("2024-03-15T10:30:05Z"),
+                text("2024-03-15T10:30:05.001"),
+                text("1999-12-31T23:59:59.999-03:30"),
+                text("2024-03-15T10:30:05.125+05:45"),
+            ]
+        );
+        assert_eq!(layer.features[1].attributes, vec![FieldValue::Null; 6]);
+    }
 }

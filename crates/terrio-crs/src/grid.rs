@@ -424,14 +424,23 @@ fn read_ntv2(b: &[u8]) -> Option<GridFile> {
         if !(ext.west < ext.east && ext.south < ext.north && ext.res_x > 1e-10 && ext.res_y > 1e-10) {
             return None;
         }
-        let cols = ((ext.east - ext.west) / ext.res_x + 0.5).abs() as usize + 1;
-        let rows = ((ext.north - ext.south) / ext.res_y + 0.5).abs() as usize + 1;
-        let count = i32_at(h, 168, le)?.max(0) as usize;
-        if count / cols != rows {
+        let cols_f = ((ext.east - ext.west) / ext.res_x + 0.5).abs();
+        let rows_f = ((ext.north - ext.south) / ext.res_y + 0.5).abs();
+        if !(cols_f < i32::MAX as f64 && rows_f < i32::MAX as f64) {
             return None;
         }
-        let data = pos + 176;
-        let (mut lat, mut lon) = (vec![0f32; cols * rows], vec![0f32; cols * rows]);
+        let cols = cols_f as usize + 1;
+        let rows = rows_f as usize + 1;
+        let count = usize::try_from(i32_at(h, 168, le)?).ok()?;
+        if cols.checked_mul(rows) != Some(count) {
+            return None;
+        }
+        let data = pos.checked_add(176)?;
+        let next_pos = data.checked_add(count.checked_mul(16)?)?;
+        if next_pos > b.len() {
+            return None;
+        }
+        let (mut lat, mut lon) = (vec![0f32; count], vec![0f32; count]);
         for y in 0..rows {
             for x in 0..cols {
                 // Rows run east to west.
@@ -453,7 +462,7 @@ fn read_ntv2(b: &[u8]) -> Option<GridFile> {
             format: Format::Ntv2,
         });
         out.push((ext, src, name, parent));
-        pos = data + count * 16;
+        pos = next_pos;
     }
     Some(GridFile { sources: out, format: Format::Ntv2 })
 }
@@ -462,13 +471,22 @@ fn read_ntv2(b: &[u8]) -> Option<GridFile> {
 fn read_gtx(b: &[u8]) -> Option<GridFile> {
     let (yo, mut xo, ys, xs) = (f64_at(b, 0, false)?, f64_at(b, 8, false)?, f64_at(b, 16, false)?, f64_at(b, 24, false)?);
     let (rows, cols) = (i32_at(b, 32, false)?, i32_at(b, 36, false)?);
-    if cols <= 0 || rows <= 0 || !(-360.0..=360.0).contains(&xo) || !(-90.0..=90.0).contains(&yo) {
+    if cols <= 0
+        || rows <= 0
+        || !(xs > 0.0 && xs.is_finite() && ys > 0.0 && ys.is_finite())
+        || !(-360.0..=360.0).contains(&xo)
+        || !(-90.0..=90.0).contains(&yo)
+    {
         return None;
     }
     if xo >= 180.0 {
         xo -= 360.0;
     }
     let (rows, cols) = (rows as usize, cols as usize);
+    let count = rows.checked_mul(cols)?;
+    if b.len() < 40usize.checked_add(count.checked_mul(4)?)? {
+        return None;
+    }
     let ext = Extent {
         west: xo * DEG_TO_RAD,
         south: yo * DEG_TO_RAD,
@@ -478,7 +496,7 @@ fn read_gtx(b: &[u8]) -> Option<GridFile> {
         north: (yo + ys * (rows - 1) as f64) * DEG_TO_RAD,
         geographic: true,
     };
-    let v: Option<Vec<f32>> = (0..rows * cols).map(|i| f32_at(b, 40 + 4 * i, false)).collect();
+    let v: Option<Vec<f32>> = (0..count).map(|i| f32_at(b, 40 + 4 * i, false)).collect();
     let src = Arc::new(Source {
         values: Values::Mem(vec![v?]),
         width: cols,
@@ -537,6 +555,9 @@ fn read_tiff(reader: GridReader) -> Option<GridFile> {
             Some(tw) => (tw as usize, num(&mut dec, Tag::TileLength)? as usize),
             None => (width, (num(&mut dec, Tag::RowsPerStrip).unwrap_or(height as u64) as usize).min(height)),
         };
+        if width == 0 || height == 0 || samples == 0 || block_w == 0 || block_h == 0 {
+            return None;
+        }
         let geokeys = dec.find_tag(Tag::GeoKeyDirectoryTag).ok().flatten().and_then(|v| v.into_u16_vec().ok()).unwrap_or_default();
         let mut geographic = true;
         let mut pixel_is_area = false;
@@ -566,6 +587,12 @@ fn read_tiff(reader: GridReader) -> Option<GridFile> {
             v_res = scale[1];
             west = tie[3] - tie[0] * h_res;
             north = tie[4] + tie[1] * v_res;
+        }
+        // Reject nonfinite/degenerate resolution. PROJ 9.8.1's GTiffDataset::nextGrid
+        // (src/grids.cpp) likewise requires west-to-east resolution and accepts either vertical
+        // sign; its additional extent/minimum-resolution checks are not reproduced here.
+        if !(h_res > 0.0 && h_res.is_finite() && v_res != 0.0 && v_res.is_finite()) {
+            return None;
         }
         if pixel_is_area {
             west += 0.5 * h_res;
@@ -601,8 +628,8 @@ fn read_tiff(reader: GridReader) -> Option<GridFile> {
                 scale_offset[smp] = (scale.unwrap_or(1.0), offset.unwrap_or(0.0));
             }
         }
-        let blocks_per_row = width.div_ceil(block_w.max(1));
-        let blocks = blocks_per_row * height.div_ceil(block_h.max(1));
+        let blocks_per_row = width.div_ceil(block_w);
+        let blocks = blocks_per_row.checked_mul(height.div_ceil(block_h))?;
         // The chunks the file has: no more blocks than these can be decoded, whatever its size
         // tags say.
         let offsets = if dec.get_chunk_type() == tiff::decoder::ChunkType::Tile { Tag::TileOffsets } else { Tag::StripOffsets };
@@ -738,12 +765,31 @@ fn config() -> &'static Mutex<Config> {
 /// of the environment (`TERRIO_GRID_DIR`, `PROJ_DATA`, `PROJ_LIB`, PROJ's user directory and
 /// terrio's download cache); `None` goes back to the environment's. As PROJ's
 /// `proj_context_set_search_paths`. Transformers created afterwards use them.
+///
+/// While search paths are set this way, grids are read only from them, from grids registered with
+/// [`register_grid`] and, with the network on, from the PROJ CDN: a grid named by a path in a CRS
+/// definition (`+nadgrids=/data/a.gsb`, `./a.gsb`, `../a.gsb`) is treated as missing, with a
+/// warning, so a definition from untrusted input cannot read grid files from arbitrary paths.
+/// Add the grid's directory to the search paths or register it instead. Unlike
+/// PROJ, which reads such paths whatever its search paths are.
 pub fn set_grid_search_paths(paths: Option<Vec<std::path::PathBuf>>) {
     {
         let mut c = config().lock().unwrap_or_else(PoisonError::into_inner);
         c.paths = paths;
     }
     reset_grid_cache();
+}
+
+/// Make the effective grid search directories explicit, refusing path-named grids.
+/// This snapshots the configured directories, or the host's default directories when none
+/// are configured. Registered grids and the network policy are unchanged. Use this before
+/// creating transformers for untrusted CRS definitions.
+pub fn confine_grid_search_paths() {
+    #[cfg(not(target_family = "wasm"))]
+    let paths = search_dirs();
+    #[cfg(target_family = "wasm")]
+    let paths = Vec::new();
+    set_grid_search_paths(Some(paths));
 }
 
 /// Enables or disables downloading grids from the PROJ CDN, instead of following the
@@ -772,7 +818,7 @@ fn cache_generation() -> u64 {
 }
 
 /// Files read, by name (`None` when not found or not readable) and cache generation.
-type FileCache = Mutex<HashMap<String, (u64, Option<Arc<GridFile>>)>>;
+type FileCache = Mutex<HashMap<String, (u64, Option<Arc<GridFile>>, Vec<String>)>>;
 fn files() -> &'static FileCache {
     crate::host::before_lock();
     static F: OnceLock<FileCache> = OnceLock::new();
@@ -781,10 +827,10 @@ fn files() -> &'static FileCache {
 
 /// A late lookup must not overwrite a result cached after a reset. Check while
 /// holding the cache lock so reset either invalidates this write or clears it.
-fn cache_file_result(name: &str, generation: u64, file: Option<Arc<GridFile>>) {
+fn cache_file_result(name: &str, generation: u64, file: Option<Arc<GridFile>>, warnings: Vec<String>) {
     let mut cache = files().lock().unwrap_or_else(PoisonError::into_inner);
     if generation == cache_generation() {
-        cache.insert(name.to_string(), (generation, file));
+        cache.insert(name.to_string(), (generation, file, warnings));
     }
 }
 
@@ -803,6 +849,8 @@ pub fn register_grid(name: &str, bytes: Vec<u8>) {
         let mut a = availability().lock().unwrap_or_else(PoisonError::into_inner);
         a.clear();
     }
+    // A download of it that failed before no longer counts: the grid is there now.
+    fetch_failures().lock().unwrap_or_else(PoisonError::into_inner).remove(name);
 }
 
 /// Old names of PROJ-data grids (before PROJ 7), by current name, from the EPSG table.
@@ -888,23 +936,122 @@ fn machine_search_dirs() -> Vec<std::path::PathBuf> {
     dirs
 }
 
+/// The largest grid file read, larger than any grid on the PROJ CDN.
+#[cfg(not(target_family = "wasm"))]
+const MAX_GRID_BYTES: u64 = 2 << 30;
+
+/// Whether file metadata is that of a grid file that can be read: a regular file of at most
+/// [`MAX_GRID_BYTES`].
+#[cfg(not(target_family = "wasm"))]
+fn readable_grid(meta: &std::fs::Metadata) -> bool {
+    meta.is_file() && meta.len() <= MAX_GRID_BYTES
+}
+
+/// Whether a path is a grid file that [`read_grid_file`] reads.
+#[cfg(not(target_family = "wasm"))]
+fn is_grid_file(p: &std::path::Path) -> bool {
+    std::fs::metadata(p).is_ok_and(|m| readable_grid(&m))
+}
+
+/// Keep untrusted grid names bounded and escape controls before displaying diagnostics.
+#[cfg(not(target_family = "wasm"))]
+fn diagnostic_grid_name(name: &str) -> String {
+    // Omit URL-shaped input before truncation, which could leave private userinfo visible.
+    if name.contains("://") {
+        return "<URL-shaped grid name omitted>".into();
+    }
+    name.chars().take(120).flat_map(char::escape_debug).collect()
+}
+
+/// The bytes of a regular file of at most [`MAX_GRID_BYTES`]: devices, FIFOs and directories are
+/// never read, and a file growing while it is read is cut off rather than read without bound.
+#[cfg(not(target_family = "wasm"))]
+fn read_grid_file(p: &std::path::Path) -> Option<Arc<[u8]>> {
+    use std::io::Read;
+    let meta = std::fs::metadata(p).ok()?;
+    if meta.is_file() && meta.len() > MAX_GRID_BYTES {
+        crate::warnings::warn(format!(
+            "grid file is not read: larger than {MAX_GRID_BYTES} bytes ({})",
+            diagnostic_grid_name(&p.to_string_lossy())
+        ));
+        return None;
+    }
+    if !readable_grid(&meta) {
+        return None;
+    }
+    // The file may have been replaced since: open without blocking (a FIFO waits for a writer
+    // otherwise), then check what was opened.
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::custom_flags(&mut options, libc::O_NONBLOCK);
+    let file = options.open(p).ok()?;
+    let meta = file.metadata().ok()?;
+    if !readable_grid(&meta) {
+        return None;
+    }
+    // read_to_end grows the buffer as needed; reserve only a modest part of the claimed size.
+    let mut buf = Vec::with_capacity(usize::try_from(meta.len().min(64 << 20)).ok()?);
+    file.take(MAX_GRID_BYTES + 1).read_to_end(&mut buf).ok()?;
+    (buf.len() as u64 <= MAX_GRID_BYTES).then(|| Arc::from(buf))
+}
+
+/// Where a grid name is looked for on disk.
+#[cfg(not(target_family = "wasm"))]
+enum GridLocation<'a> {
+    /// A path (absolute, or starting with `./` or `../`), read as given.
+    Path(&'a std::path::Path),
+    /// A name relative to the search directories, such as `us_noaa_conus.tif` or
+    /// `subdir/grid.gsb`: every component is a plain name, so it stays inside them.
+    InSearchDirs,
+    /// Neither: a path while the search paths are set from code (which confine grids to them), or
+    /// a relative name that leaves the search directories (`a/../../etc/hosts`).
+    Refused,
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn grid_location(name: &str) -> GridLocation<'_> {
+    use std::path::Component;
+    let p = std::path::Path::new(name);
+    let first = p.components().next();
+    if p.is_absolute() || p.has_root() || matches!(first, Some(Component::Prefix(_) | Component::CurDir | Component::ParentDir)) {
+        // As PROJ, a grid named by a path is read from it, unless the search paths were set
+        // from code: those then bound what is read, so a CRS definition from untrusted input
+        // cannot name any file the process can see.
+        if config().lock().unwrap_or_else(PoisonError::into_inner).paths.is_some() {
+            let shown = diagnostic_grid_name(name);
+            crate::warnings::warn(format!(
+                "grid named by a path is not read: grid search paths are set, so grids are read only from them ({shown})"
+            ));
+            return GridLocation::Refused;
+        }
+        return GridLocation::Path(p);
+    }
+    if first.is_some() && p.components().all(|c| matches!(c, Component::Normal(_))) {
+        GridLocation::InSearchDirs
+    } else {
+        let shown = diagnostic_grid_name(name);
+        crate::warnings::warn(format!("grid is not read: relative grid names must contain only ordinary path components ({shown})"));
+        GridLocation::Refused
+    }
+}
+
 /// The bytes of a grid file, by name or path, from memory or the local directories.
 fn find_local(name: &str) -> Option<Arc<[u8]>> {
     if let Some(b) = registered().lock().unwrap_or_else(PoisonError::into_inner).get(name) {
         return Some(b.clone());
     }
     #[cfg(not(target_family = "wasm"))]
-    {
-        let p = std::path::Path::new(name);
-        if p.is_absolute() || name.starts_with("./") || name.starts_with("../") {
-            return std::fs::read(p).ok().map(Arc::from);
-        }
-        for d in search_dirs() {
-            let f = d.join(name);
-            if f.is_file() {
-                return std::fs::read(f).ok().map(Arc::from);
+    match grid_location(name) {
+        GridLocation::Path(p) => return read_grid_file(p),
+        GridLocation::InSearchDirs => {
+            for d in search_dirs() {
+                if let Some(b) = read_grid_file(&d.join(name)) {
+                    return Some(b);
+                }
             }
         }
+        GridLocation::Refused => {}
     }
     None
 }
@@ -916,23 +1063,29 @@ fn present_locally(name: &str) -> bool {
     }
     #[cfg(not(target_family = "wasm"))]
     {
-        let p = std::path::Path::new(name);
-        if p.is_absolute() {
-            return p.is_file();
-        }
         let dirs = search_dirs();
         let mut names = vec![name.to_string()];
         names.extend(old_names(name));
-        return names.iter().any(|n| dirs.iter().any(|d| d.join(n).is_file()));
+        return names.iter().any(|n| match grid_location(n) {
+            GridLocation::Path(p) => is_grid_file(p),
+            GridLocation::InSearchDirs => dirs.iter().any(|d| is_grid_file(&d.join(n))),
+            GridLocation::Refused => false,
+        });
     }
     #[allow(unreachable_code)]
     false
 }
 
+/// Whether a grid name is a single ordinary file component on this platform.
+fn single_file_name(name: &str) -> bool {
+    let mut parts = std::path::Path::new(name).components();
+    matches!(parts.next(), Some(std::path::Component::Normal(_))) && parts.next().is_none() && !name.contains(['/', '\\'])
+}
+
 /// The URL of a grid on the PROJ CDN.
 #[cfg(remote)]
 fn cdn_url(name: &str) -> Option<String> {
-    if name.contains(['/', '\\']) || !name.ends_with(".tif") {
+    if !single_file_name(name) || !name.ends_with(".tif") {
         return None;
     }
     let endpoint =
@@ -968,7 +1121,7 @@ fn download(name: &str) -> Option<Arc<[u8]>> {
     }
     let path = dir.join(name);
     std::fs::rename(&tmp, &path).ok()?;
-    std::fs::read(path).ok().map(Arc::from)
+    read_grid_file(&path)
 }
 
 /// The grid file of a name, read once.
@@ -977,33 +1130,54 @@ fn load(name: &str) -> Option<Arc<GridFile>> {
         static NULL: OnceLock<Arc<GridFile>> = OnceLock::new();
         return Some(NULL.get_or_init(|| Arc::new(null_file())).clone());
     }
-    let generation = cache_generation();
-    if let Some((_, f)) = files().lock().unwrap_or_else(PoisonError::into_inner).get(name).filter(|(g, _)| *g == generation) {
-        return f.clone();
+    // Under `without_grids`, no grid is read nor fetched (an optional one is skipped).
+    if without_grids_active() {
+        return None;
     }
+    let generation = cache_generation();
+    let cached = files()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .get(name)
+        .filter(|(g, _, _)| *g == generation)
+        .map(|(_, file, warnings)| (file.clone(), warnings.clone()));
+    if let Some((file, warnings)) = cached {
+        for warning in warnings {
+            crate::warnings::warn(warning);
+        }
+        return file;
+    }
+    let (file, warnings) = crate::warnings::capture(|| load_uncached(name));
+    cache_file_result(name, generation, file.clone(), warnings);
+    file
+}
+
+/// Looks up a grid once; [`load`] caches both the result and its diagnostics.
+fn load_uncached(name: &str) -> Option<Arc<GridFile>> {
     let bytes = find_local(name);
     if bytes.is_none() {
         for old in old_names(name) {
             if let Some(b) = find_local(&old) {
-                let file = read_file(&old, b).map(Arc::new);
-                cache_file_result(name, generation, file.clone());
-                return file;
+                return read_file(&old, b).map(Arc::new);
             }
         }
     }
     // Read in place; a grid that cannot be read so (a server without range requests, a failed
     // request) is downloaded instead, unless the CDN does not have it.
+    // Only a single file name can be on the CDN. Anything else (a path, a name with directories,
+    // a Windows drive prefix) is missing, not a network failure, so the transformation can fall
+    // back to another operation. Plain names the CDN cannot serve (non-`.tif` names such as `.gsb`)
+    // are recorded as fetch failures without a request.
     #[cfg(remote)]
-    if bytes.is_none() && network_enabled() && !download_whole() {
+    let fetch = bytes.is_none() && network_enabled() && single_file_name(name);
+    #[cfg(remote)]
+    if fetch && !download_whole() {
         match open_remote(name) {
             Ok(file) => {
-                let file = Arc::new(file);
-                cache_file_result(name, generation, Some(file.clone()));
-                return Some(file);
+                return Some(Arc::new(file));
             }
             Err(true) => {
                 fetch_failures().lock().unwrap_or_else(PoisonError::into_inner).insert(name.to_string());
-                cache_file_result(name, generation, None);
                 return None;
             }
             Err(false) => {}
@@ -1011,7 +1185,7 @@ fn load(name: &str) -> Option<Arc<GridFile>> {
     }
     #[cfg(remote)]
     let bytes = match bytes {
-        None if network_enabled() => {
+        None if fetch => {
             let got = download(name);
             if got.is_none() {
                 fetch_failures().lock().unwrap_or_else(PoisonError::into_inner).insert(name.to_string());
@@ -1020,9 +1194,7 @@ fn load(name: &str) -> Option<Arc<GridFile>> {
         }
         b => b,
     };
-    let file = bytes.and_then(|b| read_file(name, b)).map(Arc::new);
-    cache_file_result(name, generation, file.clone());
-    file
+    bytes.and_then(|b| read_file(name, b)).map(Arc::new)
 }
 
 /// The grids the network was asked for and did not give (the CDN does not have them, or the
@@ -1060,18 +1232,47 @@ pub(crate) fn hold_for_fork(held: &mut Vec<Box<dyn std::any::Any>>) {
     held.push(Box::new(sets_cache().lock().unwrap_or_else(PoisonError::into_inner)));
 }
 
+thread_local! {
+    /// Whether grids count as missing on this thread, while [`without_grids`] runs.
+    static WITHOUT_GRIDS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether this thread runs as if no grid were installed nor could be fetched (PROJ's default
+/// here: no grid directory, the network off), whatever the process's grid settings, while
+/// [`without_grids`] runs: no grid, not even an optional one, is read or fetched, and no grid
+/// already loaded is used. Other threads are not affected, and the availability, file and
+/// grid-set caches (nor the grids an operation keeps) are neither read nor written meanwhile.
+pub(crate) fn without_grids_active() -> bool {
+    WITHOUT_GRIDS.with(std::cell::Cell::get)
+}
+
+/// Runs `f` on this thread as if no grid were installed: see [`without_grids_active`].
+pub(crate) fn without_grids<T>(f: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            WITHOUT_GRIDS.with(|w| w.set(self.0));
+        }
+    }
+    let _restore = Restore(WITHOUT_GRIDS.with(|w| w.replace(true)));
+    f()
+}
+
 /// Whether a grid can be used: present locally, or (with network access enabled) on the PROJ
 /// CDN. This is what makes PROJ consider an operation needing it.
 pub(crate) fn available(name: &str) -> bool {
     if name == "null" {
         return true;
     }
+    if without_grids_active() {
+        return false;
+    }
     let generation = cache_generation();
     if let Some((_, a)) = availability().lock().unwrap_or_else(PoisonError::into_inner).get(name).copied().filter(|(g, _)| *g == generation)
     {
         return a;
     }
-    let a = present_locally(name) || (network_enabled() && name.ends_with(".tif") && !name.contains(['/', '\\']));
+    let a = present_locally(name) || (network_enabled() && name.ends_with(".tif") && single_file_name(name));
     {
         let mut m = availability().lock().unwrap_or_else(PoisonError::into_inner);
         if generation == cache_generation() {
@@ -1140,22 +1341,27 @@ fn hierarchy(file: &GridFile, keep: impl Fn(&Source, usize) -> Option<Use>) -> V
                 Some(&p) => nodes[p].1.push(id),
                 None => top.push(id),
             }
-            named.insert(name.clone(), id);
+            if !name.is_empty() {
+                named.entry(name.clone()).or_insert(id);
+            }
+            continue;
+        }
+        // As in PROJ 9.8.1's GTiffDataset::open / insertIntoHierarchy (src/grids.cpp), explicit
+        // parent_grid_name resolves to the first earlier grid with that name, provided it
+        // contains `ext`; later duplicate names are not tried. Unparented GeoTIFF subgrids
+        // nest by extent containment. NTv2 also resolves duplicate parent names first-wins.
+        if !parent.is_empty()
+            && let Some(&p) = named.get(parent)
+            && nodes[p].0.ext.contains(ext)
+        {
+            nodes[p].1.push(id);
+            if !name.is_empty() {
+                named.entry(name.clone()).or_insert(id);
+            }
             continue;
         }
         if !name.is_empty() {
-            named.insert(name.clone(), id);
-        }
-        if !parent.is_empty() {
-            if let Some(&p) = named.get(parent)
-                && nodes[p].0.ext.contains(ext)
-            {
-                nodes[p].1.push(id);
-                continue;
-            }
-        } else if !name.is_empty() {
-            top.push(id);
-            continue;
+            named.entry(name.clone()).or_insert(id);
         }
         // By extents.
         let kind = src.meta("TYPE", -1).to_string();
@@ -1190,6 +1396,14 @@ where
     let cache = sets_cache();
     let mut out = Vec::new();
     for (name, optional) in grid_names(spec) {
+        // Under `without_grids`, a grid is missing whatever was loaded before: not read from the
+        // cache, nor stored into it.
+        if without_grids_active() && name != "null" {
+            if optional {
+                continue;
+            }
+            return None;
+        }
         let generation = cache_generation();
         if let Some((_, s)) =
             cache.lock().unwrap_or_else(PoisonError::into_inner).get(&(name.clone(), kind)).filter(|(g, _)| *g == generation)
@@ -1524,6 +1738,9 @@ pub(crate) fn vgrid_value(sets: &[Arc<GridSet>], lon: f64, lat: f64, multiplier:
         4 => weights.iter().map(|(v, wt)| *v as f64 * wt).sum::<f64>(),
         _ => {
             let total: f64 = valid.iter().map(|(_, wt)| wt).sum();
+            if total <= 0.0 {
+                return None;
+            }
             valid.iter().map(|(v, wt)| *v as f64 * wt).sum::<f64>() / total
         }
     };
@@ -1985,6 +2202,70 @@ pub(crate) fn gridshift_apply(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    #[cfg(not(target_family = "wasm"))]
+    fn cached_size_refusals_warn_without_reopening_the_grid() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("cached-oversized-grid.gtx");
+        std::fs::File::create(&path).unwrap().set_len(super::MAX_GRID_BYTES + 1).unwrap();
+        let name = path.to_str().unwrap();
+        crate::warnings::take();
+        crate::warnings::warn("pending caller warning".into());
+        assert!(super::load(name).is_none());
+        let warnings = crate::warnings::take();
+        assert_eq!(warnings.len(), 2);
+        assert_eq!(warnings[0], "pending caller warning");
+        assert!(warnings[1].contains("larger than"));
+        std::fs::remove_file(&path).unwrap();
+        // The cached diagnosis survives even after the refused file has gone away.
+        assert!(super::load(name).is_none());
+        assert_eq!(crate::warnings::take(), vec![warnings[1].clone()]);
+    }
+
+    #[test]
+    #[cfg(not(target_family = "wasm"))]
+    fn cached_path_refusals_warn_each_caller() {
+        let name = "refused-test/../cached-refusal.gtx";
+        for _ in 0..2 {
+            crate::warnings::take();
+            assert!(super::load(name).is_none());
+            let warnings = crate::warnings::take();
+            assert_eq!(warnings.len(), 1);
+            assert!(warnings[0].contains("ordinary path components"));
+        }
+    }
+
+    /// Resolution-orientation and empty-dimension safety checks, as in PROJ 9.8.1's
+    /// GTiffDataset::nextGrid; this does not claim its complete extent/admission parity.
+    #[test]
+    fn geotiff_grids_reject_invalid_resolution_and_dimensions() {
+        use std::io::Cursor;
+        use tiff::encoder::{TiffEncoder, colortype::Gray32Float};
+        use tiff::tags::Tag;
+        let file = |scale: [f64; 3], invalid: Option<(Tag, u32)>| {
+            let mut output = Cursor::new(Vec::new());
+            {
+                let mut encoder = TiffEncoder::new(&mut output).unwrap();
+                let mut image = encoder.new_image::<Gray32Float>(2, 2).unwrap();
+                image.encoder().write_tag(Tag::ModelPixelScaleTag, &scale[..]).unwrap();
+                image.encoder().write_tag(Tag::ModelTiepointTag, &[0.0f64, 0.0, 0.0, 0.0, 1.0, 0.0][..]).unwrap();
+                if let Some((tag, value)) = invalid {
+                    image.encoder().write_tag(tag, value).unwrap();
+                }
+                image.write_data(&[0.0f32; 4]).unwrap();
+            }
+            super::read_tiff(super::GridReader::Bytes(Cursor::new(output.into_inner().into())))
+        };
+        assert!(file([1.0, 1.0, 0.0], None).is_some());
+        for scale in
+            [[-1.0, 1.0, 0.0], [0.0, 1.0, 0.0], [f64::NAN, 1.0, 0.0], [f64::INFINITY, 1.0, 0.0], [1.0, 0.0, 0.0], [1.0, f64::NAN, 0.0]]
+        {
+            assert!(file(scale, None).is_none(), "{scale:?}");
+        }
+        assert!(file([1.0, 1.0, 0.0], Some((Tag::ImageWidth, 0))).is_none());
+        assert!(file([1.0, 1.0, 0.0], Some((Tag::TileWidth, 0))).is_none());
+    }
+
     /// Every process-wide lock of the grids is one `host::hold_for_fork` takes across a fork (an
     /// embedding library's fork handlers hold them), so that a child never starts with one held
     /// by a thread it does not have.
@@ -2037,5 +2318,103 @@ mod tests {
         assert_eq!(hgrid_apply(&sets, 0.1, 0.2, false), Some((0.1, 0.2)));
         assert!(hgrids("@surely_missing_grid.tif").unwrap().is_empty());
         assert!(hgrids("surely_missing_grid.tif").is_none());
+    }
+
+    #[test]
+    fn malformed_ntv2_and_gtx_headers_do_not_overflow_or_overallocate() {
+        // GTX header claiming i32::MAX x i32::MAX cells in 40 bytes.
+        let mut gtx = vec![0u8; 40];
+        gtx[16..24].copy_from_slice(&1.0f64.to_be_bytes());
+        gtx[24..32].copy_from_slice(&1.0f64.to_be_bytes());
+        gtx[32..36].copy_from_slice(&i32::MAX.to_be_bytes());
+        gtx[36..40].copy_from_slice(&i32::MAX.to_be_bytes());
+        assert!(read_gtx(&gtx).is_none());
+
+        // NTv2 header claiming a huge count in 352 bytes.
+        let mut ntv2 = vec![0u8; 352];
+        ntv2[8] = 11;
+        ntv2[40..44].copy_from_slice(&1i32.to_le_bytes());
+        ntv2[56..63].copy_from_slice(b"SECONDS");
+        let sub = &mut ntv2[176..352];
+        sub[..8].copy_from_slice(b"SUB_NAME");
+        for (i, val) in [0.0f64, 360000.0, -360000.0, 0.0, 1e-9, 1e-9].into_iter().enumerate() {
+            sub[72 + 16 * i..80 + 16 * i].copy_from_slice(&val.to_le_bytes());
+        }
+        sub[168..172].copy_from_slice(&i32::MAX.to_le_bytes());
+        assert!(read_ntv2(&ntv2).is_none());
+    }
+
+    #[test]
+    fn self_parenting_or_cyclic_subgrids_do_not_recurse_infinitely() {
+        let src = Arc::new(Source {
+            values: Values::Null,
+            width: 2,
+            height: 2,
+            samples: 1,
+            meta: HashMap::new(),
+            nodata: None,
+            scale_offset: Vec::new(),
+            first: None,
+            subfile_type: 0,
+            format: Format::Tiff,
+        });
+        let ext = Extent::world();
+        let inner = Extent { west: -0.5, south: -0.5, east: 0.5, north: 0.5, res_x: 0.1, res_y: 0.1, geographic: true };
+        let dup2 = Extent { west: -0.8, south: -0.8, east: 0.8, north: 0.8, res_x: 0.1, res_y: 0.1, geographic: true };
+        let child_of_dup = Extent { west: -0.2, south: -0.2, east: 0.2, north: 0.2, res_x: 0.05, res_y: 0.05, geographic: true };
+        let file = GridFile {
+            sources: vec![
+                (ext, src.clone(), "root".into(), String::new()),
+                (inner, src.clone(), "unparented_named_subgrid".into(), String::new()),
+                (dup2, src.clone(), "dup".into(), "root".into()),
+                (inner, src.clone(), "dup".into(), "root".into()),
+                (child_of_dup, src.clone(), "leaf".into(), "dup".into()),
+                (ext, src.clone(), "self".into(), "self".into()),
+                (ext, src.clone(), "a".into(), "b".into()),
+                (ext, src, "b".into(), "a".into()),
+            ],
+            format: Format::Tiff,
+        };
+        let grids = hierarchy(&file, |_, _| Some(Use::Generic));
+        assert!(!grids.is_empty());
+        // Unparented named GeoTIFF subgrid nests under "root" by extent containment.
+        assert_eq!(grids[0].children[0].ext.west, inner.west);
+        // Duplicate grid_name "dup" resolves to the first "dup" (dup2), not the second.
+        let first_dup = grids[0].children.iter().find(|c| (c.ext.west - dup2.west).abs() < 1e-12).unwrap();
+        assert_eq!(first_dup.children.len(), 1);
+        assert_eq!(first_dup.children[0].ext.west, child_of_dup.west);
+    }
+
+    #[test]
+    fn vgrid_edge_with_zero_weight_valid_corners_returns_none() {
+        let src = Arc::new(Source {
+            values: Values::Mem(vec![vec![f32::NAN, f32::NAN, 10.0, 20.0]]),
+            width: 2,
+            height: 2,
+            samples: 1,
+            meta: HashMap::new(),
+            nodata: None,
+            scale_offset: Vec::new(),
+            first: None,
+            subfile_type: 0,
+            format: Format::Tiff,
+        });
+        let ext = Extent { west: 0.0, south: 0.0, east: 1.0, north: 1.0, res_x: 1.0, res_y: 1.0, geographic: true };
+        let set = Arc::new(GridSet { grids: vec![Grid { ext, src, usage: Use::V { sample: 0 }, children: Vec::new() }] });
+        // At lat = 0.0 (south edge), the two southern corners are NaN and the two northern corners have weight 0.
+        assert_eq!(vgrid_value(&[set], 0.5, 0.0, 1.0), None);
+    }
+    #[test]
+    fn cdn_names_are_single_ordinary_file_components() {
+        assert!(single_file_name("grid.tif"));
+        for name in ["", ".", "..", "sub/grid.tif", r"sub\grid.tif", "./grid.tif", "../grid.tif"] {
+            assert!(!single_file_name(name), "{name}");
+        }
+        #[cfg(windows)]
+        for name in ["C:grid.tif", r"C:\grid.tif", r"\\host\grid.tif"] {
+            assert!(!single_file_name(name), "{name}");
+        }
+        #[cfg(unix)]
+        assert!(single_file_name("C:grid.tif"));
     }
 }

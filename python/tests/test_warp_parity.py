@@ -6,8 +6,6 @@ gives); and PROJ maps the poles to finite Web Mercator northings, which `GDALSug
 samples for a global grid. Exact comparisons; skipped without rasterio.
 """
 
-import re
-
 import numpy as np
 import pytest
 
@@ -25,6 +23,8 @@ from terrio.rio.warp import Resampling as TR  # noqa: E402
 from terrio.rio.warp import calculate_default_transform as t_cdt  # noqa: E402
 from terrio.rio.warp import reproject as t_reproject  # noqa: E402
 from terrio.rio.warp import transform as t_transform  # noqa: E402
+
+pytestmark = pytest.mark.usefixtures("gdal_warp_grid")
 
 
 @pytest.mark.parametrize("resampling", ["bilinear", "cubic", "lanczos"])

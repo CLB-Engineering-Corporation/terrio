@@ -16,36 +16,16 @@ use wbvector::{Coord, Feature, FieldValue, Geometry, GeometryType, Layer, Ring};
 /// Select named layers without silently dropping requests for missing names.
 /// Retains source order and moves the layers instead of cloning their features.
 pub fn select_layers(layers: Vec<Layer>, names: &[String]) -> Result<Vec<Layer>> {
-    for name in names {
-        if !layers.iter().any(|layer| layer.name == *name) {
-            return Err(Error::InvalidArgument(format!("no layer named '{name}'")));
-        }
-    }
-    Ok(layers.into_iter().filter(|layer| names.contains(&layer.name)).collect())
+    let available: Vec<&str> = layers.iter().map(|l| l.name.as_str()).collect();
+    let selected = crate::dataset::layer_selection(names, &available, None, false)?;
+    Ok(layers.into_iter().zip(selected).filter_map(|(layer, keep)| keep.then_some(layer)).collect())
 }
 
-/// Opens selected operation inputs and rejects every missing requested layer name.
-/// Keeps the file-stem alias supported by single-layer file drivers.
+/// Opens selected operation inputs and resolves their styles. Readers validate against the
+/// complete source inventory, including the file-stem alias for a single layer.
 pub fn open_layers(path: &str, options: &crate::VectorOpenOptions) -> Result<Vec<Layer>> {
     let mut ds = crate::open_vector(path, options)?;
     ds.resolve_styles();
-    let alias = if ds.layers.len() == 1 && ds.driver != crate::formats::VectorDriver::GPKG {
-        std::path::Path::new(path).file_stem().and_then(|stem| stem.to_str())
-    } else {
-        None
-    };
-    for name in &options.layers {
-        if !ds.layers.iter().any(|layer| {
-            if ds.driver == crate::formats::VectorDriver::GPKG { layer.name.eq_ignore_ascii_case(name) } else { layer.name == *name }
-        }) {
-            // A selected subset is not proof that the source has only one layer.
-            // Inspect all names only when validating an otherwise missing stem alias.
-            if alias == Some(name.as_str()) && crate::list_layers(path)?.len() == 1 {
-                continue;
-            }
-            return Err(Error::InvalidArgument(format!("no layer named '{name}'")));
-        }
-    }
     Ok(ds.layers)
 }
 
@@ -134,7 +114,8 @@ impl VectorTranslateOptions {
     /// features by their geometries.
     pub fn read_filter(&self, input: &str) -> Option<(f64, f64, f64, f64)> {
         use crate::formats::VectorDriver;
-        let indexed = matches!(VectorDriver::for_extension(input), Some(VectorDriver::Parquet | VectorDriver::GPKG));
+        let indexed = matches!(VectorDriver::for_extension(input), Some(VectorDriver::Parquet | VectorDriver::GPKG))
+            || crate::drivers::vector::oapif::service_target(input).is_some();
         let plain = self.spatial_filter_srs.is_none() && self.src_srs.is_none() && self.sql.is_none();
         self.spatial_filter.filter(|_| indexed && plain)
     }
@@ -686,7 +667,7 @@ pub fn write_vector_with_mode(layers: &[Layer], path: &str, options: &VectorWrit
         };
     }
     // Tile archives get the layers' features added to their tiles.
-    #[cfg(all(feature = "tiles", not(target_family = "wasm")))]
+    #[cfg(all(feature = "tiles", fs))]
     if matches!(driver, Some(crate::formats::VectorDriver::MBTiles | crate::formats::VectorDriver::PMTiles)) {
         return crate::tiles::update_vector(path, layers, &options.tiles, mode == WriteMode::Overwrite);
     }

@@ -14,10 +14,13 @@ A dataset's files are its main file and the sidecars GDAL keeps beside it (`.aux
 
 from __future__ import annotations
 
+import contextlib
 import os
 import shutil as _shutil
+from collections.abc import Iterator
 from typing import Any
 
+from terrio._terrio import _redact_diagnostic_location as _redact
 from terrio.rio.errors import DriverRegistrationError, RasterioIOError
 
 
@@ -45,7 +48,13 @@ def _same(a: str, b: str) -> bool:
     """
     if "://" in a or "://" in b:
         return a == b
-    return os.path.abspath(a) == os.path.abspath(b)
+    if os.path.abspath(a) == os.path.abspath(b):
+        return True
+    try:
+        return os.path.samefile(a, b)
+    except OSError:
+        # A new destination has no file identity yet.
+        return False
 
 
 def exists(path: Any) -> bool:
@@ -72,7 +81,15 @@ def copy(
     """Copies a raster to a new file, with GDAL's `CreateCopy` semantics.
 
     The copy keeps the pixels, georeferencing, nodata values, tags, band descriptions, color
-    interpretation and color table, and the dataset mask. It is written window by window.
+    interpretation and color table, and the dataset mask. A COG is written a row of its tiles at
+    a time from the source, its overviews computed as the rows come, so that the source's pixels
+    are not held. Taller source blocks are read in bounded slabs, then written one tile row
+    at a time. A source with a dataset mask, overviews the COG copies, or compression written
+    whole (JPEG, WebP, LERC, JPEG XL) is held until it is written. A GeoTIFF larger than the
+    in-memory limit (`TERRIO_RIO_IN_MEMORY_LIMIT`) is also copied directly from its source,
+    in rows of blocks, without a dataset mask; a smaller one is held and written whole. A copy
+    whose source fails to read leaves its destination as it was: an existing file keeps its
+    content, and no file is left where there was none.
 
     Args:
         src: A path, or a dataset opened for reading.
@@ -86,7 +103,7 @@ def copy(
         DriverRegistrationError: If the driver is not one terrio writes.
     """
     from terrio.rio import open as rio_open
-    from terrio.rio.io import DatasetReader, driver_from_extension, get_writer_for_driver
+    from terrio.rio.io import DatasetReader, _canonical_writer_driver, driver_from_extension
 
     dst_path = _fspath(dst)
     if driver is None:
@@ -95,37 +112,119 @@ def copy(
         except ValueError:
             driver = "GTiff"
     try:
-        get_writer_for_driver(driver)
+        driver = _canonical_writer_driver(driver)
     except Exception as err:
         raise DriverRegistrationError(f"Unrecognized driver: {driver}") from err
     if isinstance(src, DatasetReader):
         if _same(src.name, dst_path):
-            raise RasterioIOError(f"{src.name} and {dst_path} identify the same dataset.")
+            raise RasterioIOError(
+                f"{_redact(src.name)} and {_redact(dst_path)} identify the same dataset."
+            )
         _copy_dataset(src, dst_path, driver, creation_options)
         return
     src_path = _fspath(src)
     if _same(src_path, dst_path):
-        raise RasterioIOError(f"{src_path} and {dst_path} identify the same dataset.")
+        raise RasterioIOError(
+            f"{_redact(src_path)} and {_redact(dst_path)} identify the same dataset."
+        )
     with rio_open(src_path) as ds:
         _copy_dataset(ds, dst_path, driver, creation_options)
 
 
-def _copy_dataset(src: Any, dst_path: str, driver: str, creation_options: dict[str, Any]) -> None:
-    """Writes an open dataset to a new file, block row by block row.
+@contextlib.contextmanager
+def _unwritten_on_error(dst: Any) -> Iterator[None]:
+    """Leaves a copy's dataset unwritten when the copy raises.
+
+    When its source fails to read, or it is interrupted, the copy's dataset is not written with
+    the rows read until then and the rest the nodata value or 0: the destination stays as it was,
+    or absent.
+
+    Args:
+        dst: The dataset the copy writes.
+
+    Yields:
+        None, for the copy.
+    """
+    try:
+        yield
+    except BaseException:
+        dst._dirty = False
+        raise
+
+
+def _inherited_nbits(src: Any, requested: dict[str, Any], driver: str) -> int | None:
+    """Normalize metadata and options for the shared Rust TIFF policy.
+
+    Args:
+        src: Source raster reader.
+        requested: Explicit output creation options.
+        driver: Output raster driver name.
+
+    Returns:
+        Inherited packed width, or None when inheritance is incompatible.
+    """
+    from terrio import _terrio
+    from terrio.rio.dtypes import _getnpdtype
+
+    if driver.upper() not in ("GTIFF", "COG") or "nbits" in requested:
+        return None
+    compression = requested.get("compress")
+    compression = None if compression is None else str(getattr(compression, "value", compression))
+    predictor = requested.get("predictor")
+    if isinstance(predictor, bool):
+        predictor = "YES" if predictor else "NO"
+    predictor = "1" if predictor is None else str(getattr(predictor, "value", predictor))
+    widths = [src.tags(band, ns="IMAGE_STRUCTURE").get("NBITS") for band in src.indexes]
+    nodata = [requested["nodata"]] * src.count if "nodata" in requested else list(src.nodatavals)
+    return _terrio.Raster._inherited_sample_bits(
+        _getnpdtype(requested.get("dtype", src.dtypes[0])).name,
+        widths,
+        nodata,
+        compression,
+        predictor,
+        driver,
+    )
+
+
+def _copy_dataset(
+    src: Any,
+    dst_path: str,
+    driver: str,
+    creation_options: dict[str, Any],
+    from_source: bool = True,
+) -> None:
+    """Writes an open dataset to a new file.
+
+    A file written in rows (`DatasetWriter._streams_on_flush`) is written from the source as it is
+    written; another is written block row by block row into the dataset, written when it closes,
+    unless the copy raised (`_unwritten_on_error`).
 
     Args:
         src: The dataset.
         dst_path: The output path.
         driver: The output format.
         creation_options: Creation options.
+        from_source: Whether a file written in rows is written from the source; otherwise the
+            copy holds the source's pixels until it is written, whatever its format.
     """
+    from terrio import _terrio
     from terrio.rio import open as rio_open
+    from terrio.rio.dtypes import _getnpdtype
     from terrio.rio.windows import Window
 
+    src._check_open()
     profile = dict(src.profile)
     for k in ("blockxsize", "blockysize", "tiled", "compress", "interleave", "photometric"):
         profile.pop(k, None)
     profile["driver"] = driver
+    requested = {k.lower(): v for k, v in creation_options.items()}
+    bits = _inherited_nbits(src, requested, driver)
+    if bits is not None:
+        profile["nbits"] = bits
+    sample = getattr(src, "_complex_sample", None)
+    if sample in ("CInt16", "CInt32") and not any(k.lower() == "dtype" for k in creation_options):
+        profile["dtype"] = "complex64" if sample == "CInt16" else "complex128"
+        profile["_complex_dtype"] = sample
     profile.update({k.lower(): v for k, v in creation_options.items()})
     if driver.upper() in ("GTIFF", "COG") and src.count > 1 and "interleave" not in profile:
         # GDALDriver::CreateCopy (gcore/gdaldriver.cpp): without INTERLEAVE, and without a
@@ -151,8 +250,28 @@ def _copy_dataset(src: Any, dst_path: str, driver: str, creation_options: dict[s
             and src.overviews(1)
         ):
             profile["@copy_src_overviews"] = src.name
+            base = getattr(src._raster, "_base", src._raster)
+            source_level = getattr(src._raster, "_level", None)
+            if source_level is not None:
+                profile["@copy_src_overview_level"] = source_level
+            if "nbits" not in requested and "nbits" in profile:
+                width = base._copy_sample_bits_for_output(
+                    source_level, _getnpdtype(profile["dtype"]).name, int(profile["nbits"])
+                )
+                if width is not None:
+                    profile["nbits"] = width
+                else:
+                    profile.pop("nbits")
     gcps, gcp_crs = src.gcps
-    with rio_open(dst_path, "w", **profile) as dst:
+    per_dataset_mask = all(
+        "per_dataset" in [f.name for f in flags] for flags in src.mask_flag_enums
+    )
+    if from_source and not per_dataset_mask:
+        # When the copy is written in rows (a COG without the source's overviews to copy, or a
+        # GeoTIFF larger than the in-memory limit), it reads them from the source as it writes
+        # them, rather than holding the source's pixels until it is closed.
+        profile["_copy_of"] = src
+    with rio_open(dst_path, "w", **profile) as dst, _unwritten_on_error(dst):
         dst._mask_has_dataset = True
         dst.update_tags(**src.tags())
         for b in src.indexes:
@@ -168,6 +287,16 @@ def _copy_dataset(src: Any, dst_path: str, driver: str, creation_options: dict[s
         if any(o != 0.0 for o in src.offsets):
             dst.offsets = src.offsets
         dst.colorinterp = src.colorinterp
+        if (
+            _terrio.canonical_driver_name(src.driver) == "JP2"
+            and _terrio.canonical_driver_name(driver) == "JP2"
+        ):
+            # Two Gray roles do not identify which stored component supplies luminance.
+            dst._jp2_associations = (
+                [m.get("color_association") for m in src._raster.band_metadata]
+                if src._raster is not None
+                else list(getattr(src, "_jp2_associations", []))
+            )
         if gcps and not src._georeferenced:
             dst.gcps = (gcps, gcp_crs)
         try:
@@ -176,13 +305,13 @@ def _copy_dataset(src: Any, dst_path: str, driver: str, creation_options: dict[s
             cmap = None
         if cmap:
             dst.write_colormap(1, cmap)
-        per_dataset_mask = all(
-            "per_dataset" in [f.name for f in flags] for flags in src.mask_flag_enums
-        )
-        rows = max(1, min(src.height, (64 << 20) // max(1, src.width * src.count * 8)))
+        if dst._copy_of is not None:
+            return
+        itemsize = 16 if sample in ("CInt16", "CInt32", "CFloat64") else 8
+        rows = max(1, min(src.height, (64 << 20) // max(1, src.width * src.count * itemsize)))
         for y in range(0, src.height, rows):
             w = Window(0, y, src.width, min(rows, src.height - y))
-            dst.write(src.read(window=w), window=w)
+            dst.write(src._read_for_copy(window=w), window=w)
             if per_dataset_mask:
                 dst.write_mask(src.dataset_mask(window=w), window=w)
 
@@ -201,7 +330,9 @@ def copyfiles(src: Any, dst: Any) -> None:
 
     src_path, dst_path = _fspath(src), _fspath(dst)
     if _same(src_path, dst_path):
-        raise RasterioIOError(f"{src_path} and {dst_path} identify the same dataset.")
+        raise RasterioIOError(
+            f"{_redact(src_path)} and {_redact(dst_path)} identify the same dataset."
+        )
     try:
         with rio_open(src_path) as ds:
             files = ds.files
@@ -242,7 +373,7 @@ def delete(path: Any, driver: str | None = None) -> None:
         with rio_open(p) as ds:
             files = ds.files
     except Exception as err:
-        raise RasterioIOError(f"Invalid dataset: {p}") from err
+        raise RasterioIOError(f"Invalid dataset: {_redact(p)}") from err
     for f in files:
         if os.path.isdir(f):
             _shutil.rmtree(f)

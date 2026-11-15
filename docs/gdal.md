@@ -27,6 +27,27 @@ terrio's commands map onto GDAL's utilities, with GDAL's option names in kebab c
 | `gdallocationinfo` | `terrio pixel-info` |
 | `gdal2xyz.py` | `terrio xyz` |
 | `nearblack` | `terrio nearblack` |
+| `gdal_edit.py` | `terrio edit-raster` |
+| `gdal_footprint` | `terrio footprint` |
+| `gdal_pansharpen.py` | `terrio pansharpen` |
+| `gdal_retile.py` | `terrio retile` |
+| `gdal2tiles.py` | `terrio tile` |
+| `gdalcompare.py` | `terrio compare` |
+| `gdalenhance` | `terrio enhance` |
+| `gdaltindex` | `terrio raster-index` |
+| `ogrtindex` | `terrio vector-index` |
+| `rgb2pct.py`, `pct2rgb.py`, `gdalattachpct.py` | `terrio rgb-to-palette`, `palette-to-rgb`, `attach-palette` |
+| `gdal_create` | `terrio create-raster` |
+| `gdalmdiminfo` | `terrio mdinfo` |
+| `gdalmdimtranslate` | `terrio mdconvert`, `mdmosaic`, `mdread` |
+| `gdalmanage` | `terrio dataset-files`, `dataset-copy`, `dataset-rename`, `dataset-delete` |
+| `gdal vsi` | `terrio vsi` |
+| `sozip` | `terrio vsi sozip` |
+| `validate_cloud_optimized_geotiff.py` | `terrio validate-cog` |
+| `gdal pipeline` | `terrio pipeline` |
+| `ogrlineref` | `terrio lineref` |
+| `ogrmerge.py` | `terrio concat` |
+| `ogr_layer_algebra.py` | `terrio layer-algebra` |
 
 ## Options
 
@@ -39,6 +60,7 @@ terrio's commands map onto GDAL's utilities, with GDAL's option names in kebab c
 | `-srcwin`, `-projwin`, `-projwin_srs` | `--srcwin`, `--projwin`, `--projwin-srs` |
 | `-ot`, `-scale`, `-exponent`, `-outsize`, `-a_nodata`, `-a_ullr` | `--ot`, `--scale`, `--exponent`, `--outsize`, `--a-nodata`, `--a-ullr` |
 | `-tr`, `-te`, `-te_srs`, `-ts`, `-tap`, `-r` | `--tr`, `--te`, `--te-srs`, `--ts`, `--tap`, `-r` |
+| `-ovr` (`gdal_translate`, `gdalwarp`) | `--overview` (or `--ovr`) |
 | `-srcnodata`, `-dstnodata`, `-cutline`, `-crop_to_cutline`, `-et` | `--srcnodata`, `--dstnodata`, `--cutline`, `--crop-to-cutline`, `--et` |
 | `-where`, `-spat`, `-spat_srs`, `-select`, `-limit`, `-sql` | `--where`, `--spat`, `--spat-srs`, `--select`, `--limit`, `--sql` |
 | `-nln`, `-nlt`, `-explodecollections`, `-append`, `-overwrite` | `--nln`, `--nlt`, `--explodecollections`, `--append`, `--overwrite` |
@@ -53,16 +75,21 @@ terrio's commands map onto GDAL's utilities, with GDAL's option names in kebab c
 ## Paths
 
 GDAL's virtual file system prefixes work as they are: `/vsicurl/`, `/vsis3/`, `/vsigs/`,
-`/vsiaz/` and `/vsizip/`, nested or not. `s3://`, `gs://` and `az://` URLs work too. Remote outputs
-are not supported.
+`/vsiaz/` and `/vsizip/`, nested or not. `s3://`, `gs://` and `az://` URLs work too. Commands write
+their outputs locally; [`terrio vsi`](cli.md#vsi) copies files to S3 or Azure.
 
 ## Differences to know
 
-- terrio reads most raster formats whole into memory. GeoTIFF/COG and JPEG 2000 are read by
-  window, Zarr by chunk, and large vector layers and point clouds as streams. See
+- terrio reads most raster formats whole into memory. GeoTIFF/COG, JPEG 2000, tile archives
+  (PMTiles, MBTiles), local raw-layout rasters and remote SRTM tiles are read by window, Zarr by
+  chunk, GRIB by band, and large vector layers and point clouds as streams. See
   [Formats](formats.md).
-- Downsampling with `translate` reads full resolution, where GDAL may use overviews. `warp` chooses
-  an overview as GDAL does (`--overview AUTO`, the default).
+- `translate` and `warp` read a downsampled output from an overview as GDAL does (`--overview
+  AUTO`, the default). `translate` reads full resolution to rescale, and for an output type other
+  than the source's with resampling other than nearest neighbour. `gdal_translate` reads its
+  output in swaths of rows (and blocks, for bands other than the first ones in order), each on its
+  own: at their edges, its average, RMS and mode outputs can come from the next source pixel,
+  where `terrio translate` reads the output at once, as rasterio does.
 - `warp` and `terrio.rio` handle rotated geotransforms. `translate` refuses them.
 - GeoTIFFs are written with terrio's own writer; COGs pass GDAL's COG validator.
 - Only the drivers listed in [Formats](formats.md) exist, unless terrio is built with the
@@ -151,7 +178,7 @@ let ntf = terrio::memory::open_raster_bytes(std::fs::read("image.ntf")?, "image.
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
-Not covered: rotated geotransforms and GCP-only georeferencing (as for terrio's own drivers),
+Not covered: rotated geotransforms and GCP-only georeferencing on the GDAL bridge,
 appending to existing datasets through GDAL (`--append`), and updating GDAL datasets in place.
 
 ## Vector read budget

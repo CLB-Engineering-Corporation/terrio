@@ -23,8 +23,10 @@ from __future__ import annotations
 
 import contextlib
 import ctypes
+import logging
 import math
 import os
+import re
 import shutil
 import tempfile
 import uuid
@@ -32,17 +34,27 @@ import warnings
 import weakref
 from collections.abc import Iterator, Sequence
 from contextlib import ExitStack
+from functools import partial
 from typing import Any
 
 import numpy as np
 from affine import Affine
 
 from terrio import _terrio
+from terrio._terrio import _redact_diagnostic_location as _redact
+from terrio.errors import ResourceLimitError, TerrioError
 from terrio.rio import _tiff
 from terrio.rio._resample import gdal_cast, is_nodata, raster_io
 from terrio.rio.coords import BoundingBox
 from terrio.rio.crs import CRS
-from terrio.rio.dtypes import _getnpdtype, check_dtype, dtype_fwd, in_dtype_range, typename_rev
+from terrio.rio.dtypes import (
+    _getnpdtype,
+    _is_complex_int,
+    check_dtype,
+    dtype_fwd,
+    in_dtype_range,
+    typename_rev,
+)
 from terrio.rio.enums import (
     ColorInterp,
     Compression,
@@ -98,6 +110,10 @@ _IN_MEMORY_LIMIT = 512 * 1024 * 1024
 # The drivers of files that can hold subdatasets (several variables or arrays).
 _SUBDATASET_DRIVERS = frozenset({"netCDF", "HDF5", "HDF4", "Zarr", "STACIT", "STACTA", "GPKG"})
 
+# The drivers that read a `.hdr` beside the data: their header, read under
+# `TERRIO_DISABLE_READDIR_ON_OPEN=EMPTY_DIR` too.
+_HEADER_DRIVERS = frozenset({"ENVI", "EHdr"})
+
 
 def _in_memory_limit() -> int:
     """The size above which writers keep their pixels on disk.
@@ -124,6 +140,18 @@ _OVERVIEW_RESAMPLING = {
     Resampling.min: "min",
     Resampling.max: "max",
     Resampling.gauss: "gauss",
+}
+
+# The methods the core's resampled read (`Raster.read_resampled`) reads, by `Resampling` value.
+_CORE_RESAMPLING = {
+    int(Resampling.nearest): "nearest",
+    int(Resampling.bilinear): "bilinear",
+    int(Resampling.cubic): "cubic",
+    int(Resampling.cubic_spline): "cubicspline",
+    int(Resampling.lanczos): "lanczos",
+    int(Resampling.average): "average",
+    int(Resampling.rms): "rms",
+    int(Resampling.mode): "mode",
 }
 
 
@@ -158,14 +186,14 @@ def _check_buffer(count: int, height: int, width: int, itemsize: int) -> None:
         itemsize: The bytes of a pixel.
 
     Raises:
-        RasterioIOError: If the buffer takes more bytes than the process can use.
+        ResourceLimitError: If the buffer takes more bytes than the process can use.
     """
     nbytes = count * height * width * itemsize
     if nbytes <= 1 << 24:
         return
     most = _terrio.usable_memory()
     if most is not None and nbytes > most:
-        raise RasterioIOError(
+        raise ResourceLimitError(
             f"Read failed: a window of {width}x{height} pixels in {count} band(s) is too large: "
             f"{nbytes} bytes, more than the {most} bytes of memory the process can use"
         )
@@ -182,6 +210,8 @@ _SUPPORTED_DTYPES = {
     "int64",
     "float32",
     "float64",
+    "complex64",
+    "complex128",
 }
 
 
@@ -215,8 +245,8 @@ def _to_error(err: Exception, path: str) -> RasterioIOError:
         RasterioIOError: The error to raise.
     """
     if isinstance(err, FileNotFoundError) or "No such file" in str(err):
-        return RasterioIOError(f"{path}: No such file or directory")
-    return RasterioIOError(f"{path}: {err}")
+        return RasterioIOError(f"{_redact(path)}: No such file or directory")
+    return RasterioIOError(f"{_redact(path)}: {err}")
 
 
 def _terrio_path(path: str) -> str:
@@ -259,7 +289,8 @@ def _sidecars_allowed(path: str) -> bool:
     """Whether to read sidecar files (`.aux.xml`, `_RPC.TXT`, `.RPB`) next to a dataset.
 
     Never for remote datasets, whose sidecars terrio does not request, and not when
-    `GDAL_DISABLE_READDIR_ON_OPEN=EMPTY_DIR` tells GDAL to treat the dataset's directory as empty.
+    `TERRIO_DISABLE_READDIR_ON_OPEN`, or its other name `GDAL_DISABLE_READDIR_ON_OPEN`, is
+    `EMPTY_DIR` for the calling thread: the decision the core takes for its own sidecars.
     (A true value only stops GDAL listing the directory; it still probes each sidecar.)
 
     Args:
@@ -270,7 +301,7 @@ def _sidecars_allowed(path: str) -> bool:
     """
     if _is_remote(path):
         return False
-    return _option("GDAL_DISABLE_READDIR_ON_OPEN") != "EMPTY_DIR"
+    return not _terrio.sidecars_disabled()
 
 
 def _check_driver(path: str, name: str, driver: Any) -> None:
@@ -296,7 +327,7 @@ def _check_driver(path: str, name: str, driver: Any) -> None:
         _terrio.check_drivers(path, drivers)
     except Exception as err:
         raise RasterioIOError(
-            f"'{name}' not recognized as being in a supported file format: {err}"
+            f"'{_redact(name)}' not recognized as being in a supported file format: {err}"
         ) from err
 
 
@@ -356,11 +387,30 @@ class _OverviewRaster:
         except (TypeError, ValueError):
             n = -1
         if not 0 <= n < len(raster.overviews):
-            raise RasterioIOError(f"Cannot open overview level {level} of {name}")
+            raise RasterioIOError(f"Cannot open overview level {level} of {_redact(name)}")
         return cls(raster, n)
+
+    @property
+    def has_mask(self) -> bool:
+        """Whether the selected overview has its own native per-dataset mask."""
+        return bool(self._base._overview_has_mask(self._level))
 
     def _ovr(self, overview: int | None) -> int:
         return self._level if overview is None else self._level + 1 + overview
+
+    def _tiff_block_range(self, band: int, x: int, y: int, overview: int | None = None):
+        """Read a block range from this overview's backing TIFF.
+
+        Args:
+            band: Band numbered from 1.
+            x: Block column numbered from 0.
+            y: Block row numbered from 0.
+            overview: Relative overview index, or None for this image.
+
+        Returns:
+            tuple[int, int] | None: Offset and byte count in the backing file.
+        """
+        return self._base._tiff_block_range(band, x, y, self._ovr(overview))
 
     def read(self, bands: Any, window: Any = None, overview: int | None = None, **kw: Any) -> Any:
         """Reads pixels of this level, or of one of its overviews.
@@ -391,6 +441,26 @@ class _OverviewRaster:
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._base, name)
+
+
+def _sum_scale(ds: Any, width: int, height: int) -> float:
+    """The full-resolution pixels a pixel of a `width` x `height` level of a dataset stands for.
+
+    A `sum` counts each pixel of an overview for them, `(W / width) * (H / height)` for a `W` x `H`
+    raster, so that it estimates the raster's total. The full resolution is the raster's: a dataset
+    opened at an overview level (`overview_level`) is one of its overviews.
+
+    Args:
+        ds: The dataset.
+        width: The level's width.
+        height: The level's height.
+
+    Returns:
+        float: The ratio of the areas of a pixel of the level and of the full resolution.
+    """
+    raster = getattr(ds, "_raster", None)
+    full = raster._base if isinstance(raster, _OverviewRaster) else ds
+    return (full.width / width) * (full.height / height)
 
 
 class DatasetBase(WindowMethodsMixin, TransformMethodsMixin):
@@ -474,7 +544,7 @@ class DatasetBase(WindowMethodsMixin, TransformMethodsMixin):
             str: `<open DatasetReader name='...' mode='r'>`.
         """
         state = "closed" if self._closed else "open"
-        return f"<{state} {type(self).__name__} name='{self.name}' mode='{self.mode}'>"
+        return f"<{state} {type(self).__name__} name='{_redact(self.name)}' mode='{self.mode}'>"
 
     # Shape.
 
@@ -992,6 +1062,8 @@ class DatasetBase(WindowMethodsMixin, TransformMethodsMixin):
             )
         self.structure.colorinterp = [ColorInterp(v) for v in value]
         self._colorinterp_set = True
+        # Explicit roles select fresh channel associations; copy restores stored ones afterward.
+        self._jp2_associations: list[int | None] = []
         self._dirty = True
 
     def colormap(self, bidx: int) -> dict[int, tuple[int, int, int, int]]:
@@ -1032,6 +1104,8 @@ class DatasetBase(WindowMethodsMixin, TransformMethodsMixin):
                 return dict(spaces.get(ns, {}))
             return dict(s.band_tags[bidx - 1])
         if ns:
+            if ns == "IMAGE_STRUCTURE":
+                _tiff.infer_layout(s)
             return dict(s.namespaces.get(ns, {}))
         return dict(s.tags)
 
@@ -1055,11 +1129,31 @@ class DatasetBase(WindowMethodsMixin, TransformMethodsMixin):
             ns: The item's name.
             dm: The domain.
             bidx: The band, or 0 for the dataset.
-            ovr: Unused.
+            ovr: Overview index from 0 for TIFF block items, or None for this image.
 
         Returns:
-            str | None: The value.
+            str | None: The value, or None for an absent block or overview.
+                Stored zero offsets and byte counts are returned as "0".
+
+        Raises:
+            terrio.TerrioError: If loading TIFF chunk tables fails due to corrupt
+                metadata or an I/O error. The first block query may perform I/O.
         """
+        if dm == "TIFF" and ns.startswith(("BLOCK_OFFSET_", "BLOCK_SIZE_")):
+            self._check_open()
+            if bidx > self._count:
+                raise IndexError("band index out of range")
+            match = re.fullmatch(r"BLOCK_(OFFSET|SIZE)_([0-9]+)_([0-9]+)", ns)
+            raster = getattr(self, "_raster", None)
+            if match is None or bidx <= 0 or raster is None or (ovr is not None and ovr < 0):
+                return None
+            try:
+                block = raster._tiff_block_range(bidx, int(match[2]), int(match[3]), ovr)
+            except TerrioError:
+                raise
+            except (OverflowError, ValueError):
+                return None
+            return None if block is None else str(block[0 if match[1] == "OFFSET" else 1])
         return self.tags(bidx, dm).get(ns)
 
     @property
@@ -1162,6 +1256,10 @@ class DatasetBase(WindowMethodsMixin, TransformMethodsMixin):
     def files(self) -> list[str]:
         """The files of the dataset.
 
+        Under `TERRIO_DISABLE_READDIR_ON_OPEN=EMPTY_DIR` (or `GDAL_DISABLE_READDIR_ON_OPEN`),
+        which keeps them from being read, its `.aux.xml`, `.ovr`, `.msk`, world and RPC files are
+        not listed, nor a `.hdr` other than an ENVI or EHdr raster's header.
+
         Returns:
             list: The paths.
         """
@@ -1170,18 +1268,24 @@ class DatasetBase(WindowMethodsMixin, TransformMethodsMixin):
         out = [self.name]
         stem, ext = os.path.splitext(self.name)
         world = "." + ext[1:2] + ext[-1:] + "w" if len(ext) > 2 else ".wld"
-        sidecars = [
-            self.name + ".aux.xml",
-            self.name + ".ovr",
-            self.name + ".msk",
-            stem + world,
-            stem + ".wld",
-            stem + "_rpc.txt",
-            stem + "_RPC.TXT",
-            stem + ".RPB",
-            stem + ".rpb",
-            stem + ".hdr",
-        ]
+        allowed = _sidecars_allowed(self.name)
+        sidecars = (
+            [
+                self.name + ".aux.xml",
+                self.name + ".ovr",
+                self.name + ".msk",
+                stem + world,
+                stem + ".wld",
+                stem + "_rpc.txt",
+                stem + "_RPC.TXT",
+                stem + ".RPB",
+                stem + ".rpb",
+            ]
+            if allowed
+            else []
+        )
+        if allowed or self.driver in _HEADER_DRIVERS:
+            sidecars.append(stem + ".hdr")
         for f in sidecars:
             if f not in out and os.path.isfile(f):
                 out.append(f)
@@ -1199,6 +1303,12 @@ class DatasetBase(WindowMethodsMixin, TransformMethodsMixin):
         """
         if self.driver not in _SUBDATASET_DRIVERS or not self.name:
             return []
+        # Set by the readers that open a terrio raster (`_load`), not by every dataset.
+        raster = getattr(self, "_raster", None)
+        if self._subdatasets is None and self.driver != "GPKG" and raster is not None:
+            # The open raster lists them, as `info` reads them: no second open of the file (a
+            # remote store's metadata fetched again). A GeoPackage's raster tables are listed apart.
+            self._subdatasets = raster.subdatasets
         if self._subdatasets is None:
             # A failure (a remote file unreachable) is not remembered: the next call tries again.
             try:
@@ -1257,12 +1367,32 @@ class DatasetReader(DatasetBase):
         raster: _terrio.Raster | _OverviewRaster
         try:
             raster = _terrio.open_raster(self._path, lazy=True)
+        except ResourceLimitError:
+            raise
         except Exception as err:
             raise _to_error(err, self.name) from err
         level = kwargs.get("overview_level")
         if level is not None:
             raster = _OverviewRaster.open(raster, level, self.name)
         self._load(raster)
+
+    def _repr_png_(self) -> bytes | None:
+        """The dataset as a PNG of up to 512 pixels a side, which notebooks display.
+
+        Returns:
+            bytes | None: The PNG, or None when the dataset is closed, cannot be drawn, or was
+                opened at an overview level (`overview_level`), so that the notebook falls back
+                to the text form.
+        """
+        raster = getattr(self, "_raster", None)
+        if self.closed or not isinstance(raster, _terrio.Raster):
+            return None
+        try:
+            return _terrio.render(raster, max_size=512)
+        except Exception:
+            # A notebook shows the text form instead; the reason is kept for whoever looks.
+            logging.getLogger(__name__).debug("cannot draw %s", _redact(self.name), exc_info=True)
+            return None
 
     def _load(self, raster: Any) -> None:
         """Takes the dataset's properties from a terrio raster.
@@ -1276,7 +1406,11 @@ class DatasetReader(DatasetBase):
         self.height = raster.height
         self._count = raster.count
         self._dtype = raster.dtype
-        self._complex_int = getattr(raster, "data_type", None) == "CInt16"
+        sample_type = getattr(raster, "data_type", None)
+        self._complex_sample = (
+            sample_type if sample_type in {"CInt16", "CInt32", "CFloat32", "CFloat64"} else None
+        )
+        self._complex_int = sample_type == "CInt16"
         self._nodata = raster.nodata
         crs = raster.crs_wkt or raster.crs
         if crs:
@@ -1317,7 +1451,9 @@ class DatasetReader(DatasetBase):
         # A per-dataset mask, internal or in a `.msk` sidecar (read by the raster, when the file
         # has no internal one).
         structure.mask_in_sidecar = bool(raster.has_mask) and not structure.has_mask
-        structure.has_mask = structure.has_mask or bool(raster.has_mask)
+        # Native discovery is authoritative for full-resolution TIFFs too: inferred tags
+        # must not advertise a mask the native reader cannot actually read.
+        structure.has_mask = bool(raster.has_mask)
         # Bands a PAM sidecar doesn't list keep the file's own nodata, not band 1's PAM value.
         file_nodata = self._nodata
         if structure.nodata_override is not None:
@@ -1379,7 +1515,12 @@ class DatasetReader(DatasetBase):
     # Reading.
 
     def _read_level(
-        self, bands: Sequence[int], window: tuple[int, int, int, int], level: int | None
+        self,
+        bands: Sequence[int],
+        window: tuple[int, int, int, int],
+        level: int | None,
+        *,
+        out_dtype: Any = None,
     ) -> np.ndarray:
         """Reads an integer window of a level.
 
@@ -1387,6 +1528,7 @@ class DatasetReader(DatasetBase):
             bands: The bands, from 1.
             window: `(x, y, w, h)`.
             level: None for full resolution, else an overview index.
+            out_dtype: An optional core output type, before component precision is lost.
 
         Returns:
             numpy.ndarray: `(bands, h, w)`.
@@ -1396,9 +1538,49 @@ class DatasetReader(DatasetBase):
         """
         self._check_open()
         try:
-            return np.asarray(self._raster.read(list(bands), window=window, overview=level))
+            options = {"out_dtype": out_dtype} if out_dtype is not None else {}
+            return np.asarray(
+                self._raster.read(list(bands), window=window, overview=level, **options)
+            )
+        except ResourceLimitError:
+            raise
         except Exception as err:
             raise RasterioIOError(f"Read failed: {err}") from err
+
+    def _exact_complex_read(self) -> bool:
+        """Whether native reads can retain Int32 components before conversion to complex64.
+
+        Inherited native readers qualify. VRTs compute pixels in their own working type,
+        so overriding `_read_level` must not be bypassed to read the underlying raster.
+        Writers use `_buffer_dtype` instead: their pixels already live in a typed buffer.
+        Use the type cached at open so this check never borrows a native handle during
+        another thread's read.
+        """
+        return (
+            type(self)._read_level is DatasetReader._read_level
+            and getattr(self, "_complex_sample", None) == "CInt32"
+        )
+
+    def _read_for_copy(self, window: Any = None) -> np.ndarray:
+        """Read integer-complex copies before conversion to complex64 rounds Int32 values."""
+        if self._exact_complex_read():
+            self._check_open()
+            region = (
+                None
+                if window is None
+                else tuple(
+                    int(v) for v in (window.col_off, window.row_off, window.width, window.height)
+                )
+            )
+            height, width = (self.height, self.width) if region is None else (region[3], region[2])
+            _check_buffer(self.count, height, width, 16)
+            try:
+                return np.asarray(self._raster.read(None, window=region, out_dtype="complex128"))
+            except ResourceLimitError:
+                raise
+            except Exception as err:
+                raise RasterioIOError(f"Read failed: {err}") from err
+        return self.read(window=window)
 
     def _sample_level(
         self, bands: Sequence[int], cols: np.ndarray, rows: np.ndarray, level: int | None
@@ -1425,6 +1607,8 @@ class DatasetReader(DatasetBase):
             got = self._raster.read_sampled(
                 list(bands), cols.tolist(), rows.tolist(), overview=level
             )
+        except ResourceLimitError:
+            raise
         except Exception as err:
             raise RasterioIOError(f"Read failed: {err}") from err
         return None if got is None else np.asarray(got)
@@ -1445,6 +1629,8 @@ class DatasetReader(DatasetBase):
         window: Window | None,
         buf: tuple[int, int],
         resampling: Resampling,
+        *,
+        out_dtype: Any = None,
     ) -> np.ndarray:
         """Reads bands of a window (inside the raster) into a buffer.
 
@@ -1453,6 +1639,7 @@ class DatasetReader(DatasetBase):
             window: The window, or None for the whole raster.
             buf: The output `(height, width)`.
             resampling: The resampling method.
+            out_dtype: A wider core read type when exact integer-complex output is requested.
 
         Returns:
             numpy.ndarray: `(bands, height, width)` in the dataset's data type.
@@ -1479,12 +1666,26 @@ class DatasetReader(DatasetBase):
             fw = (window.col_off, window.row_off, window.width, window.height)
         if buf[0] <= 0 or buf[1] <= 0:
             return np.zeros((len(indexes), max(buf[0], 0), max(buf[1], 0)), self._dtype)
+        _check_buffer(len(indexes), buf[0], buf[1], np.dtype(self._dtype).itemsize)
         if fw[2] <= 0 or fw[3] <= 0:
             return np.zeros((len(indexes), buf[0], buf[1]), self._dtype)
+        core = self._core_resampled(fw, buf, resampling)
+        if core is not None:
+            try:
+                return np.asarray(self._raster.read_resampled(band=list(indexes), **core))
+            except ResourceLimitError:
+                raise
+            except Exception as err:
+                raise RasterioIOError(f"Read failed: {err}") from err
+        read_level = (
+            partial(self._read_level, out_dtype=out_dtype)
+            if out_dtype is not None
+            else self._read_level
+        )
         nodata = self.nodatavals[0] if self._count else None
         if resampling == Resampling.nearest:
             return raster_io(
-                self._read_level,
+                read_level,
                 indexes,
                 (self.width, self.height),
                 self._overview_sizes,
@@ -1514,7 +1715,7 @@ class DatasetReader(DatasetBase):
         groups = [(list(indexes[:shared]), True), (list(indexes[shared:]), False)]
         parts = [
             raster_io(
-                self._read_level,
+                read_level,
                 group,
                 (self.width, self.height),
                 self._overview_sizes,
@@ -1530,6 +1731,54 @@ class DatasetReader(DatasetBase):
             if group
         ]
         return parts[0] if len(parts) == 1 else np.concatenate(parts)
+
+    def _core_resampled(
+        self,
+        window: tuple[float, float, float, float],
+        buf: tuple[int, int],
+        resampling: Resampling,
+    ) -> dict[str, Any] | None:
+        """The arguments of the core's resampled read (`Raster.read_resampled`), when it reads.
+
+        The core reads a window into a buffer of another size as GDAL's `RasterIO` does, from
+        the overview it would choose, with GDAL's mask bands. Plain reads (a window of the
+        buffer's size), datasets read otherwise (opened at an overview level, written in memory,
+        or through subclasses), nodata values a PAM sidecar sets, paletted and complex bands, and
+        Gaussian resampling, which the core does not read, are read by `raster_io` instead.
+
+        Args:
+            window: `(x_off, y_off, x_size, y_size)` in full-resolution pixels.
+            buf: The output `(height, width)`.
+            resampling: The resampling method.
+
+        Returns:
+            dict | None: The keyword arguments of the read but the bands, or None.
+        """
+        method = _CORE_RESAMPLING.get(int(resampling))
+        _, _, w, h = window
+        if (
+            method is None
+            # A window of the buffer's size at whole pixels is a plain read (`raster_io` reads it).
+            or ((w, h) == (buf[1], buf[0]) and all(float(v).is_integer() for v in window))
+            # A dataset opened at an overview level (`_OverviewRaster`) is read by `raster_io`.
+            or not isinstance(getattr(self, "_raster", None), _terrio.Raster)
+            # Subclasses overriding how levels, samples or masks are read keep their hooks.
+            or type(self)._read_level is not DatasetReader._read_level
+            or type(self)._sample_level is not DatasetReader._sample_level
+            or type(self)._mask_reader is not DatasetReader._mask_reader
+            or type(self)._mask_flags is not DatasetReader._mask_flags
+            or self.structure.colormap is not None
+            or np.dtype(self._dtype).kind == "c"
+            # The core masks the raster's own nodata value: a PAM sidecar's is not its.
+            or self._nodatavals is not None
+            or repr(self._nodata) != repr(self._raster.nodata)
+        ):
+            return None
+        return {
+            "size": (buf[1], buf[0]),
+            "window": tuple(float(v) for v in window),
+            "resampling": method,
+        }
 
     def _mask_reader(self) -> Any:
         """Reads the GDAL mask bands of bands over a window of a level, for resampled reads.
@@ -1627,6 +1876,15 @@ class DatasetReader(DatasetBase):
             if window is None
             else (window.col_off, window.row_off, window.width, window.height)
         )
+        core = self._core_resampled(fw, buf, Resampling(resampling))
+        if core is not None and buf[0] > 0 and buf[1] > 0 and fw[2] > 0 and fw[3] > 0:
+            # The per-dataset mask is every band's mask band: band 1's, from its own overviews.
+            try:
+                return np.asarray(raster.read_resampled_masks(band=1, **core))
+            except ResourceLimitError:
+                raise
+            except Exception as err:
+                raise RasterioIOError(f"Read failed: {err}") from err
         out: np.ndarray = np.asarray(
             raster_io(
                 read,
@@ -1721,6 +1979,9 @@ class DatasetReader(DatasetBase):
 
         Raises:
             ValueError: If `out` and `out_shape` are both given, or `out` has the wrong shape.
+            ResourceLimitError: If the requested read exceeds a resource limit or the memory
+                the process can use, before its output buffer is allocated.
+            RasterioIOError: If the read otherwise fails.
         """
         self._readable()
         idx, return2d, win, win_shape = self._prepare(indexes, window, boundless)
@@ -1740,6 +2001,19 @@ class DatasetReader(DatasetBase):
             buf = (int(out_shape[-2]), int(out_shape[-1]))
         else:
             buf = win_shape
+        # Preserve components for wide real/complex outputs before their final conversion.
+        precise = self._exact_complex_read() and (
+            (dtype.kind in "iu" and dtype.itemsize >= 4)
+            or (dtype.kind == "f" and dtype.itemsize >= 8)
+            or (dtype.kind == "c" and dtype.itemsize >= 16)
+        )
+        read_options = {"out_dtype": "complex128"} if precise else {}
+        _check_buffer(
+            len(idx),
+            max(buf[0], 0),
+            max(buf[1], 0),
+            max(np.dtype(dtype).itemsize, 16 if precise else 0),
+        )
         nodatavals = [self.nodatavals[b - 1] for b in idx]
         fill = None if not nodatavals else nodatavals[-1]
         if fill is not None and not np.isnan(fill):
@@ -1752,7 +2026,7 @@ class DatasetReader(DatasetBase):
             ]
 
         if not boundless or win is None:
-            data = self._io(idx, win, buf, resampling)
+            data = self._io(idx, win, buf, resampling, **read_options)
             arr = gdal_cast(data, dtype)
             if masked or fill_value is not None:
                 if all(f == MaskFlags.all_valid.value for f in self._mask_flags()):
@@ -1777,7 +2051,15 @@ class DatasetReader(DatasetBase):
             from terrio.rio._boundless import boundless_read
 
             data, invalid = boundless_read(
-                self, idx, win, buf, int(Resampling(resampling)), fill_value, fill, masked
+                self,
+                idx,
+                win,
+                buf,
+                int(Resampling(resampling)),
+                fill_value,
+                fill,
+                masked,
+                out_dtype="complex128" if precise else None,
             )
             result = gdal_cast(data, dtype)
             if masked:
@@ -1789,7 +2071,17 @@ class DatasetReader(DatasetBase):
                 result = np.ma.array(result, **kwds)
         else:
             background = fill_value if fill_value is not None else fill
-            data, inside = self._boundless(idx, win, buf, resampling, background)
+            data, inside = self._boundless(
+                idx,
+                win,
+                buf,
+                resampling,
+                background,
+                out_dtype="complex128"
+                if dtype.name == "complex128"
+                or getattr(self, "_buffer_dtype", None) == "complex128"
+                else None,
+            )
             arr = gdal_cast(data, dtype)
             result = arr
             if masked:
@@ -1823,6 +2115,8 @@ class DatasetReader(DatasetBase):
         buf: tuple[int, int],
         resampling: Resampling,
         background: Any,
+        *,
+        out_dtype: Any = None,
     ) -> tuple[np.ndarray, np.ndarray]:
         """Reads a window that may extend past the raster.
 
@@ -1832,18 +2126,26 @@ class DatasetReader(DatasetBase):
             buf: The output `(height, width)`.
             resampling: The resampling method.
             background: The value of pixels outside the raster (None for 0).
+            out_dtype: A wider complex buffer type when requested.
 
         Returns:
             tuple: The pixels `(bands, h, w)` and where they are inside the raster.
         """
         bh, bw = buf
+        _check_buffer(len(idx), bh, bw, np.dtype(self._dtype).itemsize)
+        _check_buffer(1, 1, bw, 8)
+        _check_buffer(1, 1, bh, 8)
         sx, sy = win.width / bw if bw else 1.0, win.height / bh if bh else 1.0
         # Output pixels whose centres fall inside the raster.
         cx = win.col_off + (np.arange(bw) + 0.5) * sx
         cy = win.row_off + (np.arange(bh) + 0.5) * sy
         inx = (cx >= 0) & (cx < self.width)
         iny = (cy >= 0) & (cy < self.height)
-        out = np.full((len(idx), bh, bw), background if background is not None else 0, self._dtype)
+        out = np.full(
+            (len(idx), bh, bw),
+            background if background is not None else 0,
+            out_dtype if out_dtype is not None else self._dtype,
+        )
         inside = np.zeros((len(idx), bh, bw), bool)
         if inx.any() and iny.any():
             c0, c1 = int(np.argmax(inx)), int(len(inx) - np.argmax(inx[::-1]))
@@ -1851,7 +2153,7 @@ class DatasetReader(DatasetBase):
             sub = Window(
                 win.col_off + c0 * sx, win.row_off + r0 * sy, (c1 - c0) * sx, (r1 - r0) * sy
             ).crop(self.height, self.width)
-            part = self._io(idx, sub, (r1 - r0, c1 - c0), resampling)
+            part = self._io(idx, sub, (r1 - r0, c1 - c0), resampling, out_dtype=out_dtype)
             out[:, r0:r1, c0:c1] = part
             inside[:, r0:r1, c0:c1] = True
         return out, inside
@@ -2001,6 +2303,12 @@ class DatasetReader(DatasetBase):
         return out
 
 
+# The function `DatasetReader` reads a window of a level with, as defined above. A `WarpedVRT`
+# reads and warps a dataset's window in Rust only when the dataset reads its windows through this
+# very function, not through a replacement on a class or on the dataset (`vrt._reads_its_raster`).
+_READER_READ_LEVEL = DatasetReader._read_level
+
+
 class Statistics:
     """Band statistics: minimum, maximum, mean and standard deviation."""
 
@@ -2027,12 +2335,16 @@ class Statistics:
 class DatasetWriter(DatasetReader):
     """A dataset opened for writing (`w`, `w+`) or updating (`r+`).
 
-    The pixels are held in memory; the file is written when the dataset is closed.
+    Pixels are held in memory or a mapped staging file; streamed copies read their source
+    directly instead. The file is written when the dataset is closed.
     """
 
     # Whether the mask written is another dataset's mask band, as a copy's is (GDAL's CreateCopy
     # regenerates the overviews of its source's mask), rather than a MEM dataset's.
     _mask_has_dataset = False
+    # A copy's source (`shutil.copy`), whose pixels the file is written from as it is written,
+    # when it is written in rows: they are then not held (see `_streams_on_flush`).
+    _copy_of: Any = None
 
     def __init__(
         self,
@@ -2067,6 +2379,7 @@ class DatasetWriter(DatasetReader):
 
         Raises:
             TypeError: If the driver, size, count or dtype is missing or invalid.
+            DriverCapabilityError: If terrio cannot write the format.
             ValueError: If the nodata value does not fit the data type.
             RasterBlockError: If tile sizes are not multiples of 16.
         """
@@ -2088,9 +2401,12 @@ class DatasetWriter(DatasetReader):
         kwargs.pop("thread_safe", None)
         gcps = kwargs.pop("gcps", None)
         rpcs = kwargs.pop("rpcs", None)
+        copy_of = kwargs.pop("_copy_of", None)
+        complex_sample = kwargs.pop("_complex_dtype", None)
         if mode in ("w", "w+"):
             if not isinstance(driver, str):
                 raise TypeError("A driver name string is required.")
+            driver = _canonical_writer_driver(driver)
             try:
                 width, height = int(width), int(height)
             except (TypeError, ValueError):
@@ -2099,6 +2415,10 @@ class DatasetWriter(DatasetReader):
                 count = int(count)
             except (TypeError, ValueError):
                 raise TypeError("Integer band count is required.") from None
+            if _is_complex_int(dtype) and dtype != "complex_int16":
+                raise TypeError("unsupported complex integer dtype")
+            if complex_sample not in (None, "CInt16", "CInt32", "CFloat32", "CFloat64"):
+                raise TypeError(f"unsupported complex sample type: {complex_sample}")
             try:
                 assert dtype is not None
                 dt = _getnpdtype(dtype).name
@@ -2106,19 +2426,37 @@ class DatasetWriter(DatasetReader):
                 raise TypeError("A valid dtype is required.") from None
             if dt not in _SUPPORTED_DTYPES:
                 raise TypeError(f"terrio cannot write {dt} rasters")
+            if dtype == "complex_int16" and complex_sample not in (None, "CInt16"):
+                raise TypeError(f"complex_int16 is CInt16, not {complex_sample}")
+            if complex_sample is not None:
+                required_buffer = (
+                    "complex128" if complex_sample in ("CInt32", "CFloat64") else "complex64"
+                )
+                if dt != required_buffer:
+                    raise TypeError(f"{complex_sample} needs dtype {required_buffer}, not {dt}")
             if nodata is not None and not in_dtype_range(nodata, dt):
                 raise ValueError(
                     f"Given nodata value, {nodata}, is beyond the valid range of its data type, "
                     f"{dt}."
                 )
-            self.driver = "GTiff" if driver.upper() == "COG" else driver
+            self.driver = driver
             self._out_driver = driver
             self.width, self.height, self._count, self._dtype = width, height, count, dt
             self._nodata = None if nodata is None else float(nodata)
+            self._complex_sample = complex_sample or (
+                "CInt16" if dtype == "complex_int16" else None
+            )
+            self._complex_int = self._complex_sample == "CInt16"
             self._options = self._creation_options(kwargs)
-            fill = self._nodata if self._nodata is not None else 0
-            with np.errstate(invalid="ignore"):
-                self._data = self._allocate((count, height, width), dt, fill)
+            shape = (count, height, width)
+            storage_dtype = self._buffer_dtype
+            if copy_of is not None and self._streams_on_flush(self._streams(shape, storage_dtype)):
+                self._copy_of = copy_of
+                self._data = np.empty((0, 0, 0), storage_dtype)
+            else:
+                fill = self._nodata if self._nodata is not None else 0
+                with np.errstate(invalid="ignore"):
+                    self._data = self._allocate(shape, storage_dtype, fill)
             self._structure = self._new_structure()
             if transform is not None:
                 self._transform = guard_transform(transform)
@@ -2145,7 +2483,7 @@ class DatasetWriter(DatasetReader):
             bool: True for GeoTIFFs larger than the in-memory limit.
         """
         size = int(np.prod(shape)) * np.dtype(dtype).itemsize
-        return self.driver == "GTiff" and size > _in_memory_limit()
+        return self.driver in ("GTiff", "COG") and size > _in_memory_limit()
 
     def _allocate(self, shape: tuple[int, ...], dtype: Any, fill: Any) -> np.ndarray:
         """An array for pixels, in memory or mapped from a temporary file.
@@ -2170,13 +2508,22 @@ class DatasetWriter(DatasetReader):
                 arr[..., y : y + n, :] = fill
         return arr
 
+    @property
+    def _buffer_dtype(self) -> str:
+        """Preserve integer components and round once when converting to their output type."""
+        return (
+            "complex128"
+            if getattr(self, "_complex_sample", None) in ("CInt16", "CInt32")
+            else self._dtype
+        )
+
     def _slabs(self) -> Iterator[tuple[int, int]]:
         """Rows of blocks of about 16 MB.
 
         Yields:
             tuple: `(first row, number of rows)`.
         """
-        row = max(1, self.width * max(self._count, 1) * np.dtype(self._dtype).itemsize)
+        row = max(1, self.width * max(self._count, 1) * np.dtype(self._buffer_dtype).itemsize)
         n = max(1, (16 << 20) // row)
         block = self.structure.block_shape[0] if self._structure is not None else 1
         n = max(block, n - n % max(block, 1))
@@ -2293,12 +2640,7 @@ class DatasetWriter(DatasetReader):
             block = (1, self.width)
         s = _tiff.Structure(count=n, width=self.width, height=self.height, block_shape=block)
         s.tiled = tiled
-        ci = [ColorInterp.gray] + [ColorInterp.undefined] * (n - 1)
-        if o.get("PHOTOMETRIC", "").upper() == "RGB" and n >= 3:
-            ci[:3] = [ColorInterp.red, ColorInterp.green, ColorInterp.blue]
-        if o.get("ALPHA", "").upper() in ("YES", "NON-PREMULTIPLIED", "PREMULTIPLIED") and n > 1:
-            ci[-1] = ColorInterp.alpha
-        s.colorinterp = ci
+        s.colorinterp = self._new_structure_defaults()
         s.band_tags = [{} for _ in range(n)]
         s.descriptions = [None] * n
         s.scales = [1.0] * n
@@ -2336,22 +2678,43 @@ class DatasetWriter(DatasetReader):
         """
         DatasetReader.__init__(self, self.name)
         self.mode = "r+"
+        # GDAL infers a COG's layout for read-only datasets only.
+        if self._structure is not None:
+            self._structure.layout_path = None
+            if self._structure.layout_inferred:
+                self._structure.namespaces.get("IMAGE_STRUCTURE", {}).pop("LAYOUT", None)
+                self._structure.layout_inferred = False
         raster = self._raster
         assert raster is not None
         try:
             shape = (self._count, self.height, self.width)
-            if self._streams(shape, self._dtype):
+            storage_dtype = self._buffer_dtype
+            read_options = (
+                {"out_dtype": "complex128"} if self._complex_sample in ("CInt16", "CInt32") else {}
+            )
+            if self._streams(shape, storage_dtype):
                 # Copied into a file-backed array, block row by block row.
-                self._data = self._allocate(shape, self._dtype, 0)
+                self._data = self._allocate(shape, storage_dtype, 0)
                 for y, n in self._slabs():
                     self._data[:, y : y + n, :] = np.asarray(
-                        raster.read(window=(0, y, self.width, n))
+                        raster.read(window=(0, y, self.width, n), **read_options)
                     )
             else:
-                self._data = np.asarray(raster.read())
+                self._data = np.asarray(raster.read(**read_options))
+        except ResourceLimitError:
+            self._release_spill()
+            raise
         except Exception as err:
+            self._release_spill()
             raise RasterioIOError(f"Read failed: {err}") from err
         self._out_driver = self.driver
+        # GDAL reports every non-alpha band of a two-band gray JP2 as Gray. Keep its
+        # actual Y association separately so an update does not choose another component.
+        self._jp2_associations = (
+            [m.get("color_association") for m in raster.band_metadata]
+            if _terrio.canonical_driver_name(self.driver) == "JP2"
+            else []
+        )
         s = self.structure
         opts: dict[str, str] = {}
         if s.compression:
@@ -2384,8 +2747,19 @@ class DatasetWriter(DatasetReader):
 
     # Reading back what was written.
 
+    def _read_for_copy(self, window: Any = None) -> np.ndarray:
+        """Copy a readable writer using its component-preserving buffer type."""
+        if getattr(self, "_complex_sample", None) in ("CInt16", "CInt32"):
+            return self.read(window=window, out_dtype="complex128")
+        return self.read(window=window)
+
     def _read_level(
-        self, bands: Sequence[int], window: tuple[int, int, int, int], level: int | None
+        self,
+        bands: Sequence[int],
+        window: tuple[int, int, int, int],
+        level: int | None,
+        *,
+        out_dtype: Any = None,
     ) -> np.ndarray:
         """Reads an integer window of the pixels in memory.
 
@@ -2393,6 +2767,7 @@ class DatasetWriter(DatasetReader):
             bands: The bands, from 1.
             window: `(x, y, w, h)`.
             level: Unused: the dataset in memory has no overviews.
+            out_dtype: Unused: the writer buffer already retains its component precision.
 
         Returns:
             numpy.ndarray: `(bands, h, w)`.
@@ -2683,7 +3058,7 @@ class DatasetWriter(DatasetReader):
         for b in idx:
             if b not in self.indexes:
                 raise IndexError(f"band index {b} out of range (not in {self.indexes})")
-        arr = np.require(arr, dtype=self._dtype)
+        arr = np.require(arr, dtype=self._buffer_dtype)
         if window:
             if isinstance(window, tuple):
                 window = Window.from_slices(window[0], window[1], self.height, self.width)
@@ -2776,31 +3151,29 @@ class DatasetWriter(DatasetReader):
             if self._dirty and self.mode in ("w", "w+", "r+"):
                 self._flush()
         finally:
+            self._copy_of = None
             self._release_spill()
             DatasetBase.close(self)
 
-    def _flush(self) -> None:
-        """Writes the dataset to its file.
+    def _streams_on_flush(self, file_backed: bool | None = None) -> bool:
+        """Whether the file is written in rows of blocks (`_write_streaming`) rather than whole.
 
-        Raises:
-            RasterioIOError: If the file cannot be written.
+        A GeoTIFF is, when its pixels are held in a file (larger than the in-memory limit); a
+        COG is, without a mask, the source's overviews to copy, or overviews built, and with a
+        compression the row writers take.
+
+        Args:
+            file_backed: Whether the pixels are held in a file: by default, whether they are
+                (a copy written from its source is so only when they would be).
+
+        Returns:
+            bool: True when the file is written in rows.
         """
-        s = self.structure
-        t = self._transform
-        georef = not (t == Affine.identity() or [abs(v) for v in t[:6]] == [0, 1, 0, 0, 0, 1])
-        gt = t.to_gdal() if georef else (0.0, 1.0, 0.0, float(self.height), 0.0, -1.0)
-        tags = {k: v for k, v in s.tags.items() if k != "AREA_OR_POINT"}
-        crs_obj = self._crs if self._crs is not None else (self._gcp_crs if self._gcps else None)
-        crs = crs_obj.to_wkt() if crs_obj else None
-        if self._nodatavals is not None and len(set(map(repr, self._nodatavals))) > 1:
-            warnings.warn(
-                f"The TIFFTAG_GDAL_NODATA only support one value per dataset. This value of "
-                f"{self._nodata} will be used for all bands on re-opening",
-                stacklevel=3,
-            )
+        if file_backed is None:
+            file_backed = isinstance(self._data, np.memmap) or self._copy_of is not None
         cog = self._out_driver == "COG"
-        streaming = (
-            (isinstance(self._data, np.memmap) or cog)
+        return (
+            (file_backed or cog)
             and (
                 self._out_driver == "GTiff"
                 or (cog and self._mask is None and "@COPY_SRC_OVERVIEWS" not in self._options)
@@ -2809,12 +3182,59 @@ class DatasetWriter(DatasetReader):
             and str(self._options.get("COMPRESS", "NONE")).upper()
             in ("NONE", "LZW", "DEFLATE", "ZIP", "ZSTD", "PACKBITS")
         )
+
+    def _flush(self) -> None:
+        """Writes the dataset to its file.
+
+        Raises:
+            ResourceLimitError: If a resource policy refuses the write.
+            RasterioIOError: If the file cannot otherwise be written.
+        """
+        s = self.structure
+        t = self._transform
+        georef = not (t == Affine.identity() or [abs(v) for v in t[:6]] == [0, 1, 0, 0, 0, 1])
+        gt = t.to_gdal() if georef else (0.0, 1.0, 0.0, float(self.height), 0.0, -1.0)
+        crs_obj = self._crs if self._crs is not None else (self._gcp_crs if self._gcps else None)
+        crs = crs_obj.to_wkt() if crs_obj else None
+        # The GeoTIFF writer writes `AREA_OR_POINT=Point` as the key RasterPixelIsPoint; other
+        # formats have no raster type to write it to. The key needs a CRS (of the dataset or of its
+        # GCPs): alone, it would stand for a local CRS, so without one the raster stays PixelIsArea.
+        geotiff = self._out_driver.upper() in ("GTIFF", "COG")
+        tags = {k: v for k, v in s.tags.items() if geotiff or k != "AREA_OR_POINT"}
+        if not crs and str(tags.get("AREA_OR_POINT", "")).lower() == "point":
+            del tags["AREA_OR_POINT"]
+            warnings.warn(
+                "AREA_OR_POINT=Point is not kept: a GeoTIFF's raster type needs a CRS, and the "
+                "dataset has none, so it is written as PixelIsArea. Give the dataset a CRS to "
+                "keep it.",
+                UserWarning,
+                stacklevel=3,
+            )
+        if self._nodatavals is not None and len(set(map(repr, self._nodatavals))) > 1:
+            warnings.warn(
+                f"The TIFFTAG_GDAL_NODATA only support one value per dataset. This value of "
+                f"{self._nodata} will be used for all bands on re-opening",
+                stacklevel=3,
+            )
+        streaming = self._streams_on_flush()
+        if self._copy_of is not None and not streaming:
+            # A copy given its source to write from no longer writes in rows (unreachable from
+            # `shutil.copy`, which gives none with a mask): its pixels, then, whole.
+            self._data = np.require(self._copy_of._read_for_copy(), dtype=self._buffer_dtype)
+            self._copy_of = None
         raster: Any = None
         if not streaming:
             try:
                 raster = _terrio.Raster.from_array(
-                    np.asarray(self._data), gt, crs or None, self._nodata, tags
+                    np.asarray(self._data),
+                    gt,
+                    crs or None,
+                    self._nodata,
+                    tags,
+                    complex_dtype=getattr(self, "_complex_sample", None),
                 )
+            except ResourceLimitError:
+                raise
             except Exception as err:
                 raise RasterioIOError(f"Write failed: {err}") from err
         driver = self._out_driver
@@ -2822,6 +3242,12 @@ class DatasetWriter(DatasetReader):
         compress = opts.pop("COMPRESS", None)
         band_md: list[dict[str, Any]] = []
         defaults = self._new_structure_defaults()
+        # JP2 needs the whole role vector: once any role is written, omitted entries mean
+        # Undefined rather than the band-count default, so every role is sent explicitly.
+        inherited_associations = getattr(self, "_jp2_associations", [])
+        explicit_jp2_roles = (
+            self._colorinterp_set or bool(inherited_associations)
+        ) and _terrio.canonical_driver_name(driver) == "JP2"
         for b in range(self._count):
             md: dict[str, Any] = {}
             if s.descriptions[b]:
@@ -2835,8 +3261,12 @@ class DatasetWriter(DatasetReader):
             if s.band_tags[b]:
                 md["items"] = dict(s.band_tags[b])
             ci = s.colorinterp[b]
-            if ci != defaults[b] and not (ci == ColorInterp.palette and s.colormap):
+            if (ci != defaults[b] or explicit_jp2_roles) and not (
+                ci == ColorInterp.palette and s.colormap
+            ):
                 md["color_interp"] = _tiff.COLOR_INTERP_NAMES.get(ci, "Undefined")
+            if b < len(inherited_associations) and inherited_associations[b] is not None:
+                md["color_association"] = inherited_associations[b]
             band_md.append(md)
         colormap: list[tuple[int, int, int, int]] | None = None
         if s.colormap:
@@ -2874,7 +3304,7 @@ class DatasetWriter(DatasetReader):
                 # then regenerated otherwise than a file's (`mask_levels` in gtiff_write.rs).
                 opts["@MASK_WITHOUT_DATASET"] = "YES"
         tmp = self._path + f".tmp-{uuid.uuid4().hex}"
-        target = tmp if self.mode == "r+" else self._path
+        target = tmp if self.mode == "r+" or streaming else self._path
         # The sidecar mask is written first beside its place, then both files are put in place
         # once the dataset is written: a failure while writing leaves the dataset and its mask as
         # they were (only between the two renames could the dataset be new and its mask old).
@@ -2890,6 +3320,8 @@ class DatasetWriter(DatasetReader):
                 for leftover in (tmp, msk_tmp):
                     if leftover and os.path.exists(leftover):
                         os.remove(leftover)
+                if isinstance(err, ResourceLimitError):
+                    raise
                 raise RasterioIOError(f"Write failed: {err}") from err
             self._dirty = False
             return
@@ -2911,6 +3343,8 @@ class DatasetWriter(DatasetReader):
             for leftover in (tmp, msk_tmp):
                 if leftover and os.path.exists(leftover):
                     os.remove(leftover)
+            if isinstance(err, ResourceLimitError):
+                raise
             raise RasterioIOError(f"Write failed: {err}") from err
         self._dirty = False
 
@@ -3037,7 +3471,7 @@ class DatasetWriter(DatasetReader):
             self.width,
             self.height,
             self._count,
-            self._dtype,
+            getattr(self, "_complex_sample", None) or self._dtype,
             tuple(gt),
             crs or None,
             self._nodata,
@@ -3051,18 +3485,49 @@ class DatasetWriter(DatasetReader):
             **kw,
         )
         try:
-            for y, n in self._slabs():
-                rows = np.ascontiguousarray(self._data[:, y : y + n, :])
+            source = self._copy_of
+            # Read taller source blocks together within a 16 MiB slab budget (or one output
+            # tile row), then feed the COG writer a tile row at a time. A whole-image strip
+            # taller than a tile row is split in half or smaller. Small images can fit in one slab.
+            write_step = self.structure.block_shape[0] if cog and source is not None else 0
+            step = write_step
+            if step and source is not None:
+                block_rows = max(shape[0] for shape in source.block_shapes)
+                if block_rows > step:
+                    row_bytes = self.width * self.count * np.dtype(self._buffer_dtype).itemsize
+                    budget_rows = max(step, ((16 * 1024 * 1024 // row_bytes) // step) * step)
+                    wanted = math.lcm(step, *(shape[0] for shape in source.block_shapes))
+                    if block_rows >= self.height:
+                        wanted = max(step, (self.height // 2 // step) * step)
+                    step = min(wanted, budget_rows)
+            slabs = (
+                ((y, min(step, self.height - y)) for y in range(0, self.height, step))
+                if step
+                else self._slabs()
+            )
+            for y, n in slabs:
+                if source is None:
+                    rows = np.ascontiguousarray(self._data[:, y : y + n, :])
+                else:
+                    part = source._read_for_copy(window=Window(0, y, self.width, n))
+                    rows = np.ascontiguousarray(np.require(part, dtype=self._buffer_dtype))
                 m = (
                     None
                     if self._mask is None or sidecar_mask
                     else np.ascontiguousarray(self._mask[y : y + n])
                 )
                 if m is None:
-                    w.write(rows)
+                    if write_step:
+                        for start in range(0, n, write_step):
+                            w.write(np.ascontiguousarray(rows[:, start : start + write_step, :]))
+                    else:
+                        w.write(rows)
                 else:
                     # A GeoTiffWriter: a COG streams only without a mask.
                     w.write(rows, m)  # type: ignore[call-arg]
+                del rows
+                if source is not None:
+                    del part
         except BaseException:
             # Closing an incomplete writer fails too ("N rows written of M"): keep the first
             # error, which says what went wrong.
@@ -3072,7 +3537,13 @@ class DatasetWriter(DatasetReader):
         w.close()
 
     def _new_structure_defaults(self) -> list[ColorInterp]:
-        """The color interpretations GDAL derives from the creation options.
+        """The color interpretations the writer gives the bands when it is not told otherwise.
+
+        For a GeoTIFF or a COG they are the GeoTIFF writer's. `PHOTOMETRIC=RGB` or `YCBCR` makes
+        the first three bands red, green and blue. Without `PHOTOMETRIC`, so do three Byte bands,
+        or four compressed with WebP: a COG takes none (`_creation_options` drops it), and an
+        update passes one only for an RGB file. `ALPHA` makes the last band alpha. `_flush` sends
+        the writer each band's interpretation that differs from these.
 
         Returns:
             list: One per band.
@@ -3080,7 +3551,15 @@ class DatasetWriter(DatasetReader):
         n = self._count
         ci = [ColorInterp.gray] + [ColorInterp.undefined] * (n - 1)
         o = self._options
-        if o.get("PHOTOMETRIC", "").upper() == "RGB" and n >= 3:
+        photometric = o.get("PHOTOMETRIC", "").upper()
+        rgb = photometric == "RGB"
+        if self._out_driver.upper() in ("GTIFF", "COG"):
+            if photometric:
+                rgb = photometric in ("RGB", "YCBCR")
+            else:
+                webp = o.get("COMPRESS", "").upper() == "WEBP"
+                rgb = self._dtype == "uint8" and (n == 3 or (n == 4 and webp))
+        if rgb and n >= 3:
             ci[:3] = [ColorInterp.red, ColorInterp.green, ColorInterp.blue]
         if o.get("ALPHA", "").upper() in ("YES", "NON-PREMULTIPLIED", "PREMULTIPLIED") and n > 1:
             ci[-1] = ColorInterp.alpha
@@ -3194,8 +3673,28 @@ class MemPointerDataset(DatasetWriter):
             DatasetBase.close(self)
 
 
+def _canonical_writer_driver(driver: str) -> str:
+    """Resolve writable raster aliases once, before writer policy branches use the name."""
+    name = _terrio.canonical_driver_name(driver)
+    if name == "COG":
+        return "COG"
+    for info in _terrio.drivers():
+        if (
+            info.get("kind") == "raster"
+            and info.get("write", True)
+            and _terrio.canonical_driver_name(info["name"]) == name
+        ):
+            return str(info["name"])
+    raise DriverCapabilityError(f"Writer does not exist for driver: {driver}")
+
+
 def get_writer_for_driver(driver: str) -> type[DatasetWriter]:
     """The writer class for a driver.
+
+    Names are compared as the driver allow-list compares them (`canonical_driver_name`): in any
+    case, and with the names of JPEG 2000 drivers, such as the `JP2OpenJPEG` that
+    `driver_from_extension` gives `.jp2` paths, as terrio's `JP2`. Surrounding whitespace
+    and letter case are ignored, as in the driver allow-list.
 
     Args:
         driver: The driver's short name.
@@ -3206,10 +3705,7 @@ def get_writer_for_driver(driver: str) -> type[DatasetWriter]:
     Raises:
         DriverCapabilityError: If terrio cannot write the format.
     """
-    names = {d["name"].upper(): d for d in _terrio.drivers() if d.get("kind") == "raster"}
-    d = names.get(driver.upper())
-    if driver.upper() != "COG" and (d is None or not d.get("write", True)):
-        raise DriverCapabilityError(f"Writer does not exist for driver: {driver}")
+    _canonical_writer_driver(driver)
     return DatasetWriter
 
 

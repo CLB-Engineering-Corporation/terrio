@@ -8,7 +8,17 @@ use std::process::{Command, Stdio};
 /// Sends `messages` to `terrio mcp`, one per line, and returns its replies by id, waiting for one
 /// per request before closing its standard input (which stops the commands still running).
 fn session(messages: &[Value]) -> HashMap<u64, Value> {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_terrio")).arg("mcp").stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap();
+    session_with_env(messages, &[])
+}
+
+fn session_with_env(messages: &[Value], env: &[(&str, &str)]) -> HashMap<u64, Value> {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_terrio"))
+        .arg("mcp")
+        .envs(env.iter().copied())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
     let mut stdin = child.stdin.take().unwrap();
     for m in messages {
         writeln!(stdin, "{m}").unwrap();
@@ -33,6 +43,41 @@ fn call(id: u32, name: &str, args: &[&str]) -> Value {
 }
 
 #[test]
+fn sql_tool_executes_grouped_and_spatial_queries() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("places.geojson");
+    let grouped = dir.path().join("groups.gpkg");
+    let spatial = dir.path().join("centroids.gpkg");
+    let duplicates = dir.path().join("duplicates.gpkg");
+    std::fs::write(&input, r#"{"type":"FeatureCollection","name":"places","features":[{"type":"Feature","properties":{"v":2},"geometry":{"type":"Point","coordinates":[0,0]}},{"type":"Feature","properties":{"v":2},"geometry":{"type":"Point","coordinates":[1,0]}}]}"#).unwrap();
+    let replies = session(&[
+        call(1, "sql", &[input.to_str().unwrap(), grouped.to_str().unwrap(), "--query", "SELECT v,COUNT(*) AS n FROM places GROUP BY v"]),
+        call(
+            2,
+            "sql",
+            &[input.to_str().unwrap(), spatial.to_str().unwrap(), "--query", "SELECT ST_Centroid(ST_Buffer(geometry,1)) FROM places"],
+        ),
+        call(3, "sql", &[input.to_str().unwrap(), duplicates.to_str().unwrap(), "--query", "SELECT v,v AS v FROM places"]),
+        call(
+            4,
+            "convert",
+            &[input.to_str().unwrap(), duplicates.to_str().unwrap(), "--sql", "SELECT v AS n,COUNT(*) AS n FROM places GROUP BY v"],
+        ),
+    ]);
+    assert_eq!(replies[&1]["result"]["isError"], false);
+    assert_eq!(replies[&2]["result"]["isError"], false);
+    for id in [3, 4] {
+        assert_eq!(replies[&id]["result"]["isError"], true);
+        assert!(replies[&id]["result"]["content"][0]["text"].as_str().unwrap().contains("duplicate output field"));
+    }
+    let groups = terrio::open_vector(grouped.to_str().unwrap(), &Default::default()).unwrap();
+    assert_eq!(groups.layers[0].features[0].attributes, vec![terrio::FieldValue::Integer(2), terrio::FieldValue::Integer(2)]);
+    let points = terrio::open_vector(spatial.to_str().unwrap(), &Default::default()).unwrap();
+    assert_eq!(points.layers[0].len(), 2);
+    assert!(points.layers[0].features.iter().all(|f| matches!(f.geometry, Some(terrio::Geometry::Point(_)))));
+}
+
+#[test]
 fn serves_the_commands() {
     let replies = session(&[
         json!({"jsonrpc": "2.0", "id": 0, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "test", "version": "0"}}}),
@@ -53,6 +98,33 @@ fn serves_the_commands() {
         assert_eq!(reply["result"]["isError"], true);
         assert!(reply["result"]["content"][0]["text"].as_str().unwrap().contains(code), "{reply}");
     }
+}
+
+/// `list-crs`: a read-only tool, printing as `projinfo --list-crs` does, or JSON.
+#[test]
+fn lists_registry_crs() {
+    let replies = session(&[
+        json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}),
+        call(2, "list-crs", &["gda94", "albers", "--authority", "EPSG", "--kind", "projected", "--json"]),
+        call(3, "list-crs", &["EPSG:3785", "--include-deprecated"]),
+        call(4, "list-crs", &["--kind", "geographic"]),
+    ]);
+    let tools = replies[&1]["result"]["tools"].as_array().unwrap();
+    let tool = tools.iter().find(|t| t["name"] == "list-crs").unwrap();
+    assert_eq!(tool["annotations"]["readOnlyHint"], true);
+
+    let list: Value = serde_json::from_str(replies[&2]["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    let albers = list.as_array().unwrap().iter().find(|e| e["code"] == 3577).unwrap();
+    assert_eq!(albers["authority"], "EPSG");
+    assert_eq!(albers["name"], "GDA94 / Australian Albers");
+    assert_eq!(albers["kind"], "projected");
+    assert_eq!(albers["bounds"], json!([112.85, -43.7, 153.69, -9.86]));
+
+    let text = replies[&3]["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("EPSG:3785 \"Popular Visualisation CRS / Mercator\" [deprecated]"), "{text}");
+
+    assert_eq!(replies[&4]["result"]["isError"], true);
+    assert!(replies[&4]["result"]["content"][0]["text"].as_str().unwrap().contains("geographic_2d"));
 }
 
 #[test]
@@ -105,6 +177,11 @@ fn viewshed_tool_writes_height_raster() {
     let replies = session(&[
         json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}),
         call(2, "viewshed", &[input.to_str().unwrap(), output.to_str().unwrap(), "--ox", "5", "--oy", "5", "--om", "GROUND", "--cc", "0"]),
+        call(
+            3,
+            "viewshed",
+            &[input.to_str().unwrap(), dir.path().join("accum.tif").to_str().unwrap(), "--om", "ACCUM", "--os", "2", "--cc", "0"],
+        ),
     ]);
     assert!(replies[&1]["result"]["tools"].as_array().unwrap().iter().any(|t| t["name"] == "viewshed"));
     assert_eq!(replies[&2]["result"]["isError"], false);
@@ -112,6 +189,10 @@ fn viewshed_tool_writes_height_raster() {
     assert_eq!(out.raster.data_type, terrio::DataType::F64);
     assert_eq!(out.raster.get(0, 0, 3), 14.0);
     assert_eq!(out.raster.get(0, 0, 4), 18.0);
+    assert_eq!(replies[&3]["result"]["isError"], false);
+    let accum = terrio::open_raster(dir.path().join("accum.tif").to_str().unwrap()).unwrap();
+    assert_eq!(accum.raster.data_type, terrio::DataType::U8);
+    assert_eq!((0..5).map(|x| accum.raster.get(0, 0, x)).collect::<Vec<_>>(), [170.0, 170.0, 255.0, 170.0, 170.0]);
 }
 
 #[test]
@@ -680,4 +761,199 @@ fn two_point_oblique_mercator_coordinates_and_refusal_through_mcp() {
     assert!((values[0] - 4687059.434028593).abs() < 0.001);
     assert!((values[1] - -5279802.3632845115).abs() < 0.001);
     assert_eq!(replies[&2]["result"]["isError"], true);
+}
+
+#[cfg(not(target_family = "wasm"))]
+#[path = "../../terrio/tests/common/oapif.rs"]
+mod oapif_fixture;
+
+#[cfg(not(target_family = "wasm"))]
+#[test]
+fn oapif_conversion_through_mcp_bounds_plain_limits_and_keeps_filter_order() {
+    if !terrio::formats::VectorDriver::OAPIF.info().read {
+        return;
+    }
+    let server = oapif_fixture::Server::new();
+    let dir = tempfile::tempdir().unwrap();
+    let plain = dir.path().join("limited.gpkg");
+    let filtered = dir.path().join("filtered.gpkg");
+    let url = format!("OAPIF:{}/alias", server.url);
+    let replies = session(&[
+        call(1, "convert", &[&url, plain.to_str().unwrap(), "--oo", "PAGE_SIZE=2", "--limit", "3"]),
+        call(2, "convert", &[&url, filtered.to_str().unwrap(), "--oo", "PAGE_SIZE=2", "--where", "value > 4", "--limit", "1"]),
+    ]);
+    for id in [1, 2] {
+        assert_eq!(replies[&id]["result"]["isError"], false, "{}", replies[&id]);
+    }
+    let a = terrio::open_vector(plain.to_str().unwrap(), &Default::default()).unwrap();
+    assert_eq!(a.layers[0].len(), 3);
+    for (i, expected) in [0.5, 1.5, 2.5].into_iter().enumerate() {
+        assert_eq!(a.layers[0].features[i].get(&a.layers[0].schema, "value").unwrap(), &terrio::FieldValue::Float(expected));
+    }
+    let b = terrio::open_vector(filtered.to_str().unwrap(), &Default::default()).unwrap();
+    assert_eq!(b.layers[0].len(), 1);
+    assert_eq!(b.layers[0].features[0].get(&b.layers[0].schema, "value").unwrap(), &terrio::FieldValue::Float(4.5));
+    // Plain limit needs two item pages; filtering must inspect all three pages.
+    assert_eq!(server.requests.lock().unwrap().iter().filter(|(u, _)| u.contains("/items")).count(), 5);
+}
+
+#[test]
+fn oapif_open_options_are_rejected_on_other_vector_sources() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("in.geojson");
+    let output = dir.path().join("out.gpkg");
+    std::fs::write(&input, r#"{"type":"FeatureCollection","features":[]}"#).unwrap();
+    for option in ["CRS=EPSG:3857", "PAGE_SIZE=1000", "OAPIF_MAX_FEATURES=0", "OAPIF_SKIP_FEATURES=0"] {
+        let replies = session(&[call(1, "convert", &[input.to_str().unwrap(), output.to_str().unwrap(), "--oo", option])]);
+        assert_eq!(replies[&1]["result"]["isError"], true, "{}", replies[&1]);
+        assert!(replies[&1]["result"]["content"][0]["text"].as_str().unwrap().contains("OAPIF"));
+        assert!(!output.exists());
+    }
+}
+
+#[test]
+fn zonal_tool_computes_fractional_weighted_statistics() {
+    let dir = tempfile::tempdir().unwrap();
+    let zones = dir.path().join("zones.geojson");
+    let input = dir.path().join("values.tif");
+    let weights = dir.path().join("weights.tif");
+    let output = dir.path().join("statistics.geojson");
+    std::fs::write(&zones, r#"{"type":"Polygon","coordinates":[[[0.5,0],[2,0],[2,1],[0.5,1],[0.5,0]]]}"#).unwrap();
+    for (path, data) in [(&input, vec![10., 30.]), (&weights, vec![2., 4.])] {
+        let cfg = terrio::RasterConfig { cols: 2, rows: 1, cell_size: 1., data_type: terrio::DataType::F64, ..Default::default() };
+        let mut ds = terrio::RasterDataset::new(terrio::Raster::from_data(cfg, data).unwrap(), false);
+        ds.raster.crs.epsg = Some(4326);
+        ds.set_geo_transform([0., 1., 0., 1., 0., -1.]);
+        terrio::write_raster_dataset(&ds, path.to_str().unwrap(), &Default::default()).unwrap();
+    }
+    let replies = session(&[call(
+        1,
+        "zonal-stats",
+        &[
+            zones.to_str().unwrap(),
+            output.to_str().unwrap(),
+            "--raster",
+            input.to_str().unwrap(),
+            "--weights",
+            weights.to_str().unwrap(),
+            "--fractional",
+            "--prefix",
+            "v",
+            "--stats",
+            "count,weighted_mean,weighted_sum",
+        ],
+    )]);
+    assert_eq!(replies[&1]["result"]["isError"], false, "{}", replies[&1]);
+    let value: Value = serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+    assert_eq!(value["features"][0]["properties"]["v_b1_count"], 1.5);
+    assert_eq!(value["features"][0]["properties"]["v_b1_weighted_mean"], 26.);
+    assert_eq!(value["features"][0]["properties"]["v_b1_weighted_sum"], 130.);
+    let unused = dir.path().join("unweighted.geojson");
+    let missing = dir.path().join("missing.tif");
+    let replies = session(&[call(
+        1,
+        "zonal-stats",
+        &[
+            zones.to_str().unwrap(),
+            unused.to_str().unwrap(),
+            "--raster",
+            input.to_str().unwrap(),
+            "--weights",
+            missing.to_str().unwrap(),
+            "--stats",
+            "count",
+        ],
+    )]);
+    assert_eq!(replies[&1]["result"]["isError"], false, "{}", replies[&1]);
+}
+
+#[test]
+fn preview_returns_the_image_it_draws() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("grid.asc");
+    std::fs::write(&input, "ncols 2\nnrows 2\nxllcorner 0\nyllcorner 0\ncellsize 1\n1 2\n3 4\n").unwrap();
+    let named = dir.path().join("named.png");
+    let replies = session(&[
+        call(1, "preview", &[input.to_str().unwrap()]),
+        call(2, "preview", &[input.to_str().unwrap(), "-o", named.to_str().unwrap()]),
+        call(3, "preview", &[input.to_str().unwrap(), "-o", "-"]),
+    ]);
+    for id in [1, 2] {
+        let result = &replies[&id]["result"];
+        assert_eq!(result["isError"], false, "{result}");
+        let image = result["content"].as_array().unwrap().iter().find(|c| c["type"] == "image").expect("an image");
+        assert_eq!(image["mimeType"], "image/png");
+        assert!(image["data"].as_str().unwrap().starts_with("iVBORw0KGgo"));
+    }
+    assert!(named.exists());
+    assert_eq!(replies[&3]["result"]["isError"], true);
+}
+
+/// A failed redirected write must fail the command, rather than report truncated output as success.
+#[cfg(target_os = "linux")]
+#[test]
+fn crs_listing_propagates_output_errors() {
+    for json in [false, true] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_terrio"));
+        command.args(["list-crs", "3577"]);
+        if json {
+            command.arg("--json");
+        }
+        let full = std::fs::OpenOptions::new().write(true).open("/dev/full").unwrap();
+        let output = command.stdout(full).output().unwrap();
+        assert!(!output.status.success(), "json={json}");
+        assert!(String::from_utf8_lossy(&output.stderr).contains("space"), "{output:?}");
+    }
+}
+
+#[test]
+fn crs_tools_confine_grids_to_host_search_directories() {
+    let dir = tempfile::tempdir().unwrap();
+    let search = dir.path().join("search");
+    std::fs::create_dir(&search).unwrap();
+    // A 2x2 GTX: the geoid height at (0.25, 0.5) is exactly 22.5 m.
+    let mut bytes = Vec::new();
+    for value in [0.0f64, 0., 1., 1.] {
+        bytes.extend(value.to_be_bytes());
+    }
+    for value in [2i32, 2] {
+        bytes.extend(value.to_be_bytes());
+    }
+    for value in [10.0f32, 20., 30., 40.] {
+        bytes.extend(value.to_be_bytes());
+    }
+    let outside = dir.path().join("outside.gtx");
+    std::fs::write(&outside, &bytes).unwrap();
+    std::fs::write(search.join("inside.gtx"), &bytes).unwrap();
+    let definition = |grid: &str| format!("+proj=longlat +datum=WGS84 +geoidgrids={grid} +vunits=m");
+    let absolute = definition(outside.to_str().unwrap());
+    let named = definition("inside.gtx");
+    let coordinates = ["--to", "EPSG:4979", "--dim", "3", "0.25", "0.5", "100"];
+    let args = |crs: &str| {
+        let mut args = vec![crs.to_string()];
+        args.extend(coordinates.iter().map(|s| s.to_string()));
+        args
+    };
+    let direct = Command::new(env!("CARGO_BIN_EXE_terrio"))
+        .arg("crs")
+        .args(args(&absolute))
+        .env_remove("TERRIO_MCP_TOOL")
+        .env("TERRIO_NETWORK", "OFF")
+        .output()
+        .unwrap();
+    assert!(direct.status.success(), "{}", String::from_utf8_lossy(&direct.stderr));
+    assert!(String::from_utf8_lossy(&direct.stdout).contains("122.5"));
+    let absolute_args = args(&absolute);
+    let named_args = args(&named);
+    let replies = session_with_env(
+        &[
+            call(1, "crs", &absolute_args.iter().map(String::as_str).collect::<Vec<_>>()),
+            call(2, "crs", &named_args.iter().map(String::as_str).collect::<Vec<_>>()),
+        ],
+        &[("TERRIO_GRID_DIR", search.to_str().unwrap()), ("TERRIO_NETWORK", "OFF")],
+    );
+    assert_eq!(replies[&1]["result"]["isError"], true, "MCP read an arbitrary path-named grid");
+    assert!(replies[&1]["result"]["content"][0]["text"].as_str().unwrap().contains("cannot transform"));
+    assert_eq!(replies[&2]["result"]["isError"], false);
+    assert!(replies[&2]["result"]["content"][0]["text"].as_str().unwrap().contains("122.5"));
 }

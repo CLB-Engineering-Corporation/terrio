@@ -18,8 +18,7 @@ Transforms are `affine.Affine` objects, as in rasterio.
 from __future__ import annotations
 
 import warnings
-from collections.abc import Callable, Iterator, Sequence
-from contextlib import contextmanager
+from collections.abc import Callable, Sequence
 from numbers import Number
 from typing import Any
 
@@ -33,22 +32,12 @@ IDENTITY = Affine.identity()
 GDAL_IDENTITY = IDENTITY.to_gdal()
 
 
-@contextmanager
-def _quiet_mul() -> Iterator[None]:
-    """Silences affine's deprecation of `*` for matrix products.
-
-    Yields:
-        None.
-    """
-    with warnings.catch_warnings():
-        warnings.filterwarnings(
-            "ignore", "Use.*matmul instead of.*mul operator", category=PendingDeprecationWarning
-        )
-        yield
-
-
 def compose(a: Affine, b: Affine) -> Affine:
     """The matrix product `a * b` of two affine transforms.
+
+    Computed from the coefficients in the order affine uses, so the result is affine's to the
+    bit: affine 3 deprecates `*` with a warning that only a change of the process's warning
+    filters would silence, and affine 2 has no `@`.
 
     Args:
         a: The left transform.
@@ -57,13 +46,19 @@ def compose(a: Affine, b: Affine) -> Affine:
     Returns:
         Affine: The product.
     """
-    with _quiet_mul():
-        out: Affine = a * b
+    out: Affine = a.__class__(
+        a.a * b.a + a.b * b.d,
+        a.a * b.b + a.b * b.e,
+        a.a * b.c + a.b * b.f + a.c,
+        a.d * b.a + a.e * b.d,
+        a.d * b.b + a.e * b.e,
+        a.d * b.c + a.e * b.f + a.f,
+    )
     return out
 
 
 def apply(t: Affine, x: float, y: float) -> tuple[float, float]:
-    """Applies an affine transform to a point.
+    """Applies an affine transform to a point, `t * (x, y)`, from its coefficients (see `compose`).
 
     Args:
         t: The transform.
@@ -73,9 +68,7 @@ def apply(t: Affine, x: float, y: float) -> tuple[float, float]:
     Returns:
         tuple: The transformed `(x, y)`.
     """
-    with _quiet_mul():
-        rx, ry = t * (x, y)
-    return rx, ry
+    return x * t.a + y * t.b + t.c, x * t.d + y * t.e + t.f
 
 
 def tastes_like_gdal(seq: Sequence[float]) -> bool:
@@ -195,7 +188,7 @@ def _gcps_to_geotransform(
             g1 = (x1 - x0) / (p1 - p0)
             g5 = (y2 - y1) / (l2 - l1)
             return True, [x0 - p0 * g1, g1, 0.0, y0 - l0 * g5, 0.0, g5]
-    ps, ls, xs, ys = (list(c) for c in zip(*gcps))
+    ps, ls, xs, ys = (list(c) for c in zip(*gcps, strict=False))
     span = [max(v) - min(v) for v in (ps, ls, xs, ys)]
     if any(abs(d) < 1e-12 for d in span):
         return False, None
@@ -221,13 +214,27 @@ def _gcps_to_geotransform(
     if div == 0.0:
         return False, None
     fit = [
-        (slon * (sxx * syy - sxy * sxy) + slonx * (sy * sxy - sx * syy) + slony * (sx * sxy - sy * sxx)) / div,
-        (slon * (sy * sxy - sx * syy) + slonx * (n * syy - sy * sy) + slony * (sx * sy - sxy * n)) / div,
-        (slon * (sx * sxy - sy * sxx) + slonx * (sx * sy - n * sxy) + slony * (n * sxx - sx * sx)) / div,
-        (slat * (sxx * syy - sxy * sxy) + slatx * (sy * sxy - sx * syy) + slaty * (sx * sxy - sy * sxx)) / div,
-        (slat * (sy * sxy - sx * syy) + slatx * (n * syy - sy * sy) + slaty * (sx * sy - sxy * n)) / div,
-        (slat * (sx * sxy - sy * sxx) + slatx * (sx * sy - n * sxy) + slaty * (n * sxx - sx * sx)) / div,
-    ]  # fmt: skip
+        (
+            slon * (sxx * syy - sxy * sxy)
+            + slonx * (sy * sxy - sx * syy)
+            + slony * (sx * sxy - sy * sxx)
+        )
+        / div,
+        (slon * (sy * sxy - sx * syy) + slonx * (n * syy - sy * sy) + slony * (sx * sy - sxy * n))
+        / div,
+        (slon * (sx * sxy - sy * sxx) + slonx * (sx * sy - n * sxy) + slony * (n * sxx - sx * sx))
+        / div,
+        (
+            slat * (sxx * syy - sxy * sxy)
+            + slatx * (sy * sxy - sx * syy)
+            + slaty * (sx * sxy - sy * sxx)
+        )
+        / div,
+        (slat * (sy * sxy - sx * syy) + slatx * (n * syy - sy * sy) + slaty * (sx * sy - sxy * n))
+        / div,
+        (slat * (sx * sxy - sy * sxx) + slatx * (sx * sy - n * sxy) + slaty * (n * sxx - sx * sx))
+        / div,
+    ]
     # `geo` has no rotation: GDALInvGeoTransform's exact special case.
     inv_geo = [-geo[0] / geo[1], 1.0 / geo[1], 0.0, -geo[3] / geo[5], 0.0, 1.0 / geo[5]]
     gt = _compose_gt(_compose_gt(pl, fit), inv_geo)

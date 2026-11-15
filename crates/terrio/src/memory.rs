@@ -4,9 +4,9 @@
 //! A file name goes with the bytes: its extension tells the format, as a path's does, and its stem
 //! names vector layers.
 //!
-//! In native builds, the bytes go through a temporary directory and the file drivers, so every
-//! format reads and writes exactly as from files. WebAssembly builds have no file system and use
-//! in-memory codecs instead, for the formats that have one:
+//! Native reads use a temporary directory and the file drivers. Byte writes use shared codecs
+//! where needed to keep a standalone document or an explicit archive; other native writes use
+//! temporary files. WebAssembly uses in-memory codecs for the formats that have one:
 //!
 //! - reading: GeoTIFF, Esri ASCII grid, JPEG 2000 (JP2 and J2K), GeoPackage (vector layers and rasters), PMTiles and
 //!   MBTiles (raster and vector tiles), MVT tiles, GeoJSON, TopoJSON,
@@ -16,8 +16,8 @@
 //!   layers and rasters), PMTiles and MBTiles, GeoJSON, TopoJSON, FlatGeobuf, CSV, XLSX, GeoParquet, KML, KMZ, GML (without
 //!   its schema), GPX, DWG, DXF and Shapefile ZIP archives (`.shp.zip`).
 //!
-//! Formats made of several files (a shapefile's `.shp`, `.dbf`, `.prj`...) are written as a zip
-//! archive of them.
+//! Shapefile output requires `.shp.zip`; native MapInfo output requires `.mif.zip` or `.tab.zip`.
+//! GML byte output is a standalone document without its schema sidecar on every build.
 //!
 //! With the `gdal` feature, what terrio cannot read is opened by GDAL from memory, through its
 //! `/vsimem/` file system, and extensions terrio has no driver for are written by the GDAL
@@ -38,10 +38,143 @@ use wbvector::Layer;
 pub use crate::drivers::vector::geojson::parse as parse_geojson_layer;
 pub use crate::drivers::vector::shapefile::to_zip_bytes as write_shapefile_zip_bytes;
 
+#[cfg(test)]
+mod range_tests;
+
 /// Opens a dataset, raster or vector, from its bytes. `name` is a file name whose extension tells
 /// the format (`dem.tif`, `roads.fgb`, `parcels.zip`).
 pub fn open_bytes(bytes: Vec<u8>, name: &str) -> Result<Dataset> {
     open_bytes_of_kind(bytes, name, None)
+}
+
+/// A vector filename extension suggested by the shared byte identifiers, without opening a
+/// dataset. Unrecognizable content, including unsigned CSV, needs a filename from the caller.
+/// Identification is only a hint: the ordinary reader still validates the data and driver policy.
+/// The pyogrio compatibility caller targets Pyogrio 0.13.0 / GDAL 3.12.2.
+pub fn suggest_vector_extension(bytes: &[u8]) -> Option<&'static str> {
+    suggest_vector_extension_checked(bytes).ok().flatten()
+}
+
+/// Like [`suggest_vector_extension`], preserving archive resource-limit errors for callers
+/// that must distinguish a refusal from unsigned content. No archive member is decompressed.
+pub fn suggest_vector_extension_checked(bytes: &[u8]) -> Result<Option<&'static str>> {
+    if bytes.starts_with(b"PK\x03\x04") || bytes.starts_with(b"PK\x05\x06") {
+        let archive = match crate::vfs::LimitedZip::open(std::io::Cursor::new(bytes)) {
+            Ok(archive) => archive,
+            Err(error) if error.is_resource_refusal() => return Err(error),
+            // Keep the generic ZIP hint so the ordinary reader supplies the diagnostic.
+            Err(_) => return Ok(Some("zip")),
+        };
+        let (mut content_types, mut workbook, mut kml) = (false, false, false);
+        for name in archive.archive().file_names().flatten() {
+            content_types |= name == "[Content_Types].xml";
+            workbook |= name == "xl/workbook.xml";
+            kml |= name.eq_ignore_ascii_case("doc.kml");
+        }
+        return Ok(Some(if content_types && workbook {
+            "xlsx"
+        } else if kml {
+            "kmz"
+        } else {
+            "zip"
+        }));
+    }
+    Ok(vector_extension_hint(bytes))
+}
+
+/// Non-archive byte hints shared by the checked and compatibility probes.
+fn vector_extension_hint(bytes: &[u8]) -> Option<&'static str> {
+    // SQLite's signature alone cannot distinguish GeoPackage from MBTiles (whose optional
+    // application id is usually zero). Anonymous ambiguous databases need a filename.
+    if bytes.starts_with(b"SQLite format 3\0") && !crate::inspection::is_geopackage_header(bytes) {
+        return None;
+    }
+    // DXF group codes and SECTION are ASCII, but comments and entity strings may use
+    // a legacy codepage. Inspect only the leading pairs without decoding the body.
+    let prefix = bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(bytes).trim_ascii_start();
+    if prefix.starts_with(b"0") || prefix.starts_with(b"999") {
+        let mut lines = prefix.split(|byte| *byte == b'\n').map(<[u8]>::trim_ascii);
+        while let (Some(code), Some(value)) = (lines.next(), lines.next()) {
+            if code == b"999" {
+                continue;
+            }
+            if code == b"0" && value.eq_ignore_ascii_case(b"SECTION") {
+                return Some("dxf");
+            }
+            break;
+        }
+    }
+    let text = std::str::from_utf8(bytes).ok().map(|text| text.trim_start_matches('\u{feff}').trim_start());
+    let record = |text: &str| {
+        matches!(
+            crate::inspection::root_json_type(text).as_deref(),
+            Some("Feature" | "Point" | "MultiPoint" | "LineString" | "MultiLineString" | "Polygon" | "MultiPolygon" | "GeometryCollection")
+        )
+    };
+    if let Some(text) = text
+        && text.starts_with('{')
+        && record(text)
+    {
+        let mut values = serde_json::Deserializer::from_str(text).into_iter::<serde::de::IgnoredAny>();
+        if values.next().is_some_and(|value| value.is_ok()) {
+            let remaining = text[values.byte_offset()..].trim_start_matches([' ', '\t']);
+            if remaining.starts_with(['\r', '\n']) && record(remaining.trim_start()) {
+                return Some("geojsonl");
+            }
+        }
+    }
+    let driver = crate::inspection::identify_bytes_unjudged(bytes, "")
+        .and_then(|identified| crate::formats::VectorDriver::from_name(&identified.driver))
+        .or_else(|| {
+            // Anonymous buffers contain the complete document. A bounded header can end
+            // inside features before a root type placed last; inspect that root before
+            // falling back to format-like strings inside properties.
+            let prefix = bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(bytes);
+            let first = prefix.iter().copied().take(16 * 1024).find(|byte| !byte.is_ascii_whitespace());
+            if !matches!(first, Some(b'{' | 0x1e)) {
+                return None;
+            }
+            let text = std::str::from_utf8(bytes).ok()?.trim_start_matches('\u{feff}').trim_start();
+            let sequence = text.starts_with('\u{1e}');
+            let json = text.trim_start_matches('\u{1e}').trim_start();
+            if !json.starts_with('{') {
+                return None;
+            }
+            use crate::formats::VectorDriver;
+            match crate::inspection::root_json_type(json)?.as_str() {
+                "Topology" => Some(VectorDriver::TopoJSON),
+                "CityJSON" => Some(VectorDriver::CityJSON),
+                "FeatureCollection" | "Feature" | "Point" | "MultiPoint" | "LineString" | "MultiLineString" | "Polygon"
+                | "MultiPolygon" | "GeometryCollection" => Some(if sequence { VectorDriver::GeoJSONSeq } else { VectorDriver::GeoJSON }),
+                _ => None,
+            }
+        })
+        .or_else(|| crate::formats::identify_bytes("", bytes).by_content.as_deref().and_then(crate::formats::VectorDriver::from_name))
+        .or_else(|| codec::vector_driver(bytes, ""))?;
+    // Anonymous buffers contain the whole object. Require the binary envelope rather than
+    // a prefix that could also be a CSV column name; the reader still validates the payload.
+    match driver {
+        crate::formats::VectorDriver::FlatGeobuf
+            if bytes.len() < 8
+                || !bytes.starts_with(b"fgb")
+                || !matches!(bytes[3], 2 | 3)
+                || bytes.get(4..7) != Some(b"fgb".as_slice()) =>
+        {
+            return None;
+        }
+        crate::formats::VectorDriver::Parquet => {
+            if bytes.len() < 12 || !bytes.starts_with(b"PAR1") || !bytes.ends_with(b"PAR1") {
+                return None;
+            }
+            let metadata_length = u32::from_le_bytes(bytes[bytes.len() - 8..bytes.len() - 4].try_into().ok()?);
+            if usize::try_from(metadata_length).ok()? > bytes.len() - 12 {
+                return None;
+            }
+        }
+        crate::formats::VectorDriver::OSM if crate::drivers::vector::citygml::is_xml_prefix(bytes) => return Some("osm"),
+        _ => {}
+    }
+    driver.info().extensions.first().copied()
 }
 
 /// [`open_bytes`] for a dataset of `kind`: its name and content must pass that kind's allowed
@@ -51,6 +184,7 @@ fn open_bytes_of_kind(bytes: Vec<u8>, name: &str, kind: Option<Kind>) -> Result<
     {
         let (_dir, path) = native::spill(&bytes, name)?;
         crate::formats::check_allowed(&path, kind)?;
+        check_vector_archive_filename(&bytes, name)?;
         let result = crate::dataset::open_native(&path);
         // What terrio cannot read, GDAL reads from memory (`/vsimem/`).
         #[cfg(feature = "gdal")]
@@ -60,7 +194,11 @@ fn open_bytes_of_kind(bytes: Vec<u8>, name: &str, kind: Option<Kind>) -> Result<
     #[cfg(target_family = "wasm")]
     {
         crate::formats::check_allowed_bytes(name, &bytes, kind)?;
-        codec::open(bytes, name, &VectorOpenOptions::default())
+        let ds = codec::open(bytes, name, &VectorOpenOptions::default())?;
+        if let Dataset::Raster(raster) = &ds {
+            crate::declared::check_dataset(raster)?;
+        }
+        Ok(ds)
     }
 }
 
@@ -70,7 +208,9 @@ pub fn open_raster_bytes(bytes: Vec<u8>, name: &str) -> Result<RasterDataset> {
     #[cfg(feature = "hecras")]
     if crate::drivers::hdf5::parse_subdataset(name).is_none() && crate::drivers::hecras::driver::is_hecras_bytes(&bytes) {
         crate::formats::check_allowed_bytes(name, &bytes, Some(Kind::Raster))?;
-        return crate::drivers::hdf5::read_bytes(bytes, name, None);
+        let ds = crate::drivers::hdf5::read_bytes(bytes, name, None)?;
+        crate::declared::check_dataset(&ds)?;
+        return Ok(ds);
     }
     match open_bytes_of_kind(bytes, name, Some(Kind::Raster))? {
         Dataset::Raster(r) => Ok(r),
@@ -81,6 +221,13 @@ pub fn open_raster_bytes(bytes: Vec<u8>, name: &str) -> Result<RasterDataset> {
 /// Opens a raster from its bytes for reading by window. GeoTIFFs are decoded one window at a time;
 /// other formats are decoded whole.
 pub fn open_raster_lazy_bytes(bytes: Vec<u8>, name: &str) -> Result<LazyRaster> {
+    let r = open_raster_lazy_bytes_unchecked(bytes, name)?;
+    // What it declares (see `crate::declared`), from its header when it is read by window.
+    crate::declared::check_lazy(&r)?;
+    Ok(r)
+}
+
+fn open_raster_lazy_bytes_unchecked(bytes: Vec<u8>, name: &str) -> Result<LazyRaster> {
     // Tile archives, JPEG 2000, GRIB and TIFF are decoded from memory, without a file to check.
     crate::formats::check_allowed_bytes(name, &bytes, Some(Kind::Raster))?;
     if let Some(kind) = crate::tiles::archive_kind(name) {
@@ -113,6 +260,22 @@ pub fn open_raster_lazy_bytes(bytes: Vec<u8>, name: &str) -> Result<LazyRaster> 
     open_raster_bytes(bytes, name).map(LazyRaster::from)
 }
 
+/// Backwards-compatible name for the input opened by the shared translate policy.
+pub use crate::ops::translate::OpenedRaster as OpenedRasterBytes;
+
+/// [`open_raster_lazy_bytes`], falling back to [`open_raster_bytes`] for a TIFF the lazy reader
+/// refuses (as `terrio translate` falls back to reading a file whole), without copying the bytes:
+/// the lazy reader shares them, and they are taken back from it when it fails. Invalid arguments
+/// and resource refusals of the lazy reader are kept, as are the errors of other formats, which
+/// the whole decode would read with the same decoder.
+///
+/// # Errors
+///
+/// As [`open_raster_lazy_bytes`], or as [`open_raster_bytes`] after a fallback.
+pub fn open_raster_lazy_bytes_or_whole(bytes: Vec<u8>, name: &str) -> Result<OpenedRasterBytes> {
+    crate::ops::translate::open_bytes(bytes, name, crate::ops::overview::OverviewSelection::Auto)
+}
+
 /// Opens a Zarr store (or GeoZarr) from its files: `(path, bytes)` pairs, paths relative to the
 /// store's directory or its parent (`.zgroup`, `dem/.zarray`, `dem/0.0`...), as a key-value store
 /// holds them.
@@ -122,7 +285,9 @@ pub fn open_zarr_store(files: Vec<(String, Vec<u8>)>) -> Result<RasterDataset> {
     // Opened as Zarr by its caller: only if the process-wide raster allow-list has Zarr, as a
     // de-registered GDAL driver opens no store.
     crate::formats::check_driver_allowed("Zarr", if root.is_empty() { "the Zarr store" } else { &root }, Kind::Raster)?;
-    codec::open_zarr_store(files, &root)
+    let ds = codec::open_zarr_store(files, &root)?;
+    crate::declared::check_dataset(&ds)?;
+    Ok(ds)
 }
 
 /// Opens a vector dataset from its bytes.
@@ -131,6 +296,7 @@ pub fn open_vector_bytes(bytes: Vec<u8>, name: &str, options: &VectorOpenOptions
     {
         let (_dir, path) = native::spill(&bytes, name)?;
         crate::formats::check_allowed(&path, Some(Kind::Vector))?;
+        check_vector_archive_filename(&bytes, name)?;
         let result = crate::dataset::open_vector_native(&path, options);
         #[cfg(feature = "gdal")]
         let result = crate::dataset::gdal_fallback(&path, result, |_| crate::gdal_backend::open_vector_bytes(bytes, name, options));
@@ -144,6 +310,16 @@ pub fn open_vector_bytes(bytes: Vec<u8>, name: &str, options: &VectorOpenOptions
         Dataset::Vector(v) => Ok(v),
         Dataset::Raster(_) => Err(Error::Unsupported(format!("'{name}' is a raster, not a vector dataset"))),
     }
+}
+
+/// Refuses a multi-file archive mislabeled as a single vector document.
+fn check_vector_archive_filename(bytes: &[u8], name: &str) -> Result<()> {
+    if codec::is_zip(bytes) && matches!(crate::formats::extension(name).as_deref(), Some("gml" | "mif" | "tab")) {
+        return Err(Error::InvalidArgument(format!(
+            "'{name}' contains a ZIP archive: use a .zip filename to read its dataset and sidecars"
+        )));
+    }
+    Ok(())
 }
 
 /// Writes rasters into one netCDF-4 file in memory, each in its group, as
@@ -175,6 +351,16 @@ pub fn write_raster_bytes(ds: &RasterDataset, name: &str, options: &RasterWriteO
             return Err(Error::InvalidArgument(format!("cannot tell the output format of '{name}': give it explicitly")));
         }
     };
+    // JP2 byte exports, including WASM, retain the source's absent transform just as
+    // file conversion does. An explicit output transform/GEOREFERENCED still wins.
+    let mut jp2_options;
+    let options = if driver == RasterDriver::JP2 {
+        jp2_options = options.clone();
+        crate::drivers::common::keep_unreferenced(&mut jp2_options, name, ds.geotransform_present.unwrap_or(true));
+        &jp2_options
+    } else {
+        options
+    };
     // A Zarr store is a directory: written in memory and zipped, on every platform.
     if driver == RasterDriver::Zarr {
         let stem = std::path::Path::new(name).file_stem().and_then(|s| s.to_str()).unwrap_or("raster");
@@ -198,9 +384,20 @@ pub fn write_raster_bytes(ds: &RasterDataset, name: &str, options: &RasterWriteO
 /// Shapefile driver). The result is `application/zip` on native and WASM alike.
 /// Bare `.shp` names are refused: use [`crate::write_vector`] for filesystem members.
 /// See [`write_shapefile_zip_bytes`] for supported data and refusals.
+/// GML bytes are one XML document without an XSD sidecar; use a `.gml` filename.
+/// Native MapInfo bytes require `.mif.zip` or `.tab.zip`. A `.zip` name with the MapInfo driver
+/// defaults to MIF members. MapInfo byte writing remains unavailable in WebAssembly.
 pub fn write_vector_bytes(layers: &[Layer], name: &str, options: &VectorWriteOptions) -> Result<Vec<u8>> {
+    let archive = name.to_ascii_lowercase().ends_with(".zip");
     let requested = options.driver.or_else(|| {
-        if name.to_ascii_lowercase().ends_with(".shp.zip") { Some(VectorDriver::Shapefile) } else { VectorDriver::for_extension(name) }
+        if archive {
+            match VectorDriver::for_extension(&name[..name.len() - 4]) {
+                Some(driver @ (VectorDriver::Shapefile | VectorDriver::MapInfo | VectorDriver::GML)) => Some(driver),
+                _ => VectorDriver::for_extension(name),
+            }
+        } else {
+            VectorDriver::for_extension(name)
+        }
     });
     let driver = match requested {
         Some(d) if !d.written_through_gdal() => d,
@@ -214,8 +411,27 @@ pub fn write_vector_bytes(layers: &[Layer], name: &str, options: &VectorWriteOpt
         }
     };
     crate::dataset::ensure_vector_options_apply(options, Some(driver))?;
+    if driver == VectorDriver::GML {
+        if archive {
+            return Err(Error::InvalidArgument(
+                "GML byte output is one XML document: use a .gml filename; use write_vector for a schema sidecar".into(),
+            ));
+        }
+        crate::formats::check_driver_allowed(driver.name(), name, Kind::Vector)?;
+        return codec::write_vector(layers, driver, options);
+    }
+    #[cfg(target_family = "wasm")]
+    if driver == VectorDriver::MapInfo {
+        return Err(Error::Unsupported("MapInfo byte output is unavailable in WebAssembly".into()));
+    }
+    if driver == VectorDriver::MapInfo && !archive {
+        let extension = if crate::formats::extension(name).as_deref() == Some("tab") { "tab" } else { "mif" };
+        return Err(Error::InvalidArgument(format!(
+            "MapInfo bytes are a ZIP archive: use a .{extension}.zip filename (MIME application/zip)"
+        )));
+    }
     if driver == VectorDriver::Shapefile {
-        if !name.to_ascii_lowercase().ends_with(".zip") {
+        if !archive {
             return Err(Error::InvalidArgument("Shapefile bytes are a ZIP archive: use a .shp.zip filename (MIME application/zip)".into()));
         }
         let [layer] = layers else {
@@ -229,7 +445,14 @@ pub fn write_vector_bytes(layers: &[Layer], name: &str, options: &VectorWriteOpt
     #[cfg(not(target_family = "wasm"))]
     {
         let dir = native::temp_dir()?;
-        let path = dir.path().join(native::file_name(name, driver.info().extensions.first().copied().unwrap_or("dat")));
+        let member_name = if driver == VectorDriver::MapInfo {
+            let stem = &name[..name.len() - 4];
+            let member = native::file_name(stem, "mif");
+            if matches!(crate::formats::extension(&member).as_deref(), Some("mif" | "tab")) { member } else { format!("{member}.mif") }
+        } else {
+            name.to_string()
+        };
+        let path = dir.path().join(native::file_name(&member_name, driver.info().extensions.first().copied().unwrap_or("dat")));
         let path = path.to_str().ok_or_else(|| Error::InvalidArgument(format!("invalid file name '{name}'")))?;
         crate::write_vector(layers, path, &VectorWriteOptions { driver: Some(driver), ..options.clone() })?;
         native::collect(dir.path(), path)
@@ -238,6 +461,7 @@ pub fn write_vector_bytes(layers: &[Layer], name: &str, options: &VectorWriteOpt
     {
         let mut options = options.clone();
         options.xlsx = options.xlsx.for_name(name);
+        options.csv = crate::drivers::vector::csv::file_options(name, &options.csv);
         codec::write_vector(layers, driver, &options)
     }
 }
@@ -272,7 +496,7 @@ mod native {
     }
 
     /// The bytes of what a driver wrote: the file itself, or a zip archive of every file written
-    /// when there are several (a shapefile and its sidecars).
+    /// when there are several (a MapInfo table and its sidecars).
     pub(super) fn collect(dir: &Path, main: &str) -> Result<Vec<u8>> {
         let mut files = Vec::new();
         for entry in std::fs::read_dir(dir)? {
@@ -302,19 +526,19 @@ mod native {
 #[cfg_attr(not(target_family = "wasm"), allow(dead_code))]
 pub(crate) mod codec {
     use super::*;
-    use std::io::{Cursor, Read};
+    use std::io::Cursor;
 
     /// Whether the bytes start with a TIFF or BigTIFF signature.
     pub(crate) fn is_tiff(b: &[u8]) -> bool {
         matches!(b.get(..4), Some(b"II*\0" | b"MM\0*" | b"II+\0" | b"MM\0+"))
     }
 
-    fn is_zip(b: &[u8]) -> bool {
+    pub(super) fn is_zip(b: &[u8]) -> bool {
         b.starts_with(b"PK\x03\x04") || b.starts_with(b"PK\x05\x06")
     }
 
     /// The vector driver of a file, by its extension or, without one, its first bytes.
-    fn vector_driver(bytes: &[u8], name: &str) -> Option<VectorDriver> {
+    pub(super) fn vector_driver(bytes: &[u8], name: &str) -> Option<VectorDriver> {
         let json = bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(bytes).trim_ascii_start();
         if json.starts_with(b"{")
             && let Ok(text) = std::str::from_utf8(json)
@@ -375,6 +599,9 @@ pub(crate) mod codec {
 
     /// Opens a dataset from bytes with the in-memory codecs.
     pub(crate) fn open(bytes: Vec<u8>, name: &str, options: &VectorOpenOptions) -> Result<Dataset> {
+        // Bytes never designate a service, even when their caller-supplied label does.
+        options.oapif.validate_source("in-memory dataset")?;
+        check_vector_archive_filename(&bytes, name)?;
         // Formats this build leaves out, by their extension.
         if let Some(feature) = RasterDriver::for_extension(name).and_then(RasterDriver::missing_feature) {
             return Err(Error::disabled(feature));
@@ -406,7 +633,7 @@ pub(crate) mod codec {
             let driver = VectorDriver::HECRAS;
             let layers = crate::drivers::vector::read_bytes(bytes, name, driver, options)?.unwrap_or_default();
             let layers: Vec<Layer> = layers.into_iter().map(|l| crate::dataset::fix_layer(l, name, driver)).collect();
-            return finish_vector(layers, driver, options);
+            return finish_vector(layers, name, driver, options);
         }
         #[cfg(feature = "netcdf-hdf5")]
         if crate::drivers::hdf5::signature_offset_in(&bytes).is_some() {
@@ -431,7 +658,7 @@ pub(crate) mod codec {
         #[cfg(feature = "tiles")]
         if (ext == "mvt" || ext == "gz" || ext == "pbf") && crate::tiles::is_mvt(&bytes) {
             let layers = crate::tiles::vector::read_tile_file(&bytes, name, &options.tiles)?;
-            return Ok(Dataset::Vector(crate::dataset::finish_vector(layers, name, VectorDriver::MVT)));
+            return finish_vector(layers, name, VectorDriver::MVT, options);
         }
         if bytes.starts_with(b"SQLite format 3\0") {
             #[cfg(feature = "sqlite")]
@@ -460,6 +687,7 @@ pub(crate) mod codec {
             return open_zip(&bytes, name, options);
         }
         if RasterDriver::for_extension(name) == Some(RasterDriver::AAIGrid) {
+            crate::drivers::declared_header::check_ascii_bytes(&bytes)?;
             let raster = wbraster::formats::esri_ascii::parse(Cursor::new(&bytes), name)?;
             return Ok(Dataset::Raster(RasterDataset::with_driver(raster, RasterDriver::AAIGrid, true)));
         }
@@ -469,7 +697,7 @@ pub(crate) mod codec {
         if matches!(driver, VectorDriver::KML | VectorDriver::KMZ) {
             let (layers, style_table) = crate::drivers::vector::read_kml_bytes(bytes, name, driver)?;
             let layers: Vec<Layer> = layers.into_iter().map(|l| crate::dataset::fix_layer(l, name, driver)).collect();
-            return finish_vector(layers, driver, options).map(|d| match d {
+            return finish_vector(layers, name, driver, options).map(|d| match d {
                 Dataset::Vector(v) => Dataset::Vector(VectorDataset { style_table, ..v }),
                 raster => raster,
             });
@@ -483,27 +711,30 @@ pub(crate) mod codec {
             )));
         };
         let layers: Vec<Layer> = layers.into_iter().map(|l| crate::dataset::fix_layer(l, name, driver)).collect();
-        finish_vector(layers, driver, options)
+        finish_vector(layers, name, driver, options)
     }
 
     /// Opens the main dataset of a zip archive held in memory.
+    ///
+    /// Its members are read within the archive limits (`crate::vfs::ZipLimits`), as `/vsizip/`
+    /// reads the same archive on disk.
     fn open_zip(bytes: &[u8], name: &str, options: &VectorOpenOptions) -> Result<Dataset> {
-        let mut zip = zip::ZipArchive::new(Cursor::new(bytes))?;
+        let mut zip = crate::vfs::LimitedZip::open(Cursor::new(bytes))?;
         let mut names = Vec::new();
-        for i in 0..zip.len() {
-            let f = zip.by_index(i)?;
-            if f.is_file() {
-                names.push(f.name()?.to_string());
+        for i in 0..zip.archive().len() {
+            let (member, _, is_file) = zip.entry(i)?;
+            if is_file {
+                names.push(member);
             }
         }
         names.sort();
         // A Zarr store: its files, read under a directory in memory.
         if let Some(root) = zarr_root(&names) {
+            // Only the store's files: other members do not count toward the limits.
+            let prefix = format!("{root}/");
             let mut files = Vec::with_capacity(names.len());
-            for n in &names {
-                let mut b = Vec::new();
-                zip.by_name(n)?.read_to_end(&mut b)?;
-                files.push((n.clone(), b));
+            for n in names.iter().filter(|n| root.is_empty() || n.trim_start_matches("./").starts_with(&prefix)) {
+                files.push((n.clone(), zip.read_name(n, u64::MAX)?));
             }
             return open_zarr_store(files, &root).map(Dataset::Raster);
         }
@@ -512,33 +743,48 @@ pub(crate) mod codec {
             .find_map(|ext| names.iter().find(|n| extension(n.as_str()).as_deref() == Some(*ext)))
             .cloned()
             .ok_or_else(|| Error::Unsupported(format!("no dataset found in '{name}'")))?;
-        let mut member = Vec::new();
-        zip.by_name(&main)?.read_to_end(&mut member)?;
+        let member = zip.read_name(&main, u64::MAX)?;
         let driver = VectorDriver::for_extension(&main);
         if let Some(driver @ (VectorDriver::Shapefile | VectorDriver::MapInfo)) = driver {
             // The sidecars: the members named as the main file, with another extension.
             let base = &main[..main.len() - extension(&main).map_or(0, |e| e.len() + 1)];
             let zip = std::cell::RefCell::new(zip);
+            // A sidecar past the archive limits refuses the dataset, rather than opening it without.
+            let refused = std::cell::RefCell::new(None);
             let sidecar = |ext: &str| -> Option<Vec<u8>> {
                 let member = names.iter().find(|n| {
                     n.len() == base.len() + ext.len() + 1 && n.starts_with(base) && extension(n.as_str()).as_deref() == Some(ext)
                 })?;
-                let mut out = Vec::new();
-                zip.borrow_mut().by_name(member).ok()?.read_to_end(&mut out).ok()?;
-                Some(out)
+                match zip.borrow_mut().read_name(member, u64::MAX) {
+                    Ok(bytes) => Some(bytes),
+                    Err(e) if e.is_resource_refusal() => {
+                        refused.borrow_mut().get_or_insert(e);
+                        None
+                    }
+                    Err(error) => {
+                        if ext == "prj" {
+                            crate::drivers::vector::shapefile::warn_prj_read_error(member, &error);
+                        }
+                        None
+                    }
+                }
             };
-            let layers = crate::drivers::vector::read_parts(&member, &main, driver, &sidecar, options)?;
+            let layers = crate::drivers::vector::read_parts(&member, &main, driver, &sidecar, options);
+            if let Some(e) = refused.into_inner() {
+                return Err(e);
+            }
+            let layers = layers?;
             let layers: Vec<Layer> = layers.into_iter().map(|l| crate::dataset::fix_layer(l, &main, driver)).collect();
-            return finish_vector(layers, driver, options);
+            return finish_vector(layers, &main, driver, options);
         }
-        let mut ds = open(member, &main, options)?;
+        // An archive in the member shares what is left of this one's limits.
+        let mut ds = zip.nested(|| open(member, &main, options))?;
         // A raster's `.aux.xml` sidecar (a JPEG 2000's nodata value).
         let aux = format!("{main}.aux.xml");
         if let Dataset::Raster(r) = &mut ds
             && names.contains(&aux)
         {
-            let mut xml = String::new();
-            zip.by_name(&aux)?.read_to_string(&mut xml)?;
+            let xml = String::from_utf8(zip.read_name(&aux, u64::MAX)?).map_err(|_| Error::InvalidData(format!("'{aux}' is not UTF-8")))?;
             crate::drivers::nodata::apply(crate::drivers::common::parse_pam(&xml), r);
         }
         Ok(ds)
@@ -561,8 +807,8 @@ pub(crate) mod codec {
     /// directory among them), as GDAL reads a store directory.
     #[cfg(feature = "zarr")]
     pub(crate) fn open_zarr_store(files: Vec<(String, Vec<u8>)>, root: &str) -> Result<RasterDataset> {
-        let mount = crate::memfs::Mount::new(files.into_iter().map(|(n, b)| (n.trim_start_matches("./").to_string(), b)));
-        let dir = if root.is_empty() { mount.path().to_path_buf() } else { mount.path().join(root) };
+        let mount = crate::memfs::Mount::new(files)?;
+        let dir = mount.join(root)?;
         crate::drivers::zarr::read(&dir)
     }
 
@@ -575,8 +821,8 @@ pub(crate) mod codec {
     /// named `<name>.zarr`).
     #[cfg(feature = "zarr")]
     fn write_zarr(ds: &RasterDataset, options: &RasterWriteOptions, name: &str) -> Result<Vec<u8>> {
-        let mount = crate::memfs::Mount::new(std::iter::empty());
-        let dir = mount.path().join(format!("{name}.zarr"));
+        let mount = crate::memfs::Mount::new(std::iter::empty())?;
+        let dir = mount.join(&format!("{name}.zarr"))?;
         crate::drivers::zarr::write_with(
             &ds.raster,
             ds.nodata(),
@@ -595,13 +841,14 @@ pub(crate) mod codec {
     }
 
     /// Keeps the layers the options ask for.
-    fn finish_vector(layers: Vec<Layer>, driver: VectorDriver, options: &VectorOpenOptions) -> Result<Dataset> {
+    pub(super) fn finish_vector(layers: Vec<Layer>, name: &str, driver: VectorDriver, options: &VectorOpenOptions) -> Result<Dataset> {
         let names: Vec<String> = layers.iter().map(|l| l.name.clone()).collect();
-        let layers: Vec<Layer> =
-            if options.layers.is_empty() { layers } else { layers.into_iter().filter(|l| options.layers.contains(&l.name)).collect() };
-        if layers.is_empty() {
+        let mut layers = crate::dataset::select_layers(layers, name, options)?;
+        // Preserve empty MVT datasets; explicit missing selections are checked above.
+        if layers.is_empty() && driver != VectorDriver::MVT {
             return Err(Error::InvalidArgument(format!("no layer named {} (layers: {})", options.layers.join(", "), names.join(", "))));
         }
+        layers.iter_mut().for_each(|layer| options.keep_range(layer));
         Ok(Dataset::Vector(VectorDataset::new(layers, driver)))
     }
 
@@ -636,7 +883,14 @@ pub(crate) mod codec {
             RasterDriver::GPKG => crate::drivers::gpkg::to_bytes(&ds.raster, ds.nodata(), table, options.compression.as_deref()),
             #[cfg(feature = "jp2")]
             RasterDriver::JP2 => {
-                let jp2 = crate::drivers::jp2::to_bytes(&ds.raster)?;
+                let inherited = options.inherited_from(ds, Some(driver));
+                let jp2 = crate::drivers::jp2::to_bytes(
+                    &ds.raster,
+                    crate::drivers::common::georeferenced(&inherited.creation_options),
+                    inherited.geo_transform,
+                    &inherited.band_metadata,
+                    &inherited.creation_options,
+                )?;
                 // The nodata value goes to a `.aux.xml` sidecar, the two files zipped as the file
                 // drivers' output is.
                 let Some(xml) = crate::drivers::common::pam_xml(None, ds.nodata(), ds.raster.bands) else { return Ok(jp2) };
@@ -698,9 +952,398 @@ pub(crate) mod codec {
 
 #[cfg(test)]
 mod tests {
+    /// Documents of another kind are refused by file-backed and in-memory codecs alike.
+    #[test]
+    fn wrong_vector_documents_are_not_empty_datasets() {
+        for (name, bytes) in [
+            ("wrong.kml", b"<gpx/>".as_slice()),
+            ("wrong.gpx", b"<kml/>".as_slice()),
+            ("wrong.geojsonl", br#"{"type":"FeatureCollection","features":[]}"#.as_slice()),
+            ("wrong.geojsonl", br#"{"hello":"world"}"#.as_slice()),
+        ] {
+            for result in [
+                open_vector_bytes(bytes.to_vec(), name, &Default::default()).map(|_| ()),
+                codec::open(bytes.to_vec(), name, &Default::default()).map(|_| ()),
+            ] {
+                let error = result.unwrap_err();
+                assert!(crate::drivers::vector::is_document_error(&error), "{name}: {error}");
+            }
+        }
+    }
+
+    /// Reference: GDAL 3.13.3. The WASM codec and native writer use the requested output grid.
+    #[test]
+    #[cfg(feature = "jp2")]
+    fn jp2_codec_applies_explicit_output_transform() {
+        let raster = crate::Raster::from_data_native(
+            crate::RasterConfig { cols: 32, rows: 24, bands: 1, data_type: crate::DataType::U8, ..Default::default() },
+            crate::raster::RasterData::U8(vec![7; 32 * 24]),
+        )
+        .unwrap();
+        let mut ds = crate::RasterDataset::new(raster, false);
+        ds.geotransform_present = Some(false);
+        let transform = [500000.0, 10.0, 0.0, 4600000.0, 0.0, -10.0];
+        let options = crate::RasterWriteOptions { geo_transform: Some(transform), ..Default::default() };
+        let codec_bytes = super::codec::write_raster(&ds, crate::formats::RasterDriver::JP2, &options, "grid").unwrap();
+        let file_bytes = super::write_raster_bytes(&ds, "grid.jp2", &options).unwrap();
+        for bytes in [codec_bytes, file_bytes] {
+            let output = crate::drivers::jp2::read_bytes(&bytes).unwrap();
+            assert_eq!(output.geotransform_present, Some(true));
+            assert_eq!(output.geo_transform(), transform);
+            assert_eq!(output.raster.data.to_f64_vec(), vec![7.0; 32 * 24]);
+        }
+        for transform in [[500000.0, 10.0, 1.0, 4600000.0, 2.0, -10.0], [500000.0, 10.0, 0.0, 4600000.0, 0.0, 10.0]] {
+            let options = crate::RasterWriteOptions { geo_transform: Some(transform), ..Default::default() };
+            let bytes = super::codec::write_raster(&ds, crate::formats::RasterDriver::JP2, &options, "grid").unwrap();
+            let output = crate::drivers::jp2::read_bytes(&bytes).unwrap();
+            assert_eq!(output.geo_transform(), transform);
+            assert_eq!(output.raster.data.to_f64_vec(), vec![7.0; 32 * 24]);
+        }
+    }
+
     use super::*;
     use wbraster::raster::RasterData;
     use wbraster::{DataType, Raster};
+
+    #[test]
+    fn empty_mvt_keeps_an_empty_dataset_without_a_layer_selection() {
+        let dataset = codec::finish_vector(Vec::new(), "empty.mvt", VectorDriver::MVT, &Default::default()).unwrap();
+        assert!(matches!(dataset, Dataset::Vector(dataset) if dataset.layers.is_empty()));
+        let options = VectorOpenOptions { layers: vec!["missing".into()], ..Default::default() };
+        let error = codec::finish_vector(Vec::new(), "empty.mvt", VectorDriver::MVT, &options).unwrap_err();
+        assert!(matches!(error, Error::InvalidArgument(message) if message.contains("no layer named missing")));
+    }
+
+    fn packaging_layer() -> Layer {
+        parse_geojson_layer(
+            br#"{"type":"FeatureCollection","name":"points","features":[{"type":"Feature","properties":{"name":"first","n":1},"geometry":{"type":"Point","coordinates":[10,46]}},{"type":"Feature","properties":{"name":"second","n":2},"geometry":{"type":"Point","coordinates":[11,46]}}]}"#,
+            "points",
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn gml_bytes_are_a_document_under_their_filename() {
+        let bytes = write_vector_bytes(&[packaging_layer()], "points.gml", &Default::default()).unwrap();
+        assert!(!bytes.starts_with(b"PK"), "a .gml filename must contain a GML document");
+        let back = open_vector_bytes(bytes.clone(), "points.gml", &Default::default()).unwrap();
+        assert_eq!(back.layers[0].features.len(), 2);
+        let Dataset::Vector(back) = codec::open(bytes, "points.gml", &Default::default()).unwrap() else { panic!() };
+        assert_eq!(back.layers[0].features.len(), 2);
+    }
+
+    #[test]
+    #[cfg(not(target_family = "wasm"))]
+    fn mapinfo_bytes_require_explicit_archive_filenames() {
+        for extension in ["mif", "tab"] {
+            let error = write_vector_bytes(&[packaging_layer()], &format!("points.{extension}"), &Default::default()).unwrap_err();
+            assert!(matches!(error, Error::InvalidArgument(_)), "{error}");
+            assert!(error.to_string().contains(&format!(".{extension}.zip")), "{error}");
+        }
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn named_mapinfo_archives_round_trip_through_each_reader() {
+        for extension in ["mif", "tab"] {
+            let name = format!("points.{extension}.zip");
+            let bytes = write_vector_bytes(&[packaging_layer()], &name, &Default::default()).unwrap();
+            assert!(bytes.starts_with(b"PK"));
+            let back = open_vector_bytes(bytes.clone(), &name, &Default::default()).unwrap();
+            assert_eq!(back.layers[0].features.len(), 2);
+            let Dataset::Vector(back) = codec::open(bytes, &name, &Default::default()).unwrap() else { panic!() };
+            assert_eq!(back.layers[0].features.len(), 2);
+        }
+    }
+
+    /// Wrong-format MIF content remains refused with the optional GDAL backend enabled
+    /// (reference: GDAL 3.12.1 with its MapInfo driver explicitly selected).
+    #[test]
+    fn mif_header_refusal_is_not_retried_as_another_format() {
+        for bytes in [b"hello\n".to_vec(), br#"{"type":"FeatureCollection","features":[{"type":"Feature","properties":{},"geometry":{"type":"Point","coordinates":[10,46]}}]}"#.to_vec()] {
+            let result = open_vector_bytes(bytes.clone(), "points.mif", &Default::default());
+            assert!(matches!(result, Err(Error::InvalidData(message)) if message.starts_with("MIF:")));
+            let result = codec::open(bytes, "points.mif", &Default::default());
+            assert!(matches!(result, Err(Error::InvalidData(message)) if message.starts_with("MIF:")));
+        }
+    }
+
+    #[test]
+    fn mislabeled_vector_archives_are_refused_instead_of_decoded_as_documents() {
+        use std::io::Write;
+
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        zip.start_file("points.geojson", zip::write::SimpleFileOptions::default()).unwrap();
+        zip.write_all(br#"{"type":"FeatureCollection","features":[]}"#).unwrap();
+        let bytes = zip.finish().unwrap().into_inner();
+        for extension in ["gml", "mif", "tab"] {
+            let name = format!("points.{extension}");
+            for error in [
+                open_bytes(bytes.clone(), &name).unwrap_err(),
+                open_vector_bytes(bytes.clone(), &name, &Default::default()).unwrap_err(),
+                codec::open(bytes.clone(), &name, &Default::default()).unwrap_err(),
+            ] {
+                assert!(matches!(error, Error::InvalidArgument(_)), "{error}");
+                assert!(error.to_string().contains("ZIP"), "{error}");
+                assert!(error.to_string().contains(".zip"), "{error}");
+            }
+        }
+    }
+
+    #[test]
+    fn unreadable_projection_member_is_diagnosed_by_the_memory_codec() {
+        let bytes = include_bytes!("../tests/data/shapefile/prj_bad_crc.zip");
+        let _ = crate::warnings::take();
+        let result = codec::open(bytes.to_vec(), "points.zip", &Default::default());
+        let warnings = crate::warnings::take();
+        let Dataset::Vector(dataset) = result.unwrap() else { panic!() };
+        assert_eq!(dataset.layers[0].features.len(), 3);
+        assert_eq!(dataset.layers[0].crs_wkt(), None);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("pts.prj cannot be read"));
+        assert!(warnings[0].to_ascii_lowercase().contains("checksum"));
+    }
+
+    #[test]
+    fn projection_member_budget_refusals_are_not_downgraded_to_warnings() {
+        let bytes = include_bytes!("../tests/data/shapefile/prj_bad_crc.zip");
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+        let main_size = archive.by_name("pts.shp").unwrap().size();
+        let before_projection = main_size + archive.by_name("pts.dbf").unwrap().size();
+        let _ = crate::warnings::take();
+        crate::config::push_scope(std::collections::HashMap::from([("TERRIO_ZIP_MAX_SIZE".into(), Some(before_projection.to_string()))]));
+        let result = codec::open(bytes.to_vec(), "points.zip", &Default::default());
+        crate::config::pop_scope();
+        let warnings = crate::warnings::take();
+        assert!(result.is_err_and(|error| error.is_resource_refusal()));
+        assert!(warnings.is_empty(), "{warnings:?}");
+    }
+
+    #[test]
+    fn vector_byte_hints_share_signatures_and_xml_probes() {
+        for application_id in [b"GPKG", b"GP10", b"GP11"] {
+            let mut header = [0; 100];
+            header[..16].copy_from_slice(b"SQLite format 3\0");
+            header[68..72].copy_from_slice(application_id);
+            assert_eq!(suggest_vector_extension(&header), Some("gpkg"));
+        }
+        for (bytes, extension) in [
+            (b"SQLite format 3\0".as_slice(), None),
+            (b"fgb\x03fgb\0".as_slice(), Some("fgb")),
+            (b"fgb\x02fgb\0".as_slice(), Some("fgb")),
+            (b"PAR1\0\0\0\0PAR1".as_slice(), Some("parquet")),
+            (br#"{"type":"FeatureCollection","features":[]}"#.as_slice(), Some("geojson")),
+            (br#"{"type":"FeatureCollection","features":[],"Topology":"survey"}"#.as_slice(), Some("geojson")),
+            (b"<kml/>".as_slice(), Some("kml")),
+            (b"  0\r\nSECTION\r\n  2\r\nENTITIES\r\n".as_slice(), Some("dxf")),
+            (b"0\nsection\n2\nENTITIES\n".as_slice(), Some("dxf")),
+            (b"999\nexporter comment\n999\nsecond comment\n0\nSECTION\n2\nENTITIES\n".as_slice(), Some("dxf")),
+            (b"999\ncaf\xe9\n0\nSECTION\n2\nENTITIES\n".as_slice(), Some("dxf")),
+            (b"0\nSECTION\n2\nENTITIES\n0\nTEXT\n1\ncaf\xe9\n".as_slice(), Some("dxf")),
+            (b"PK\x03\x04broken".as_slice(), Some("zip")),
+            (b"0,SECTION\n1,survey\n".as_slice(), None),
+            (
+                b"{\"type\":\"Feature\",\"properties\":{},\"geometry\":null}\n{\"type\":\"Feature\",\"properties\":{},\"geometry\":null}\n"
+                    .as_slice(),
+                Some("geojsonl"),
+            ),
+            (b"<gpx/>".as_slice(), Some("gpx")),
+            (br#"<osm version="0.6"/>"#.as_slice(), Some("osm")),
+            (br#"<osm version="0.6"><tag k="name" v="gml survey"/></osm>"#.as_slice(), Some("osm")),
+            (b"\0\0\0\x0b\x0a\x09OSMHeader".as_slice(), Some("pbf")),
+            (b"<gml:FeatureCollection/>".as_slice(), Some("gml")),
+            (b"WKT,id\nPOINT (1 2),1\n".as_slice(), None),
+            (b"fgb_id,lat,lon\n1,2,3\n".as_slice(), None),
+            (b"PAR1_id,lat,lon\n1,2,3\n".as_slice(), None),
+            (b"PAR1,id\nx,PAR1".as_slice(), None),
+            (b"fgb,fgb,name\n1,2,3\n".as_slice(), None),
+            (b"PAR1".as_slice(), None),
+            (b"II*\0".as_slice(), None),
+            (b"".as_slice(), None),
+        ] {
+            assert_eq!(suggest_vector_extension(bytes), extension, "{bytes:?}");
+        }
+    }
+
+    #[test]
+    fn vector_archive_hints_distinguish_workbooks_and_kmz() {
+        use std::io::Write;
+        for (names, expected) in [
+            (vec!["doc.kml", "layers/points.kml"], "kmz"),
+            (vec!["[Content_Types].xml", "xl/workbook.xml"], "xlsx"),
+            (vec!["points.shp", "points.dbf"], "zip"),
+            (vec!["README.txt"], "zip"),
+            (vec![], "zip"),
+        ] {
+            let mut archive = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+            for name in names {
+                archive.start_file(name, zip::write::SimpleFileOptions::default()).unwrap();
+                archive.write_all(b"not decoded during identification").unwrap();
+            }
+            let bytes = archive.finish().unwrap().into_inner();
+            assert_eq!(suggest_vector_extension(&bytes), Some(expected));
+        }
+    }
+
+    #[test]
+    fn vector_archive_probe_checks_entry_limits_before_listing() {
+        // A tiny synthetic ZIP is enough to verify the configured directory-entry cap.
+        let mut archive = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        archive.start_file("doc.kml", zip::write::SimpleFileOptions::default()).unwrap();
+        let bytes = archive.finish().unwrap().into_inner();
+        crate::config::push_scope(std::collections::HashMap::from([("TERRIO_ZIP_MAX_ENTRIES".into(), Some("0".into()))]));
+        let extension = suggest_vector_extension(&bytes);
+        let checked = suggest_vector_extension_checked(&bytes);
+        crate::config::pop_scope();
+        assert_eq!(extension, None);
+        assert!(checked.is_err_and(|error| error.is_resource_refusal()));
+    }
+
+    #[test]
+    fn vector_archive_probe_keeps_zip_hint_for_unreadable_names() {
+        let mut archive = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        archive.start_file("bad.txt", zip::write::SimpleFileOptions::default()).unwrap();
+        let mut bytes = archive.finish().unwrap().into_inner();
+        for index in 0..bytes.len() - 8 {
+            if bytes[index..].starts_with(b"bad.txt") {
+                bytes[index] = 0xff;
+            }
+        }
+        // A legacy single-byte name must retain the generic hint, irrespective of whether
+        // the configured ZIP decoder can represent it.
+        assert_eq!(suggest_vector_extension(&bytes), Some("zip"));
+        for index in 0..bytes.len() - 10 {
+            let flags = if bytes[index..].starts_with(b"PK\x03\x04") {
+                index + 6
+            } else if bytes[index..].starts_with(b"PK\x01\x02") {
+                index + 8
+            } else {
+                continue;
+            };
+            let value = u16::from_le_bytes([bytes[flags], bytes[flags + 1]]) | 0x800;
+            bytes[flags..flags + 2].copy_from_slice(&value.to_le_bytes());
+        }
+        // Deliberately invalid UTF-8 names are left for the ordinary reader to diagnose.
+        assert_eq!(suggest_vector_extension(&bytes), Some("zip"));
+    }
+
+    #[test]
+    fn late_geojson_root_type_is_not_relabelled_by_property_text() {
+        let bytes = format!(
+            r#"{{"features":[{{"type":"Feature","properties":{{"Topology":"{}"}},"geometry":{{"type":"Point","coordinates":[1,2]}}}}],"type":"FeatureCollection"}}"#,
+            "x".repeat(20_000)
+        );
+        assert_eq!(suggest_vector_extension(bytes.as_bytes()), Some("geojson"));
+    }
+
+    #[test]
+    fn a_misspelled_layer_name_is_refused_in_memory() {
+        let bytes = br#"{"type":"FeatureCollection","features":[{"type":"Feature","properties":{},"geometry":{"type":"Point","coordinates":[1,2]}}]}"#;
+        let names = |n: &[&str]| VectorOpenOptions { layers: n.iter().map(|s| s.to_string()).collect(), ..Default::default() };
+        // The codecs WebAssembly reads with; native builds read a spilled file.
+        let Dataset::Vector(kept) = codec::open(bytes.to_vec(), "points.geojson", &names(&["points"])).unwrap() else { panic!() };
+        assert_eq!(kept.layers.len(), 1);
+        let error = codec::open(bytes.to_vec(), "points.geojson", &names(&["points", "pionts"])).unwrap_err();
+        assert_eq!(error.to_string(), "no layer named pionts (layers: points)");
+    }
+
+    #[test]
+    fn named_layers_answer_to_the_file_stem_through_each_reader() {
+        let bytes = br#"{"type":"FeatureCollection","name":"roads","features":[{"type":"Feature","properties":{"v":7},"geometry":{"type":"Point","coordinates":[1,2]}}]}"#;
+        let options = |names: &[&str]| VectorOpenOptions { layers: names.iter().map(|s| s.to_string()).collect(), ..Default::default() };
+        let dir = tempfile::tempdir().unwrap();
+        // Exercise the WASM codecs directly, as well as native paths and native spilled bytes.
+        for names in [vec![], vec!["map"], vec!["roads"], vec!["roads", "map", "map"]] {
+            let o = options(&names);
+            let path = dir.path().join("map.geojson");
+            std::fs::write(&path, bytes).unwrap();
+            let datasets = [
+                codec::open(bytes.to_vec(), "map.geojson", &o).unwrap(),
+                Dataset::Vector(crate::open_vector(path.to_str().unwrap(), &o).unwrap()),
+                Dataset::Vector(open_vector_bytes(bytes.to_vec(), "map.geojson", &o).unwrap()),
+            ];
+            for ds in datasets {
+                let Dataset::Vector(ds) = ds else { panic!() };
+                assert_eq!(ds.layers.len(), 1);
+                assert_eq!(ds.layers[0].name, "roads");
+                assert_eq!(ds.layers[0].features.len(), 1);
+            }
+        }
+        for names in [vec!["missing"], vec!["map", "missing"]] {
+            let o = options(&names);
+            let error = codec::open(bytes.to_vec(), "map.geojson", &o).unwrap_err();
+            assert_eq!(error.to_string(), "no layer named missing (layers: roads)");
+        }
+    }
+
+    #[test]
+    fn named_layer_selection_is_consistent_across_codecs() {
+        let source = codec::open(br#"{"type":"FeatureCollection","name":"roads","features":[{"type":"Feature","properties":{"v":7},"geometry":{"type":"Point","coordinates":[1,2]}}]}"#.to_vec(), "source.geojson", &Default::default()).unwrap();
+        let Dataset::Vector(source) = source else { panic!() };
+        let mut extensions = vec!["geojson", "kml", "kmz", "gml"];
+        if cfg!(feature = "flatgeobuf") {
+            extensions.push("fgb");
+        }
+        if cfg!(feature = "parquet") {
+            extensions.push("parquet");
+        }
+        if cfg!(feature = "sqlite") {
+            extensions.push("gpkg");
+        }
+        if cfg!(feature = "xlsx") {
+            extensions.push("xlsx");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        for ext in extensions {
+            let filename = format!("map.{ext}");
+            let bytes = write_vector_bytes(&source.layers, &filename, &Default::default()).unwrap();
+            let o = VectorOpenOptions { layers: vec!["map".into()], ..Default::default() };
+            let Dataset::Vector(ds) = codec::open(bytes.clone(), &filename, &o).unwrap() else { panic!("{ext}") };
+            assert_eq!(ds.layers.len(), 1, "{ext}");
+            assert_eq!(ds.layers[0].features.len(), 1, "{ext}");
+            let path = dir.path().join(&filename);
+            crate::write_vector(&source.layers, path.to_str().unwrap(), &Default::default()).unwrap();
+            let native = crate::open_vector(path.to_str().unwrap(), &o).unwrap_or_else(|e| panic!("{ext}: {e}"));
+            assert_eq!(native.layers[0].name, ds.layers[0].name, "{ext}");
+            let o = VectorOpenOptions { layers: vec!["map".into(), "missing".into()], ..Default::default() };
+            let error = crate::open_vector(path.to_str().unwrap(), &o).unwrap_err();
+            assert_eq!(error.to_string(), format!("no layer named missing (layers: {})", ds.layers[0].name), "{ext}");
+            if matches!(ext, "kml" | "kmz" | "gpkg" | "xlsx") {
+                let mut other = source.layers[0].clone();
+                other.name = "rivers".into();
+                let bytes = write_vector_bytes(&[source.layers[0].clone(), other], &filename, &Default::default()).unwrap();
+                let o = VectorOpenOptions { layers: vec!["roads".into(), "map".into()], ..Default::default() };
+                let error = codec::open(bytes, &filename, &o).unwrap_err();
+                assert_eq!(error.to_string(), "no layer named map (layers: roads, rivers)", "{ext}");
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(not(target_family = "wasm"))]
+    fn zip_layer_selection_uses_member_names_through_each_reader() {
+        let bytes = br#"{"type":"FeatureCollection","features":[{"type":"Feature","properties":{},"geometry":{"type":"Point","coordinates":[1,2]}}]}"#;
+        let source = open_vector_bytes(bytes.to_vec(), "source.geojson", &Default::default()).unwrap();
+        for filename in ["member.shp.zip", "member.mif.zip"] {
+            let bytes = write_vector_bytes(&source.layers, filename, &Default::default()).unwrap();
+            let member = VectorOpenOptions { layers: vec!["member".into()], ..Default::default() };
+            let Dataset::Vector(codec) = codec::open(bytes.clone(), "archive.zip", &member).unwrap() else { panic!() };
+            let native = open_vector_bytes(bytes.clone(), "archive.zip", &member).unwrap();
+            assert_eq!(codec.layers[0].name, "member", "{filename}");
+            assert_eq!(codec.layers[0].features[0].geometry, native.layers[0].features[0].geometry, "{filename}");
+            let archive = VectorOpenOptions { layers: vec!["archive".into()], ..Default::default() };
+            let native_error = open_vector_bytes(bytes.clone(), "archive.zip", &archive).unwrap_err();
+            assert_eq!(native_error.to_string(), "no layer named archive (layers: member)", "{filename}");
+            let codec_error = codec::open(bytes, "archive.zip", &archive).unwrap_err();
+            assert_eq!(codec_error.to_string(), native_error.to_string(), "{filename}");
+        }
+    }
+
+    #[test]
+    fn a_source_without_layers_is_refused_in_memory() {
+        let error = codec::finish_vector(Vec::new(), "empty.geojson", VectorDriver::GeoJSON, &VectorOpenOptions::default()).unwrap_err();
+        assert!(error.to_string().starts_with("no layer named"), "{error}");
+    }
 
     /// A Zarr store opened from its files is a Zarr open, as GDAL's de-registered driver opens no
     /// store: refused under a raster allow-list without Zarr, opened with it or without a list.
@@ -1102,6 +1745,23 @@ mod tests {
         }
     }
 
+    /// The in-memory JPEG 2000 codec (WebAssembly's) writes no GeoJP2 box for a raster without a
+    /// geotransform (`GEOREFERENCED=NO`) and without a CRS, as the file writer does; with a CRS,
+    /// the box is written.
+    #[test]
+    fn jpeg2000_codec_writes_no_geojp2_box_without_georeferencing() {
+        const GEOJP2: [u8; 16] = [0xb1, 0x4b, 0xf8, 0xbd, 0x08, 0x3d, 0x4b, 0x43, 0xa5, 0xae, 0x8c, 0xd7, 0xd5, 0xa6, 0xce, 0x03];
+        let has_box = |bytes: &[u8]| bytes.windows(20).any(|w| w[..4] == *b"uuid" && w[4..] == GEOJP2);
+        let unreferenced = RasterWriteOptions { creation_options: vec![("GEOREFERENCED".into(), "NO".into())], ..Default::default() };
+        let mut ds = raster(3, DataType::U8);
+        ds.has_nodata = false;
+        assert!(has_box(&codec::write_raster(&ds, RasterDriver::JP2, &unreferenced, "x").unwrap()));
+        ds.raster.crs = Default::default();
+        let jp2 = codec::write_raster(&ds, RasterDriver::JP2, &unreferenced, "x").unwrap();
+        assert!(crate::drivers::jp2::is_jpeg2000(&jp2) && !has_box(&jp2));
+        assert!(has_box(&codec::write_raster(&ds, RasterDriver::JP2, &Default::default(), "x").unwrap()));
+    }
+
     #[test]
     fn netcdf_hdf5_and_zarr_codecs_round_trip() {
         for (dt, bands) in [(DataType::I16, 1), (DataType::F32, 2)] {
@@ -1187,6 +1847,20 @@ mod tests {
     }
 
     #[test]
+    fn tiff_bytes_open_lazily_or_whole() {
+        let ds = raster(2, DataType::I32);
+        let bytes = write_raster_bytes(&ds, "a.tif", &Default::default()).unwrap();
+        let Ok(OpenedRasterBytes::Lazy(mut r)) = open_raster_lazy_bytes_or_whole(bytes, "a.tif") else { panic!() };
+        assert_eq!(r.read().unwrap().raster.data.to_f64_vec(), ds.raster.data.to_f64_vec());
+        // Bytes neither reader reads are refused; other formats open as the lazy opener opens them.
+        let mut broken = b"II*\0".to_vec();
+        broken.extend([0xff; 60]);
+        assert!(open_raster_lazy_bytes_or_whole(broken, "b.tif").is_err());
+        let asc = b"ncols 2\nnrows 1\nxllcorner 0\nyllcorner 0\ncellsize 1\n1 2\n".to_vec();
+        assert!(matches!(open_raster_lazy_bytes_or_whole(asc, "c.asc"), Ok(OpenedRasterBytes::Lazy(_))));
+    }
+
+    #[test]
     #[cfg(not(target_family = "wasm"))]
     fn native_bytes_round_trip() {
         let ds = raster(2, DataType::I32);
@@ -1210,7 +1884,7 @@ mod tests {
             {"type":"Feature","properties":{"id":7,"name":"Zürich"},"geometry":{"type":"Point","coordinates":[8.5,47.4]}},
             {"type":"Feature","properties":{"id":8,"name":"b"},"geometry":{"type":"Point","coordinates":[1,2]}}]}"#;
         let v = open_vector_bytes(gj.as_bytes().to_vec(), "p.geojson", &Default::default()).unwrap();
-        for name in ["p.shp.zip", "p.mif"] {
+        for name in ["p.shp.zip", "p.mif.zip"] {
             let zip = write_vector_bytes(&v.layers, name, &Default::default()).unwrap();
             // The in-memory codecs (what WebAssembly builds use), and the native path.
             let Dataset::Vector(back) = codec::open(zip.clone(), "p.zip", &Default::default()).unwrap() else { panic!() };
@@ -1224,5 +1898,122 @@ mod tests {
                 assert_eq!(l.features[0].attributes[i], wbvector::FieldValue::Text("Zürich".into()), "{name}");
             }
         }
+    }
+
+    /// A zip archive opened from memory reads its members within the archive limits, as
+    /// `/vsizip/` reads the same archive on disk.
+    #[test]
+    fn zip_bytes_are_read_within_the_zip_limits() {
+        let gj = format!(
+            r#"{{"type":"FeatureCollection","features":[{{"type":"Feature","properties":{{}},"geometry":{{"type":"Point","coordinates":[1,2]}}}}]}}{}"#,
+            " ".repeat(1 << 20)
+        );
+        let mut buf = std::io::Cursor::new(Vec::new());
+        let mut writer = zip::ZipWriter::new(&mut buf);
+        writer.start_file("p.geojson", zip::write::SimpleFileOptions::default()).unwrap();
+        std::io::Write::write_all(&mut writer, gj.as_bytes()).unwrap();
+        writer.finish().unwrap();
+        let zip = buf.into_inner();
+        let scoped = |key: &str, value: &str| {
+            crate::config::with_options(&[(key, value)], || codec::open(zip.clone(), "p.zip", &Default::default()))
+        };
+        let Dataset::Vector(v) = codec::open(zip.clone(), "p.zip", &Default::default()).unwrap() else { panic!() };
+        assert_eq!(v.layers[0].features.len(), 1);
+        for (key, value) in [("TERRIO_ZIP_MAX_SIZE", "1000"), ("TERRIO_ZIP_MAX_RATIO", "10"), ("TERRIO_ZIP_MAX_ENTRIES", "0")] {
+            let refused = scoped(key, value);
+            assert!(matches!(&refused, Err(Error::ResourceLimit(m)) if m.contains(key)), "{key}: {:?}", refused.err());
+        }
+    }
+
+    /// A shapefile sidecar past the archive limits refuses the dataset, rather than it opening
+    /// without the sidecar's attributes.
+    #[test]
+    #[cfg(not(target_family = "wasm"))]
+    fn zip_bytes_refuse_a_sidecar_past_the_zip_limits() {
+        let gj = r#"{"type":"FeatureCollection","features":[{"type":"Feature","properties":{"id":7},"geometry":{"type":"Point","coordinates":[1,2]}}]}"#;
+        let v = open_vector_bytes(gj.as_bytes().to_vec(), "p.geojson", &Default::default()).unwrap();
+        let zip = write_vector_bytes(&v.layers, "p.shp.zip", &Default::default()).unwrap();
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(zip.clone())).unwrap();
+        let shp = (0..archive.len())
+            .map(|i| archive.by_index_raw(i).map(|f| (f.name().unwrap().to_string(), f.size())).unwrap())
+            .find(|(name, _)| name.ends_with(".shp"))
+            .unwrap()
+            .1;
+        let Dataset::Vector(back) = codec::open(zip.clone(), "p.zip", &Default::default()).unwrap() else { panic!() };
+        assert_eq!(back.layers[0].features.len(), 1);
+        // Room for the .shp, not for its sidecars too.
+        let refused =
+            crate::config::with_options(&[("TERRIO_ZIP_MAX_SIZE", &shp.to_string())], || codec::open(zip, "p.zip", &Default::default()));
+        assert!(matches!(&refused, Err(Error::ResourceLimit(m)) if m.contains("TERRIO_ZIP_MAX_SIZE")), "{:?}", refused.err());
+    }
+
+    /// A zip archive inside a zip archive shares the outer one's `TERRIO_ZIP_MAX_SIZE`, so nesting
+    /// cannot multiply it.
+    #[test]
+    fn nested_zip_bytes_share_the_zip_size_limit() {
+        let zip_of = |name: &str, bytes: &[u8]| {
+            let mut buf = std::io::Cursor::new(Vec::new());
+            let mut writer = zip::ZipWriter::new(&mut buf);
+            writer.start_file(name, zip::write::SimpleFileOptions::default()).unwrap();
+            std::io::Write::write_all(&mut writer, bytes).unwrap();
+            writer.finish().unwrap();
+            buf.into_inner()
+        };
+        let gj = format!(
+            r#"{{"type":"FeatureCollection","features":[{{"type":"Feature","properties":{{}},"geometry":{{"type":"Point","coordinates":[1,2]}}}}]}}{}"#,
+            " ".repeat(4000)
+        );
+        let inner = zip_of("p.geojson", gj.as_bytes());
+        let outer = zip_of("inner.geojson", &inner);
+        let Dataset::Vector(v) = codec::open(outer.clone(), "p.zip", &Default::default()).unwrap() else { panic!() };
+        assert_eq!(v.layers[0].features.len(), 1);
+        // Room for either member alone, not for both.
+        let limit = (gj.len().max(inner.len()) + 10).to_string();
+        let refused = crate::config::with_options(&[("TERRIO_ZIP_MAX_SIZE", &limit)], || codec::open(outer, "p.zip", &Default::default()));
+        // The message names the configured limit, not what was left of it.
+        let expected = format!("more than the {limit} bytes allowed (TERRIO_ZIP_MAX_SIZE), shared with the archives it is in");
+        assert!(matches!(&refused, Err(Error::ResourceLimit(m)) if m.ends_with(&expected)), "{:?}", refused.err());
+        // Archives nest at most 8 deep.
+        let mut nested = zip_of("p.geojson", gj.as_bytes());
+        for _ in 0..8 {
+            nested = zip_of("inner.geojson", &nested);
+        }
+        let refused = codec::open(nested, "p.zip", &Default::default());
+        assert!(matches!(&refused, Err(Error::ResourceLimit(m)) if m.contains("nest more than 8 deep")), "{:?}", refused.err());
+    }
+
+    /// What an archive nested in a member reads counts toward the outer archive's later reads, and
+    /// the outer budget is restored when the nested open panics.
+    #[test]
+    fn nested_zip_reads_are_charged_to_the_outer_archive() {
+        use crate::vfs::LimitedZip;
+        let zip_of = |members: &[(&str, &[u8])]| {
+            let mut buf = std::io::Cursor::new(Vec::new());
+            let mut writer = zip::ZipWriter::new(&mut buf);
+            for (name, bytes) in members {
+                writer.start_file(*name, zip::write::SimpleFileOptions::default()).unwrap();
+                std::io::Write::write_all(&mut writer, bytes).unwrap();
+            }
+            writer.finish().unwrap();
+            buf.into_inner()
+        };
+        let inner = zip_of(&[("a", &[b'x'; 600])]);
+        let outer = zip_of(&[("inner.zip", &inner), ("b", &[b'y'; 300])]);
+        let (refused, panicked) = crate::config::with_options(&[("TERRIO_ZIP_MAX_SIZE", "1000")], || {
+            let mut zip = LimitedZip::open(std::io::Cursor::new(outer)).unwrap();
+            let member = zip.read_name("inner.zip", u64::MAX).unwrap();
+            let read =
+                zip.nested(|| LimitedZip::open(std::io::Cursor::new(member.clone())).unwrap().read_name("a", u64::MAX).map(|b| b.len()));
+            assert_eq!(read.unwrap(), 600);
+            // inner.zip, then its 600 bytes, then 300 more: past the 1,000 allowed.
+            let refused = zip.read_name("b", u64::MAX);
+            let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| zip.nested(|| panic!("nested open"))));
+            (refused, panicked)
+        });
+        assert!(matches!(&refused, Err(Error::ResourceLimit(m)) if m.contains("TERRIO_ZIP_MAX_SIZE")), "{refused:?}");
+        assert!(panicked.is_err());
+        // No budget is left behind for later, unrelated archives.
+        let fresh = zip_of(&[("c", &[b'z'; 2000])]);
+        assert_eq!(LimitedZip::open(std::io::Cursor::new(fresh)).unwrap().read_name("c", u64::MAX).unwrap().len(), 2000);
     }
 }

@@ -36,7 +36,7 @@
 //! assert_eq!(bytes, data[150_000..150_100]);
 //! ```
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{self, Read, Seek, SeekFrom};
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -74,6 +74,8 @@ pub struct SparseFile {
     shared: Arc<Mutex<Shared>>,
     len: u64,
     pos: u64,
+    /// Whether reads of blocks not held fail without recording them (see [`SparseFile::quiet`]).
+    quiet: bool,
 }
 
 impl std::fmt::Debug for SparseFile {
@@ -111,7 +113,15 @@ impl SparseFile {
             bytes: 0,
             inserts: 0,
         };
-        Self { shared: Arc::new(Mutex::new(shared)), len, pos: 0 }
+        Self { shared: Arc::new(Mutex::new(shared)), len, pos: 0, quiet: false }
+    }
+
+    /// A clone whose reads of blocks not held fail without recording them as missing, so that
+    /// the caller does not fetch them: for reads that can do without those bytes, such as the
+    /// extra decoders of a GeoTIFF read, which are skipped when they cannot reopen the file.
+    /// Missing chunk bytes can be retried through the primary nonquiet decoder.
+    pub fn quiet(&self) -> Self {
+        Self { quiet: true, ..self.clone() }
     }
 
     /// The file's length in bytes.
@@ -256,8 +266,10 @@ impl SparseFile {
             return Ok((at - pos) as usize);
         }
         // Nothing held at `pos`: record every block of the read, not only the first.
-        let missing: Vec<u64> = (pos / bs..=(end - 1) / bs).filter(|b| !s.blocks.contains_key(b)).collect();
-        s.missing.extend(missing);
+        if !self.quiet {
+            let missing: Vec<u64> = (pos / bs..=(end - 1) / bs).filter(|b| !s.blocks.contains_key(b)).collect();
+            s.missing.extend(missing);
+        }
         Err(io::Error::other(NotFetched { offset: pos }))
     }
 
@@ -286,14 +298,20 @@ impl Read for SparseFile {
 
 impl Seek for SparseFile {
     fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
-        let new = match pos {
-            SeekFrom::Start(p) => Some(p),
-            SeekFrom::End(d) => self.len.checked_add_signed(d),
-            SeekFrom::Current(d) => self.pos.checked_add_signed(d),
-        };
-        self.pos = new.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "seek before the start of the file"))?;
+        self.pos = seek_position(self.pos, self.len, pos)?;
         Ok(self.pos)
     }
+}
+
+/// The position a seek from `pos` moves a reader of `len` bytes at `cur` to; an error before the
+/// start or past `u64::MAX`.
+pub(crate) fn seek_position(cur: u64, len: u64, pos: SeekFrom) -> io::Result<u64> {
+    match pos {
+        SeekFrom::Start(p) => Some(p),
+        SeekFrom::End(d) => len.checked_add_signed(d),
+        SeekFrom::Current(d) => cur.checked_add_signed(d),
+    }
+    .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid seek: before the start of the file or past u64::MAX"))
 }
 
 // Row groups of remote GeoParquet files are read through the same blocks.
@@ -344,9 +362,141 @@ pub fn read_with<T>(
     Err(crate::Error::InvalidData(format!("the read still needed more bytes after {rounds} fetch rounds")))
 }
 
+/// Grows each range `(offset, length)` of [`SparseFile::missing`] to at least `least` bytes, in
+/// whole `block`s within a file of `len` bytes, merging those that then overlap: a header read in
+/// steps (a TIFF's IFDs, one after another) takes requests that grow with what it read so far,
+/// rather than a request per block or two.
+pub fn grow_ranges(ranges: &[(u64, u64)], least: u64, block: u64, len: u64) -> Vec<(u64, u64)> {
+    let least = least.div_ceil(block.max(1)) * block.max(1);
+    // Ranges starting at or past the end hold nothing to fetch.
+    let mut spans: Vec<(u64, u64)> =
+        ranges.iter().filter(|&&(o, _)| o < len).map(|&(o, n)| (o, o.saturating_add(n.max(least)).min(len))).collect();
+    spans.sort_unstable();
+    let mut out: Vec<(u64, u64)> = Vec::with_capacity(spans.len());
+    for (start, end) in spans {
+        match out.last_mut() {
+            Some((_, last)) if start <= *last => *last = (*last).max(end),
+            _ => out.push((start, end)),
+        }
+    }
+    out.into_iter().map(|(start, end)| (start, end - start)).collect()
+}
+
+/// The least payload worth another server-runtime request. Small windows keep their merged
+/// runs; large reads can fill the request window without multiplying requests in saturated rounds.
+const MIN_PARALLEL_PIECE: u64 = 256 << 10;
+
+/// Splits a round with fewer runs than request slots, balancing pieces across its largest runs.
+/// Boundaries remain on the sparse file's block grid, with the original final partial block.
+/// No bytes are added or duplicated. `None` leaves an already saturated or small round intact.
+/// Long runs get pieces of at least 256 KiB (or a whole larger block); existing short ranges
+/// remain intact. Ranges that overflow or do not start on the block grid remain for the
+/// caller's usual range validation.
+///
+/// The fetching client selects where this is useful: terrio-js uses it after opening, in
+/// Node.js, Deno and Bun, where extra requests are not queued behind a browser's connection cap.
+/// This request-grouping policy does not change raster decoding or GDAL conformance.
+pub fn parallel_ranges(ranges: &[(u64, u64)], block_size: u64) -> Option<Vec<(u64, u64)>> {
+    if ranges.is_empty() || ranges.len() >= PARALLEL_REQUESTS {
+        return None;
+    }
+    let block = block_size.max(1);
+    let least_blocks = MIN_PARALLEL_PIECE.div_ceil(block).max(1);
+    let mut pieces = [1usize; PARALLEL_REQUESTS];
+    let mut capacity = [1usize; PARALLEL_REQUESTS];
+    for (i, &(offset, len)) in ranges.iter().enumerate() {
+        // Leave invalid ranges for the fetcher's existing validation, without overflowing or
+        // introducing boundaries outside the block grid.
+        if offset.checked_add(len).is_none() || offset % block != 0 {
+            continue;
+        }
+        let full = len / block;
+        let tail = len % block;
+        capacity[i] = (full / least_blocks + u64::from(tail >= MIN_PARALLEL_PIECE)).clamp(1, PARALLEL_REQUESTS as u64) as usize;
+    }
+    let mut count = ranges.len();
+    while count < PARALLEL_REQUESTS {
+        let next = (0..ranges.len()).filter(|&i| pieces[i] < capacity[i]).max_by_key(|&i| ranges[i].1 / pieces[i] as u64);
+        let Some(i) = next else { break };
+        pieces[i] += 1;
+        count += 1;
+    }
+    if count == ranges.len() {
+        return None;
+    }
+    let mut split = Vec::with_capacity(count);
+    for (i, &(offset, len)) in ranges.iter().enumerate() {
+        let n = pieces[i] as u64;
+        if n == 1 {
+            split.push((offset, len));
+            continue;
+        }
+        let full = len / block;
+        let tail = len % block;
+        let (base, extra) = (full / n, full % n);
+        let mut from = offset;
+        for part in 0..n {
+            let bytes = (base + u64::from(part < extra)) * block + if part + 1 == n { tail } else { 0 };
+            split.push((from, bytes));
+            from += bytes;
+        }
+    }
+    Some(split)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parallel_pieces_preserve_ranges_and_partial_blocks() {
+        let block = 16 << 10;
+        let ranges = [(2 * block, (5 << 20) + 17), (20 << 20, 2 << 20)];
+        let pieces = parallel_ranges(&ranges, block).unwrap();
+        assert_eq!(pieces.len(), PARALLEL_REQUESTS);
+        let mut merged: Vec<(u64, u64)> = Vec::new();
+        for &(offset, len) in &pieces {
+            assert_eq!(offset % block, 0);
+            assert!(len >= MIN_PARALLEL_PIECE);
+            let &(start, total) = ranges.iter().find(|&&(start, total)| offset >= start && offset < start + total).unwrap();
+            assert!(offset + len <= start + total);
+            if offset + len < start + total {
+                assert_eq!(len % block, 0);
+            }
+            if let Some(last) = merged.last_mut()
+                && last.0 + last.1 == offset
+            {
+                last.1 += len;
+            } else {
+                merged.push((offset, len));
+            }
+        }
+        assert_eq!(merged, ranges);
+        assert!(pieces.iter().map(|&(_, len)| len).max().unwrap() < ranges[0].1);
+    }
+
+    #[test]
+    fn parallel_pieces_keep_small_and_saturated_rounds_whole() {
+        assert!(parallel_ranges(&[], 16384).is_none());
+        assert!(parallel_ranges(&[(0, MIN_PARALLEL_PIECE * 2 - 1)], 16384).is_none());
+        let ranges: Vec<_> = (0..PARALLEL_REQUESTS).map(|i| ((i as u64) * (16 << 20), 8 << 20)).collect();
+        assert!(parallel_ranges(&ranges, 16384).is_none());
+    }
+
+    #[test]
+    fn parallel_pieces_respect_large_blocks_and_extreme_offsets() {
+        assert_eq!(parallel_ranges(&[(0, 24 << 20)], 16 << 20).unwrap(), [(0, 16 << 20), (16 << 20, 8 << 20)]);
+        let block = 16384;
+        let from = (u64::MAX / block - 1000) * block;
+        let len = 300 * block + 7;
+        let pieces = parallel_ranges(&[(from, len)], block).unwrap();
+        assert_eq!(pieces[0].0, from);
+        assert_eq!(pieces.last().map(|&(off, size)| off + size), Some(from + len));
+        assert_eq!(pieces.iter().map(|&(_, size)| size).sum::<u64>(), len);
+        assert!(parallel_ranges(&[(u64::MAX - 5, 10)], block).is_none());
+        assert!(parallel_ranges(&[(1, 4 << 20)], block).is_none());
+        assert!(parallel_ranges(&[(0, 0)], block).is_none());
+    }
 
     fn data() -> Vec<u8> {
         (0..300_000u32).map(|i| (i * 7 % 251) as u8).collect()
@@ -410,5 +560,165 @@ mod tests {
         assert_eq!(fetches, 2);
         f.trim(4096);
         assert!(f.lock().blocks.len() <= 4);
+    }
+
+    #[test]
+    fn ranges_grow_to_the_least_and_merge() {
+        let k = 1024;
+        // Grown to 4 KiB (from 3.5 KiB in whole blocks), the first two overlap; the file ends at 20 KiB.
+        assert_eq!(grow_ranges(&[(2 * k, k), (0, k), (18 * k, k)], 3 * k + 512, k, 20 * k), [(0, 6 * k), (18 * k, 2 * k)]);
+        // Longer than the least: unchanged.
+        assert_eq!(grow_ranges(&[(0, 8 * k)], 2 * k, k, 20 * k), [(0, 8 * k)]);
+        // Past the end: dropped, not an underflowing length.
+        assert_eq!(grow_ranges(&[(25 * k, k), (20 * k, k)], 2 * k, k, 20 * k), []);
+    }
+}
+
+/// A part of an object of a store: the whole object, `length` bytes from `offset`, or its last `n`
+/// bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ObjectRange {
+    /// The whole object.
+    Whole,
+    /// `length` bytes from `offset`.
+    At(u64, u64),
+    /// The last `n` bytes.
+    Suffix(u64),
+}
+
+/// The requests the caller of a [`SparseFile`] or [`SparseObjects`] in terrio-js keeps in flight at
+/// once: browsers queue more, and servers may rate-limit them.
+pub const PARALLEL_REQUESTS: usize = 12;
+
+/// A part of an object: its key and range.
+type Part = (String, ObjectRange);
+
+/// The parts fetched (`None`: no such object), and the bytes they hold.
+type Held = (HashMap<Part, Option<Vec<u8>>>, u64);
+
+/// The objects of a store (a Zarr store's metadata documents, chunks and shard parts) fetched by
+/// the caller, as a [`SparseFile`] holds the blocks of one file: a read of a part not fetched
+/// yet fails, and the part is recorded. The caller fetches the parts [`SparseObjects::missing`]
+/// lists, hands them over with [`SparseObjects::insert`] (`None` for a missing object) and runs
+/// the read again.
+///
+/// ```
+/// use terrio::sparse::{ObjectRange, SparseObjects};
+///
+/// let objects = SparseObjects::new();
+/// assert!(objects.get("a/zarr.json", ObjectRange::Whole).is_err());
+/// assert_eq!(objects.missing(), [("a/zarr.json".to_string(), ObjectRange::Whole)]);
+/// objects.insert("a/zarr.json", ObjectRange::Whole, Some(b"{}".to_vec()));
+/// objects.insert("a/.zarray", ObjectRange::Whole, None);
+/// assert_eq!(objects.get("a/zarr.json", ObjectRange::Whole).unwrap(), Some(b"{}".to_vec()));
+/// assert_eq!(objects.get("a/.zarray", ObjectRange::Whole).unwrap(), None);
+/// assert!(!objects.has_missing());
+/// ```
+#[derive(Debug, Default)]
+pub struct SparseObjects {
+    held: Mutex<Held>,
+    missing: Mutex<(Vec<Part>, HashSet<Part>)>,
+    /// The requests the caller keeps in flight, when reads should fill them (0: not asked).
+    parallel: std::sync::atomic::AtomicUsize,
+}
+
+impl SparseObjects {
+    /// No object fetched yet.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// A part of an object: `None` when the object does not exist, an error recording the part
+    /// when it is not fetched yet.
+    pub fn get(&self, key: &str, range: ObjectRange) -> io::Result<Option<Vec<u8>>> {
+        if let Some(held) = lock(&self.held).0.get(&(key.to_string(), range)) {
+            return Ok(held.clone());
+        }
+        let mut missing = lock(&self.missing);
+        let part = (key.to_string(), range);
+        if missing.1.insert(part.clone()) {
+            missing.0.push(part);
+        }
+        Err(io::Error::other(format!("{key} ({range:?}) is not fetched yet")))
+    }
+
+    /// Asks reads to split their parts into at least `n` requests where they can, as the caller
+    /// keeps `n` in flight at once: Zarr reads then split the inner chunks of a shard into that
+    /// many runs, rather than runs of up to 1 MiB. Worth it where requests at once are not queued:
+    /// in Node.js, not in browsers, which keep 6 connections to an HTTP/1.1 server such as S3.
+    /// Not asked (0), the default, parts are as reads choose them.
+    pub fn set_parallel_requests(&self, n: usize) {
+        self.parallel.store(n, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The requests reads should fill ([`SparseObjects::set_parallel_requests`]), when asked.
+    pub fn parallel_requests(&self) -> Option<usize> {
+        Some(self.parallel.load(std::sync::atomic::Ordering::Relaxed)).filter(|&n| n > 0)
+    }
+
+    /// Whether a read missed parts not fetched since.
+    pub fn has_missing(&self) -> bool {
+        !lock(&self.missing).0.is_empty()
+    }
+
+    /// The parts reads missed, in the order they were asked for, forgotten once listed.
+    pub fn missing(&self) -> Vec<(String, ObjectRange)> {
+        std::mem::take(&mut *lock(&self.missing)).0
+    }
+
+    /// Hands over a part fetched: its bytes, or `None` when the object does not exist.
+    pub fn insert(&self, key: &str, range: ObjectRange, data: Option<Vec<u8>>) {
+        let mut held = lock(&self.held);
+        let overhead = key.len() as u64 + std::mem::size_of::<(Part, Option<Vec<u8>>)>() as u64;
+        held.1 += overhead + data.as_ref().map_or(0, |d| d.len() as u64);
+        if let Some(old) = held.0.insert((key.to_string(), range), data) {
+            held.1 -= overhead + old.map_or(0, |d| d.len() as u64);
+        }
+    }
+
+    /// Forgets every part held once they take more than `max_bytes`; parts a read needs again are
+    /// then fetched again. Readers keep what they parsed from them (metadata, shard indexes).
+    pub fn trim(&self, max_bytes: u64) {
+        let mut held = lock(&self.held);
+        if held.1 > max_bytes {
+            *held = Default::default();
+        }
+    }
+}
+
+/// A lock, also after a panic elsewhere poisoned it.
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+#[cfg(test)]
+mod object_tests {
+    use super::*;
+
+    #[test]
+    fn missing_parts_are_ordered_unique_and_can_be_requested_again() {
+        let objects = SparseObjects::new();
+        for _ in 0..2 {
+            for i in 0..1000 {
+                assert!(objects.get(&i.to_string(), ObjectRange::Whole).is_err());
+                assert!(objects.get(&i.to_string(), ObjectRange::Whole).is_err());
+            }
+            let missing = objects.missing();
+            assert_eq!(missing.len(), 1000);
+            assert_eq!(missing[0].0, "0");
+            assert_eq!(missing[999].0, "999");
+        }
+    }
+
+    #[test]
+    fn absent_objects_count_toward_cache_budget() {
+        let objects = SparseObjects::new();
+        objects.insert("missing", ObjectRange::Whole, None);
+        objects.trim(0);
+        assert!(objects.get("missing", ObjectRange::Whole).is_err());
+        objects.insert("missing", ObjectRange::Whole, None);
+        objects.insert("missing", ObjectRange::Whole, None);
+        let held = lock(&objects.held);
+        assert_eq!(held.1, 7 + std::mem::size_of::<(Part, Option<Vec<u8>>)>() as u64);
     }
 }

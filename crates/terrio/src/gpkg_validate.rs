@@ -3,14 +3,20 @@ use crate::{Error, Result};
 
 #[cfg(feature = "sqlite")]
 fn same_image_metadata(before: &std::fs::Metadata, after: &std::fs::Metadata) -> bool {
-    #[cfg(unix)]
-    let same_inode = {
-        use std::os::unix::fs::MetadataExt;
-        (before.dev(), before.ino(), before.ctime(), before.ctime_nsec()) == (after.dev(), after.ino(), after.ctime(), after.ctime_nsec())
-    };
-    #[cfg(not(unix))]
-    let same_inode = true;
-    before.len() == after.len() && before.modified().ok() == after.modified().ok() && same_inode
+    before.len() == after.len() && before.modified().ok() == after.modified().ok() && same_inode(before, after)
+}
+
+/// Whether two metadata snapshots name the same inode with an unchanged status-change time.
+#[cfg(all(feature = "sqlite", unix))]
+fn same_inode(before: &std::fs::Metadata, after: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    (before.dev(), before.ino(), before.ctime(), before.ctime_nsec()) == (after.dev(), after.ino(), after.ctime(), after.ctime_nsec())
+}
+
+/// Platforms without inode metadata compare the length and modification time only.
+#[cfg(all(feature = "sqlite", not(unix)))]
+fn same_inode(_before: &std::fs::Metadata, _after: &std::fs::Metadata) -> bool {
+    true
 }
 
 /// A GeoPackage core requirement number or a named extension requirement.

@@ -7,7 +7,7 @@
 //! string). Outputs are `Dataset`s, written to bytes with `toBytes`. Options are objects with
 //! camelCase names after the command-line options (`tSrs`, `srcNodata`, `cropToCutline`...).
 
-use crate::{Dataset, Inner, js_err, parse_options};
+use crate::{Dataset, Inner, OverviewArg, js_err, parse_options};
 use serde::Deserialize;
 use terrio::crs::SpatialRef;
 use terrio::formats::VectorDriver;
@@ -58,6 +58,20 @@ pub(crate) fn input_raster(v: &JsValue) -> Result<RasterDataset, JsError> {
     Err(invalid("expected a raster: a Dataset, a Uint8Array or { bytes, filename }"))
 }
 
+/// A raster given to an operation, read lazily: a `Dataset` (sharing its reader) or a file's bytes.
+pub(crate) fn input_lazy_raster(v: &JsValue) -> Result<terrio::LazyRaster, JsError> {
+    if let Some(inner) = Dataset::lookup(v) {
+        return match &mut *inner.borrow_mut() {
+            Inner::Raster(r) => Ok(r.shared()),
+            Inner::Vector(..) => Err(invalid("expected a raster, got a vector dataset")),
+        };
+    }
+    if let Some((bytes, name)) = file_bytes(v) {
+        return terrio::memory::open_raster_lazy_bytes(bytes, &name).map_err(js_err);
+    }
+    Err(invalid("expected a raster: a Dataset, a Uint8Array or { bytes, filename }"))
+}
+
 /// Rasters given to an operation: one, or an array of them.
 pub(crate) fn input_rasters(v: &JsValue) -> Result<Vec<RasterDataset>, JsError> {
     let out: Vec<RasterDataset> = if js_sys::Array::is_array(v) {
@@ -96,6 +110,15 @@ pub(crate) fn input_layers(v: &JsValue) -> Result<Vec<Layer>, JsError> {
     Err(invalid("expected vector data: a Dataset, a Uint8Array, { bytes, filename } or GeoJSON"))
 }
 
+/// Select file layers while their source name and complete inventory are still available.
+pub(crate) fn selected_input_layers(v: &JsValue, names: &[String]) -> Result<Vec<Layer>, JsError> {
+    if let Some((bytes, name)) = file_bytes(v) {
+        let options = terrio::VectorOpenOptions { layers: names.to_vec(), ..Default::default() };
+        return terrio::memory::open_vector_bytes(bytes, &name, &options).map(|d| d.into_resolved_layers()).map_err(js_err);
+    }
+    terrio::ops::vector_filter::select_layers(input_layers(v)?, names).map_err(js_err)
+}
+
 /// Takes the options that are JavaScript values (datasets) out of an options object, returning
 /// them and a copy of the object without them, for the others to be parsed.
 pub(crate) fn split_options(options: &JsValue, keys: &[&str]) -> Result<(JsValue, Vec<Option<JsValue>>), JsError> {
@@ -116,8 +139,8 @@ pub(crate) fn split_options(options: &JsValue, keys: &[&str]) -> Result<(JsValue
     Ok((copy.into(), taken))
 }
 
-fn srs(s: Option<&str>) -> Result<Option<SpatialRef>, JsError> {
-    s.map(SpatialRef::parse).transpose().map_err(js_err)
+pub(crate) fn srs(s: Option<&str>) -> Result<Option<SpatialRef>, JsError> {
+    s.map(SpatialRef::parse_literal).transpose().map_err(js_err)
 }
 
 /// A number, a list of numbers, or a word (`"none"`).
@@ -231,6 +254,7 @@ struct WarpArgs {
     allow_ballpark: Option<bool>,
     only_best: bool,
     kernel_version: Option<String>,
+    grid_invariant: Option<bool>,
     geoloc: bool,
     s_srs: Option<String>,
     t_srs: Option<String>,
@@ -240,7 +264,7 @@ struct WarpArgs {
     ts: Option<[usize; 2]>,
     tap: bool,
     resampling: Option<String>,
-    overview: Option<SizeArg>,
+    overview: Option<OverviewArg>,
     src_nodata: Option<NumberOrList>,
     dst_nodata: Option<NumberOrList>,
     ot: Option<String>,
@@ -275,7 +299,8 @@ pub fn warp(src: JsValue, options: JsValue) -> Result<Dataset, JsError> {
     };
     let mut o = WarpOptions {
         transform_options: terrio::crs::TransformOptions { allow_ballpark: a.allow_ballpark, only_best: a.only_best, ..Default::default() },
-        kernel_version: terrio::ops::warp::KernelVersion::parse(a.kernel_version.as_deref().unwrap_or("3.12")).map_err(js_err)?,
+        kernel_version: terrio::ops::warp::KernelVersion::parse_or_configured(a.kernel_version.as_deref()).map_err(js_err)?,
+        grid_invariant: a.grid_invariant.unwrap_or_else(|| WarpOptions::default().grid_invariant),
         geoloc: a.geoloc,
         src_srs: srs(a.s_srs.as_deref())?,
         dst_srs: srs(a.t_srs.as_deref())?,
@@ -285,11 +310,7 @@ pub fn warp(src: JsValue, options: JsValue) -> Result<Dataset, JsError> {
         size: a.ts.map(|[w, h]| (w, h)),
         target_aligned_pixels: a.tap,
         resampling: Resampling::parse(a.resampling.as_deref().unwrap_or("near")).map_err(js_err)?,
-        overview: match a.overview {
-            None => terrio::ops::overview::OverviewSelection::Auto,
-            Some(SizeArg::Pixels(n)) => terrio::ops::overview::OverviewSelection::Level(n),
-            Some(SizeArg::Text(s)) => terrio::ops::overview::OverviewSelection::parse(&s).map_err(js_err)?,
-        },
+        overview: overview_arg(a.overview)?,
         src_nodata: nodata_arg(a.src_nodata)?,
         dst_nodata: nodata_arg(a.dst_nodata)?,
         output_type: a.ot.as_deref().map(parse_data_type).transpose().map_err(js_err)?,
@@ -391,6 +412,12 @@ impl SizeArg {
     }
 }
 
+/// The stored resolution an operation reads from (`-ovr`): `"AUTO"` (the default), `"AUTO-n"`,
+/// `"NONE"` or a level from 0, as `readResampled` takes it.
+fn overview_arg(v: Option<OverviewArg>) -> Result<terrio::ops::overview::OverviewSelection, JsError> {
+    OverviewArg::selection(v.as_ref()).map_err(js_err)
+}
+
 /// `true`, or a list of 2 or 4 numbers.
 #[derive(Deserialize)]
 #[serde(untagged)]
@@ -416,6 +443,7 @@ struct TranslateArgs {
     a_nodata: Option<NumberOrList>,
     a_srs: Option<String>,
     a_ullr: Option<[f64; 4]>,
+    overview: Option<OverviewArg>,
 }
 
 /// Subsets, resizes, rescales or converts a raster, as `terrio translate` (GDAL's
@@ -425,7 +453,13 @@ struct TranslateArgs {
 /// `projwin` (`[ulx, uly, lrx, lry]`), `projwinSrs`, `outsize` (`[width, height]`, pixels or
 /// percentages such as `"50%"`; 0 keeps the aspect ratio), `tr`, `resampling`, `scale` (`true`,
 /// `[srcMin, srcMax]` or `[srcMin, srcMax, dstMin, dstMax]`), `exponent`, `aNodata` (a number or
-/// `"none"`), `aSrs`, `aUllr`.
+/// `"none"`), `aSrs`, `aUllr`, `overview` (the stored resolution to read, as `gdal_translate
+/// -ovr`: `"AUTO"`, the default, `"AUTO-n"`, `"NONE"` or a level from 0). Inputs the lazy reader
+/// opens (GeoTIFFs, JPEG 2000, GRIB, tile archives...) are read by window, for the output alone,
+/// from that level where the reader exposes overviews; a TIFF it refuses is decoded whole, at
+/// full resolution, as are the formats it decodes whole. A level or `"AUTO-n"` is refused, before
+/// any whole decode, for bytes the lazy reader cannot open; on a raster without overviews it warns
+/// and reads full resolution, as `gdal_translate` and `terrio translate` do.
 #[wasm_bindgen]
 pub fn translate(src: JsValue, options: JsValue) -> Result<Dataset, JsError> {
     let a: TranslateArgs = parse_options(&options)?;
@@ -460,8 +494,17 @@ pub fn translate(src: JsValue, options: JsValue) -> Result<Dataset, JsError> {
         assign_srs: srs(a.a_srs.as_deref())?,
         assign_ullr: tuple4(a.a_ullr),
     };
-    let ds = input_raster(&src)?;
-    Ok(Dataset::from_raster(terrio::ops::translate::translate(&ds, &o).map_err(js_err)?))
+    let overview = overview_arg(a.overview)?;
+    // As Python's `translate` and `terrio translate`: a TIFF the lazy reader cannot read is
+    // decoded whole, as before, and translated at full resolution.
+    if Dataset::lookup(&src).is_none()
+        && let Some((bytes, name)) = file_bytes(&src)
+    {
+        let out = terrio::ops::translate::translate_bytes(bytes, &name, &o, overview);
+        return Ok(Dataset::from_raster(out.map_err(js_err)?));
+    }
+    let mut src = input_lazy_raster(&src)?;
+    Ok(Dataset::from_raster(terrio::ops::translate::translate_lazy(&mut src, &o, overview).map_err(js_err)?))
 }
 
 /// Options of [`rasterize`].
@@ -490,6 +533,7 @@ struct RasterizeArgs {
 /// `src`: vector data (a `Dataset`, bytes or GeoJSON). Options: `burn` (a value, or one per
 /// band) or `attribute`, `layers`, `sql`, `where`, `tr`, `ts`, `te`, `tap`, `like` (a raster
 /// whose grid to use), `ot`, `init`, `nodata`, `allTouched`, `add`, `aSrs`.
+/// Without `init`, uncovered pixels start at `nodata` when set, otherwise 0, for every format.
 #[wasm_bindgen]
 pub fn rasterize(src: JsValue, options: JsValue) -> Result<Dataset, JsError> {
     let (rest, taken) = split_options(&options, &["like"])?;
@@ -498,12 +542,8 @@ pub fn rasterize(src: JsValue, options: JsValue) -> Result<Dataset, JsError> {
     if burn_values.is_empty() && a.attribute.is_none() {
         return Err(invalid("give burn or attribute"));
     }
-    let all = input_layers(&src)?;
     let named = a.layers.is_some();
-    let all: Vec<Layer> = match &a.layers {
-        Some(names) => all.into_iter().filter(|l| names.contains(&l.name)).collect(),
-        None => all,
-    };
+    let all = selected_input_layers(&src, a.layers.as_deref().unwrap_or_default())?;
     let to_burn = match &a.sql {
         Some(sql) => {
             let o = VectorTranslateOptions { sql: Some(sql.clone()), ..Default::default() };
@@ -964,7 +1004,8 @@ pub fn sieve(src: JsValue, options: JsValue) -> Result<Dataset, JsError> {
 }
 
 /// Runs the documented read-only OGR SQL subset on vector inputs, returning a Dataset.
-/// SELECT expressions and LEFT JOIN retain primary geometry; DISTINCT and summaries discard it.
+/// Attribute expressions and LEFT JOIN retain primary geometry; DISTINCT, GROUP BY and summaries discard it.
+/// Supports the spatial-function subset in docs/sql.md; explicit geometry expressions replace primary geometry.
 #[wasm_bindgen]
 pub fn sql(src: JsValue, query: &str) -> Result<Dataset, JsError> {
     let layers = input_layers(&src)?;
@@ -982,17 +1023,18 @@ struct ViewshedArgs {
     cc: Option<f64>,
     om: String,
     ov: u8,
+    os: usize,
 }
 impl Default for ViewshedArgs {
     fn default() -> Self {
-        Self { band: 1, oz: 2.0, tz: 0.0, md: 0.0, cc: None, om: "NORMAL".into(), ov: 0 }
+        Self { band: 1, oz: 2.0, tz: 0.0, md: 0.0, cc: None, om: "NORMAL".into(), ov: 0, os: 10 }
     }
 }
 
 /// Single-observer visibility or minimum visible height on a projected DEM.
 /// `ox`, `oy` are coordinates in the DEM CRS. Options: `band`, `oz` (observer height),
 /// `tz` (target height), `md` (maximum distance, 0 unlimited), `cc` (curvature coefficient,
-/// 1 minus refraction), `om` (NORMAL/DEM/GROUND), `ov` (out-of-range value).
+/// 1 minus refraction), `om` (NORMAL/DEM/GROUND/ACCUM), `os` (ACCUM observer spacing in pixels, default 10), `ov` (out-of-range value).
 /// Numeric nodata is treated as elevation, as in GDAL; nonfinite elevations are rejected.
 #[wasm_bindgen]
 pub fn viewshed(src: JsValue, ox: f64, oy: f64, options: JsValue) -> Result<Dataset, JsError> {
@@ -1008,6 +1050,7 @@ pub fn viewshed(src: JsValue, ox: f64, oy: f64, options: JsValue) -> Result<Data
         curvature_coefficient: a.cc,
         mode: ViewshedMode::parse(&a.om).map_err(js_err)?,
         out_of_range: a.ov,
+        observer_spacing: a.os,
     };
     let ds = input_raster(&src)?;
     Ok(Dataset::from_raster(terrio::ops::viewshed::viewshed(&ds, &o).map_err(js_err)?))

@@ -263,7 +263,7 @@ impl TileWriteOptions {
             "RESAMPLING" => self.resampling = Some(value.to_string()),
             "OVERVIEW_RESAMPLING" => self.overview_resampling = Some(value.to_string()),
             "TILE_FORMAT" => self.tile_format = Some(value.to_ascii_uppercase()),
-            "QUALITY" => self.quality = num(value)?.clamp(1.0, 100.0) as u8,
+            "QUALITY" => self.quality = crate::drivers::common::jpeg_quality(value)?,
             "NAME" => self.name = Some(value.to_string()),
             "DESCRIPTION" => self.description = Some(value.to_string()),
             "TYPE" => self.tileset_type = value.to_string(),

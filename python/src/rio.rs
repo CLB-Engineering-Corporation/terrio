@@ -15,9 +15,14 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(resampled_region, m)?)?;
     m.add_function(wrap_pyfunction!(resampled_read, m)?)?;
     m.add_function(wrap_pyfunction!(tiff_tags, m)?)?;
+    m.add_function(wrap_pyfunction!(tiff_infers_cog_layout, m)?)?;
+    m.add_function(wrap_pyfunction!(gdal_compat, m)?)?;
     m.add_function(wrap_pyfunction!(crs_info, m)?)?;
+    m.add_function(wrap_pyfunction!(proj_boolean_parameters, m)?)?;
     m.add_function(wrap_pyfunction!(crs_projjson, m)?)?;
     m.add_function(wrap_pyfunction!(crs_to_projjson, m)?)?;
+    m.add_function(wrap_pyfunction!(crs_to_proj4, m)?)?;
+    m.add_function(wrap_pyfunction!(crs_to_wkt1_strict, m)?)?;
     m.add_function(wrap_pyfunction!(suggested_grid, m)?)?;
     m.add_function(wrap_pyfunction!(warped_vrt_type, m)?)?;
     m.add_function(wrap_pyfunction!(gcp_transform, m)?)?;
@@ -259,6 +264,33 @@ fn tiff_tags<'py>(py: Python<'py>, path: &str) -> PyResult<Option<Bound<'py, PyL
     Ok(Some(out))
 }
 
+/// Whether GDAL 3.13 reports `LAYOUT=COG` for a TIFF opened read-only without structural
+/// metadata saying so (`GTiffDataset::CheckCOGLayout()`, which GDAL 3.12 does not have).
+///
+/// Args:
+///     path: A local path, a URL, an `s3://` object or a zip archive member.
+///
+/// Returns:
+///     bool: Whether the file's layout is one GDAL 3.13 reports as a COG's; False for files
+///     that are not TIFFs.
+///
+/// Raises:
+///     TerrioIOError: If the file cannot be read.
+#[pyfunction]
+fn tiff_infers_cog_layout(py: Python<'_>, path: &str) -> PyResult<bool> {
+    py.detach_result(|| terrio::gdal_infers_cog_layout(path)).py()
+}
+
+/// The GDAL release whose behavior terrio reproduces where releases differ, for the calling
+/// thread: the `TERRIO_GDAL_COMPAT` option (`Env` scopes, then the environment), else 3.12.
+///
+/// Returns:
+///     str: `"3.12"` or `"3.13"`.
+#[pyfunction]
+fn gdal_compat() -> &'static str {
+    terrio::ops::warp::KernelVersion::configured().as_str()
+}
+
 /// Describes a CRS.
 ///
 /// Args:
@@ -273,16 +305,34 @@ fn tiff_tags<'py>(py: Python<'py>, path: &str) -> PyResult<Option<Bound<'py, PyL
 ///     CRSError: If the CRS cannot be parsed.
 #[pyfunction]
 fn crs_info<'py>(py: Python<'py>, crs: &str) -> PyResult<Bound<'py, PyDict>> {
-    let s = SpatialRef::parse(crs).py()?;
+    let s = SpatialRef::parse_literal(crs).py()?;
     let d = PyDict::new(py);
     d.set_item("epsg", s.epsg)?;
     d.set_item("esri", s.esri)?;
     d.set_item("authority", s.authority())?;
     d.set_item("wkt", s.to_wkt())?;
-    d.set_item("proj4", s.proj4.clone())?;
+    // A WKT given with a PROJ4 extension: that string, as terrio reads it (the one the CRS
+    // computes on), as `proj4`. An authority code keeps none, though its WKT has one.
+    let wkt_given = crs.contains(['[', '(']) && !crs.trim_start().starts_with('+');
+    d.set_item("proj4", if wkt_given { s.proj4_or_extension() } else { s.proj4.clone() })?;
     d.set_item("name", s.name())?;
     d.set_item("is_geographic", s.is_geographic())?;
     Ok(d)
+}
+
+/// Normalizes boolean PROJ parameters with the shared CRS parser.
+///
+/// Args:
+///     definition: A PROJ parameter string.
+///
+/// Returns:
+///     list: Parameter names and boolean values, in definition order.
+///
+/// Raises:
+///     CRSError: Quoting or a recognized flag's value is invalid.
+#[pyfunction]
+fn proj_boolean_parameters(definition: &str) -> PyResult<Vec<(String, bool)>> {
+    terrio::crs::proj_boolean_parameters(definition).py()
 }
 
 /// A CRS as PROJJSON, as GDAL (3.12.1, with PROJ 9.7.1) writes it, without PROJ.
@@ -300,7 +350,7 @@ fn crs_info<'py>(py: Python<'py>, crs: &str) -> PyResult<Bound<'py, PyDict>> {
 ///     CRSError: If the CRS cannot be parsed, or terrio cannot write it as PROJJSON.
 #[pyfunction]
 fn crs_projjson(crs: &str, database: bool) -> PyResult<String> {
-    let s = SpatialRef::parse(crs).py()?;
+    let s = SpatialRef::parse_literal(crs).py()?;
     Ok(s.to_gdal_projjson(database).py()?.to_string())
 }
 
@@ -310,7 +360,37 @@ fn crs_projjson(crs: &str, database: bool) -> PyResult<String> {
 ///     CRSError: If the CRS cannot be parsed, or would be described wrongly.
 #[pyfunction]
 fn crs_to_projjson(crs: &str) -> PyResult<String> {
-    SpatialRef::parse(crs).and_then(|s| s.to_projjson()).py()
+    SpatialRef::parse_literal(crs).and_then(|s| s.to_projjson()).py()
+}
+
+/// The PROJ string of a CRS as PROJ 9.8.1 writes it (`projinfo -o PROJ`, pyproj's
+/// `CRS.to_proj4()`). Like PROJ's, it leaves out the datum transformation of an EPSG CRS, the
+/// angular unit of a geographic CRS and most axis orders: keep the code or WKT to keep the CRS.
+///
+/// Returns:
+///     str | None: The PROJ string, or None for a CRS PROJ has none for (an engineering CRS).
+///
+/// Raises:
+///     CRSError: If the CRS cannot be parsed.
+#[pyfunction]
+fn crs_to_proj4(crs: &str) -> PyResult<Option<String>> {
+    SpatialRef::parse_literal(crs).map(|s| s.to_proj4()).py()
+}
+
+/// The WKT 1 of a CRS without GDAL's ``EXTENSION["PROJ4", ...]``, for formats whose readers
+/// ignore it (a ``.prj`` file), as PROJ 9.8.1 exports ``WKT1_GDAL``. Web Mercator (EPSG:3857)
+/// keeps GDAL's extension under its code.
+///
+/// Returns:
+///     str | None: The WKT 1, or None where WKT 1 needs the extension (a datum grid, an axis
+///     order or parameter it has no node for) or PROJ writes no WKT 1 (a geographic 3D CRS,
+///     Equal Earth).
+///
+/// Raises:
+///     CRSError: If the CRS cannot be parsed.
+#[pyfunction]
+fn crs_to_wkt1_strict(crs: &str) -> PyResult<Option<String>> {
+    SpatialRef::parse_literal(crs).map(|s| s.to_wkt1_strict()).py()
 }
 
 /// The output grid GDAL suggests for a raster reprojected to another CRS
@@ -350,14 +430,14 @@ fn suggested_grid(
     rpc: Option<std::collections::HashMap<String, String>>,
     rpc_options: Option<std::collections::HashMap<String, String>>,
 ) -> PyResult<((f64, f64, f64, f64, f64, f64), usize, usize)> {
-    let dst = SpatialRef::parse(dst_crs).py()?;
+    let dst = SpatialRef::parse_literal(dst_crs).py()?;
     if let Some(items) = rpc {
         let rpc = parse_rpc(items)?;
         let opts = parse_rpc_options(rpc_options)?;
         let (g, w, h) = py.detach_result(|| terrio::ops::warp::suggested_grid_rpc(width, height, &rpc, &opts, &dst)).py()?;
         return Ok(((g[0], g[1], g[2], g[3], g[4], g[5]), w, h));
     }
-    let src = SpatialRef::parse(src_crs).py()?;
+    let src = SpatialRef::parse_literal(src_crs).py()?;
     let gcps = crate::raster::parse_gcps(gcps);
     let method = terrio::ops::gcp::GcpMethod::parse(gcp_method).py()?;
     if gcps.is_empty() && transform[1] * transform[5] - transform[2] * transform[4] == 0.0 {
@@ -383,6 +463,9 @@ fn suggested_grid(
 ///     src_type: The source's data type, as GDAL names it (`"Byte"`...).
 ///     src_nodata: One source nodata value (or None) per band.
 ///     dst_nodata: The output nodata values (or None): one per band, or one for every band.
+///     kernel_version: The GDAL release whose resolution to reproduce, "3.12" (from Byte: an
+///         Int8 source gives Int16) or "3.13" (from the source's type). By default the
+///         `TERRIO_GDAL_COMPAT` option's, else "3.12".
 ///
 /// Returns:
 ///     tuple: GDAL's name of the type, and the source nodata values (None for every band when no
@@ -391,13 +474,16 @@ fn suggested_grid(
 /// Raises:
 ///     ValueError: If the type is unknown.
 #[pyfunction]
+#[pyo3(signature = (src_type, src_nodata, dst_nodata, kernel_version=None))]
 fn warped_vrt_type(
     src_type: &str,
     src_nodata: Vec<Option<f64>>,
     dst_nodata: Vec<Option<f64>>,
+    kernel_version: Option<&str>,
 ) -> PyResult<(&'static str, Vec<Option<f64>>)> {
     let t = terrio::ops::parse_data_type(src_type).py()?;
-    let (w, src_nodata) = terrio::ops::warp::warped_vrt_type(t, src_nodata, &dst_nodata);
+    let version = terrio::ops::warp::KernelVersion::parse_or_configured(kernel_version).py()?;
+    let (w, src_nodata) = terrio::ops::warp::warped_vrt_type(version, t, src_nodata, &dst_nodata);
     Ok((terrio::ops::data_type_name(w), src_nodata))
 }
 

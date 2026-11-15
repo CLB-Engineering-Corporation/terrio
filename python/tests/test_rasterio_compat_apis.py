@@ -21,7 +21,9 @@ import terrio.rio as rio
 
 def _run(code: str) -> str:
     """Runs `code` in a fresh interpreter and returns its standard output; fails on an error."""
-    result = subprocess.run([sys.executable, "-c", textwrap.dedent(code)], capture_output=True, text=True, timeout=120)
+    result = subprocess.run(
+        [sys.executable, "-c", textwrap.dedent(code)], capture_output=True, text=True, timeout=120
+    )
     assert result.returncode == 0, result.stdout + result.stderr
     return result.stdout
 
@@ -78,7 +80,7 @@ def test_a_later_broader_call_cannot_re_enable_a_driver(files):
             with pytest.raises(InvalidArgumentError, match="cannot be lifted"):
                 terrio.set_allowed_drivers(None, kind=kind)
         with pytest.raises(ValueError, match="kind must be"):
-            terrio.set_allowed_drivers(["GTiff"], kind="pointcloud")
+            terrio.set_allowed_drivers(["GTiff"], kind="table")
         assert terrio.allowed_drivers("raster") == ["GTIFF"]
         """
     )
@@ -120,7 +122,10 @@ def test_bytes_and_layer_listings_are_checked_by_content_and_kind(files):
         assert type(terrio.open_bytes(tif, "a.tif")).__name__ == "Raster"
         assert type(terrio.open_bytes(tif, "a.tif", lazy=True)).__name__ == "Raster"
         for data, name, lazy in [
-            (png, "a.png", False), (png, "a.tif", False), (png, "a.png", True), (png, "a.tif", True),
+            (png, "a.png", False),
+            (png, "a.tif", False),
+            (png, "a.png", True),
+            (png, "a.tif", True),
             (gj, "a.geojson", False), (gj, "a.shp", False),
         ]:
             with pytest.raises(ValueError, match="not allowed"):
@@ -146,6 +151,120 @@ def test_compat_aliases_pyogrio_and_its_errors():
         assert pyogrio is sys.modules["terrio.pyogrio"]
         assert pyogrio.errors is sys.modules["terrio.pyogrio.errors"]
         assert DataSourceError is sys.modules["terrio.pyogrio.errors"].DataSourceError
+        """
+    )
+
+
+@pytest.fixture
+def clouds(tmp_path):
+    """A point cloud in each format terrio reads, written before any list is set: LAS, LAZ, COPC,
+    PLY and E57 files, and EPT datasets with LAZ tiles (`laz/`) and with binary tiles (`bin/`)."""
+    rng = np.random.default_rng(0)
+    cloud = terrio.PointCloud.from_dict(
+        {axis: rng.uniform(0, 1000, 100) for axis in "xyz"}, crs="EPSG:32633"
+    )
+    for name in ("x.las", "x.laz", "x.copc.laz", "x.ply", "x.e57"):
+        cloud.write(str(tmp_path / name))
+    for tiles in ("laz", "bin"):
+        data_type = "laszip" if tiles == "laz" else "binary"
+        cloud.write(str(tmp_path / tiles), format="EPT", ept_data_type=data_type)
+    return tmp_path
+
+
+def test_a_list_for_every_kind_restricts_the_point_cloud_readers(clouds):
+    """A list set without `kind` restricts point clouds too, as `TERRIO_ALLOWED_DRIVERS` does. Under
+    GTiff alone, every format is refused, from a file or bytes, and identifies nothing; under EPT
+    alone, the LAS-data files and the LAZ tiles of an EPT dataset are refused, and binary tiles
+    read. Writing an EPT dataset, which reads back the LAS records it encodes, is not refused."""
+    files = [
+        ("x.las", "LAS"),
+        ("x.laz", "LAS"),
+        ("x.copc.laz", "LAS"),
+        ("x.ply", "PLY"),
+        ("x.e57", "E57"),
+    ]
+    for allowed, ept_laz, ept_bin in [
+        ("GTiff", "holds EPT data", "holds EPT data"),
+        ("EPT", "'0-0-0-0.laz' holds LAS data", None),
+    ]:
+        _run(
+            f"""
+            import numpy as np, pytest, terrio
+            from terrio.errors import UnsupportedError
+            d = {str(clouds)!r}
+            terrio.set_allowed_drivers([{allowed!r}])
+            for name, driver in {files!r}:
+                refusal = f"holds {{driver}} data, and the {{driver}} driver is not allowed"
+                with pytest.raises(UnsupportedError, match=refusal):
+                    terrio.read_points(d + "/" + name)
+                with pytest.raises(UnsupportedError, match=refusal):
+                    terrio.read_points_bytes(open(d + "/" + name, "rb").read())
+            with pytest.raises(UnsupportedError, match={ept_laz!r}):
+                terrio.read_points(d + "/laz/ept.json")
+            binary_refusal = {ept_bin!r}
+            if binary_refusal is None:
+                assert len(terrio.read_points(d + "/bin/ept.json")) == 100
+            else:
+                with pytest.raises(UnsupportedError, match=binary_refusal):
+                    terrio.read_points(d + "/bin/ept.json")
+            assert terrio.identify(d + "/x.las") == []
+            assert terrio.allowed_drivers("pointcloud") == [{allowed.upper()!r}]
+            cloud = terrio.PointCloud.from_dict({{axis: np.arange(3.0) for axis in "xyz"}})
+            for tiles in ("laszip", "binary"):
+                cloud.write(d + "/written-" + tiles, format="EPT", ept_data_type=tiles)
+            """
+        )
+
+
+def test_a_point_cloud_list_restricts_point_clouds_alone(clouds, files):
+    """`kind="pointcloud"` sets the list of point clouds alone, which rasters and vectors ignore,
+    and which, like the others, only narrows and cannot be lifted."""
+    _run(
+        f"""
+        import pytest, terrio, terrio.rio as rio
+        from terrio.errors import InvalidArgumentError, UnsupportedError
+        d, f = {str(clouds)!r}, {str(files)!r}
+        terrio.set_allowed_drivers(["LAS", "PLY"], kind="pointcloud")
+        terrio.set_allowed_drivers(["LAS", "LAZ"], kind="pointcloud")
+        assert terrio.allowed_drivers("pointcloud") == ["LAS"], "PLY is dropped, LAZ not enabled"
+        assert terrio.allowed_drivers("raster") is None and terrio.allowed_drivers("vector") is None
+        assert terrio.allowed_drivers() is None
+        assert len(terrio.read_points(d + "/x.las")) == 100
+        refused = [("x.laz", "LAZ"), ("x.copc.laz", "COPC"), ("x.ply", "PLY"), ("x.e57", "E57")]
+        for name, driver in refused + [("laz/ept.json", "EPT")]:
+            with pytest.raises(UnsupportedError, match=f"holds {{driver}} data"):
+                terrio.read_points(d + "/" + name)
+        assert [r["driver"] for r in terrio.identify(d + "/x.las")] == ["LAS"]
+        assert terrio.identify(d + "/x.ply") == []
+        assert len(terrio.open_vector(f + "/a.geojson").layers[0]) == 1
+        with rio.open(f + "/a.png") as src:
+            assert src.read(1)[0, 0] == 7
+        with pytest.raises(InvalidArgumentError, match="cannot be lifted"):
+            terrio.set_allowed_drivers(None, kind="pointcloud")
+        """
+    )
+
+
+def test_an_env_and_the_process_list_both_restrict_point_clouds(clouds):
+    """With `TERRIO_ALLOWED_DRIVERS` set in an `Env` and a list set for every kind, a point-cloud
+    driver must be in both, as for rasters and vectors."""
+    _run(
+        f"""
+        import pytest, terrio, terrio.rio as rio
+        from terrio.errors import UnsupportedError
+        d = {str(clouds)!r}
+        terrio.set_allowed_drivers(["LAS", "PLY"])
+        assert len(terrio.read_points(d + "/x.las")) == 100
+        with pytest.raises(UnsupportedError, match="holds LAZ data"):
+            terrio.read_points(d + "/x.laz")
+        with rio.Env(TERRIO_ALLOWED_DRIVERS="PLY,LAZ"):
+            assert terrio.allowed_drivers("pointcloud") == ["PLY"]
+            assert len(terrio.read_points(d + "/x.ply")) == 100
+            with pytest.raises(UnsupportedError, match="holds LAS data"):
+                terrio.read_points(d + "/x.las")
+            with pytest.raises(UnsupportedError, match="holds LAS data"):
+                terrio.read_points(d + "/x.laz")
+        assert len(terrio.read_points(d + "/x.las")) == 100
         """
     )
 
@@ -181,7 +300,8 @@ _IDENTITY = """
     import rasterio
     assert rasterio is sys.modules["terrio.rio"]
     for sub in terrio.compat.RASTERIO_SUBMODULES:
-        alias, real = importlib.import_module("rasterio." + sub), importlib.import_module("terrio.rio." + sub)
+        alias = importlib.import_module("rasterio." + sub)
+        real = importlib.import_module("terrio.rio." + sub)
         assert alias is real, sub
         assert sys.modules["rasterio." + sub] is sys.modules["terrio.rio." + sub], sub
         assert real.__spec__.name == "terrio.rio." + sub, (sub, real.__spec__.name)
@@ -223,7 +343,10 @@ def test_compat_registers_terrios_accessor_as_rio():
         import numpy as np, xarray as xr
         import rioxarray
         assert rioxarray is sys.modules["terrio.xarray"]
-        da = xr.DataArray(np.zeros((2, 3)), dims=("y", "x"), coords={"y": [1.5, 0.5], "x": [0.5, 1.5, 2.5]})
+        da = xr.DataArray(
+            np.zeros((2, 3)), dims=("y", "x"),
+            coords={"y": [1.5, 0.5], "x": [0.5, 1.5, 2.5]}
+        )
         assert type(da.rio).__module__.startswith("terrio.xarray"), type(da.rio)
         assert da.rio.transform() == da.terrio.transform()
         """
@@ -311,7 +434,10 @@ def test_the_pth_line_installs_compat_before_user_code(tmp_path):
     (tmp_path / "terrio-compat.pth").write_text(terrio.compat.PTH_LINE)
     code = f"import site, sys; site.addsitedir({str(tmp_path)!r}); exec(sys.argv[1])"
     result = subprocess.run(
-        [sys.executable, "-c", code, textwrap.dedent(_IDENTITY)], capture_output=True, text=True, timeout=120
+        [sys.executable, "-c", code, textwrap.dedent(_IDENTITY)],
+        capture_output=True,
+        text=True,
+        timeout=120,
     )
     assert result.returncode == 0, result.stderr
 
@@ -330,12 +456,12 @@ def server(tmp_path):
             a, _, b = self.headers["Range"][6:].partition("-")
             start, end = int(a), min(int(b), len(data) - 1)
             body = data[start : end + 1]
+            # Record before replying: the client can finish and read `sent` once the body arrives.
+            sent.append(len(body))
             self.send_response(206)
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Content-Range", f"bytes {start}-{end}/{len(data)}")
             self.end_headers()
-            # Recorded first: the client can return before this thread runs again after the write.
-            sent.append(len(body))
             self.wfile.write(body)
 
     httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)

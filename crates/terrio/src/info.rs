@@ -144,6 +144,9 @@ pub struct CrsSummary {
 }
 
 impl CrsSummary {
+    /// The CRS as reported. Its WKT is `to_wkt`, a NUL in a name (from a PROJJSON name) kept, and
+    /// escaped in JSON output, as PROJ 9.8.1's `to_json` keeps it; unlike files, a report isn't
+    /// read as a C string.
     pub(crate) fn new(s: &SpatialRef) -> Self {
         Self { epsg: s.epsg, name: s.name(), wkt: s.to_wkt(), esri: s.esri }
     }
@@ -158,11 +161,14 @@ impl CrsSummary {
     }
 
     /// The CRS as `info` prints it: `EPSG:4326 (WGS 84)`, else its name.
+    /// The CRS on one line of the text report. A NUL in its name (from a PROJJSON name) is
+    /// written `\u0000`, as the JSON report escapes it, rather than sent to the terminal.
     pub(crate) fn line(&self) -> String {
-        match (self.code(), &self.name) {
+        let name = self.name.as_deref().map(|n| crate::crs::escape_nul(n).into_owned());
+        match (self.code(), name) {
             (Some(code), Some(name)) => format!("{code} ({name})"),
             (Some(code), None) => code,
-            (None, Some(name)) => name.clone(),
+            (None, Some(name)) => name,
             (None, None) => "unknown".into(),
         }
     }
@@ -295,7 +301,7 @@ fn subdataset_index(key: &str) -> Option<(usize, bool)> {
 }
 
 /// The subdatasets a driver listed as GDAL's `SUBDATASET_N_NAME`/`SUBDATASET_N_DESC` metadata.
-fn subdatasets_from_metadata(metadata: &[(String, String)]) -> Vec<Subdataset> {
+pub(crate) fn subdatasets_from_metadata(metadata: &[(String, String)]) -> Vec<Subdataset> {
     let mut out: Vec<Subdataset> = Vec::new();
     for (k, v) in metadata {
         let Some((n, is_name)) = subdataset_index(k) else { continue };
@@ -424,6 +430,7 @@ fn lazy_raster_info_at(r: &mut LazyRaster, options: &InfoOptions, path: Option<&
 /// # Ok::<(), terrio::Error>(())
 /// ```
 pub fn info_path(path: &str, options: &InfoOptions) -> crate::Result<Info> {
+    let _asset_scope = crate::stac::AssetReadPolicy::enter_nested(path)?;
     // Judged as `crate::open` judges a dataset of either kind, by its name and first bytes; a point
     // cloud against the allow-list of its kind (`TERRIO_ALLOWED_DRIVERS` alone), as its reader is.
     #[cfg(feature = "pointcloud")]
@@ -431,6 +438,15 @@ pub fn info_path(path: &str, options: &InfoOptions) -> crate::Result<Info> {
     #[cfg(not(feature = "pointcloud"))]
     let kind = None;
     crate::formats::check_allowed(path, kind)?;
+    if let Some(target) = crate::drivers::vector::oapif::service_target(path) {
+        #[cfg(remote)]
+        return Ok(Info::VectorService(crate::drivers::vector::oapif::info(target)?));
+        #[cfg(not(remote))]
+        {
+            let _ = target;
+            return Err(crate::drivers::vector::oapif::transport_required());
+        }
+    }
     if let Some(target) = crate::drivers::vector::wfs::service_target(path) {
         #[cfg(remote)]
         return Ok(Info::VectorService(crate::drivers::vector::wfs::info(target)?));
@@ -452,7 +468,10 @@ pub fn info_path(path: &str, options: &InfoOptions) -> crate::Result<Info> {
         return Ok(Info::Vector(vector_info(&result?)));
     }
     if let Some(r) = crate::drivers::open_lazy(path) {
-        return Ok(Info::Raster(Box::new(lazy_raster_info_at(&mut r?, options, Some(path))?)));
+        let mut r = r?;
+        // Refused as an open refuses it, before statistics decode it (see `crate::declared`).
+        crate::declared::check_lazy(&r)?;
+        return Ok(Info::Raster(Box::new(lazy_raster_info_at(&mut r, options, Some(path))?)));
     }
     #[cfg(feature = "pointcloud")]
     if crate::pointcloud::is_point_cloud_path(path) {
@@ -472,6 +491,7 @@ pub fn info_path(path: &str, options: &InfoOptions) -> crate::Result<Info> {
             return Ok(info(&crate::tiles::archive_dataset(archive, &loc.file_name(), &Default::default())?, options));
         }
         let mut r = LazyRaster::from_tiles(crate::tiles::raster::TileRaster::new(archive, None)?);
+        crate::declared::check_lazy(&r)?;
         return Ok(Info::Raster(Box::new(lazy_raster_info(&mut r, options)?)));
     }
     if !matches!(loc, crate::vfs::Location::Zip { .. })
@@ -854,4 +874,36 @@ fn write_subdatasets(s: &mut String, subdatasets: &[Subdataset]) {
 
 fn fmt_box(b: &[f64; 4]) -> String {
     format!("({}, {}) - ({}, {})", b[0], b[1], b[2], b[3])
+}
+
+#[cfg(test)]
+mod subdataset_tests {
+    use super::*;
+
+    /// Reference GDAL 3.13.3: malformed metadata indices are ignored, and names are ordered.
+    #[test]
+    fn metadata_subdataset_indices_are_fallible_and_bounded() {
+        let metadata = vec![
+            ("SUBDATASET_2_NAME".into(), "two".into()),
+            ("SUBDATASET_+1_NAME".into(), "one".into()),
+            ("SUBDATASET_²_NAME".into(), "invalid".into()),
+            ("SUBDATASET_١_NAME".into(), "invalid".into()),
+            (format!("SUBDATASET_{}_NAME", "9".repeat(6000)), "invalid".into()),
+            (format!("SUBDATASET_{}3_NAME", "0".repeat(6000)), "three".into()),
+            ("SUBDATASET_0_NAME".into(), "invalid".into()),
+            ("SUBDATASET_100000_NAME".into(), "last".into()),
+            ("SUBDATASET_100001_NAME".into(), "invalid".into()),
+            ("SUBDATASET_1_DESC".into(), "description".into()),
+        ];
+        let listed = subdatasets_from_metadata(&metadata);
+        assert_eq!(listed.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(), ["one", "two", "three", "last"]);
+        assert_eq!(listed[0].description, "description");
+    }
+
+    #[test]
+    fn empty_duplicate_subdataset_names_remove_prior_names() {
+        let metadata = [("SUBDATASET_1_NAME", "first"), ("SUBDATASET_2_NAME", "two"), ("SUBDATASET_1_NAME", "")]
+            .map(|(key, value)| (key.into(), value.into()));
+        assert_eq!(subdatasets_from_metadata(&metadata).iter().map(|s| s.name.as_str()).collect::<Vec<_>>(), ["two"]);
+    }
 }

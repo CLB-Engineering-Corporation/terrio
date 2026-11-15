@@ -32,6 +32,7 @@ import numpy as np
 import xarray
 from affine import Affine
 
+from terrio import _terrio
 from terrio.rio import mask as rio_mask
 from terrio.rio import open as rio_open
 from terrio.rio import warp, windows
@@ -217,12 +218,13 @@ def _ensure_nodata_dtype(original_nodata: Any, new_dtype: Any) -> Any:
     )
     message = f"Unable to convert nodata value ({original}) to new dtype ({new_dtype})."
     try:
-        with warnings.catch_warnings():
-            warnings.simplefilter("error", RuntimeWarning)
+        # NumPy's floating-point error state, not a warning filter: changing the process's warning
+        # filters would make Python show again the warnings it has shown, and is not thread-safe.
+        with np.errstate(divide="raise", over="raise", invalid="raise"):
             nodata = new_dtype.type(original)
     except ValueError as error:
         raise ValueError(message) from error
-    except (OverflowError, RuntimeWarning) as error:
+    except (OverflowError, FloatingPointError) as error:
         raise OverflowError(message) from error
     if not np.isnan(nodata) and original != nodata:
         raise OverflowError(message)
@@ -231,6 +233,9 @@ def _ensure_nodata_dtype(original_nodata: Any, new_dtype: Any) -> Any:
 
 class XRasterBase:
     """What the DataArray and Dataset accessors share: dimensions, CRS, transform, bounds."""
+
+    # The object is a slot: the instance dict is the state `_StateCachedAccessor` caches on it.
+    __slots__ = ("__dict__", "_obj")
 
     def __init__(self, xarray_obj: XarrayObject) -> None:
         """Creates the accessor of an object.
@@ -1590,8 +1595,10 @@ class TerrioArray(XRasterBase):
         """Clips the array to geometries: pixels outside them become nodata.
 
         Args:
-            geometries: GeoJSON-like geometries (dicts, or objects with `__geo_interface__`).
-            crs: Their CRS (default: the array's).
+            geometries: GeoJSON-like geometries (dicts, or objects with `__geo_interface__`), or
+                a terrio `Layer`, burnt without a round trip through GeoJSON on north-up grids in
+                memory.
+            crs: Their CRS (default: the Layer's own, else the array's).
             all_touched: Keep every pixel a geometry touches (else those whose centre is inside).
             drop: Crop to the geometries' extent.
             invert: Keep the pixels outside the geometries instead.
@@ -1604,16 +1611,34 @@ class TerrioArray(XRasterBase):
         Raises:
             MissingCRS: If the array has no CRS.
             NoDataInBounds: If no pixel is left.
+            ValueError: If `crs` differs from the Layer's own CRS.
         """
         if self.crs is None:
             raise MissingCRS(
                 "CRS not found. Please set the CRS with 'rio.write_crs()'."
                 f"{get_data_var_message(self._obj)}"
             )
-        crs = crs_from_user_input(crs) if crs is not None else self.crs
-        geoms = [getattr(g, "__geo_interface__", g) for g in geometries]
-        if self.crs != crs:
-            geoms = list(warp.transform_geom(crs, self.crs, geoms))
+        crs = crs_from_user_input(crs) if crs is not None else None
+        geoms: Any
+        if isinstance(geometries, _terrio.Layer):
+            own = crs_from_user_input(geometries.crs) if geometries.crs else None
+            if own is not None and crs is not None and own != crs:
+                raise ValueError(f"crs={crs} differs from the Layer's own CRS")
+            src_crs = own or crs or self.crs
+            geoms = geometries
+            if src_crs != self.crs and own is None:
+                # A Layer without a CRS cannot reproject itself: as GeoJSON, from `crs`.
+                shapes = [f["geometry"] for f in geometries.to_geojson()["features"]]
+                geoms = list(warp.transform_geom(src_crs, self.crs, shapes))
+            elif src_crs != self.crs:
+                geoms = geometries.to_crs(self.crs.to_wkt())
+            if from_disk and isinstance(geoms, _terrio.Layer):
+                geoms = [f["geometry"] for f in geoms.to_geojson()["features"]]
+        else:
+            crs = crs or self.crs
+            geoms = [getattr(g, "__geo_interface__", g) for g in geometries]
+            if self.crs != crs:
+                geoms = list(warp.transform_geom(crs, self.crs, geoms))
         cropped: xarray.DataArray | None = None
         if from_disk:
             cropped = self._clip_from_disk(geoms, all_touched=all_touched, drop=drop, invert=invert)
@@ -2057,7 +2082,7 @@ class TerrioDataset(XRasterBase):
         """Clips every variable to geometries.
 
         Args:
-            geometries: GeoJSON-like geometries.
+            geometries: GeoJSON-like geometries, or a terrio `Layer`.
             crs: Their CRS.
             all_touched: Keep every pixel a geometry touches.
             drop: Crop to the geometries' extent.
@@ -2067,7 +2092,8 @@ class TerrioDataset(XRasterBase):
         Returns:
             xarray.Dataset: The clipped Dataset.
         """
-        geometries = list(geometries)
+        if not isinstance(geometries, _terrio.Layer):
+            geometries = list(geometries)
         out = self._per_var(
             lambda da: da.terrio.clip(
                 geometries,
@@ -2166,14 +2192,15 @@ class TerrioDataset(XRasterBase):
         nodatavals = encoded_nodatavals if use_encoded else attr_nodatavals
         nodata = nodatavals[0]
         if (
-            all(v == nodata for v in nodatavals)
-            or np.isnan(np.array(nodatavals, dtype=float)).all()
+            all(v is None for v in nodatavals)
+            or all(v == nodata for v in nodatavals)
+            or all(isinstance(v, (int, float, np.number)) and np.isnan(v) for v in nodatavals)
         ):
             data_array.terrio.write_nodata(nodata, inplace=True, encoded=use_encoded)
         else:
             raise RioXarrayError(
                 "All nodata values must be the same when exporting to raster. "
-                f"Current values: {attr_nodatavals}"
+                f"Current values: {nodatavals}"
             )
         if self.crs is not None:
             data_array.terrio.write_crs(self.crs, inplace=True)
@@ -2192,3 +2219,55 @@ class TerrioDataset(XRasterBase):
 
 
 __all__ = ["TerrioArray", "TerrioDataset", "XRasterBase"]
+
+
+class _StateCachedAccessor:
+    """Registers an accessor as xarray's `register_*_accessor` do, without a reference cycle.
+
+    xarray caches the accessor on its object, and the accessor refers to the object: a cycle,
+    which only the cyclic garbage collector frees, and it counts objects, not bytes. Every
+    object `.terrio` touched, the views of each variable it reads internally among them (they
+    share the Dataset's variables), then holds its pixels until a collection. Here the object
+    caches only the accessor's state (its `__dict__`), and each access wraps it in a new
+    accessor: what one access sets, the next sees.
+    """
+
+    def __init__(self, name: str, accessor: type[XRasterBase]) -> None:
+        """Registers `accessor`, its state cached under `name`.
+
+        Args:
+            name: The key of the state in the object's cache.
+            accessor: The accessor class.
+        """
+        self._name = name
+        self._accessor = accessor
+
+    def __get__(self, obj: Any, cls: Any) -> Any:
+        """The accessor of `obj` over its cached state, or the accessor class.
+
+        Args:
+            obj: The DataArray or Dataset, or None on the class.
+            cls: The class.
+
+        Returns:
+            XRasterBase | type[XRasterBase]: The accessor.
+        """
+        if obj is None:  # the class's attribute, as xarray's
+            return self._accessor
+        try:
+            cache = obj._cache
+        except AttributeError:
+            cache = obj._cache = {}
+        state = cache.get(self._name)
+        if state is None:
+            try:
+                acc = self._accessor(obj)
+            except AttributeError as err:
+                # xarray's __getattr__ would swallow it (as in xarray's own registration)
+                raise RuntimeError(f"error initializing {self._name!r} accessor.") from err
+            cache[self._name] = acc.__dict__
+            return acc
+        acc = self._accessor.__new__(self._accessor)
+        acc._obj = obj
+        acc.__dict__ = state
+        return acc

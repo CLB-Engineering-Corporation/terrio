@@ -3,9 +3,671 @@
 GDAL is terrio's reference: drivers and operations are compared with GDAL on real-world files.
 The conformance suites run against GDAL 3.12.2 and PROJ 9.8.1 in `ci-extended.yml`, on every push
 to `main` and on pull requests on demand (Run workflow, or a `ci:conformance` or `ci:all` label).
-Suites that require GDAL 3.13 run only in a local environment with that version. Pull requests
+Suites that require GDAL 3.13 run only in a local environment with that version. The Python
+tests set `TERRIO_GDAL_COMPAT=3.13` when rasterio's (or `osgeo.gdal`'s) GDAL is 3.13, so that
+terrio reproduces the GDAL they compare with (see [warp](cli.md#warp)). Pull requests
 compare the point cloud filters with PDAL's on `autzen_trim.las` only; pushes to `main` on the
 Madison lidar (4 million points) too (`scripts/compare_pointclouds.py --quick` skips it).
+
+## Grid confinement and diagnostics
+
+`python -m pytest python/tests/test_grid_policy.py` checks the Python confinement
+binding with host-default and explicit search directories, registered GTX bytes,
+path and parent-component refusals, and oversized sparse grids. Refusals must emit
+one `UserWarning` whether transformation raises or returns infinite coordinates,
+and must not reappear during an unrelated successful call. These check Terrio's
+host policy, rather than GDAL conformance. The shared warning drain includes the
+standalone CRS engine's grid diagnostics for CLI and language-binding callers.
+
+## Parquet row group pruning
+
+`cargo test -p terrio --lib drivers::vector::geoparquet` covers native GEOMETRY
+and GEOGRAPHY statistics through feature and Arrow reads, including real HTTP
+range requests, original feature IDs and exact selected values. Missing,
+non-finite or wrapped bounds remain conservative. The fixtures supply geospatial
+statistics independently of Terrio's writer and omit covering columns.
+Invalid covering bounds fall back to usable native statistics. GEOGRAPHY reads
+retain the existing WKB vertex bounds and planar geometry predicates; this
+optimization does not add geodesic edge intersection semantics.
+
+The sorted attribute conversion regression checks a plain remote Parquet file,
+an AND predicate with equality and BETWEEN, output projection and transferred
+bytes. Conversion uses statistics before reading predicate columns, then fetches
+payload only for groups containing matching rows. Remote Parquet conversions can
+use the streaming conversion path. Additional tests cover combined spatial and
+attribute selections, FID, nulls, coercions and unsupported expressions.
+
+Statistics pruning supports signed integers, floating-point values and string
+equality. Ordered string pruning is restricted to digit-only literals because
+OGR SQL's ASCII case folding and Parquet's byte ordering differ. Unsupported
+types, inexact string statistics and expressions remain candidates and use the
+ordinary SQL evaluator. These are Terrio I/O and predicate-semantics checks,
+rather than numerical GDAL conformance claims.
+
+The predicate pass evaluates all candidate groups before returning a batch and
+holds their selected file row IDs. On unselective data, it reads all predicate
+columns even with a conversion limit of one. Only payload decoding and prefetch
+use the bounded row group windows. Predicate arrays are evaluated one record
+batch at a time. Selected file row IDs require eight bytes
+per matching row, in addition to the row selections. An unselective LIKE regression records this
+behavior with HTTP ranges and a one-row conversion limit. Remote conversion
+regressions also check credentialed STAC policy refusal before any request and
+removal of a partial output after a corrupt Parquet page fails decoding.
+
+## Repeated GeoParquet columns through Arrow
+
+`python -m pytest python/tests/test_vector_duplicate_columns.py python/tests/test_pyogrio_arrow.py`
+checks repeated attributes through Arrow stream export, `read_arrow` and Arrow-backed
+dataframes. Generated suffixes reserve existing declared names and remain stable
+when selecting a single column or filtering by bbox. Covering-struct and geometry
+filters, multiple row groups, Snappy/Zstandard, nested types, nulls and field
+metadata are covered. Native regressions run with
+`cargo test -p terrio --lib drivers::vector::geoparquet_arrow::tests`.
+This is Terrio's naming policy, checked against independently written positional
+PyArrow columns, rather than a GDAL naming-conformance claim.
+The Arrow filter uses geometry bounding boxes; this does not claim identical row selection to an exact
+geometry-intersection filter.
+
+## Input isolation and diagnostic privacy
+
+`python/tests/test_pyogrio_buffer_routing.py` checks unsupported single-file and
+multi-file ZIPs through paths, bytes, named buffers and open files. Reads and
+layer inspection must name the archive (or `buffer`) rather than extracted or
+spilled files. Explicit `/vsizip/.../member` refusals retain that virtual path,
+including the GeoPackage layer-list shortcut. A malformed GeoJSON buffer retains
+its parsing reason and caller-visible name. The native regression is
+`cargo test -p terrio --lib vector_archive_member_refusals_name_the_requested_location`.
+
+`python/tests/test_crs_input_safety.py` checks that Python CRS strings and dataset
+metadata cannot implicitly read a host file. Literal EPSG/WKT/PROJ definitions
+remain supported; trusted Rust and CLI file parsing has separate coverage in
+`crates/terrio-crs/tests/definition_files.rs`.
+
+`python/tests/test_input_container_safety.py` checks archive provenance, rooted
+and escaping Zarr keys, normalized key collisions, and closed VRT source maps.
+The VRT checks include unmapped local and remote sources, uploaded source bytes,
+and explicit file-based opens. Core regressions cover archive extraction aliases,
+portable remote download basenames, mask sources, and RPC DEM references.
+The catalog tests keep VRT bytes in the closed-source-map opener for both reading
+and overwrite inventory, including XML declarations and `GDAL:`/`NETCDF:` name
+prefixes, prolog comments beyond the identification header, and rejected extra
+document roots and GDAL-accepted case variants. Direct paths and
+already-open native handles retain file-based lookup. Archive diagnostic tests
+check formatted Python exception chains and native sidecar/directory failures
+for private extraction paths. Named malformed CRS and MIF-header refusals remain
+terminal under the optional GDAL fallback.
+
+`python/tests/test_diagnostic_url_safety.py` uses a loopback range server and fake
+credentials to check exceptions, multilayer warnings, notebook display logs, and
+CLI stderr. It checks custom authentication parameter names as well as signed URL
+parameters and userinfo. A successful raster read verifies that the network still
+receives the original query. Diagnostic redaction never rewrites request URLs.
+Standalone schemeless signed locations and percent-encoded credential separators
+are redacted too. Literal `?` filenames, Windows verbatim prefixes and bare words
+such as "unexpected token" remain intact when no credential parameter is present.
+The same policy applies to schemeless `#` fragments. Bare schemeless suffixes
+without a `name=value` credential parameter remain literal filenames or keys;
+queries and fragments of locations with a URL scheme are always redacted.
+
+## Configuration alias precedence
+
+`cargo test -p terrio --lib config::tests::` checks scope ordering, alias priority,
+explicit unsets and thread isolation. `python/tests/test_config_alias_precedence.py`
+adds 24 real-I/O checks: TIFF sidecar metadata and file discovery across both
+aliases and nested scopes, restoration on exit, and HTTP User-Agent/retry
+settings applied to a loopback server. Spare-reader tests hold the primary reader
+on another thread and verify nested aliases and explicit unsets survive reopening.
+Ordered worker snapshots retain the same scope boundaries; flattened
+`thread_options()` remains an introspection API. Every scoped alias wins over process
+environment values or outer scopes. This alias policy is specific to Terrio;
+it is not a claim that GDAL understands the `TERRIO_` option names.
+
+## Additional HTTPS trust
+
+`python -m pytest python/tests/test_https_additional_ca.py` generates an ephemeral
+CA and localhost certificate with OpenSSL, then reads real TIFF windows through
+loopback HTTP and HTTPS range servers. It checks both CA option aliases, nested
+scope isolation, untrusted issuers, hostname mismatches and malformed/missing
+bundles. Warm-cache tests retain cached responses between trusted and untrusted
+opens. The native constrained-anchor regression includes an unconstrained DER
+copy of a public root and verifies that every compiled Mozilla anchor, including
+its applied name constraints, remains unchanged. HTTP and HTTPS CONNECT proxy
+tests verify tunneled reads, and a stalled TLS peer checks the handshake timeout.
+The successful reads use partial byte ranges and transfer less than the source
+file. These are native TLS trust-policy tests, not a GDAL
+conformance claim. OpenSSL is only a test fixture generator, not a runtime
+dependency.
+
+## Failed native Zarr reads
+
+`cargo test -p terrio --lib a_failed_waiting_read_cancels_a_stalled_response`
+checks the shared waiting-worker path used by remote Zarr chunks and shard runs:
+a failed request cancels a stalled response-header wait or a long retry delay,
+including nested waiting workers and either request index failing. The initiating
+HTTP error survives cancellation, and a subsequent request on the calling thread
+still succeeds.
+
+`python -m pytest python/tests/test_stac_geozarr.py` also reads a real two-chunk
+Zarr store over loopback HTTP. One body stalls after its first byte while the
+other chunk returns 400. Both chunk orders must return the 400 before the stalled
+body is released, and rereading the same dataset after recovery must return all
+four values exactly. These are Terrio cancellation and lifecycle checks, rather
+than GDAL numerical conformance comparisons. Response waits use the existing
+50 ms cancellation polling; DNS resolution, connection establishment and
+non-HTTP computation are outside this cancellation mechanism.
+
+## Server-runtime parallel range pieces (#865)
+
+`cargo test -p terrio --lib sparse::tests::parallel_pieces` checks request-slot
+allocation, exact range coverage, block alignment, partial final blocks, small
+and already saturated rounds, large block sizes and overflow boundaries. The
+shared `sparse::parallel_ranges` planner fills up to twelve slots, with pieces
+of at least 256 KiB or one larger block. Existing short ranges stay intact.
+
+After rebuilding the Node package, run:
+
+```sh
+node --test --test-name-pattern='long adjacent tile runs' js/tests/node.test.mjs
+```
+
+The test serves an uncompressed tiled COG over real HTTP and gates responses
+until another request starts, with a watchdog for the unfixed single request.
+It checks concurrent pieces in a server runtime, the unchanged merged request
+with a browser document present, exact UInt8 values, identical fetched bytes,
+and no new requests on a warm read. Opening/header probes keep their existing
+request growth policy.
+
+A local comparison used the existing `usgs_dem.tif` fixture (3612 by 3612,
+Float32, 51,486,544 bytes), Node.js 26.13.1 and geotiff.js 3.0.5. Baseline and
+candidate used matching single-threaded core WASM release builds with
+`--no-default-features` and no wasm-opt. The loopback server served a preloaded
+file buffer. Each number is the median open-plus-first-read time from three
+fresh processes, with libraries interleaved in rotating order:
+
+| Per-connection response pacing | Baseline | Parallel pieces | geotiff.js |
+| --- | ---: | ---: | ---: |
+| Unrestricted loopback | 830 ms | 849 ms | 5022 ms |
+| 64 KiB every 4 ms | 3194 ms | 955 ms | 5014 ms |
+
+The unrestricted case has about 2.3% overhead in this run; the paced case
+isolates a per-connection throughput bottleneck. Both Terrio builds made one
+64 KiB opening request and fetched 38,182,736 response-body bytes for the read.
+The candidate used twelve data requests in place of one. geotiff.js used two
+opening requests (2048 bytes) and 192 data requests (38,162,102 bytes).
+
+All 13,046,544 Float32 values were byte-identical to live GDAL 3.13.3, including
+nodata samples. The Float32 type, nodata value, all six geotransform coefficients
+and EPSG:4269 also matched exactly across both Terrio builds and geotiff.js.
+These measurements cover this local-server fixture and the selected pacing
+conditions; endpoint and network behavior determine the benefit elsewhere.
+## Parallel range reads across fork
+
+`cargo test -p terrio --lib a_fork_cancels_and_joins_parallel_range_requests`
+runs a real Linux fork while two HTTP range responses are held open. The fork
+cancels their response waits and joins the range workers before copying the
+process. The child must run parallel work, and the parent must reread both
+ranges correctly on the same reader after the server recovers. Four range
+requests are observed: two abandoned requests, then two successful retries.
+
+`cargo test -p terrio --lib waiting_workers_are_counted_cancelled_and_fall_back_during_a_fork`
+checks the worker lifetime, cancellation, serial fallback while a fork is already
+in progress, and a cancellation flag published after a fork inspects the
+registry. The registry mutex joins the locks held across fork, including when
+two threads fork concurrently.
+
+Cancellation is process-wide: a libc fork from any application thread cancels
+all active parallel range batches, including reads whose own callers never
+fork. Those concurrent readers receive an I/O cancellation error and may retry
+after the fork, as the recovery test does. Existing serial-read and Zarr fork
+behavior is unchanged. Cancellation covers response waits and retry delays.
+Because range workers are now counted, a fork also waits for their DNS and
+connection setup phases, which cancellation cannot interrupt. The default
+connection timeout is 30 seconds; DNS has no Terrio-configured timeout and can
+hold the fork until the resolver returns. These are lifecycle and I/O checks,
+not GDAL numerical comparisons.
+
+## Remote-read locks across fork
+
+`cargo test -p terrio --lib each_remote_read_lock_is_handed_off_across_a_fork`
+runs on Unix, including macOS. It independently checks the file-cache, host/file
+statistics, path-options (reader and writer), retry-warning and process-agent
+locks. Direct probes verify that `http::hold_for_fork` holds every lock. Each
+lock is then held alone by another thread while the process forks: the child's
+snapshot must show that the holder began releasing it, and both child and parent
+must be able to acquire it afterwards. The scenario runs in its own test process
+with bounded timeouts.
+
+This regression sends no remote requests and initializes no HTTP agents in the child. The
+read-in-child test remains disabled on macOS because of an intermittent SIGTRAP
+whose cause is unconfirmed (#696). Lock hand-off coverage does not establish that
+system networking libraries are safe to call after a multithreaded fork.
+
+## Mixed-validity coordinate batches
+
+`python/tests/test_rio_transform_batch.py` verifies that rio coordinate and
+geometry transforms use one native batch when a point fails. Good points remain
+exactly equal to the all-valid Terrio batch; failed ordinates remain positive
+infinity. Native `transform_points` retains its strict default, with optional
+`errcheck=False` for this behavior in 2D and 3D. Invalid CRS definitions and
+array lengths still raise in the native API. The rio helper retains its existing
+all-infinity result for batch setup failures without retrying every point.
+
+`python scripts/conformance.py DATA --only transform-batches --strict` requires
+all 22 tests, including two 1,000-point Natural Earth populated-place batches
+transformed to EPSG:3857 and EPSG:3395. Successful coordinates after inserting a
+NaN agree with GDAL via rasterio within 1e-7 metres. Failed-point output follows
+Terrio's existing policy; rasterio raises on these mixed-invalid batches. The
+reference for local validation is GDAL 3.12.1. Timing is measured separately;
+the regression uses a deterministic native-call count instead of a timing limit.
+
+## Transformed polar bounds
+
+`cargo test -p terrio-crs --lib transform_bounds` checks pole inclusion, explicit
+edge densification and diagnostics. `python/tests/test_transform_bounds_poles.py`
+checks Python and xarray, including the northern and southern NSIDC 25 km grid
+extents from #903. `terrio info` and operations use the same CRS implementation.
+
+`python scripts/conformance.py ../terrio-data --only transform-bounds --strict`
+compares 48 polar and regional boxes with live GDAL via rasterio: four polar
+stereographic CRSs, EPSG:4326/OGC:CRS84 targets, and 2, 21 or 40 interior points
+per edge. Pole latitudes and full longitude endpoints must be exact; other
+bounds allow absolute error of 1e-8 target units. Regional UTM checks also
+require no warnings from synthetic pole probes. The reference for development
+is GDAL 3.12.1 via rasterio 1.5.0. Antimeridian crossings without an interior pole retain scalar
+longitude minima/maxima; wrapped bounds are outside this comparison's scope.
+Poles on an edge retain GDAL's edge-sampling behavior; only an interior pole
+forces the full longitude range. Sampling counts above 65,536 per edge are
+refused. The conformance runner clears inherited pytest options and requires
+all 48 comparison results in its JUnit report before declaring agreement.
+
+## Polar-edge source windows
+
+`python/tests/test_warp_polar_edge_windows.py` checks 15 tiles beside either pole,
+including north-up and sheared grids. Its 60 parameterized checks cover nearest
+and average, both compatibility selectors, ordinary/dense edge sampling and the
+default policy as a control. Every covered center must be written, and the
+chunk-dependent planner must include both stored longitude edges when adjacent
+samples cross the cut. An orthographic control exercises invalid corners and
+the interior-grid fallback without writing outside the projection's domain.
+
+The lazy HTTP regression reads 802,816 bytes in two requests from a
+12,978,366-byte global COG. The rectangular source window includes all longitude
+columns but only the necessary latitude rows. More columns are read in the
+affected chunks to retain their meridian side. These are coverage and I/O checks,
+not a numerical GDAL parity claim; regional and multi-turn placement rules remain
+separate.
+
+## TIFF block metadata
+
+`python scripts/conformance.py DATA --only tiff-block-tags --strict` requires
+all 15 checks in `python/tests/test_rio_block_tags.py`, including corrupt-table
+open-time refusal and propagation of a native corruption exception at the facade
+query boundary. TIFF-domain
+`BLOCK_OFFSET_x_y` and `BLOCK_SIZE_x_y` items match the file's chunk arrays and
+GDAL exactly for tiles, strips, classic TIFF, BigTIFF, planar/interleaved bands,
+complex samples, MemoryFile, overviews and real Landsat data. External overview
+offsets refer to the `.ovr` file. Block items are queried individually and are
+not enumerated in `tags()`.
+
+The loopback HTTP COG test measures transferred bytes and requests. Opening
+the dataset and querying all base blocks transfers less than one quarter of
+the file; repeated queries send no additional requests. The implementation
+reuses the lazy reader's chunk tables and does not decode pixels for metadata.
+Local validation uses GDAL 3.12.1 through rasterio.
+
+## Periodic geographic storage
+
+`python/tests/test_warp_longitude_period.py` checks all 14 resamplers, both grid
+policies, four destination CRSs, nodata, polar meridian pixels and the excluded
+south latitude edge. Rust regressions also compare whole and small-memory
+chunks, reversed source columns, and a 400-grad longitude period. Regional and
+multi-turn source placement rules remain separate.
+
+`python scripts/conformance.py DATA --only longitude-period --strict` requires
+twelve real Natural Earth country-coverage comparisons. The same values stored
+from 0° and from 180° W agree within 1e-8. Nearest, average and chunk-dependent
+bilinear match GDAL 3.12.1 within 1e-6. Stable bilinear uses per-pixel scales and
+differs from GDAL's chunk sampling by up to 0.411959 on this binary land field.
+Exact `sum` differs by up to 0.010157 per Mercator pixel, while both retain the
+same 15,276 source-pixel area total within 1e-6. These policy differences are
+reported explicitly rather than treated as pixel-identical agreement.
+
+`python/tests/test_warp_wider_source_placements.py` checks the 361-column source
+from #884: its crossing 2-degree pixel sums to 20. Distinguishable edge values
+check every area method under both sampling policies, with increasing and
+decreasing source longitudes. The preferred placement keeps its existing
+greatest-overlap rule; only the uncovered part uses another placement, clipped
+to exclude duplicate longitudes. Quantiles retain their existing sample-count
+policy, while average, RMS and mode retain coverage weights.
+
+Four Natural Earth comparisons match independent column-area integrals and
+Terrio's single-turn control within absolute 1e-9. Against GDAL 3.12.1, average
+agrees within 1e-9; GDAL's approximate sum weights differ by up to 0.02785515
+(a 0.03 absolute bound), rather than providing pixel-identical agreement.
+The extra stored column duplicates the first column, so either preferred copy
+represents the same field. These are
+included in `longitude-period`. Rust tests independently check fractional clips
+of tilted quadrilaterals within 1e-12 and require bit-for-bit equality between
+whole-window and two strip-based sums. Loopback HTTP tests measure range traffic
+under both grid policies: 1,916,928 bytes in two requests from a 9,749,624-byte
+COG. Source windows remain rectangular and can span the
+source's full longitude width, while retaining a bounded latitude window.
+
+Nodata mode-tie regressions require source-column order after ownership clipping,
+even when the preferred placement is at the high-column edge. Sources of 721 and
+1081 columns exercise complete preferred placements under every area method and
+both sampling policies. Chunk-dependent area windows include the final fractional
+column of that placement, as stable windows do.
+
+A 10,801 by 512 UInt16, three-turn local source uses one lazy reader and requests
+749,632 decoded pixel bytes under either sampling policy. At a 262,144-byte planning
+budget it makes 12 strip reads, versus one read at 64 MB. Measured local debug
+warps, including opening that reader, took about 9 to 11 ms with the tight budget;
+timings are observations, not test thresholds. These counts measure decoded read
+requests, not filesystem traffic or a total-process memory ceiling.
+
+`python/tests/test_warp_regional_longitudes.py` checks all 14 resamplers under both
+grid policies for a Pacific source stored past 180 degrees and a rounded near-full world.
+It separately checks meridian ownership and the rounded world's actual tiny gap. The two
+regional Natural Earth nearest-neighbor comparisons match GDAL 3.12.1 exactly. A small
+regional COG footprint a turn from its stored numbering transfers 147,456 of 13,107,613 bytes
+under each policy in local validation, using range requests.
+
+`python/tests/test_warp_meridian_footprints.py` adds 16 analytic checks across
+both compatibility selectors and grid policies. Eight further curved-coarse
+checks preserve sinusoidal min/max footprints whose corners extend beyond half
+a turn from the center; proposed wraps must narrow the span and retain that
+center. Three NSIDC pixels west of,
+on and east of the cut keep bilinear/cubic sampling local; `sum` agrees with
+their transformed quadrilateral areas within relative 1e-6 and absolute 1e-8.
+Two UPS pixels with a corner at the pole and on the meridian retain mirrored
+sum areas within relative 1e-8. The two additional real-data comparisons check
+NSIDC bilinear and sum against GDAL within absolute 1e-8, under both policies
+and both longitude storage layouts. A separate stable cubic comparison on
+those three country-coverage samples measured a maximum absolute difference
+of 0.032862 from GDAL 3.12.1; exact cubic agreement is not claimed.
+
+The lazy HTTP test measures 212,992 bytes in two requests for a footprint
+crossing 0° in a 2,089,218-byte COG. Both stored edges contribute without a
+whole-file download. A contiguous source window crossing the cut can include
+all columns, while retaining a narrow range of source rows.
+
+A separate 129,600-column by 512-row COG measurement exposes that cost at a
+larger width. The old one-sided result was 4.0 after 131,072 bytes in three
+requests; the corrected result is 3.6 after 16,711,680 bytes in ten requests,
+from an 84,831,353-byte file. The current rectangular source-window interface
+reads the intervening columns of the selected tile-row band. Reading two
+disjoint edge segments would require a separate source-window interface change;
+this fix does not claim that boundary I/O is proportional to the output width.
+
+The coarse bilinear regressions use an independent periodized triangular
+filter, compare a rotated storage layout, and retain finite-clipping controls
+for regional sources. A full-world filter on constant rows gives the global
+mean. These replace finite-edge expectations that conflict with periodic
+source extension, across both kernel versions and exact/approximate transforms.
+
+## Vector source ranges
+
+`python/tests/test_pyogrio_buffer_sources.py` compares named files with bytes,
+bytearrays, memoryviews and streams, including KMZ, XLSX, newline-delimited
+GeoJSON and DXF. It checks dataframes, layer listings and metadata, preserves
+named file-object extensions for CSV, and verifies multi-layer KMZ containers.
+These are Terrio path/buffer consistency checks, separate from the GDAL
+comparisons below. Shared Rust byte-probe tests distinguish ZIP containers by
+their directory entries without decompressing their contents; ordinary readers
+still validate the selected dataset and enforce driver policy.
+
+`cargo test -p terrio --test vector_stream_ranges` checks eager/streamed ranges,
+STAC asset forwarding and MVT directories/tiles. The memory range tests exercise
+filesystem-free codecs, including multi-layer and archive readers. Ranges count
+live features after a driver's candidate filtering, once per selected layer.
+Zero retains an empty layer with its schema. Pyogrio's compatibility facade
+retains its separate convention that `max_features=0` means unbounded.
+
+The Linux CSV regression measures the number of live input handles and the file
+cursor after bounded and full reads. Schema discovery still scans the file;
+the feature reader stops after its prefetched prefix for a bounded range. A
+portable source counter also checks that a zero limit decodes no feature batches
+and a satisfied limit never requests another batch.
+
+FlatGeobuf streams scan features sequentially even when an index exists; indexed
+bounding-box filtering happens before range counting, but does not use the index
+to avoid those reads. No indexed-read byte reduction is claimed here. Without an
+index, both eager and streamed readers retain all features as spatial candidates,
+so a bounding box does not remove features on that path. Eager codec reads and
+the GDAL fallback materialize a layer before slicing its feature range. A small
+range therefore does not reduce their decoding memory or GDAL vector-budget
+charges. Native Python `terrio.open_vector` keeps its existing whole-dataset API;
+Python callers use the pyogrio facade for range parameters.
+Skipping still decodes and discards the skipped live features, so its work grows
+with the requested offset; this wrapper does not add indexed seeks for pagination.
+
+`python scripts/conformance.py DATA --only vector-ranges --strict` compares
+GeoJSON and multi-layer GeoPackage STAC assets with GDAL/OGR using 16 real Natural
+Earth populated places. It checks 12 selected-layer/range combinations: order,
+scalar values and EPSG:4326 exactly, and point coordinates within 1e-9 degrees.
+Local validation uses GDAL 3.13.3 and finds zero coordinate difference.
+The public Python tests also exercise archives and CLI layer selection; Node
+checks byte ranges and rejects service options for in-memory files.
+
+## GDAL backend date-times
+
+The optional backend reads date-time fields using `OGR_F_GetFieldAsDateTimeEx`,
+retaining GDAL's millisecond precision and raw timezone flag. UTC is written as
+`Z`, explicit offsets are retained, and unknown/local zones remain unqualified.
+Fractions are canonicalized to three decimal digits when nonzero; this does not
+preserve the source's original text spelling or sub-millisecond precision.
+
+`cargo test -p terrio --features gdal --test gdal_backend date_time_fields` checks
+path and byte reads, fractional seconds, UTC, signed and quarter-hour offsets,
+unzoned values and nulls. The native unit test
+`gdal_backend::tests::datetime_field_keeps_gdal_timezone_flags` independently checks
+GDAL-authored in-memory fields with unknown, local and explicit UTC flags.
+These tests use GDAL itself as the typed-field reference; validation uses GDAL 3.13.3.
+
+## CSV and TSV column collisions
+
+`python/tests/test_csv_duplicate_headers.py` checks repeated and blank headers,
+case-distinct names, pre-existing numeric suffixes, and mixed field types through
+whole, streamed, paged and converted reads. Every source column retains its value
+under a distinct name. CSV/TSV names are case-sensitive; generated suffixes skip
+existing original names.
+
+Writer checks cover ordinary self-conversion, append, bytes and CLI output.
+Generated geometry columns normally use `WKT`, `X`, `Y`, `Z`. When attributes
+collide, WKT uses `__terrio_wkt`, and a complete coordinate block uses
+`__terrio_xy2_x`/`__terrio_xy2_y` or the corresponding `xy3` X/Y/Z block.
+Occupied marker names get a common numeric suffix before the axis, for example
+`__terrio_xy2_2_x`/`__terrio_xy2_2_y`. Native inference recognizes these reserved
+headers only at the start of a file, with all possible-name options at their
+defaults. Explicit possible-name options retain their existing matching rules.
+Ordinary `X_2`, `Y_2`, `Z_2` and `WKT_2` attributes do not become geometry.
+Other CSV consumers may need an explicit geometry-column hint for reserved names.
+Original colliding attributes keep their names and values. This is Terrio's
+lossless naming policy, not a claim to reproduce GDAL's duplicate-name spelling.
+
+## CSV and TSV writing
+
+`cargo test -p terrio --test merged csv_writing::` checks whole-file, byte and
+streamed writes of point and polygon layers, with `.csv`, `.tsv` and uppercase
+`.TSV` filenames. TSV defaults to tabs; explicit comma, semicolon, tab or pipe
+options override the filename. Round trips check geometry and attribute values,
+including quoted tabs, commas, quotes and newlines. CSV's inferred WKT column and
+its existing CRS limitations are unchanged.
+
+`python/tests/test_tsv_writing.py` checks Layer, VectorDataset, byte, convert and
+CLI exports against CSV controls. The Node test `TSV byte output uses tabs and preserves polygon commas`
+exercises the filesystem-free WebAssembly writer and reader with polygon WKT.
+TSV is also an output of the registered `streams` conformance suite. On the real
+country boundaries, whole and streamed TSV files are byte-identical and GDAL
+3.12.1 reads all 176 features.
+
+## Python warning attribution
+
+`python/tests/test_native_warning_locations.py` checks warnings recorded in Rust
+through direct bindings and pyogrio wrappers. It verifies the caller's filename and
+line in functions and module-level code, module-specific error filters, and default
+once-per-location suppression. The shared warning bridge skips Terrio's Python
+frames using APIs available on Python 3.10 and later, without changing warning filters.
+Attribution stops at the first frame outside the Terrio package, including a
+third-party intermediary when one calls Terrio on the application's behalf.
+Subprocess regressions also invoke the native binding and warning helper directly
+from `atexit` and `_thread` callbacks, where no Python caller frame exists. These
+calls must emit their warnings at the interpreter fallback location (`sys:1` or
+`<sys>:0`, depending on CPython) without raising a frame lookup error. Thread
+regressions also wait for callback completion without adding a Python wrapper frame.
+
+`python/tests/test_pyogrio_datetime_filters.py` checks pandas 2 and 3 datetime parsing without
+Terrio changing warning filters, including invalid input after mixed offsets and pandas-only
+ISO forms. Standard ISO strings with a uniform offset pass directly to pandas after a distinct
+value syntax scan. Other pandas 2 inputs inspect every distinct value so invalid strings retain
+their original diagnostic; pandas 3 uses its parser directly. Reduced `YYYY`/`YYYY-MM` values
+are parsed in a timezone-free batch, retaining valid results when one value is invalid.
+Mixed UTC conversion on pandas 2 parses naive and aware strings in separate batches,
+so a naive row cannot inherit an earlier row's offset. The regressions cover GeoJSON
+reads in both row orders, signed and fractional-hour offsets, missing and repeated
+values, duplicate indices, string storage types and millisecond output precision.
+Python datetime output normalizes timestamp fractions to six digits before stdlib parsing
+and attributes any precision warning to the caller. Other pandas-only ISO forms can still
+require one pandas fallback per distinct value on older Python versions.
+Regressions check bounded pandas calls for repeated and reduced-date inputs, the older stdlib
+precision path, and the uniform-offset shortcut. The additional scan has a CPU cost; it is
+not an end-to-end read benchmark or a timing gate.
+Each live buffer-reference comparison owns its GDAL and Arrow state in a child process. The
+GeoParquet case checks both ordinary buffers and Arrow dataframe reads with registered WKB
+extension types, keeping the reference driver's registrations out of other tests.
+`python/tests/test_geoparquet_arrow_crs.py` also isolates a registered WKB type
+that discards its incoming extension metadata. Valid CRS metadata must survive;
+null and rejected definitions stay absent, with the existing warnings. An uploaded
+field's forged fallback value must not override native validation. The retained
+metadata does not rebuild geometry or attribute buffers.
+An explicit child assertion is a comparison difference; skipped references stay skipped.
+Other exit codes, signals and the 60-second timeout are fixture setup errors, which the
+conformance reporter records as suite errors instead of data differences.
+
+## KMZ dataset-wide layer names
+
+`python/tests/test_kmz_layer_names.py` checks whole-dataset naming across main
+folders, main placemarks and linked documents, including ASCII case collisions, existing numbered names
+and link order different from ZIP entry order. Every layer remains selectable by
+name and converts to a distinct GeoPackage table through Python and CLI. The
+shared reader's Rust tests retain the single-document suffix rules. Node checks
+the same cross-document suffix collision through a frozen KMZ fixture. Layer
+names follow Terrio's deterministic policy; this is not GDAL name equivalence.
+
+## Vector byte packaging
+
+`python/tests/test_vector_byte_packaging.py` reads default vector byte outputs
+under their original filenames, checks explicit multi-file output names and
+refuses ZIP input mislabeled as a standalone GML/MIF/TAB document. The Rust
+memory tests also exercise the filesystem-free readers directly, and Node
+checks GML documents, archive refusals and unsupported MapInfo byte writing.
+
+`python/tests/test_mif_header.py` checks 51 combinations of wrong-format or
+incomplete MIF content and legitimate empty layers through standalone bytes,
+paths and ZIP members. MIF requires Version, Columns and Data declarations;
+case-insensitive keywords, CRLF and UTF-8 BOMs remain supported. Zero-column
+and declared-column headers followed by no objects retain their empty schema.
+Node exercises the same header checks in the filesystem-free MIF reader.
+Header recognition is a native policy in GDAL-enabled builds too: missing or
+incomplete required declarations are terminal, while geometry errors can still
+use the optional backend. This does not claim GDAL rejects every incomplete header.
+
+`scripts/compare_vector_byte_packaging.py DATA --json`, registered as the
+`vector-byte-packaging` conformance suite, compares GML documents and explicit
+MIF/TAB ZIP archives with GDAL/OGR on 16 real Natural Earth populated places.
+Counts, original scalar attributes, archive members and EPSG:4326 agree exactly;
+GML also exposes its generated `gml_id` field, which the Python regression checks.
+Coordinates allow 1e-6 degrees for MapInfo's storage grid. The script reports
+the measured maximum and distinguishes exact coordinates from agreement within
+that tolerance. The original comparisons were validated with GDAL 3.13.3;
+the current suite, including the MIF header cases, was validated with GDAL 3.12.1.
+The suite also compares three wrong-format payloads and two valid empty MIF
+schemas with GDAL's explicitly selected MapInfo driver (locally GDAL 3.12.1).
+Driver selection prevents a mislabeled GeoJSON file from being opened by GDAL's
+separate GeoJSON driver.
+
+Run `python scripts/conformance.py DATA --only vector-byte-packaging --strict`
+to execute this suite and fail on differences or suite errors. Check its report
+for skipped comparisons when reference dependencies or data are unavailable.
+
+## Translate input-opening policy
+
+Translate input-opening policy is tested with `cargo test -p terrio --lib ops::translate::tests`
+and `cargo test -p terrio --features gdal --test gdal_backend translate_input_policy`.
+The latter reads the generated `translate_complex_half.tif` fixture: GDAL 3.12.1 wrote
+16 x 8 CFloat16 samples with real values 0..127 and imaginary values -real-1,
+EPSG:32613 and transform `[500000,30,0,4100000,0,-30]`. The native lazy reader refuses
+that sample type, so path and byte tests exercise a successful whole-read GDAL fallback,
+including `GDAL:` paths and destination writes. Explicit levels are refused before fallback.
+Default-feature tests cover lazy paths/bytes, streamed outputs, missing local files and the
+shared terminal-error classification. Existing Python and Node overview regressions exercise
+the same entry points through the bindings.
+
+`cargo test -p terrio --lib vfs::tests` covers the shared local-path versus GDAL-name
+classifier, including Windows drive, drive-relative, verbatim and UNC paths, URL schemes,
+subdataset names and colon-free `/vsi` names. The GDAL backend tests also keep a TIFF
+in GDAL's `/vsimem` under a `.grb` name: the native GRIB lazy opener returns `NotFound`,
+while GDAL identifies the TIFF content and the whole-read translation succeeds.
+The name deliberately exercises GRIB dispatch without requiring GDAL's optional GRIB
+plugin. Explicit overview levels still refuse the whole read. On Windows,
+`input_policy_keeps_missing_windows_paths_terminal` exercises `translate_path` with
+drive-relative and verbatim missing paths and `OverviewSelection::Level(0)`.
+
+## Updating the ordinary CI GDAL reference
+
+`GDAL_REFERENCE_VERSION` in `.github/workflows/ci.yml` controls both micromamba GDAL
+package pins, the external-overview comparison's exact version assertion, and the
+GDAL component of the generated-data cache key. Its current value remains 3.12.2.
+Changing it invalidates that workflow's dataset cache automatically.
+
+The parity job separately pins rasterio 1.5.2 and rio-cogeo 7.0.4. Rasterio's wheel
+bundles its own GDAL: changing the environment variable does not replace that library.
+When upgrading, select and validate a compatible wheel; the assertion intentionally
+fails if its bundled GDAL differs, including a development-version suffix.
+
+The dataset cache keys in `ci.yml` and `ci-extended.yml` currently resolve to the same
+value: both use GDAL 3.12.2, PROJ 9.8.1, and the same three hashed input files. This lets
+the workflows share cached datasets within GitHub Actions cache access rules. Update
+both workflows' reference pins and cache keys together when moving the reference;
+a `ci.yml`-only version bump would make their keys diverge.
+
+Coordinate upgrades with the PROJ reference and any regenerated reference data. Keep
+historical GDAL version annotations attached to the results they describe; update
+current-reference documentation and tests only after validating the new oracle.
+
+## Warp grid consistency
+
+The default warp policy retains pixels and validity across aligned independent tiles,
+VRT windows and memory chunks. `python/tests/test_warp_grid_invariance.py` covers
+all 14 resamplers, both kernel versions, exact/default approximate transforms,
+interior nodata holes, dataset masks, binary alpha, masked arrays and explicit
+configuration overrides. Rust's
+`reprojected_samples_are_invariant_to_memory_chunks` checks a polar reprojection
+with three working memory limits.
+
+The `warp-grid` conformance suite uses a 256 × 256 crop of real USGS terrain,
+prepared by GDAL with an interior nodata hole. It compares independent tiles and
+WarpedVRT windows with their whole-grid output, requiring exact validity and an
+absolute Float64 tolerance of 1e-7:
+
+```sh
+python scripts/conformance.py ../terrio-data --only warp-grid --strict
+```
+
+These are consistency checks, not comparisons with GDAL's chunk-dependent warp
+values. Exact GDAL warp reference tests and the JSON raster conformance comparisons explicitly
+select `TERRIO_WARP_GRID=GDAL`; the standalone rasterio/rioxarray comparison scripts
+select that policy unless explicitly configured otherwise.
+The default policy remains covered separately. Kernel version selects arithmetic
+independently of grid policy. See [warp sampling](cli.md#warp) for per-call options.
+
+Additional regressions check nearest centres next to integer boundaries and
+300/360-degree output pixels through geographic and Web Mercator destinations,
+with exact and default approximate transforms. Wide-footprint bilinear values use
+analytic weights with absolute tolerance 1e-9. A fixed subpixel probe detects
+periodic transforms that alias the primary approximation anchors; exact midpoint
+checks distinguish longitude cuts from continuous coarse footprints.
 
 ## Test data
 
@@ -26,7 +688,157 @@ GDAL:
 - GeoTIFFs written by GDAL in each compression it offers beyond the common ones: JPEG (YCbCr and
   RGB), WebP, JPEG XL, LERC (with Deflate and Zstandard, lossy and with NaN masks) and LZMA
 
+### Datum shift grids and PROJ directories
+
+The real-data tests compare terrio with GDAL computed without datum shift grids, so the grid
+search is switched off for them (`crates/terrio/tests/common/test_data.rs`). The EPSG tests do the
+same, and the grid tests use only the `grids` directory of the test data. Grids found elsewhere
+change results by centimetres (NAD27 and NAD83) to metres: PROJ's user directory
+(`~/.local/share/proj`, which `projsync` and PROJ's network cache fill), `PROJ_DATA` and
+`PROJ_LIB`. Conda's `proj-data` package puts about 390 grids in the PROJ data directory, and
+GDAL reads them there. `scripts/gen_epsg_points.py` therefore searches a temporary directory
+holding only PROJ's `proj.db` and `proj.ini`, so that its references do not depend on which
+packages are installed. The Python grid test does the same for GDAL.
+
+Python's test setup also initializes GDAL and Rasterio with a database-only PROJ directory
+when a shared database is available, including when `PROJ_DATA` was already set. Without
+one, optional reference wheels retain their bundled databases. Networking and user/grid
+caches are isolated in both cases, including for CLI subprocesses, before either reference
+library is imported. Grid-specific tests explicitly select their own directories instead.
+
+Transformations in the real-data Rust test binaries must go through the `data()` helper first,
+which turns grid search and the network off. A test that transforms without calling `data()`
+can see the machine's grids, depending on test order. No current test does this.
+
+If the EPSG tests report a few hundred CRSs off by metres, or the warp or point-cloud tests are
+off by centimetres, check for grids in those directories (`projsync` leaves them in the user
+directory).
+
+### CRS definition files and MCP grid paths
+
+`cargo test -p terrio-crs --test definition_files --test grid_path_confinement`
+checks regular CRS files, symlinks, literal-only parsing and grid path rules. The
+FIFO definition regression runs the parser in a subprocess with a five-second
+deadline, so a blocking open fails deterministically and is terminated. It failed
+before the regular-file guard and now returns promptly.
+
+`cargo test -p terrio-cli --test mcp crs_tools_confine_grids_to_host_search_directories`
+uses the real MCP stdio server. An absolute path-named GTX grid is refused, while
+the same transformation succeeds with a grid name in the host's `TERRIO_GRID_DIR`.
+A direct CLI control retains the ordinary path-named grid behavior. This test
+failed before MCP tool processes made their effective search directories explicit.
+
+Independent local GDAL 3.13.3 controls identify a regular WKT file as EPSG:4979 and
+transform `(0.25, 0.5, 100)` to `(0.25, 0.5, 122.5)` with the tiny GTX fixture,
+exactly matching the direct CLI. The confinement policy deliberately differs from
+PROJ's default path lookup; it does not change interpolation or coordinate math.
+
+### Stored vector CRS definitions
+
+`python/tests/test_unresolvable_vector_crs.py` checks that retained EPSG:5800 engineering
+definitions cannot produce unreadable GeoJSON or TopoJSON through file, byte,
+conversion and CLI writes. GML file, byte and stream reads warn once for an unresolved
+name while retaining coordinates and attributes; short-code writes warn about the missing
+definition. Known CRS names remain quiet and diagnostic URLs redact credentials.
+Rust and Node regressions exercise the shared naming and GML warning behavior.
+
+`python/tests/test_vector_stored_crs.py` checks actual GeoPackage SRS rows,
+FlatGeobuf WKT headers and Shapefile projection sidecars. Prose warns and gives
+no layer CRS; balanced but unparseable WKT remains on the layer while GeoPandas,
+Arrow-table and Arrow-stream exports warn and omit the unusable CRS. Valid custom
+Transverse Mercator, engineering and WKT2-only temporal definitions retain equivalent
+CRS and values across those exports and pyogrio. Custom dynamic definitions also
+retain their frame reference epoch instead of losing it through WKT1 conversion.
+Unknown FlatGeobuf authority codes paired with usable projected or engineering WKT
+export without warnings through all five Python surfaces while retaining the
+layer's declared code. Rewriting a layer whose prose definition was ignored does
+not carry that text into another format. The JavaScript regression checks the
+native FlatGeobuf byte-read path, including retained incomplete and engineering
+definitions without a Python parser.
+Local GDAL 3.13.3 checks match geometry and attributes for six malformed-definition
+fixtures. GDAL's CRS lookup/export can itself fail on incomplete Shapefile WKT or
+an invalid FlatGeobuf CRS object; Terrio deliberately keeps dataframe export usable
+with a warning and no consumer CRS. The registered Arrow suite also matches all
+12 available comparisons on `countries.gpkg`, including CRS and native encodings.
+The stream coverage includes `terrio.open_stream`, both directly into GeoPandas
+and through `pyarrow.RecordBatchReader.from_stream`. Invalid WKT and unknown
+authority codes without stored WKT warn once at export and use the same schema
+on every batch, including empty streams. Without optional pyproj validation,
+native metadata is retained. GeoParquet's native stream schema is unchanged.
+
+### GeoJSON write CRS policy
+
+`python/tests/test_geojson_write_crs.py` checks Layer, bytes, streamed convert,
+CLI and pyogrio exports for EPSG, ESRI, custom WKT/PROJ and engineering CRSs.
+Registered authorities are named without changing coordinates; unnamed retained
+definitions are refused before the default writer creates or truncates a file.
+This refusal is Terrio policy, not GDAL write equivalence. Rust also checks ESRI
+aliases, IAU_2015 names and preservation of existing whole/streamed output files;
+Node checks the filesystem-free byte writer and reader. Explicit RFC 7946 output
+is compared with pyproj coordinates within 1e-6 degrees and refuses the local grid.
+
+`python scripts/conformance.py DATA --only geojson-crs --strict` requires eight
+real-data comparisons on US boundaries from `countries.gpkg`, projected by GDAL
+to EPSG:32615 and ESRI:102003. GDAL reads all four export surfaces: CRS authority
+and code, counts and scalar attributes are exact; coordinates allow 1e-7 metres.
+Local GDAL 3.12.1 validation measures zero coordinate difference in all eight
+cases. Missing input data is a suite error, and the runner requires all eight
+JUnit cases to pass before declaring agreement.
+
 ## The conformance suite
+
+Complex TIFF writes are checked with
+`python scripts/conformance.py DATA --only complex-writes --strict`, using current
+bindings and `landsat7.tif`. The suite checks whole/streamed GTiff/COG paths, complex
+integer copies without Float32 precision loss, component rounding/saturation, masks,
+types and georeferencing against GDAL (locally validated with 3.13.3). Its real-data
+case derives complex integer components from Landsat pixels and keeps the crop's CRS
+and transform. It checks samples and metadata, without claiming compressed byte identity.
+
+JPEG 2000 creation options are checked with
+`python scripts/conformance.py DATA --only jp2-writer --strict`, using the real
+`landsat7.tif` fixture, current Python bindings, pytest and rasterio. Path and memory
+writes check default lossless pixels, lossy quality/rate selection, reversible and
+irreversible filters, progressive quality layers, invalid options, georeferencing,
+types and independent GDAL decoding (reference: GDAL 3.13.3). Encoder byte identity
+with GDAL is not claimed. The corresponding JavaScript/WASM regression is in
+`js/tests/node.test.mjs`.
+
+`python/tests/test_jp2_decode_reference.py` separately pins the four irreversible
+9/7 cases whose live GDAL comparison permits sparse one-step differences on macOS
+arm64. Frozen JP2 payloads and Linux reference arrays in
+`python/tests/data/jp2_decode` require exact dtype, shape and samples through path
+and memory reads on every platform, without importing rasterio. The reference
+arrays agree exactly with GDAL 3.12.1 on Linux x86_64. Only the live GDAL comparison
+retains its platform limits; Terrio's frozen-reference check has no tolerance.
+The fixture README records inputs and regeneration instructions. These are
+decoder references, not assertions of encoder byte stability.
+
+Standalone WebP creation options are checked with
+`python scripts/conformance.py DATA --only webp-writer --strict`, using the
+`landsat7.tif` downloaded by `scripts/fetch_test_data.sh`. Current Python bindings,
+pytest and rasterio are required. Default/explicit lossless samples are exact;
+requested lossy output changes with quality, keeps alpha exactly, and is decoded
+independently with GDAL (validated locally with GDAL 3.13.3). Path and memory
+outputs agree. Lossy byte streams, size and PSNR are not claimed to match libwebp.
+Malformed `QUALITY` values, including empty strings and trailing text, must raise
+an argument error through native, rio path and memory writes, even when lossless
+output is selected. This is intentionally stricter than GDAL's numeric-prefix
+parser. Complete numbers from 0 to 100, decimals and surrounding whitespace are
+accepted; NaN retains the historical quality 75 default.
+The shared lossy encoder is also checked through WebAssembly GeoTIFF tiles in
+`js/tests/node.test.mjs`. General `toBytes` and `open` do not support WebP in that
+build; `rasterTiles` can emit standalone WebP bytes through its callback.
+
+`python/tests/test_webp_lossy_damage.py` checks the 30 seeded RGB tiles from #973
+at 11 qualities, plus default lossy GeoTIFF WebP tiles and the reported quality
+70/75 failures. Pillow/libwebp independently decodes standalone output, and GDAL
+3.12.1 via rasterio decodes the TIFF tiles. Every control requires at least 30 dB
+PSNR versus its input and no 16 by 16 macroblock with mean absolute error above
+20 levels. These are corruption thresholds, not a claim of equal libwebp encoder
+quality. The corrected shared fast encoder always signals skipped macroblocks
+whose coefficient tokens are omitted, including a single skipped block. This
+preserves token alignment without switching encoder methods or quality levels.
 
 CityJSON uses its published schemas and specifications as the reference because
 GDAL 3.13.3 has no CityJSON driver. Prepare the real CityJSON 1.1 Den Haag and 2.0
@@ -157,10 +969,17 @@ cases that are not identical. The [Conformance](conformance.md) page is that rep
 
 ```sh
 cargo build --release
+cargo build --release -p terrio --example xlsx_workbook
 python scripts/conformance.py ../terrio-data --output docs/conformance.md
 python scripts/conformance.py ../terrio-data --only ops,dem-calc   # some suites
 python scripts/conformance.py ../terrio-data --remote --strict     # remote COGs too; fail on a difference
 ```
+
+The `ops` report explicitly records the known footprint-edge weighting divergence from #703
+for the DEM NAD83-to-UTM average/RMS and the 100 m aligned Mercator average cases. Their
+original tolerances and full pixel/mask comparisons remain in force; results beyond tolerance
+remain **differs**, including in `--strict` mode. The note explains the intentional area-overlap
+rule rather than treating the outputs as pixel-identical or excluding edge pixels.
 
 ## What is compared
 
@@ -170,6 +989,7 @@ python scripts/conformance.py ../terrio-data --remote --strict     # remote COGs
 | RPF table of contents | `scripts/compare_rpftoc_with_gdal.py` (`rpftoc`) | Twenty-five cross-reads of flat two-scale Landsat mosaics, a historical polar frame, WI 3.5M and synthetic frames centered on both poles through CLI/MCP, Python native/bytes and Node (20 cases without the optional Node package). Exact samples, masks, palettes, types, nodata, CRS, GEOREF, classification and producer metadata; affine limit 1e-7 CRS units. Native reads stay below 1 KiB per frame. GDAL 3.13.3 requires an explicit 3.5M override to correct its verified fractional-scale truncation. Prepare external data with `scripts/make_rpftoc_fixtures.py DATA`; the suite requires GDAL 3.13 and current bindings. |
 | Tile publication | `scripts/compare_tile_publication_with_gdal.py` (`tile-publication`) | Three real Landsat XYZ/TMS cases: exact PNG payloads, KML overlay bounds and complete local links, custom MapML substitutions, and GDAL cross-read STACTA grids and samples. One case corrects the independently verified GDAL default-256 scale defect for 64-pixel tiles. Seven Leaflet/OpenLayers pages were also checked in real Chrome on global XYZ/TMS, Mercator and anisotropic raster grids, including zoom changes, tile requests, rendered pixels and screenshots. Native tests cover typed STACTA in projected US feet and nondefault tile sizes. |
 | Retile layouts | `scripts/compare_retile_with_gdal.py` (`retile`) | 28 Landsat/USGS DEM cases: samples, masks, nodata, types, georeferencing, band properties, filenames, edge crops, overlap, row directories, three recursive levels, all five kernels, COG, Byte, CSV extents and Shapefile indexes. Fourteen exact; fourteen account explicitly for GDAL six-decimal index-origin rounding, one-ULP bilinear Float32 differences and its verified COG Byte-conversion defect. The defect workaround compares native COG samples with GDAL GTiff retile and validates all native COG layouts fully. Six verifier tests reject excessive roundoff, nonfinite, mask and grid changes and incorrect reference workarounds. |
+| Grouped/spatial SQL | `scripts/compare_grouped_spatial_sql_with_gdal.py` (`grouped-spatial-sql`) | Natural Earth grouped aggregates and six spatial functions against GDAL 3.13.3 SQLite, through CLI/MCP, conversion, Python and optional Node/WASM. Exact counts, nulls, text, source geometry WKB and CRS; numeric tolerance relative/absolute 1e-10, constructed point displacement 1e-7 CRS units, buffer symmetric-difference area relative 1e-7 and envelopes absolute 1e-7 source units. Two explicitly checked schema policies retain static numeric types for empty groups and all-null spatial expressions where SQLite infers String. Unordered GROUP BY compares complete rows with row order excluded. Duplicate output aliases are explicitly checked as intentional rejections across every surface. Missing optional Node validation is reported as not compared; explicit unavailable Node requests fail. Buffers retain MultiPolygon declarations and use shape-equivalence comparisons. |
 | Dataset summaries | `scripts/compare_with_gdal.py` (`--pixels`) | size, bands, data types, nodata, geotransform, EPSG code, statistics, pixels; layers, feature counts, fields, extents, geometry types |
 | Multidimensional mosaics | `scripts/compare_mdmosaic_with_gdal.py` | NOAA wind spatial tiles, gaps, overlap/nodata priority, irregular time ranges, nested selection, netCDF/Zarr snapshots and all ten numeric types. Exact values/coordinates/types/nodata/units; source-group and Float32 coordinate-type preservation reported within tolerance. Descending GDAL reference inputs are normalized for its invalid-VRT size/offset bug. Registered as `mdmosaic`. |
 | Native multidimensional arrays | `scripts/compare_multidim_with_gdal.py` | GDAL MD and xarray: named axes, indexing variables, native slices/transposes, netCDF/Zarr coordinate/chunk preservation and damaged-unselected-chunk checks |
@@ -177,6 +997,8 @@ python scripts/conformance.py ../terrio-data --remote --strict     # remote COGs
 | Histograms | `scripts/compare_hist_with_gdal.py` | `terrio info --hist` vs `gdalinfo -hist` and `-json -hist`, byte for byte, with `-stats` and with histograms stored in `.aux.xml` sidecars, on every data type |
 | Raster round trips | `scripts/raster_roundtrip.py` | GDAL writes → terrio reads; terrio writes → GDAL reads, pixel for pixel; COGs pass GDAL's validator |
 | Window and overview reads | `scripts/compare_windows_with_gdal.py` | every overview level of every GeoTIFF, local and remote over `/vsicurl/` |
+| Overview sum estimates | `scripts/compare_warp_sum_overviews.py` (`sum-overviews`) | GDAL 3.13.3 full-resolution NONE sums and overview sums multiplied explicitly by the exact source/overview pixel-area ratio. Controlled TIFFs and a real USGS DEM crop; values within 1e-8 / 1e-4 absolute, respectively; masks, nodata, type, CRS and geotransform match. Cropped cells, integer means and partly nodata blocks remain estimates of full-resolution totals. |
+| Translations resized from overviews | `scripts/compare_translate_overviews_with_gdal.py` (`translate-overviews`) | `gdal_translate -outsize`, `-tr` and `-ovr` (AUTO, AUTO-n, NONE, levels) on level markers, real USGS terrain and Landsat RGB with an internal mask, every resampling: pixels, types, nodata, geotransforms; HTTP bytes of a real COG resized with AUTO against NONE |
 | Indexed raster catalogs | `scripts/compare_catalogs_with_gdal.py` | Real DEM mosaics in GeoPackage/FlatGeobuf indexes: z-order, nodata, masks, partial alpha, mixed CRS and Terrio-written indexes read by GDAL GTI; an 8x8 HTTP query from 1,002 features checks opens/cache bounds and actual bytes for both implementations |
 | Raster operations | `scripts/compare_ops_with_gdal.py` | translate, warp (all resampling methods), mosaic and VRT against `gdal_translate`, `gdalwarp`, `gdalbuildvrt`, `gdal_merge.py` |
 | Raster comparison, pixel queries, XYZ | `scripts/compare_raster_query_with_gdal.py` | `terrio compare` vs `gdal raster compare` (report lines and exit status), `terrio pixel-info` vs `gdal raster pixel-info` (GeoJSON, CSV) and `gdallocationinfo` (text, `-valonly`), `terrio xyz` vs `gdal2xyz.py`, on real rasters and derived copies. Registered in conformance as `raster-query`. |
@@ -197,6 +1019,7 @@ python scripts/conformance.py ../terrio-data --remote --strict     # remote COGs
 | GRIB | `scripts/compare_grib_with_gdal.py` (`OUT_DIR URL[#REGEX] ...`; registered in conformance as `grib`, on the repository's GRIB fixtures and the test data's GRIB files) | real products by URL (subsets of NOAA's GFS and HRRR by their `.idx` lines, MRMS, files GDAL writes), band by band: band count, size, geotransform, CRS, pixels, nodata, mask, description and `GRIB_*` metadata, from a file and as a URL |
 | Tile archives | `scripts/compare_tiles_with_gdal.py` | MBTiles written by `gdal_translate`/`gdaladdo` and by terrio, pixel for pixel per zoom level; PMTiles pixels; vector tiles read by both tools and written by `ogr2ogr` and terrio: feature counts, areas, lengths per feature key |
 | Point clouds | `scripts/compare_pointclouds.py` | every value vs laspy; headers, COPC queries, `writers.gdal` grids and reprojection vs PDAL |
+| pyogrio signed buffers | `python/tests/test_pyogrio_buffer_sources.py::test_signed_buffers_match_gdal` (`pyogrio-buffers`) | GeoPackage, FlatGeobuf and GeoParquet bytes against the installed Pyogrio/GDAL reference: columns, values, dtypes, point geometries and CRS match. Missing reference drivers are reported as not compared. Warning text is outside this comparison. |
 | Arrow | `scripts/compare_arrow_with_gdal.py` | `Layer.to_arrow()` (WKB and native GeoArrow) vs GDAL's Arrow streams, through pyarrow and GeoPandas; `terrio.from_arrow()` of GDAL's, GeoPandas' and terrio's tables; GDAL's `WriteArrow` of terrio's tables |
 | GeoPackage updates and spatial filters | `scripts/compare_gpkg_with_gdal.py` | `--append`, `--overwrite` and added layers vs `ogr2ogr` (features, extents, counts, sequences, R-trees, `integrity_check`, `validate_gpkg.py`, rasters kept); `--spat` vs `ogr2ogr -spat`; timings on a large file |
 | CAD drawings | `scripts/compare_cad_with_gdal.py` (`cad`) | Independent AutoCAD R2000 DWG files and public GDAL DXF fixtures (binary DXF, OCS, faces, solids, hatches and blocks), real OSM roads through DWG/DXF, and Terrio-authored DXF read by GDAL. Counts, types, layer names and coordinates; linear tolerance 1e-8 (zero-Z promotion to XYZ reported), curve Hausdorff tolerance 0.001 times diagonal and relative length/area tolerance 0.002; Z bounds separately. Independent DWG coordinates were checked with GDAL/libopencad; generated DWG is cross-read through DXF. GDAL uses unmerged blocks and an explicit UTF-8 override for the mislabeled Russian hatch fixture. |
@@ -204,6 +1027,7 @@ python scripts/conformance.py ../terrio-data --remote --strict     # remote COGs
 | Streamed vector conversions | `scripts/compare_streams_with_gdal.py` | conversions read and written as streams vs the same conversions of whole layers (identical files) and read back by GDAL; with `--features N`, a synthetic layer converted by terrio and `ogr2ogr`, with time and peak memory |
 | rasterio API | `scripts/compare_rio_with_rasterio.py` | `terrio.rio` vs rasterio: metadata, reads, masks, writes read back by rasterio, features, warping, merging, masking, warped VRTs, rasterio's documentation examples, and `terrio-rio` against rasterio's `rio` command line (see [Coming from rasterio](rasterio.md)) |
 | Coordinate transformations | `crates/terrio-crs/tests/epsg_accuracy.rs` | a point per EPSG CRS, forward, inverse and between CRSs, vs GDAL |
+| PROJ parameter exports | `python/tests/test_crs_proj_parameters.py` (`crs-parameters`) | Nine WGS 84 projected CRS cases read from exported PROJ strings versus the active rasterio GDAL oracle, forward coordinates within 1e-5 metres. Other regressions cover dictionary/WKT round trips, named datums and explicit shifts, warnings for unrepresentable datums, and boolean flags through Rust, CLI, Python and WebAssembly. |
 | Chains through intermediate datums | `crates/terrio-crs/tests/crs_chains.rs`, `scripts/compare_chains_with_proj.py` | every pair of EPSG geographic 2D CRSs on two datums no transformation links directly whose areas overlap, and a projected CRS of each datum, without and with grids, vs GDAL |
 | Datum shift grids, geoid models, epochs | `crates/terrio-crs/tests/epsg_accuracy_grids.rs`, `crates/terrio-crs/tests/crs_grids.rs`, `scripts/compare_crs_grids_with_gdal.py` | the same EPSG points with the grids of `scripts/proj_grids.txt`; random points through every grid (forward and inverse), legacy NTv2 and GTX files, NADCON5 and geocentric grids, compound CRSs and coordinate epochs, vs GDAL with the same grids |
 
@@ -488,6 +1312,30 @@ Actions. Add
 `ci:npm` to PRs that change the npm build or WebAssembly-sensitive code, and
 `ci:conformance` to GDAL-parity work.
 
+The RustSec advisories job (`audit` in `ci.yml`) runs on every pull request and
+on pushes to `main`: advisories are published without the code changing. It runs
+`cargo audit` on `Cargo.lock` and on `fuzz/Cargo.lock`, the fuzz targets'
+lockfile, with `.cargo/audit.toml`, which ignores the five
+advisories of wbraster's zip 8.6.0 and ruzstd 0.8.3 and says why, then again
+without that file: since an ignore covers its advisory in every version of a
+crate, any vulnerability other than those five, in those two versions, fails the
+job. Unmaintained and unsound crates are listed without failing it. Run
+`cargo audit` locally from the repository root: it reads the same file, so it
+ignores those advisories in every version, and only the job checks the versions.
+`cargo audit --file fuzz/Cargo.lock` audits the fuzz targets' lockfile.
+
+The fuzz targets job (`fuzz` in `ci.yml`) checks the targets in `fuzz/`, a
+workspace of their own that `cargo fuzz` builds with a nightly toolchain, against
+their lockfile as it is (`cargo check --locked`): a change that breaks a target,
+or a dependency change that `fuzz/Cargo.lock` does not follow, fails it. To bring
+that lockfile up to date, copy the root one over it and let Cargo remove what the
+targets do not use, which keeps the crates the two share at the root's versions:
+
+```sh
+cp Cargo.lock fuzz/Cargo.lock
+cargo update --manifest-path fuzz/Cargo.toml --workspace
+```
+
 ## Benchmark harness regressions
 
 ### CRS benchmark regressions (#266, #268)
@@ -604,7 +1452,8 @@ allowance does not apply to exact benchmark or conformance comparisons.
 ### Footprint attributes and singleparts (#275)
 
 ```sh
-cargo test -p terrio -p terrio-cli --test processing
+cargo test -p terrio --test merged processing::
+cargo test -p terrio-cli --test processing
 python scripts/conformance.py ../terrio-data --only footprint --strict
 ```
 
@@ -622,7 +1471,8 @@ source-path attribute automatically; callers provide it explicitly when needed.
 ### Zonal and point-sampling output controls (#280)
 
 ```sh
-cargo test -p terrio -p terrio-cli --test processing --test raster_analysis
+cargo test -p terrio --test merged -- processing:: raster_analysis::
+cargo test -p terrio-cli --test processing --test raster_analysis
 python scripts/conformance.py ../terrio-data --only analysis-output --strict
 ```
 
@@ -638,6 +1488,64 @@ The options also apply to Python's bundled CLI and MCP. Direct zonal statistics
 are exposed as Python `zonal_stats` and JavaScript `zonalStats`; direct
 point-sampling functions remain unavailable in the language bindings.
 
+## Compound authority references
+
+`cargo test -p terrio-crs --lib` (also with `--features wbprojection-fallback`)
+checks compound EPSG URNs, invalid component roles and unrelated text. GML and
+CityGML regressions keep both components and normalize horizontal axis order
+without changing height. Python path/bytes and layer CRS arguments are covered
+in `python/tests/test_compound_crs_urn.py`; Node covers shared parsing and GML XYZ.
+The registered `compound-crs` suite runs
+`scripts/compare_compound_crs_with_gdal.py`: three EPSG horizontal/vertical pairs
+against GDAL 3.13.3 with `GML_REPORT_COMPD_CS=YES`, with exact component IDs,
+2+1 axes and normalized XYZ. CRS
+names and serialized PROJJSON text are deliberately outside that comparison.
+
+## Engineering and vertical WKT keywords
+
+`cargo test -p terrio-crs --test wkt_root_keywords` checks engineering roots,
+case-insensitive keywords, vertical root identifiers and malformed syntax, both
+with and without `wbprojection-fallback`. Python and Node share eleven GDAL
+3.13.3-authored metadata references. Python also covers reader constructors and CLI
+literal/file arguments. Compare independent GDAL identity and real USGS elevation
+pixels with unchanged nodata and affine:
+
+```sh
+python scripts/conformance.py ../data --only wkt-keywords --strict
+```
+
+The registered comparison also writes each definition to GeoTIFF and COG, and
+adds three engineering definitions with root EPSG:5800 identifiers. Across 14
+definitions and both formats, native reads retain the exact input WKT and GDAL
+reads equivalent CRS identities/kinds; USGS pixels, sample type, nodata and affine
+are exact. Engineering-to-Earth transforms are unsupported and their refusal is
+checked after each engineering round trip. Local validation uses GDAL 3.12.1;
+the original eleven metadata references were authored by GDAL 3.13.3.
+
+`python/tests/test_gtiff_engineering_crs.py` checks engineering roots, unit IDs,
+root IDs and compact EPSG controls across whole, byte, lazy-streamed and rio
+writes, with pyproj available and unavailable. GeoKeys must include user-defined
+model type 32767 and a general citation, without a projected or geographic CRS
+code for engineering definitions. The original writer failed all 48 initial
+GeoKey cases; the expanded matrix has 138 cases. Node covers engineering WKT
+through GeoTIFF/COG byte writing and reading in WebAssembly.
+Engineering roots are refused before the legacy projection fallback, including
+in unoptimized WebAssembly warps, where the fallback's large frame could exhaust
+the stack. Node also checks that the dataset remains readable after this refusal.
+
+## Stored raster CRS definitions
+
+`python/tests/test_raster_stored_crs.py` checks JPEG 2000, Zarr and GeoPackage
+rasters with LOCAL_CS, ENGCRS and ENGINEERINGCRS definitions. Each is tested
+without an identifier, with unknown EPSG identifiers and with another authority.
+Tests independently inspect the stored WKT, then check eager and lazy read-back
+of the exact definition, grid, type and pixels. Engineering CRSs must still
+refuse a warp to EPSG:4326. Registered EPSG:32615 controls retain their existing
+behavior, including identifier fallback when Zarr or GeoPackage lacks a usable
+definition. These are metadata-preservation checks, not a numerical GDAL claim.
+Stored-definition fields containing a local filename are not resolved; tests
+check both absence of a CRS and fallback to a separate valid EPSG identifier.
+
 ## Standalone CRS feature coverage
 
 Run the standalone suite separately from the workspace to avoid Cargo feature
@@ -650,7 +1558,7 @@ TERRIO_TEST_DATA=../terrio-data cargo test -p terrio-crs --all-features
 
 Both runs exercise EPSG tables and grids; the data-dependent tests require the
 reference datasets described above. The 117-method inventory explicitly checks
-43 native methods with default features and 89 with `wbprojection-fallback`.
+45 native methods with default features and 89 with `wbprojection-fallback`.
 Unsupported methods must be refused in every tested encoding. The projection
 conformance runner enables the fallback to retain Terrio's full coverage.
 
@@ -675,7 +1583,8 @@ ellipsoids; an explicit GDAL no-op checks Cartesian vector preservation.
 
 ```sh
 cargo test -p terrio-crs --test geocentric
-cargo test -p terrio --test geocentric -p terrio-cli --test mcp
+cargo test -p terrio --test merged geocentric::
+cargo test -p terrio-cli --test mcp
 python scripts/conformance.py ../terrio-data --only geocentric --strict
 python -m pytest python/tests/test_geocentric.py
 node --test --test-name-pattern='geocentric XYZ' js/tests/node.test.mjs
@@ -686,6 +1595,22 @@ reports nonzero component errors as within tolerance (1 mm Cartesian/projected
 and height; 1e-8 degrees geographic), never as identical. The Rust tests also
 check malformed definitions, nonfinite inputs, round trips, coordinate metadata,
 vector Z and measure retention, and an actual MCP XYZ call through `--dim 3`.
+
+## Shapefile dataset names
+
+`python/tests/test_shapefile_dotted_names.py` verifies dotted stems through eager,
+streamed, paged and metadata reads, plus Layer, conversion and CLI writes.
+It checks matching SHP/SHX/DBF/PRJ/CPG components, uppercase sidecars and geometry
+extensions, UTF-8 attributes, CRS and geometry. Neighboring datasets use different
+attributes and CRS, and every neighbor component must remain byte-for-byte
+unchanged. Dots in directory names and multiple dots in stems are included.
+Explicit-driver controls cover extensionless and mismatched names, including
+companion extensions: the geometry file is normalized to `.shp` and remains
+distinct from SHX/DBF/PRJ/CPG outputs. Unknown dotted suffixes remain part of the
+basename: `roads.v2` becomes `roads.v2.shp`, preserving neighboring `roads.*`.
+Converting to an alias of the source reads the input whole before writing.
+Error cleanup removes only normalized output components. These are dataset-identity
+and file-preservation checks, not numerical GDAL parity.
 
 ## Shapefile archives (#278)
 
@@ -835,6 +1760,189 @@ Terrio-exported WKT with GDAL, then compares its transformed coordinates with
 the original JSON definitions. Rust regressions also
 check file loading, malformed/unsupported definitions, wrong units/dimensions,
 and that a root authority ID cannot overwrite a caller's false easting.
+The live suite also repeats projected definitions with the geographic base's
+optional `type` omitted. Rust, Python and Node regressions check code identification
+from the definition with absent or false root IDs, while modified parameters
+continue to control coordinates. Local validation uses GDAL 3.12.1.
+`TERRIO_TEST_DATA="$PWD/../terrio-data" cargo test -p terrio-crs --test crs_grids projjson_identity`
+adds the real NADCON `us_noaa_conus.tif` grid. Both an identified NAD27 UTM CRS and
+a custom false easting agree with the WKT-only path and GDAL 3.12.1 within 1e-10
+degrees. The test returns early without assertions unless the grid and legacy-grid directories are populated by
+`scripts/fetch_test_data.sh`; no network access occurs during transformation.
+The complete installed grid set is checked against WKT behavior. A child process isolates
+`us_noaa_conus.tif` for the frozen GDAL coordinates, so additional NADCON5 grids cannot change
+the operation behind that independent oracle.
+
+PROJ-string export (`SpatialRef::to_proj4`) is compared with PROJ 9.8.1's strings of every 20th
+EPSG, ESRI and IAU_2015 code, the codes behind each rule, custom definitions (bound CRSs among
+them) and compound references, character for character, and reads back as the same conversion
+(`cargo test -p terrio-crs --test proj_string_export`; regenerate with
+`scripts/gen_proj_string_export.py`, pyproj 3.8.0; `--all PATH` and the ignored
+`every_code_matches_proj` compare every code).
+
+Projected CRSs given by WKT 1 and by PROJ's WKT 2 of them, with each order of an east-west and a
+north-south `AXIS` (Transverse Mercator, south-orientated Transverse Mercator, Lambert Conformal
+Conic, Krovak, Mercator and Polar Stereographic, 54 CRSs), place a point where PROJ 9.8.1 does with `always_xy`, as GDAL 3.10's
+`gdaltransform` also does, within 1 mm. Both WKT versions write the `+axis` PROJ writes. Eighteen
+geographic and geographic BOUNDCRS exports also match PROJ, including omission of their CS axes
+and preservation of the bound datum shift (`cargo test -p
+terrio-crs --test wkt1_axes`; regenerate with `scripts/gen_wkt1_axes.py`, pyproj 3.8.0).
+
+WKT 2 `BOUNDCRS`s with a Helmert transformation, to WGS 84 and to ED50 and OSGB36 (with and
+without their codes, three and seven parameters, position vector and coordinate frame, a
+geographic and a projected source, over a source terrio identifies as EPSG:4277, and to a datum
+without transformations), place points where PROJ 9.8.1 does, in WGS 84 and, both ways, in CRSs on
+the target's datum (and without the shift in CRSs on the source's datum and in other CRSs of the
+target's ellipsoid), within 1 mm (`cargo test -p terrio-crs --test wkt2_bound`;
+regenerate with `scripts/gen_wkt2_bound.py`, pyproj 3.8.0).
+
+WKT that PROJ 9.8.1 reads, 26 CRSs (20 of which terrio refused), is read and places a point where
+PROJ does, within 1 mm (1e-9 degrees for geographic CRSs), with PROJ's PROJ string (values within a
+relative 1e-12) and PROJ's EPSG code where PROJ identifies one: ESRI's `Mercator_Variant_A` (EPSG
+Guidance Note 7-2's Makassar / NEIEZ example, in metres and US survey feet, without a scale factor,
+and with a latitude of origin and a standard parallel PROJ leaves out), EPSG's `Mercator (variant
+A)` with a latitude of origin of 0, and geographic and projected WKT 1 and a WKT 2 with a node of an
+unknown keyword (`rustgis:unapplied` as RustGIS marks the WKT 1 it converts a WKT 2 `BOUNDCRS` to,
+on a datum and at the root, a hyphen, a dot, a leading digit, other letters, quoted runs, an empty
+keyword, a vertical tab before it, text after a NUL, which was already ignored, and values whose
+quote runs over a comma or a sibling node). EPSG:32631's PROJJSON with a `\u0000` in a parameter's
+name is EPSG:32631 and places a point as PROJ does, within 1 mm. A bound CRS's PROJJSON with a NUL
+in its name keeps its `+towgs84` (PROJ's PROJ string, a point in WGS 84 within 1e-8 degrees, its
+GeoTIFF keys), and a stored WKT 1 with `TOWGS84` and a NUL in its name is written to PROJJSON as
+PROJ's `BoundCRS`. GeoAsciiParamsTag ends at its first NUL, as GDAL 3.12.1 reads GeoTIFFs with such
+citations (rasterio 1.5.0), and CRSs with a NUL in a name round-trip through GeoKeys (EPSG:32631,
+UTM 32N with `+towgs84`) or, needing an ESRI PE citation (Mollweide), are refused, as GDAL 3.12.1
+refuses to write them. Makassar / NEIEZ is EPSG:3002 and goes to WGS 84 as in PROJ, within 1e-8
+degrees. A keyword with a space, a vertical tab, a NUL or an unclosed quote, and a value with an
+unclosed quote, are refused, as PROJ refuses them, and EPSG's `Mercator (variant A)` with a latitude
+of origin other than 0, which PROJ neither transforms nor writes as a PROJ string, is refused
+(`cargo test -p terrio-crs --test wkt1_proj_reads`; regenerate with
+`scripts/gen_wkt1_proj_reads.py`, pyproj 3.8.0).
+
+WKTs that PROJ 9.8.1 does not resolve to their EPSG CRS place points where PROJ does: ESRI WKT 1,
+renamed CRSs, renamed WKT 2 `GEODCRS`s with an ellipsoidal CS, ESRI compound CRSs, renamed WKT 2
+CRSs on the WGS 84 and ETRS89 ensembles with their IDs, WKT 2 CRSs named by an alias (lon-first
+Monte Mario (Rome); NAD83(2011) on a renamed datum, which terrio reads as no code), and custom
+Transverse Mercator CRSs without code on NAD83, ED50, DHDN, OSGB36 and Monte Mario (Rome) given as
+WKT 1 `GEOGCS` and WKT 2 `BASEGEOGCRS`, DHDN / 3-degree Gauss-Kruger zone 3 with another false
+easting, and renamed ESRI WKTs with an ID of an authority PROJ does not know (`LOCAL`), which PROJ
+places by the code's own transformations. So do the WKTs it resolves (WKT 2 without IDs, WKT 2 with
+the datum's ID). WKT 1 with the datum's `AUTHORITY` alone falls under one or the other, by its name.
+The WKTs are variants of the 16 geographic CRSs whose ESRI or renamed WKT PROJ places through an
+intermediate datum (Monte Mario (Rome), Tokyo 1892, DHDN, ...), of every 25th EPSG geographic 2D
+CRS, and ESRI WKTs of eight projected CRSs (three with northing first). The points go to and from
+WGS 84 and, for a sample, to ETRS89, NAD83 and ETRS89 / UTM zone 32N: 1,100 cases. 1,074 of them are
+placed within 1 mm of PROJ, 107 of those where PROJ places them otherwise than by the code; on main,
+those 107 differ, by 0.12 m to 390 m. The other 26 are pinned at the code's placement: those PROJ
+places by its datum pivot (ESRI's ONGD14) or through its ballpark into a CRS of a renamed datum
+(also under the CRS's own name), which terrio does not follow yet. ATF (Paris) is left out (its ESRI
+WKT is checked in `grads_and_prime_meridians`) (`cargo test -p terrio-crs --test wkt_unresolved`;
+regenerate with `scripts/gen_wkt_unresolved.py`, pyproj 3.8.0; the names PROJ looks CRSs up by come
+from `scripts/gen_crs_names.py`).
+
+WKTs whose geographic CRS has no EPSG code of its own, with the datum known by its ID alone (WKT 2
+`ID`, WKT 1 `AUTHORITY` on the `DATUM`, also under other CRS and datum names), by its name in a WKT
+2 without IDs, or by ESRI's name (`D_Monte_Mario`, with and without the datum's or the CRS's code,
+and under another `GEOGCS` name), of 20 EPSG CRSs on OSGB36, Monte Mario, ED50, DHDN, Amersfoort,
+GGRS87, CH1903, Tokyo, HD72, AGD66 and NZGD49, and the two WKTs of opengeos/terrio#1012, place a
+point in WGS 84 where PROJ 9.8.1 does without grids, by the transformation it uses, within 1 mm (180
+cases). For OSGB36, DHDN, NZGD49 and some CH1903 cases (46), PROJ's best transformation needs a grid
+(OSTN15, BETA2007, CHENyx06, the NZGD2000 grids), so with those grids installed PROJ may place these
+points otherwise; the cases record it. Five WKTs PROJ does not resolve to their code and places
+through other datums or CRSs (the ESRI WKT 1 of EPSG:4806, 5132 and 7373, and of EPSG:4314 and 31467
+renamed) are placed as PROJ places them, but EPSG:7373's, which PROJ places through its datum pivot
+and terrio still where its code places it (`cargo test -p terrio-crs --test wkt_datum_shift`;
+regenerate with `scripts/gen_wkt_datum_shift.py`, pyproj 3.8.0).
+
+CRSs in grads, and prime meridians, place points where PROJ 9.8.1 does, both ways, within 1 mm and
+1e-9 of a degree or grad: in WKT 1, NTF (Paris) (EPSG:4807) and its sixteen projected CRSs
+(EPSG:27561-27594) as GDAL and ESRI write them, with their codes and without; geographic CRSs in
+grads written by hand, with Paris, Ferro, Lisbon and Copenhagen meridians in grads, in degrees and
+in sexagesimal degrees; ATF (Paris) (EPSG:27500); and Krovak East North (EPSG:5514) with its angles
+in grads; in WKT 2, PROJ's WKT of EPSG:4807, 27572 and 27500, and geographic, geodetic, projected
+and geocentric CRSs with prime meridians in their own unit, in their CRS's or base CRS's
+(`ANGLEUNIT`, `UNIT` in grads, radians and gons) and in none; Paris near 2.33722917 in both; 116
+WKTs (89 WKT 1, 27 WKT 2). EPSG:4807 and PROJ strings with `+pm=` within and just beyond 1e-10
+radians of Paris and Greenwich, on both sides, and near Copenhagen transform with PROJ's prime
+meridian, within 1e-12 degrees, and Paris is written as PROJ writes it in PROJ strings, WKT 1,
+PROJJSON and GeoKeys. ESRI's WKT 1 of EPSG:4901 and 27500 is identified as its code and placed where
+PROJ places the code. A WKT 2 prime meridian unit without its size is refused, as in PROJ
+(`cargo test -p terrio-crs --test grads_and_prime_meridians`; regenerate with
+`scripts/gen_grads_and_prime_meridians.py`, pyproj 3.8.0).
+
+PROJ-string parameter values are refused where PROJ 9.8.1 refuses them: each method with each
+common parameter unreadable (`abc`) or in radians (`0.5r`), scale factors PROJ may refuse, and
+`+to_meter`, `+units`, `+vto_meter`, `+towgs84`, `+pm` and rotated-pole cases, 3,350 unique strings
+in all, against whether PROJ accepts them (`cargo test -p terrio-crs --test proj_param_values`; regenerate with
+`scripts/gen_proj_param_values.py`, pyproj 3.8.0). The strings that still differ are listed by
+kind in the test, counted, and pinned as sorted rows in `proj_param_value_differences.tsv`.
+This includes `h_0`, `t_epoch` and `dh`, plus a nonpositive `+k` fallback. Terrio retains its
+strict rotated-pole `o_lat_p` validation where PROJ's CRS parser leaves the value unchecked.
+The matrix does not verify `fouc_s`'s `n`, `rot_xy`, or the other `o_*` rotation parameters.
+For scale factors with an `r` suffix, Terrio retains its numeric-alias/default policy, which
+can differ from PROJ's numeric-prefix interpretation even when both accept the definition.
+Literal PROJ `towgs84` lists require three or seven numeric elements. A refused WKT `PROJ4`
+extension fails transformation setup rather than silently substituting the WKT nodes' conversion.
+The acceptance generator intentionally does not overwrite the known-difference baseline.
+When an intended behavior change changes that set, review the focused test's actual/expected
+rows, edit only the approved rows in `proj_param_value_differences.tsv` (definition, tab,
+PROJ's `OK`/`ERR` outcome), keep them sorted, and update the count in the test. Rerun the focused
+test with default features and `--all-features`; unexpected changes require investigation.
+
+PROJ-string ellipsoids are compared with PROJ 9.8.1 in 484 strings. Each of `laea`, `tmerc`,
+`merc`, `ortho`, `geocent` and `longlat` (with a null `+towgs84`) is combined with `+R`,
+`+ellps`, `+datum`, `+a`, `+b`, `+rf`, `+f`, `+es`, `+e` and the spherification flags, alone
+and together. A few strings cover spherical orthographic (`+f=0`), `mill`, `cea`, the latitude of
+`+R_lat_a` and `+R_lat_g` (unreadable, in radians, in DMS, beyond 90°) and `+datum=NAD27` beside
+its own `+a` or `+rf`, which PROJ drops, and the datum shifts of `+datum=` names beside a
+spherification flag. The test checks where PROJ places a point
+(`Transformer.from_crs("EPSG:4326", CRS(s + " +type=crs"), always_xy=True)`, or from a
+geographic CRS to EPSG:4326), within 1 mm. It also checks the axes of the ellipsoid the CRS
+reports, and that terrio refuses the 37 strings PROJ refuses. 27 WKT 1 CRSs with such a `PROJ4`
+extension are checked the same way (`Transformer.from_crs("EPSG:4326", CRS(wkt), always_xy=True)`;
+PROJ computes on the extension as a pipeline step, and refuses to transform 5 of them). The WKT terrio
+writes for every string reads back where PROJ places the string, and 9 normalized extensions it
+writes are pinned with PROJ's coordinates of their WKT, which the generator checks against those of
+the string
+(`cargo test -p terrio-crs --test proj_ellipsoid_shape`; regenerate with
+`scripts/gen_proj_ellipsoid_shape.py`, pyproj 3.8.0, no grids, `PROJ_NETWORK=OFF`).
+The PROJ strings of the EPSG and ESRI registries (as `to_proj4` writes them, 9,873 CRSs) keep the
+ellipsoid axes of their WKT, within 1e-6 m, under that reading. 22 CRSs whose string terrio reads
+with other axes than its WKT's are pinned bit for bit to the axes terrio read before: Web Mercator
+(`+a=6378137 +b=6378137 +nadgrids=@null +wktext`, a sphere to terrio, where PROJ reports WGS 84),
+PROJ's `bess_nam`, `walbeck` and `clrk66`, and EPSG:3139 in links (`cargo test -p terrio-crs --test
+proj_ellipsoid_registry`).
+
+Strict WKT 1 export (`SpatialRef::to_wkt1_strict`) is compared with PROJ 9.8.1's `WKT1_GDAL`
+(with GDAL's axes) of every 20th EPSG and ESRI code and every one PROJ refuses, character for
+character, and of custom definitions and every 20th IAU_2015 CRS by whether PROJ has a WKT 1
+without extension and by reading it back (`cargo test -p terrio-crs --test wkt1_strict_export`;
+regenerate with `scripts/gen_wkt1_strict_export.py`, pyproj 3.8.0; `--all PATH` and the ignored
+`every_code_matches_proj` compare every code). `--only wkt1-strict-export` has live PROJ (which
+GDAL reads WKT with) read terrio's strict WKT 1 of every custom definition of that data, whose
+points must transform as from the original within 1 mm or 1e-8 degrees
+(`scripts/compare_wkt1_strict_with_proj.py`, needs pyproj).
+
+GeoTIFF GeoKeys (`SpatialRef::from_geokeys`, `SpatialRef::to_geokeys`) are compared with GDAL 3.12.1
+(rasterio 1.5.0) on 376 CRSs (every 20th EPSG projected and geographic 2D code, rule codes, PROJ
+strings of every method GeoTIFF names in other units and datums, ESRI codes, compound and geographic
+3D CRSs): GDAL's GeoKeys must read as the CRS GDAL reads from them, and terrio's must hold GDAL's
+model type, codes, method, linear unit and projection parameters and read back as the CRS (`cargo
+test -p terrio-crs --test geokeys_gdal`; regenerate with `scripts/gen_geokeys_gdal.py`, rasterio
+1.5.0, pyproj 3.8.0, numpy and tifffile).
+
+Axis orders, conversion parameters and celestial bodies (`SpatialRef::axis_order`,
+`projection_params`, `body`, `is_earth`) are compared with PROJ 9.8.1 on 777 CRSs:
+- every 20th EPSG and ESRI code, and the codes behind each rule;
+- custom PROJ strings and WKTs;
+- compound references, every 20th IAU_2015 CRS and a CRS of every IAU_2015 body.
+
+PROJ's values are the directions of `CRS.axis_info`, `proj_get_celestial_body_name`, and the
+parameters of `CRS.to_proj4()` with the ellipsoid and prime meridian PROJ reports. The tolerances
+are 1e-9° for angles (1e-8° for the prime meridian), 1 µm for lengths and 1e-12 for scale
+factors and units. Run `cargo test -p terrio-crs --test crs_accessors`; regenerate with
+`scripts/gen_crs_accessors.py` (pyproj 3.8.0). `--all PATH` and the ignored
+`every_code_matches_proj` compare every code.
 
 PROJJSON export (`SpatialRef::to_projjson`) has unit tests of each kind of CRS and refusal
 (`cargo test -p terrio-crs --test projjson_export`); `--only projjson-export` compares it with
@@ -842,6 +1950,12 @@ live PROJ's PROJJSON of 52 CRSs by meaning and has GDAL read those and every IAU
 coordinates must match the originals' (`scripts/compare_projjson_export_with_gdal.py`); a case
 with no point the original CRS transforms is reported as `not compared`, and a point only the
 original transforms as `differs`.
+
+Its keys are in PROJ's order without serde_json's `preserve_order` feature, which terrio-crs leaves
+off (`cargo test -p terrio-crs --test projjson_key_order`). The key order of every kind of object
+PROJ 9.8.1 writes for its registry CRSs is frozen in
+`crates/terrio-crs/tests/data/projjson_key_order.txt`; regenerate it with
+`scripts/gen_projjson_key_order.py` (pyproj 3.8.0, `PROJ_NETWORK=OFF`).
 
 ## IAU_2015 authority support (#271)
 
@@ -994,7 +2108,7 @@ conformance suite check that terrio refuses them, and Python and Node/WASM leave
 
 ```sh
 cargo test -p terrio-crs --test ob_tran
-cargo test -p terrio --test rotated_pole
+cargo test -p terrio --test merged rotated_pole::
 cargo test -p terrio-cli --test mcp oblique_mollweide
 python -m pytest python/tests/test_ob_tran.py
 node --test --test-name-pattern='general oblique' js/tests/node.test.mjs
@@ -1124,6 +2238,65 @@ node --test --test-name-pattern='vector geometry' js/tests/node.test.mjs
 python scripts/conformance.py ../terrio-data --only vector-geom
 ```
 
+## Packed unsigned TIFF output
+
+`python scripts/conformance.py ../data --only packed-tiff --strict` checks GTiff
+and COG writes and their Python/CLI copies against GDAL's TIFF decoder. The
+reference is locally validated with GDAL 3.13.3. Twelve synthetic cases cover
+1, 4, 7, 12, 24 and 31 bits, partial bytes, tile edges and generated COG overviews.
+An available `esa_worldcover_colormap.tif` adds a real 7-bit palette COG crop,
+checking exact base samples, masks, nodata, affine, CRS and the first 128 palette
+entries. Native and GDAL readers also compare every stored overview's samples.
+These are exact decoding/metadata checks, not compressed-byte or file-size claims.
+
+Native tests check MSB order, padding at every row boundary, clipping at 31 bits,
+and round trips at all widths 1–32 through stripes/tiles and pixel/band interleaving.
+Python regressions check bit-width preservation, bilevel palette copies, explicit
+width overrides and refusals. Node verifies the stored TIFF tags and values through
+explicit exports and copies that inherit the source width.
+
+Packed-TIFF copy regressions also check predictor aliases, compression enums and
+NumPy dtype objects, nodata outside the stored bit domain, and shared readers with
+wider overviews. Internal/external overview tests retain each image's photometric
+tags and color table; the structure reader requests the base tags once and the
+external tags once when needed (no pixel reads by that metadata helper). Bilevel
+clipping is silent in GDAL 3.13.3, while wider streamed COG clipping warns on the
+calling thread. The packed conformance comparison requires synthetic COG overviews
+and verifies each overview's stored NBITS as well as its independently decoded values.
+GTiff/COG translation-output regressions check that clipping warnings reach Python.
+The native strip-writer test preserves parent diagnostics and relays worker warnings
+on successful finish, failed sends and drop, while incomplete files are removed.
+Selected external-overview tag reads also preserve a missing-file error rather
+than replacing it with a missing-image-directory diagnostic.
+The four-bit bright-edge CUBIC control matches an independent GDAL 3.13.3 pyramid
+exactly; Terrio reports encode-time clipping where the reference is quiet.
+The native metadata regression also requires NBITS to share its band's existing
+IMAGE_STRUCTURE domain with other items, preserving unrelated empty domains.
+JPEG 2000 controls cover 15-bit whole copies and AUTO/explicit-base resampling,
+with and without stored resolution levels. The registered `packed-tiff` suite includes
+two JP2 AUTO controls and the overview-only source-mask case, alongside the earlier
+14 comparisons (17 total). Its mask oracle is source validity, not GDAL's lossy COG
+copy. Twelve additional nearest/cubic/Lanczos
+controls at 128- and 384-square output exactly match GDAL 3.13.3 sample arrays.
+
+Mask-pyramid regressions include sources whose base mask is absent but whose
+overviews have masks. These cases compare the output with the source's validity:
+GDAL 3.13.3's COG copier drops the overview-only masks. Missing physical masks
+remain absent, so implicit nodata and alpha masks retain their flags and values;
+no base-sized all-valid mask is allocated. Regressions cover both nodata and RGBA
+sources. Other cases retain the GDAL-copy comparison. Run the mask controls with
+`pytest python/tests/test_gtiff_packed_writer.py -k 'partial_and_overview_only_masks or overview_only_masks_keep_implicit_alpha'`.
+They verify each overview's source validity while retaining the base's implicit
+mask and flags.
+
+Selected-overview COG copies are checked with internal and external three-level
+UInt16 pyramids storing 9/9/12 bits. GDAL 3.13.3 independently checks the selected
+pixels, the later level, the output width, rescaled affine/CRS and masks. A shared
+Rust width-inheritance policy is exercised through native writes and the Python
+copy adapter, including GTiff/COG default compression and ineffective uncompressed
+predictors. Type promotion across incompatible native overview containers is not
+part of these controls; native TIFF discovery filters those levels.
+
 ## Lazy GeoTIFF metadata and external overviews
 
 The `lazy-geotiff` conformance suite runs the Rust regressions for sample bit
@@ -1141,12 +2314,45 @@ TIFF mask is not inherited by the external dataset. Its georeferencing is
 scaled from the base raster. Internal overviews take precedence over `.ovr`.
 External overview discovery applies to local files and adds one `.ovr` existence
 probe per local open, and probes `.ovr.msk` only when `.ovr` exists. It does
-not decode pixel chunks or probe remote paths.
+not decode pixel chunks or probe remote paths. Under
+`TERRIO_DISABLE_READDIR_ON_OPEN=EMPTY_DIR` (or `GDAL_DISABLE_READDIR_ON_OPEN=EMPTY_DIR`)
+no `.ovr` is attached, and a reduced read takes the GeoTIFF's own pixels
+(`an_ovr_is_not_read_under_empty_dir`). An external refresh over an extent still
+reads the `.ovr` it refreshes, and no other sidecar (in `raster_manage`:
+`external_overviews_are_refreshed_over_an_extent_under_empty_dir` and
+`external_overviews_refreshed_under_empty_dir_read_no_other_sidecar`).
 
 ```sh
 cargo test -p terrio --test external_overviews --test geotiff_nodata
 python scripts/conformance.py ../terrio-data --only lazy-geotiff --strict
 ```
+
+### Reduced first-image masks
+
+The `reduced-first-masks` conformance suite checks `NewSubfileType` mask association
+for ordinary and reduced-resolution first TIFF images. Using a Landsat-derived
+external overview pyramid, it compares pixels and masks before and after an
+extent-limited external overview refresh with an equivalent ordinary-first-image
+GDAL control. The refresh check changes base pixels inside the masked region and
+verifies the reduced overview's updated values and mask. This checks decoding after
+Terrio's refresh, not equivalence to GDAL's refresh algorithm. Internal reduced-first
+TIFF overview creation and refresh remain outside this change: the existing writer
+planner requires a full-resolution image. A reduced first image with a legacy mask
+marked 4 is also covered.
+A unique size-matching legacy mask remains usable for a reduced first image.
+An unreduced first image still ignores a reduced mask and uses nodata/alpha validity.
+GDAL 3.13.3 itself ignores first-image masks marked 5; Terrio deliberately
+uses the image's own reduced-resolution flag rather than its position in the file,
+following [TIFF 6.0 NewSubfileType](https://www.itu.int/itudoc/itu-t/com16/tiff-fx/docs/tiff6.pdf). Local validation uses
+GDAL 3.13.3. The `lazy-geotiff` suite also checks own-mask detection and full-image
+mask fallback when the smaller image has no mask.
+
+The stored masked-external cubic 26×41 resampled-read case uses the separate
+`expected_mask_control.json.gz` reference. Regenerate it with
+`python scripts/make_resampled_reads_fixtures.py --mask-control` and GDAL 3.13.3.
+The control changes only first-image/mask flags from 1/5 to 0/4, so GDAL weights the
+stored mask. Its pixels match Terrio exactly; 488 samples differ from the historical
+raw GDAL reference, which remains unchanged in `expected.json.gz`.
 
 `LazyRaster::rpc`, `file_list` and `sample_bits` are Rust APIs. Python and
 JavaScript exposure of these additional lazy-reader facts remains follow-up
@@ -1224,6 +2430,70 @@ With `--check-rasterio`, the script compares the cases with rasterio's masked re
 (`read(masked=True, out_dtype=...)`, NaN-filled, overviews as decimated reads, unscaled with
 `scales` and `offsets`): rasterio 1.4.3 (GDAL 3.10.3) read the 35 cases it can open identically;
 its GDAL had no netCDF driver for the other 3.
+
+## Resampled window reads (#429)
+
+```sh
+cargo test -p terrio --lib resampled_read
+cargo test -p terrio --test merged resampled_reads::
+cargo test -p terrio-cli --test translate_overviews
+python scripts/make_resampled_reads_fixtures.py                  # GDAL's Python bindings
+python scripts/make_resampled_reads_fixtures.py --check-rasterio # rasterio
+python scripts/conformance.py ../terrio-data --only translate-overviews
+```
+
+`scripts/make_resampled_reads_fixtures.py` writes small GeoTIFFs with GDAL and, for 238 cases (a
+file, bands, a window, an output size, a resampling, an overview selection), the pixels and mask
+bands GDAL 3.13.2 reads, frozen in `tests/data/resampled_reads/expected.json.gz`. Pixels of several
+bands are read through `GDALDatasetRasterIOEx`, a band alone through `GDALRasterIOEx`, and masks
+through the bands' `GetMaskBand()`, called through `ctypes` with the floating-point window always
+given, as rasterio calls them: GDAL's Python bindings give it only for windows that are not whole,
+and GDAL then samples an overview from the integer window rounded to it. Selections other than
+`AUTO` are read as `gdal_translate -ovr` writes them. The rasters are Byte RGB with an internal
+mask and mask overviews, and the same with overviews built before the mask; UInt16 of odd size,
+Int16 and Float32 with nodata values (NaN included); Float32 with a `.ovr`; RGBA, and a UInt16
+alpha band; a paletted band; a `.msk` sidecar; and two bands all valid. Every method is read at
+whole and fractional windows, into smaller and larger outputs and outputs reduced on one axis,
+and at the selection thresholds; 36 cases are also read from the rasters read into memory.
+
+The fixtures pin GDAL's behaviour where it is not obvious:
+
+- Full resolution is a candidate of `GDALBandGetBestOverviewLevel` (ratio 1), so a reduction
+  within 0.1 of 1 reads it, and an overview reduced only on one axis (a single row) is never read.
+- An overview without a mask of its own is all valid in resampling: its band's mask band is not
+  the full-resolution mask. The mask band itself has the levels with masks of their own as
+  overviews, else none, and is then resampled from full resolution.
+- Cubic, cubic spline and Lanczos results are clamped to the band's `NBITS`: a GeoTIFF's internal
+  mask (1 bit) reads as 0 and 1 with those kernels.
+- An overview of a paletted GeoTIFF reports no color table, so its bands are interpolated.
+- GDAL 3.13 skips NaN values of a masked floating-point chunk (GDAL 3.12 sums them as NaN).
+  Resampled reads follow the release `TERRIO_GDAL_COMPAT` selects (3.12 by default, as
+  `terrio.rio`'s rasterio parity tests expect), and the test selects 3.13; overviews follow 3.12.
+  Mode fills a footprint without a valid pixel with 0 for a NaN nodata value (`GDALIsValueInRange`).
+
+Values are compared bit for bit, but GDAL 3.13.2 built by clang for arm64 (Homebrew) contracts the
+multiply-adds of its average and RMS kernels into fused ones, rounding a mean exactly between two
+integers the other way: 13 average and RMS cases have up to 10 such values each, all within 1,
+and one Float32 bilinear case a value one ULP away. The test allows those differences in at most
+1% of a case's values. Rust does not fuse operations: terrio rounds as GDAL does where its compiler
+does not fuse them (x86-64). With `--check-rasterio`, rasterio 1.4.3 (GDAL 3.10.3) agrees with the
+`AUTO` cases but for the 8 Float32 NaN cases of 3.13's NaN skipping and one average.
+
+The `translate-overviews` conformance suite (`scripts/compare_translate_overviews_with_gdal.py`)
+compares `terrio translate` with `gdal_translate -outsize`, `-tr` and `-ovr` on levels holding
+markers, real USGS terrain (Float32, nodata) and Landsat RGB (Byte, internal mask): pixels, types,
+nodata and geotransforms, and the HTTP bytes of a real COG resized with `AUTO` and `NONE`.
+Default-size source and georeferenced windows check that `AUTO-n` keeps the full-resolution
+output size while explicit level numbers reduce it, including real terrain with nodata.
+These default-size cases also compare equivalent CRSs and exact validity masks.
+The HTTP comparison records bytes and request counts for a 400 x 300 source window
+with `NONE` and `AUTO-1`, checking the actual pixels at the unchanged output size.
+`gdal_translate` reads its output in swaths of 128 rows (into a GeoTIFF of default layout), and in
+blocks of 128 x 128 pixels when its bands are not the source's first ones in order, each a
+`RasterIO` request of its own: at a swath's first row or a block's first column, an average, RMS
+or mode output can come from the next source pixel (the request rounded to the level), where
+terrio reads the output in one request, as rasterio does. The suite's outputs stay within one
+swath and block for those methods.
 
 ## File management (#289)
 
@@ -1930,7 +3200,7 @@ limit, while wildcard-only patterns use the direct matching path.
 ## JTS provenance replacement regressions
 
 `docs/jts-provenance.md` maps the geometry replacements to pinned JTS 1.20.0
-sources. `cargo test -p terrio --test jts_behavior` replays the captured GEOS
+sources. `cargo test -p terrio --test merged jts_behavior::` replays the captured GEOS
 simplification, convex/concave hull and STR ordering observations without native
 reference libraries. `cargo test -p terrio --lib tiles::validity` checks recorded
 integer-grid validity decisions. The existing `vector-geom` conformance suite
@@ -2065,12 +3335,16 @@ parallel unit tests contaminating the measurement.
 ## Separate-file raster tiles (#289)
 
 `raster-tiles` in `scripts/conformance.py` compares XYZ/TMS folder output with
-GDAL 3.13.3 on real Landsat RGB derivatives and USGS elevation. The 48 cases
-include 46 exact comparisons of filenames, pixels, sample types, nodata/masks
-and GeoTIFF grids/CRS, plus two explicitly reported policy differences.
-The lower-zoom pyramid's 1,146,880 samples independently match GDAL direct-source per-tile
-warps exactly. Terrio resamples every level directly from the source; GDAL's
-previously generated image pyramid can give different lower-level values/masks.
+GDAL 3.13.3 on real Landsat RGB derivatives and USGS elevation. The 49 cases
+include 48 exact comparisons of filenames, pixels, sample types, nodata/masks
+and GeoTIFF grids/CRS, plus one explicitly reported policy difference.
+Lower zooms built from the tiles below them (the default) match GDAL's generated
+pyramid exactly with nearest resampling: 1,146,880 samples on a raster grid, and
+351 tiles (77,004,800 samples) of a six-zoom WebMercatorQuad TMS pyramid. With
+`--overview-source source`, the raster-grid pyramid's samples independently match
+GDAL direct-source per-tile warps exactly. Interpolating kernels are not compared:
+a separate bilinear probe of the WebMercatorQuad pyramid matched the maximum zoom
+exactly, while about 3% of the zoom-12 pixels differed by 1 or 2 levels (up to 13 at zoom 8).
 GDAL's `--no-alpha` output retains 15 zero-filled tiles even when all source
 pixels are nodata and `--skip-blank` is requested. Terrio omits those tiles;
 independent checks verify the source mask and both results. Valid zero-valued
@@ -2105,14 +3379,19 @@ changes or dataset-mask differences. All tile structures and metadata are checke
 before any value-only exception can be reported.
 
 Rust regressions additionally check source-window/output budgets on a ten-billion
-pixel procedural source, nodata/padded-edge alpha, grid arithmetic,
+pixel procedural source, tile-sized source windows at every zoom of a pyramid
+built from child tiles (and its agreement with direct-source averages), lossless
+WebP tiles, parents rebuilt from existing tiles on resume, blank parents of blank
+children, nodata/padded-edge alpha, grid arithmetic,
 atomic publication, unfinished temporary files, non-overwriting resume and refusal
 of preexisting symlinked output descendants. Additional regressions cover cubic
 premultiplied RGBA, partial-channel nodata, typed masks with valid NaNs, mask
 retention when alpha is removed, and an excluded maximum zoom retaining the lower
 zoom's resampler. Python exercises loaded/lazy/path inputs and typed dataset masks;
 JavaScript exercises incremental callbacks, partial-channel nodata and preservation
-of the original callback exception. Retile output layouts are not implemented yet.
+of the original callback exception. For `gdal_retile.py` grids and pyramids, see
+the [retile section](cli.md#retile) of the CLI reference and the "Retile layouts"
+row of the table above.
 
 ```sh
 python scripts/conformance.py ../terrio-data --only raster-tiles --strict
@@ -2249,6 +3528,25 @@ python scripts/conformance.py ../terrio-data --only omerc-two-point --strict
 
 ### WFS services
 
+GML axis-order regressions cover EPSG:6708 (N-E), EPSG:7792 (E-N) and EPSG:4326
+with modern/legacy URNs, modern URLs, legacy dictionary URLs and short EPSG names.
+Rust, Python and Node tests check reads and GML writes, including Z preservation.
+The standalone CRS tests also cover compound/3D geographic CRSs and south-west/polar
+axis controls. Run the local GDAL export/reprojection comparisons without contacting
+public services:
+
+```sh
+cargo test -p terrio --lib drivers::vector::gml::tests
+python -m pytest python/tests/test_gml_axis_order.py
+node --test --test-name-pattern='GML projected' js/tests/node.test.mjs
+python scripts/compare_wfs_with_gdal.py --terrio target/release/terrio
+```
+
+These generated controls compare GeoPackage, Shapefile and GML exports, plus
+reprojection to EPSG:4326. They are also registered in the `wfs` conformance suite.
+GDAL 3.12.1 cannot resolve legacy `epsg.xml#` dictionary URLs offline; these reference
+reads are reported as not compared, while native unit/binding tests cover their XY behavior.
+
 `cargo test -p terrio --test wfs_service --test remote_vector_response` exercises
 HTTP request counts, WFS 1.0/1.1/2.0, empty schemas, axis order, paging, exceptions,
 allowlists and allocation refusals. Linux also checks a sparse page under an
@@ -2316,3 +3614,603 @@ and geometry coordinate, and caps Arrow batches at 37 rows. Without the example 
 PyArrow it runs the original four CLI comparisons only. The corpus is limited to
 the supplied public fixture; frozen mechanics regressions cover valid zero, exact
 grid edges, Float32 nodata precision, finite checks and transform/read failures.
+
+### Cumulative viewshed
+
+Build the optimized CLI and current Python bindings, and optionally the Node/WASM
+package, then run:
+
+```sh
+python scripts/conformance.py ../terrio-data --only cumulative-viewshed --strict
+```
+
+The suite compares a real USGS DEM projected to 151 × 141 pixels with GDAL 3.13.3:
+five cases through CLI, Python and, when built, Node/WASM (15 comparisons).
+Observer spacings 10, 13, 17, 19, and 1000, observer/target heights and an explicit
+curvature coefficient are exercised. Byte pixels, dimensions, types, nodata,
+masks and CRS are exact; the geotransform allowance is 1e-8 pixels. The native
+operation and GDAL both ignore curvature in cumulative mode: GDAL's temporary
+rasters have no CRS from which to obtain the ellipsoid. Numeric nodata remains
+an elevation, as in GDAL; this suite does not imply missing DEM pixels are safe.
+
+Rust and binding regressions also cover a ridge with known visibility sums,
+spacing zero, maximum-distance rejection and the normal/height modes. MCP executes
+cumulative mode without observer coordinates. Execution is sequential, with
+O(pixels) working memory and O(observers × pixels) work.
+
+Cumulative normalization retains GDAL 3.13.3's binary64 arithmetic: a maximum
+count of 7 maps to 255, while a maximum count of 25 maps to 254 because the
+product rounds below 255 before flooring. Flat-raster regressions cover both.
+Per-observer elevation/visibility buffers are reused and only the final dataset
+is built. Work remains proportional to observers × pixels; for example, a
+10,000 × 10,000 raster at spacing 10 needs a million observer sweeps. There is
+no arbitrary work cutoff; crop or increase spacing for expensive workloads.
+
+### Fractional and weighted zonal statistics
+
+```sh
+python scripts/conformance.py ../terrio-data --only fractional-zonal --strict
+```
+
+Requires current Python bindings, GDAL 3.13.3, exactextract 0.3.0, NumPy and Shapely;
+Node/WASM is included when `js/pkg-node/terrio.js` is built. Six real-data cases
+(USGS DEM and NLCD, each with coverage-only, positive weights and missing weights)
+run through CLI, Python and optional Node/WASM. Zones include fractional edges,
+holes, overlaps and multipolygons. GDAL and exactextract must first agree within
+relative 2e-7 or absolute 1e-7; native results use the same allowance. Reference
+coverage is Float32, while native overlay areas are binary64. Source geometry,
+attributes, feature IDs, CRS, Real output types and null weighted statistics are
+checked separately and exactly. These are numeric comparisons within tolerance,
+not pixel-identical claims.
+
+Quantiles (`quantile_25`, `quantile_75`), `mode`, `minority`, `variety`, `variance` and `cv`
+are compared with exactextract 0.3.0 on the same Float64 samples: quantiles, variance and cv
+within the allowance above, and mode, minority and variety exactly, except where several values'
+total coverages lie within the coverage tolerance of the winner's (relative 2e-7 or absolute
+1e-7). There the choice depends on coverage rounding (terrio binary64, exactextract Float32: one
+USGS DEM zone has 18 boundary cells at coverage 0.1, which the two compute 3e-8 apart), and terrio's
+value must be one of the near-tied values; such cases are reported within tolerance. A local run
+(2026-11-04) passed all 18 comparisons within tolerance, with one near-tied `minority` on each
+USGS DEM case. The centre/all-touched suite (`zonal-bindings`) compares the same statistics
+with GDAL masks + NumPy (`np.quantile(..., method="linear")`, mode/minority by pixel count with
+ties to the larger/smaller value): 12 of 12 cases identical or within its tolerance, mode,
+minority and variety exact.
+
+Median uses exactextract on the same stored samples promoted to Float64, so its
+integer/Float32 quantile cast does not truncate the fractional result. GDAL 3.13.3
+advertises median but rejects it. Native empty zones keep null sums, while the
+references return zero sums; dedicated native regressions retain that documented
+policy. Weight rasters currently require identical grids and CRSs. Rasters are read
+in strips; zones are computed once per grid as spans of covered pixels (fractional
+coverages cropped per zone), shared across bands and rasters.
+
+A local optimized run passed all 18 comparisons within the stated tolerance. Maximum
+absolute errors were 0.00447 for coverage-only USGS statistics and 12.12 for sums
+weighted by the raw elevation-derived weights (sums about 1.16e10); NLCD maxima
+were 3.99e-5 and 0.00107, respectively.
+
+The weighted median port is attributed in its SPDX header and both NOTICE files;
+`reuse lint` checks the complete repository against REUSE 3.3.
+
+The boundary fast path uses an R-tree of polygon edges and row scanline parity;
+only boundary candidate cells require polygon overlay. It agrees with independent
+per-cell overlays on interior, exterior, partial-cell and raster-surrounding shapes.
+A local optimized 966 × 731 real NLCD run (706,146 pixels, count/mean/sum/stddev/median,
+one fractional zone) took median 1.03 s before and 0.119 s afterward over three runs.
+Peak RSS was 67.4–69.6 MiB before and 69.6–70.1 MiB afterward. Against exactextract
+on the same samples promoted to Float64, the largest relative statistic error was
+2.74e-10; maximum absolute sum error was 0.00761. These are local measurements,
+not portable performance thresholds. Fractional masks retain binary64 coverage
+(8 bytes/cell); existing binary membership masks remain Byte.
+
+For a complete 966×731 NLCD window and count-only requests, three fresh-process
+runs measured binary median 0.06796 s / peak RSS 44.2–44.7 MiB, and fractional
+median 0.08048 s / peak RSS 49.6–50.6 MiB. Both counts matched the source's valid
+pixel count. The masks themselves use 706,146 and 5,649,168 bytes respectively;
+the process measurements include decoding and runtime overhead.
+
+### OGC API Features
+
+```sh
+python scripts/conformance.py ../terrio-data --only oapif --remote --strict
+```
+
+The public-service suite compares CLI, Python and Node/WASM reads with GDAL
+3.13.3 on pygeoapi Natural Earth lakes and PDOK BAG buildings. Five profiles
+exercise three-feature paging with a four-feature limit, advertised schema,
+spatial bounding boxes, preferred CRS fallback, projected storage CRS and
+geographic authority axes. All source attributes/nulls, IDs carried as fields,
+geometry types, vertices and equivalent CRS are checked. Coordinates allow
+1e-8 source units; real attributes allow relative 1e-12 or absolute 1e-10.
+Generated output FIDs are excluded because format conversion renumbers them.
+
+Physical schema differences are explicit: the service returns a flattened
+`verblijfsobject.href` array, preserved natively as JSON text and checked against
+GDAL's StringList. The service schema's absent `verblijfsobject` field is retained
+natively and checked to be null in every row. Native `documentdatum` follows the
+advertised string type, compared with GDAL's inferred Date as ISO text. These are reported
+as normalized agreement, not identical schemas. No source fields are dropped.
+Unavailable public services are reported as not compared.
+
+Native unit tests cover catalog paging, field union, local JSON references,
+axis/bbox/datetime handling, resource limits and terminal paging errors. Native
+HTTP tests measure seven requests including redirect/catalog/schema and three
+item pages for a bounded range; metadata-only reads fetch no items or schemas.
+Python and Node tests each observe four real localhost HTTP requests for
+catalog/schema and two item pages. MCP checks bounded conversion and filtering
+before a final feature limit.
+
+A local pygeoapi lakes measurement fetched one metadata response (4,509 body
+bytes) for layer listing, and four responses (32,622 body bytes) for the
+four-feature read at page size three: metadata, schema and two item pages.
+These are observed public-service response sizes, not fixed assertions.
+All 15 CLI/Python/WASM comparisons passed: nine exact and six with the explicit
+schema normalizations above; maximum observed coordinate error was zero.
+
+### XLSX workbook interoperability
+
+The `xlsx-workbook` conformance suite checks authored cells, formulas and caches,
+styles, sheet views and print controls with openpyxl. It also edits an openpyxl
+workbook and checks retained cells, charts, tables and conditional formatting,
+including byte-for-byte preservation of chart, drawing, table and theme parts.
+It does not evaluate formulas. Native unit tests also cover macro preservation
+and malformed or oversized input.
+
+Install openpyxl and build the CLI and workbook example in the same profile:
+
+```sh
+cargo build --release -p terrio-cli
+cargo build --release -p terrio --example xlsx_workbook
+python scripts/conformance.py ../terrio-data --only xlsx,xlsx-layout,xlsx-workbook --strict
+```
+
+The `xlsx` suite uses GDAL as the reference; `xlsx-layout` and `xlsx-workbook`
+use openpyxl. Default CI runs `xlsx-workbook` with the debug example, while the
+extended conformance job uses the release example.
+
+## Vector layer selection
+
+Rust regressions exercise native paths, spilled bytes, the codecs used by WASM,
+and the optional GDAL backend. Python and Node regressions cover readers and
+operations, including file bytes passed directly to JavaScript operations:
+
+```sh
+cargo test -p terrio --lib layer_selection
+cargo test -p terrio --test merged layer_selection::
+cargo test -p terrio --lib zip_layer_selection
+cargo test -p terrio --lib named_layer
+cargo test -p terrio --features gdal --test gdal_backend
+pytest python/tests/test_layer_selection.py
+node --test --test-name-pattern='single named layer' js/tests/node.test.mjs
+```
+
+### Deleted Shapefile records
+
+The `shapefile-deleted` suite generates small OGR Shapefiles and marks DBF slots
+deleted without repacking. It compares whole reads, streaming reads and live-feature pages against
+OGR, retaining physical FIDs, exact scalar attributes/nulls and ISO WKB bytes.
+Null geometry still counts as a live feature; both indexed and unindexed reads
+are checked. Build the bridge in the same profile as the CLI:
+
+```sh
+cargo build --release -p terrio --example shapefile_rows
+python scripts/conformance.py ../terrio-data --only shapefile-deleted --strict
+```
+
+The GDAL/OGR Python bindings (`osgeo`) are required; Terrio Python bindings and
+downloaded data are not. The positional data-directory argument is required by the
+conformance runner, but this suite generates its fixtures in a temporary directory.
+
+### GeoPackage feature pages
+
+The `gpkg-paging` conformance suite compares the real `countries.gpkg` with GDAL
+through Python path/byte inputs and a CLI conversion limit. FIDs and order,
+attributes, geometry WKB, fields and CRS are exact for full, head, middle, tail,
+empty and spatially filtered pages. CLI output-writer FID policy is outside this
+comparison. Local validation uses GDAL 3.13.3.
+
+Native tests cover layer selection, original row ordinals, primary keys with gaps,
+UTF-16 text, overflow records, zero limits, and spatial matching with/without an
+R-tree. A malformed record outside a requested Python page is not decoded; a
+selected malformed record remains an error. A real-data test counts row decodes
+at the SQLite traversal boundary rather than inferring them from returned features.
+That external-data test is explicitly ignored unless requested; the synthetic
+SQLite page test asserts decoder-call counts in every ordinary CI run. The spatial
+page regression also asserts that only returned rows materialize their attributes,
+both without an index and with deliberately loose R-tree boxes that include null
+and nonmatching geometries. Borrowed geometry projection checks blob offsets
+without decoding neighboring fields, including UTF-16 databases:
+
+```sh
+cargo test -p terrio --lib drivers::sqlite::tests
+cargo test -p terrio --lib drivers::vector::gpkg_read::tests
+TERRIO_GPKG_PAGING_DATA=../terrio-data/countries.gpkg \
+  cargo test -p terrio --lib real_feature_pages_decode_only_requested_rows -- --ignored --nocapture
+pytest python/tests/test_pyogrio_feature_range.py
+python scripts/conformance.py ../terrio-data --only gpkg-paging --strict
+```
+
+The measured 176-feature countries table decodes three rows for an unfiltered three-feature
+page after skipping 88, versus 176 for a full traversal. Metadata reads are outside
+that feature-row count. Skipping visits leaf headers to count records without
+decoding their payloads or reading their overflow chains. Spatial filters instead
+read candidate geometry blobs and count matching geometries before materializing
+the selected records' attributes. Candidate payloads can still read overflow pages;
+this is not a geometry-only I/O guarantee. Byte and HTTP inputs
+still obtain the SQLite snapshot; paging bounds decoding rather than input transfer.
+
+The native ranged visitor decodes serially; unpaged full reads use the parallel
+decoder. To measure the index-free trade-off, `vector_read_profile` was built
+against both base commit `649d64cd` and the paging implementation. A GDAL 3.13.3
+fixture contained 200,000 EPSG:3857 points at `(i, 0)`, with name/category text and
+a floating value, and `SPATIAL_INDEX=NO`. Five alternating fresh-process runs
+followed one warm-up per binary, with `RAYON_NUM_THREADS=4` and warm file caches.
+Each requested one skipped match and three returned features; FIDs agreed exactly.
+
+| Bounding-box matches | Before median (ms) | After median (ms) | Before peak RSS (MiB) | After peak RSS (MiB) |
+|---|---:|---:|---:|---:|
+| Early, x=0.5..1000 | 94.44 | 4.16 | 149.39 | 25.52 |
+| Near the end, x=199990.5..200000 | 95.53 | 16.26 | 148.38 | 38.43 |
+
+The late filter scans almost the whole layer before finding its result. These
+point-workload measurements show the cost of that path alongside early stopping;
+they are not throughput guarantees for other geometry or attribute workloads.
+The example reports elapsed milliseconds, returned FIDs and Linux peak RSS:
+
+```sh
+cargo build --release -p terrio --example vector_read_profile
+RAYON_NUM_THREADS=4 target/release/examples/vector_read_profile FILE.gpkg 1 3 0.5 -1 1000 1
+RAYON_NUM_THREADS=4 target/release/examples/vector_read_profile FILE.gpkg 1 3 199990.5 -1 200000 1
+```
+
+### GeoPackage text encodings
+
+`cargo test -p terrio --test merged sqlite_encodings::` reads the small SQLite-generated
+snapshots in `crates/terrio/tests/data/sqlite_encodings`; it needs no Python
+executable. The directory contains the generator and SHA-256 manifest for
+regeneration. Tests cover non-ASCII schema names, UTF-8/UTF-16LE/UTF-16BE,
+whole and R-tree-filtered eager/streamed reads, and malformed records. Unit tests
+also exercise `IndexedLayer` and malformed R-tree child records.
+
+The Rust vector/raster display readers return Unicode strings and replace invalid
+text with U+FFFD, retaining the previous UTF-8 replacement policy and applying it
+to UTF-16. This is not raw-byte text preservation or a guarantee about SQLite's
+conversion of invalid text. Malformed CRS, geometry-column, layer-count and extent records propagate
+errors instead of being treated as absent metadata. Genuinely absent optional
+tables retain their fallback. This includes the optional raster metadata,
+metadata-reference and per-tile ancillary tables. Metadata tables are decoded
+whole: one malformed record can therefore fail an open even when it belongs to
+an unrelated layer.
+
+Validation decoding stays strict. Stored-row rewrite decoding is **now strict**:
+rewriting a UTF-8 database with invalid text or malformed records fails rather
+than silently re-encoding replacement text. Display reads remain lossy for
+invalid Unicode. Record payload bytes not described by the header are rejected;
+host sqlite3 3.54.0 rejects the tested surplus-byte records too.
+
+Header encodings use SQLite's low two bits, with zero meaning UTF-8, consistently
+across reads, inspection, validation expression evaluation and compaction.
+Regression tests cover high-bit aliases and preserve UTF-16 rewrite refusal.
+
+These error assertions cover the Rust decoders. With the `gdal` feature, public
+eager opens may fall back to GDAL after a Rust error; the fallback keeps GDAL's
+admission behavior. Native eager rejection is checked directly in unit tests,
+and streamed GPKG reads continue to use the Rust reader in that build.
+
+## HDF5 resource limits
+
+HDF5 allocation regressions run with `cargo test -p terrio --lib drivers::hdf5::tests`.
+They refuse fill-only datasets and oversized scalar HDF-EOS5 text before reading their values,
+through path and byte inputs, and check arithmetic overflow without allocating.
+`crates/terrio/tests/data/hdf5_fill_only.h5` is a generated 1,400-byte file with no allocated
+chunks. Recreate it with h5py by creating `grid` with `shape=(2**20, 2**20)`, `dtype="f8"`,
+`chunks=(16, 16)` and `fillvalue=-9999`, without assigning any values. Its declared decoded
+size is 8 TiB. These are resource-limit checks, independent of GDAL's allocation policy.
+On 32-bit hosts, including wasm32, the 8 TiB fixture is refused by the address-space check
+before the fallback budget runs. On 64-bit hosts without memory discovery, the 512 MiB
+combined pixel-buffer budget refuses it. A host with a discovered limit permitting the
+fixture checks its declared-size arithmetic without attempting the read. Synthetic budget
+tests cover combined allocations, overflow and the fallback independently of the host's memory.
+Scalar-text checks require filesystem support. A separate public WASM check used a 1,400-byte
+fill-only file declaring 300 MiB of raw Float64 pixels: its 600 MiB combined raw/decoded
+buffers were refused by the 512 MiB fallback budget, below the wasm32 address-space bound.
+
+## Rasterize background initialization
+
+The `vector-ops` conformance suite includes 21 Natural Earth country comparisons for
+nodata backgrounds, explicit zero initialization, multiple bands, additive burns and NaN,
+with Int16, Float32 and Byte outputs. Run those cases alone with:
+
+```sh
+python scripts/compare_vector_ops_with_gdal.py ../terrio-data --only rasterize-nodata
+```
+
+Pixel values (NaNs equal), validity masks and types are exact; CRSs are equivalent and
+geotransforms agree within 1e-12 source units. GeoTIFF is the GDAL pixel reference for COG
+outputs because `gdal_rasterize` cannot create COGs directly. ENVI cases are labelled
+`GTiff oracle`: GDAL converts the GeoTIFF rasterization to ENVI before comparison.
+This checks Terrio's consistent background policy rather than GDAL's driver-dependent
+ENVI initialization.
+
+## Polar area footprints
+
+`python -m pytest python/tests/test_warp_polar_area_footprints.py` checks all eight
+non-sum area methods around EPSG:3031 and EPSG:3413 pole corners under both grid
+policies. An analytic longitude-only field bounds the possible values and tests
+mirror symmetry to absolute tolerance 1e-9. Off the singular corner, averages must agree with independently
+computed `sum(field) / sum(valid)` to absolute tolerance 1e-10, including nodata.
+The native `angular_pole_polygon_shares_match_independent_clipping` test compares
+polygon-cell overlap against a separate clipping implementation to 1e-12, including
+fractional ownership clips and reversed orientation. A loopback TIFF test verifies
+partial range requests transfer less than the file while preserving pixel values.
+
+The reference comparison used GDAL 3.12.1. On the issue's one-degree cosine field,
+GDAL's EPSG:3031 southeast pole pixel averages +30.01092478 and its maximum is
++99.99619231, although that sector contains negative values. Its EPSG:3413
+northwest pole pixel similarly includes positive field values. Terrio's
+polygonal area policy intentionally differs here; these checks do not claim
+pixel-identical GDAL output or exact curved-edge integration.
+
+## Exact sum footprints
+
+A reprojected `sum` uses quadrilaterals of exactly transformed output-pixel corners,
+including their extrema in source-window bounds. This deliberately differs from GDAL
+3.13.3's area kernel, even with `-et 0`: pixel equality is not a conformance claim for
+this case. Existing `sum-overviews` comparisons still cover same-CRS controlled sums
+and total tolerances for reprojected default grids.
+
+A local GDAL 3.13.3 comparison used the 400 × 400 crop at source offset (1000, 1000)
+of `USGS_1_n40w106.tif`, warped to EPSG:3857 on GDAL's 256 × 256 suggested grid, in
+Float64 with full-resolution source pixels. At thresholds 0, 0.125 and 4, both totals
+were exactly 526094763.3955078; maximum absolute per-pixel differences from GDAL were
+0.003154 or less. Terrio's pixels were identical across those thresholds. This
+single terrain crop does not establish a universal error bound against GDAL.
+
+The curved-grid regression independently integrates the transformed tile outline,
+and exercises `terrio.warp`, `WarpedVRT` and `reproject`. The polar source-window
+regression covers extrema between sampled edge points: the prior window missed 68
+exact corners, by up to about 39 source pixels. RPC/DEM chunk comparisons retain
+complete 513-point batches; a bounded 64-entry cache reuses them across nearby
+chunks and regions (about 560 KiB of sample storage per transformer). Cache eviction
+only changes recomputation, never batch membership or pixels.
+
+Indicative local single-thread timings (optimized bindings, one warmup and medians of
+seven reads) for that synthetic 400 × 400 UTM source into a 256 × 256 Web Mercator
+tile were 26.7 ms with exact corners/bounds versus 5.3 ms before at threshold 0.125;
+at threshold 0, 26.4 versus 15.8 ms. A separate RPC/DEM probe using the Rust RPC
+regression's 100 × 100 image and 300 × 260 DEM, median of five reads after warmup,
+took 11.7 versus 7.5 ms at threshold 0.125, and 11.7 versus 11.7 ms at threshold 0.
+These small local probes are not throughput guarantees; source-window corner scans
+also add transformation work during chunk planning. The machine was not reserved.
+
+The real fixed-grid crop is registered in `scripts/compare_warp_sum_overviews.py`
+and the `sum-overviews` conformance suite, with the sum kernel's suggested grid
+(rather than the nearest-neighbour grid, which can crop an edge). Run:
+
+```sh
+python scripts/conformance.py ../terrio-data --only sum-overviews --strict
+```
+
+A GDAL 3.13.3 run with the optimized CLI passed all 38 cases: 27 identical and 11
+within their documented tolerances. The fixed-grid cases check size, type, nodata,
+CRS, geotransform, masks, totals and bitwise threshold independence; they record
+rather than require equality of pixels against GDAL.
+
+A single-thread optimized Rust `warp` probe on the same 400 × 400 synthetic UTM
+source, with the tile footprint rendered at 1024 × 1024, measured recursive
+planning under smaller `memory_limit` values. Medians of three runs after warmup
+were 0.398 s at 1 GB, 1.089 s at 1 MB, 2.297 s at 64 KB and 3.167 s at 4 KB.
+Every run totaled 97275019.84721899. Thus many small chunks have a substantial
+planning cost; the bounded RPC cache does not eliminate repeated pointwise corner
+transforms. These are observations, not an invariant timing bound.
+
+Bounds planning scans at most 512 corners at a time, including the final endpoint,
+with roughly 17 KiB of coordinate/validity scratch rather than allocating an entire
+output-width row before memory-limit splitting. The polar regression starts off a
+global batch boundary and spans several batches; RPC batch membership stays global.
+
+## Shapefile projection decoding warnings
+
+`python/tests/test_native_warning_locations.py` runs late `__del__`, `atexit` and
+`weakref.finalize` callbacks in child interpreters. A successful native read that
+records a warning must still return its dataset when shutdown disables imports,
+with default or ignored warnings. Existing caller-location, module-filter and
+warnings-as-errors checks retain the normal warning policy outside teardown.
+
+`python/tests/test_pyogrio_prj.py` checks invalid Latin-1 and UTF-16 sidecars through
+whole, range, stream, ZIP path and ZIP byte reads. Reads retain their geometries
+and attributes, leave the CRS absent, and issue one warning naming the sidecar
+and the decoding reason. CLI inspection and conversion report the same warning.
+Existing tests keep valid UTF-8 (including a BOM), empty and missing sidecars
+unchanged. A present sidecar that cannot be read is diagnosed separately.
+
+The Node test uses tiny GDAL 3.13.3-authored geometry fixtures under
+`crates/terrio/tests/data/shapefile`, with deliberately non-UTF-8 projection bytes.
+These check native warning policy, not equality to GDAL's metadata encoding policy.
+A projection member with a deliberately wrong CRC checks the WASM memory codec's
+read-error diagnostic; native extraction retains its fatal checksum refusal.
+A separate native memory-codec regression keeps sidecar budget refusals terminal.
+
+## JPEG 2000 channel roles
+
+`python/tests/test_jp2_color_roles.py` checks UInt8/UInt16 path and MemoryFile writes,
+independent GDAL reads, exact masks and a GDAL-authored BGR/ARGB reader regression.
+It also checks inferred and alias drivers and absence of invented GeoJP2 transforms.
+Encoded CDEF/COD checks cover channel associations and RGB component transforms;
+small RGB subsets remain grayscale and duplicate RGB associations are rejected.
+A GDAL-authored BGRA fixture checks stored 8/8/8/1-bit component precisions, alpha
+promotion and masks. The native test checks full and selected-window component order.
+Two Gray components with luminance in either component retain their CDEF association
+through updates and `rio.shutil.copy` (including the alias driver); an explicit color-role
+assignment still selects new associations. Inherited multispectral roles pin the disabled
+multiple-component transform. Source-affine tests check rotated and south-up grids
+through both file and byte exports. Unreferenced sources remain without a transform;
+CRS-only sources retain their existing unit-pixel grid, as specified in #714.
+
+The `jp2-colors` conformance suite writes real Landsat subsets through Python
+paths/bytes, CLI and Node/WASM when its package is available. GDAL independently
+checks exact values, types, masks, roles and either absence of georeferencing or exact
+rotated/south-up affine grids with EPSG:32633; this does
+not claim compressed-byte identity with GDAL's encoder. Copies of real two-component
+subsets also check stored luminance associations through both path and open-reader
+inputs and the JP2 alias driver. Run with GDAL 3.13.3:
+
+```sh
+python scripts/conformance.py ../terrio-data --only jp2-colors --strict
+```
+
+## Categorical Deflate output
+
+Run `python scripts/conformance.py ../data --only deflate --strict` with current
+Python bindings and GDAL. The five issue #712 patterns check the exact decoded
+samples, mask, Byte type, nodata, affine and CRS through GDAL (locally validated
+with GDAL 3.13.3). Three repeating-class TIFFs have an 8,500-byte ceiling; this
+catches the previous 12–20 KiB outputs without asserting compressed-byte equality.
+An available `esa_worldcover_colormap.tif` contributes a real-data crop, whose
+pixel and georeferencing preservation is checked without a compression-ratio
+promise. Palette preservation is outside this encoder comparison.
+
+The native codec tests retain the original libdeflate byte goldens and add size
+bounds for repeating rows, odd row widths and 32 KiB window crossings. Python
+checks the default GTiff and COG writers; Node checks the WASM TIFF writer.
+CPU timing is a measurement, not a CI threshold: compare repeated optimized
+encodes on the same inputs. On a local 512-square tile benchmark, the new search
+reduced squares from 4,870 to 1,220 compressed bytes and about 0.93 to 0.45 ms CPU;
+a WorldCover tile stayed at 27,597 bytes and took about 2.62 versus 3.47 ms.
+A half-zero/half-noise UInt16 control grew 72 bytes out of about 265 KiB. These
+measurements describe the size/CPU tradeoff and are not universal speed claims.
+
+## GeoPackage raster allocation checks
+
+Run `cargo test -p terrio --lib drivers::gpkg::tests` and
+`python -m pytest python/tests/test_gpkg_raster_limits.py`. Header-valid RGB TIFF,
+RGB PNG and indexed PNG tiles with corrupt pixels must be refused by configured
+band/byte limits before pixel decoding. The controls retain the decoder error
+without those limits. Heterogeneous coverage tiles retain the first tile's returned
+band count, while allocation checks account for the channels actually decoded.
+
+Linux child processes constrain the usable-memory policy to 128 MiB: a 5000-square
+Float32 result fits that policy, but its Float64 working grid does not. Tile and empty
+table cases must return a resource error, while 1536-square controls preserve values.
+A tiny destination also refuses a large TIFF tile's simultaneous Float32/Float64
+buffers before decoding. These are allocation-policy checks, not process-memory caps.
+
+GDAL 3.13.3 writes the Python coverage fixture. Its exact logical limits preserve
+pixels, types, masks and nodata; the native API also checks its geotransform and CRS.
+The Node suite checks Byte, UInt16, Int16 and Float32 GeoPackage byte round trips
+at their exact limits and refuses one byte less. The registered raster round-trip
+comparison can be focused with `python scripts/raster_roundtrip.py GPKG -v`.
+
+## Resized UInt16-alpha allocation checks
+
+`cargo test -p terrio --test declared_size resized_alpha_checks_the_source_and_conversion_together`
+uses separate TIFF planes whose individual decoded strips fit a Linux child process's
+32 MiB usable-memory policy. A 512-square mask must refuse its nearly 4096-square
+UInt16 source and simultaneous Byte conversion before allocating the large source window.
+Nearest, bilinear and average controls retain small-window values and Byte-alpha reads.
+A two-window control allows the first conversion, then refuses the second peak while
+the previously produced Byte output remains live.
+
+`python -m pytest python/tests/test_resource_limits.py -k resized_alpha_source_memory`
+checks the native Python mask API with GDAL 3.13.3-authored opaque UInt16 alpha strips.
+The small-window mask matches GDAL before the large read is refused. This targets the
+native path that converts source samples before resizing; the rio alpha fallback has
+its own resampling/conversion path.
+
+## Fallback header refusals
+
+`fallback_pcraster_is_checked_before_whole_file_detection` in the `declared_size` suite
+opens a complete PCRaster file with an unknown suffix at its exact logical limit and checks
+pixels and geotransform. A one-byte limit must refuse it without a file-sized allocation
+during format detection. The fallback's bounded signature check precedes its whole-file CSF
+detector, including when the name is neither `.asc` nor `.txt`.
+
+Default-feature native and fallback Esri/GRASS controls reject malformed UTF-8 headers and pixels with
+limits unset, below the valid declaration and at its exact maximum sample size. An injected
+header I/O error also remains an error in the unchanged fallback codec; partial preflight
+does not make it a successful raster read. The existing valid-header/invalid-pixel control
+retains the earlier declaration refusal.
+
+The Python GeoPackage raster-limit suite includes a GDAL-authored mixed raster/vector file.
+A complete check counts both before a limit is set. Under a raster refusal, raster-first
+rendering and complete checking fail, while vector opens, loaded-vector rendering and
+layer-selected vector clip templates retain the single polygon and its attribute.
+
+The malformed ASCII preflight regression requires native codec rejection in default
+builds. With the optional GDAL backend, successful fallback reads are compared with
+a direct GDAL read for values, sample type, dimensions, georeferencing and nodata;
+GDAL 3.13.3 can interpret an invalid pixel token as zero. A one-byte declaration
+budget still refuses every such accepted fallback before decoding.
+
+
+Known native Esri header keys without a value are ignored during preflight just as
+in the native reader. The declaration regression checks bare `ncols`, `nrows` and
+`nodata_value` lines, preserving valid Int32 pixels at the exact bound while a
+one-byte bound refuses before allocating a 16 MiB encoded text row. HDF5/netCDF
+component-band counts use checked arithmetic before declaration checks; a shared
+boundary regression refuses complex-count overflow even with limits unset.
+
+## Shapefile host memory reuse
+
+`cargo test -p terrio --lib dbf_record_storage_is_built_on_the_calling_thread`
+checks on glibc Linux that live DBF record vectors and their text/date values are constructed on
+the calling thread, retaining deleted physical slots. The test failed with the
+previous pool decoder. The existing `shapefile-deleted` conformance suite compares
+physical FIDs, attributes/nulls and WKB against GDAL 3.13.3, including streamed reads
+and paging with and without SHX.
+
+On Linux/glibc, profile the read/drop/next-allocation workflow with:
+
+```sh
+cargo build --release -p terrio --example vector_memory_reuse
+RAYON_NUM_THREADS=16 target/release/examples/vector_memory_reuse points.shp
+```
+
+The thread count fixes the old decoder's pool size for a before/after comparison;
+the new glibc DBF path does not use the pool. Other native platforms retain parallel
+DBF decoding, and WebAssembly retains its existing serial path.
+
+The example reads through the library, drops the dataset, then retains 768 written
+256-KiB buffers (192 MiB). It reports elapsed read time and Linux peak RSS before
+and after each step; RSS is null on platforms without `/proc/self/status`.
+Run each measurement in a fresh process. Compare default allocator settings with
+`MALLOC_ARENA_MAX=1` and `MALLOC_MMAP_THRESHOLD_=4194304` as separate controls.
+These variables change the whole host process and are not required by the reader.
+
+The Python reproduction from [#729](https://github.com/opengeos/terrio/issues/729)
+uses `terrio.open_vector`, `del dataset`, then 768 `bytearray(256 * 1024)` allocations.
+A local Linux/glibc measurement used optimized bindings, 16 Rayon threads and three
+fresh processes per case. GDAL 3.13.3 wrote the issue's six-field data shapes:
+200,000 points and 80,000 rectangular polygons, with text, integer and real fields.
+The table shows medians of peak RSS growth above the post-import baseline:
+
+| Data | Decoder | Read peak growth | Peak growth after next 192 MiB | Read time |
+| --- | --- | ---: | ---: | ---: |
+| Points | Previous worker allocation | 180.7 MiB | 268.9 MiB | 62.5 ms |
+| Points | Calling-thread allocation | 188.5 MiB | 215.1 MiB | 154.5 ms |
+| Polygons | Previous worker allocation | 108.7 MiB | 230.2 MiB | 59.5 ms |
+| Polygons | Calling-thread allocation | 118.5 MiB | 215.8 MiB | 94.9 ms |
+
+The new default result approaches the single-arena control (212.8 MiB for points,
+214.3 MiB for polygons). On this host the fixed-mmap control also reduced the old
+decoder's final peak (208.0/208.1 MiB), unlike the original issue's measurement.
+Allocator behavior varies by host and workload. This change improves reuse after
+freeing records. The read's own peak increases by about 8 MiB for points and 10 MiB
+for polygons in these runs, while the later peak drops by about 54 and 14 MiB.
+There is no fixed RSS bound.
+Serial DBF decoding trades parallel parsing throughput for allocation ownership.
+RSS thresholds are deliberately not CI assertions; the calling-thread regression
+and GDAL comparisons provide deterministic checks.
+
+## Empty warp regions
+
+`python/tests/test_region_warp_empty.py` checks zero-width, zero-height and
+fully empty `RegionWarp` destinations across seven resamplers, both grid policies,
+and one or two bands. Source planning returns an empty window. Warping returns
+typed empty data and validity before source-window validation or row kernels,
+even when a caller supplies a nonempty source window. The raster-backed private
+`_warp_from` path skips source borrowing and reading for empty regions too.
+Python preserves the
+configured band axis in `(bands, height, width)` output arrays. The Rust regression
+`empty_regions_return_typed_empty_outputs_even_with_nonempty_source_windows`
+checks the public API directly. These are API invariants, not GDAL comparisons.

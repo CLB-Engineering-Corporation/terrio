@@ -27,10 +27,10 @@
 //! lazy warped VRTs, built-in scalar derived bands, kernel sources and validity masks.
 
 mod virtual_raster;
+pub use virtual_raster::{SUPPLIED_VRT_DEPTH, SuppliedSource, VirtualRaster, open_virtual_raster};
 pub(crate) use virtual_raster::{SourceInventoryScope, resolve_reference, source_input_paths, subdataset_parts};
-pub use virtual_raster::{VirtualRaster, open_virtual_raster};
 
-use super::{Grid, Resampling, convert_value, data_type_name, parse_data_type};
+use super::{Grid, Resampling, common_type, convert_value, data_type_name, parse_data_type};
 use crate::crs::SpatialRef;
 use crate::formats::RasterDriver;
 use crate::{Error, RasterDataset, Result};
@@ -65,47 +65,6 @@ pub struct VrtDataset {
     pub srs: Option<SpatialRef>,
     /// The bands.
     pub bands: Vec<VrtBand>,
-}
-
-/// GDALDataTypeUnion-style common buffer type for bands with different native types.
-/// Float64 is required when Float32 cannot cover an integer type's precision/range.
-fn common_type(types: impl IntoIterator<Item = DataType>) -> DataType {
-    fn union(a: DataType, b: DataType) -> DataType {
-        use DataType::*;
-        if a == b {
-            return a;
-        }
-        if a == F64 || b == F64 {
-            return F64;
-        }
-        if a == F32 || b == F32 {
-            let integer = if a == F32 { b } else { a };
-            return if integer.size_bytes() > 2 { F64 } else { F32 };
-        }
-        fn range(t: DataType) -> (i128, i128) {
-            match t {
-                U8 => (0, u8::MAX as i128),
-                I8 => (i8::MIN as i128, i8::MAX as i128),
-                U16 => (0, u16::MAX as i128),
-                I16 => (i16::MIN as i128, i16::MAX as i128),
-                U32 => (0, u32::MAX as i128),
-                I32 => (i32::MIN as i128, i32::MAX as i128),
-                U64 => (0, u64::MAX as i128),
-                I64 => (i64::MIN as i128, i64::MAX as i128),
-                F32 | F64 => unreachable!("integer types only"),
-            }
-        }
-        let (amin, amax) = range(a);
-        let (bmin, bmax) = range(b);
-        [U8, I8, U16, I16, U32, I32, U64, I64]
-            .into_iter()
-            .find(|&t| {
-                let (min, max) = range(t);
-                min <= amin.min(bmin) && max >= amax.max(bmax)
-            })
-            .unwrap_or(F64)
-    }
-    types.into_iter().reduce(union).unwrap_or(DataType::U8)
 }
 
 /// A band of a virtual raster.
@@ -155,7 +114,15 @@ impl VrtDataset {
     #[cfg(not(target_family = "wasm"))]
     pub fn open(path: &str) -> Result<Self> {
         crate::formats::check_driver_allowed("VRT", path, crate::formats::Kind::Raster)?;
-        Self::from_xml(&std::fs::read_to_string(path)?)
+        let dataset = Self::from_xml(&std::fs::read_to_string(path)?)?;
+        crate::declared::check(
+            dataset.width,
+            dataset.height,
+            dataset.bands.len(),
+            common_type(dataset.bands.iter().map(|b| b.data_type)),
+            false,
+        )?;
+        Ok(dataset)
     }
 
     /// Parses a VRT description. Under a process-wide raster allow-list, only with the VRT driver
@@ -187,7 +154,7 @@ impl VrtDataset {
             }
             None => None,
         };
-        let srs = root.child("SRS").filter(|s| !s.text.trim().is_empty()).map(|s| SpatialRef::parse(s.text.trim())).transpose()?;
+        let srs = root.child("SRS").filter(|s| !s.text.trim().is_empty()).map(|s| SpatialRef::parse_literal(s.text.trim())).transpose()?;
         let mut bands = Vec::new();
         for b in root.children.iter().filter(|c| c.name == "VRTRasterBand") {
             if let Some(sub) = b.attr("subClass") {
@@ -265,7 +232,7 @@ impl VrtDataset {
     pub fn to_xml(&self) -> String {
         let mut s = format!("<VRTDataset rasterXSize=\"{}\" rasterYSize=\"{}\">\n", self.width, self.height);
         // GDAL reads any CRS definition here; an EPSG (or ESRI) code is the most portable.
-        let srs = self.srs.as_ref().and_then(|s| s.authority_code().or_else(|| s.to_wkt()));
+        let srs = self.srs.as_ref().and_then(|s| s.authority_code().or_else(|| s.to_file_wkt()));
         if let Some(def) = srs {
             s += &format!("  <SRS>{}</SRS>\n", xml::escape(&def));
         }
@@ -337,20 +304,28 @@ impl VrtDataset {
     }
 
     /// Writes the VRT file.
-    #[cfg(not(target_family = "wasm"))]
+    #[cfg(fs)]
     pub fn write(&self, path: &str) -> Result<()> {
         Ok(std::fs::write(path, self.to_xml())?)
     }
 
     /// Reads the pixels of the virtual raster. `base` is the directory relative source paths are
-    /// relative to.
+    /// relative to. Refused, before any source is read, when the VRT declares more than
+    /// `TERRIO_MAX_DECLARED_BYTES` or `TERRIO_MAX_BANDS` allow.
     pub fn materialize(&self, base: &Path) -> Result<RasterDataset> {
-        let mut cache: HashMap<PathBuf, RasterDataset> = HashMap::new();
-        let n = self.width * self.height;
         let data_type = common_type(self.bands.iter().map(|b| b.data_type));
+        // What the VRT declares, before its output is allocated (see `crate::declared`).
+        crate::declared::check(self.width, self.height, self.bands.len(), data_type, false)?;
+        crate::dataset::fallible::check_raster_buffer("a VRT", self.width, self.height, self.bands.len(), data_type)?;
+        let mut cache: HashMap<PathBuf, RasterDataset> = HashMap::new();
+        let n = crate::dataset::fallible::len(&[self.width, self.height], "a VRT output")?;
+        let samples = crate::dataset::fallible::len(&[n, self.bands.len()], "a VRT output")?;
+        let output_bytes = crate::dataset::fallible::len(&[samples, data_type.size_bytes()], "a VRT output")?;
+        let output_band_bytes = crate::dataset::fallible::len(&[n, data_type.size_bytes()], "a VRT band")?;
+        let mut cached_bytes = 0usize;
         let nodata = self.bands[0].nodata;
         // The output in its type, values converted as they are stored.
-        let mut out = RasterData::new_filled(data_type, n * self.bands.len(), 0.0);
+        let mut out = crate::dataset::fallible::raster_data(data_type, samples, 0.0, "a VRT output")?;
         let mut srs = self.srs.clone();
         for (bi, band) in self.bands.iter().enumerate() {
             crate::pixel::with_data!(&mut out, v => {
@@ -365,6 +340,13 @@ impl VrtDataset {
                 };
                 if !cache.contains_key(&path) {
                     let ds = crate::open_raster(&path.to_string_lossy())?;
+                    cached_bytes = ds
+                        .raster
+                        .data
+                        .len()
+                        .checked_mul(ds.raster.data_type.size_bytes())
+                        .and_then(|bytes| cached_bytes.checked_add(bytes))
+                        .ok_or_else(|| Error::ResourceLimit("VRT cached source buffers exceed the address space".into()))?;
                     cache.insert(path.clone(), ds);
                 }
                 let ds = &cache[&path];
@@ -378,6 +360,16 @@ impl VrtDataset {
                 }
                 let values = super::BandView::of(r, src.band - 1);
                 let skip = if src.complex { src.nodata } else { None };
+                let valid_bytes = if skip.is_some() { r.cols.checked_mul(r.rows) } else { Some(0) };
+                let peak = output_bytes.checked_add(cached_bytes).and_then(|bytes| valid_bytes.and_then(|mask| bytes.checked_add(mask)));
+                crate::dataset::fallible::check_usable(peak, || {
+                    "VRT output, cached sources and validity buffers are too large to allocate".into()
+                })
+                .map_err(Error::ResourceLimit)?;
+                let retained = output_bytes
+                    .checked_sub(output_band_bytes)
+                    .and_then(|bytes| cached_bytes.checked_sub(values.byte_len()).and_then(|cached| bytes.checked_add(cached)))
+                    .ok_or_else(|| Error::ResourceLimit("VRT retained buffers exceed the address space".into()))?;
                 let valid: Option<Vec<bool>> = skip.map(|nd| values.valid(nd));
                 let src_rect = if src.src_rect[0].is_nan() { [0.0, 0.0, r.cols as f64, r.rows as f64] } else { src.src_rect };
                 let req = SourceRead {
@@ -392,6 +384,7 @@ impl VrtDataset {
                     resampling: src.resampling,
                     working_float: src.complex,
                     invalid_value: None,
+                    within_rects: true,
                 };
                 // GDAL's complex sources work in double precision for some types, else in float.
                 let double = is_float_working(r.data_type)
@@ -421,7 +414,7 @@ impl VrtDataset {
                     }
                 };
                 crate::pixel::with_data!(&mut out, v => {
-                    req.read(self.width, self.height, &mut v[bi * n..(bi + 1) * n], |x| convert_value(value(x), band.data_type) as _);
+                    req.read_with_retained(self.width, self.height, &mut v[bi * n..(bi + 1) * n], retained, |x| convert_value(value(x), band.data_type) as _)?;
                 });
             }
         }
@@ -429,6 +422,7 @@ impl VrtDataset {
             Grid { width: self.width, height: self.height, geo_transform: self.geo_transform.unwrap_or([0.0, 1.0, 0.0, 0.0, 0.0, -1.0]) };
         let mut ds = super::build_raster_data(grid, out, self.bands.len(), nodata, &srs.unwrap_or_default())?;
         ds.driver = RasterDriver::VRT;
+        ds.geotransform_present = Some(self.geo_transform.is_some());
         Ok(ds)
     }
 }
@@ -523,7 +517,8 @@ pub(crate) fn fmt_number(v: f64) -> String {
 // ─── Reading a window of a source into a destination window ────────────────────────────────────
 
 /// A read of a source window into a destination window, with GDAL's VRT source semantics
-/// (`VRTSimpleSource::GetSrcDstWindow()` followed by `GDALRasterBand::RasterIO()`).
+/// (`VRTSimpleSource::GetSrcDstWindow()` followed by `GDALRasterBand::RasterIO()`). A VRT
+/// source's read stays within its rectangles ([`Self::within_rects`]).
 pub(crate) struct SourceRead<'a> {
     /// The source band's pixels.
     pub values: super::BandView<'a>,
@@ -537,6 +532,7 @@ pub(crate) struct SourceRead<'a> {
     /// whole width each ([`SourceRead::source_rows`] tells which rows a read needs).
     pub row0: usize,
     /// The source's data type (resampled values are rounded to it, as GDAL does).
+    /// A `sum` is not: its value goes to the output's type as it is.
     pub src_type: DataType,
     /// The source window.
     pub src_rect: [f64; 4],
@@ -550,13 +546,32 @@ pub(crate) struct SourceRead<'a> {
     /// The value written where resampling finds no valid source pixel (`None`: nothing is
     /// written).
     pub invalid_value: Option<f64>,
+    /// Whether the read stays within its rectangles, as a VRT source's does: it uses only the
+    /// source pixels that meet `src_rect`, and writes a destination pixel only from the part of
+    /// it inside `dst_rect` (a method sampling a point, only when the pixel's centre is inside).
+    /// Otherwise, as for a window of one raster, kernels and areas reach the source pixels
+    /// around `src_rect`. Either way, a window is copied one for one only as [`Self::copies`]
+    /// says, and resampled at its offset otherwise.
+    pub within_rects: bool,
 }
 
 impl SourceRead<'_> {
     /// Reads into a destination `out` of `dw × dh` pixels, setting each valid destination pixel
     /// the source covers to `f(value)`. Rows are read in parallel.
-    pub fn read<T: Send>(&self, dw: usize, dh: usize, out: &mut [T], f: impl Fn(f64) -> T + Sync + Send) {
-        self.read_rows(dw, dh, 0..dh, out, f);
+    pub fn read<T: Send>(&self, dw: usize, dh: usize, out: &mut [T], f: impl Fn(f64) -> T + Sync + Send) -> Result<()> {
+        self.read_with_retained(dw, dh, out, 0, f)
+    }
+
+    /// Also account for buffers retained by a caller while this source is resampled.
+    pub fn read_with_retained<T: Send>(
+        &self,
+        dw: usize,
+        dh: usize,
+        out: &mut [T],
+        retained: usize,
+        f: impl Fn(f64) -> T + Sync + Send,
+    ) -> Result<()> {
+        self.read_rows(dw, dh, 0..dh, out, retained, f)
     }
 
     /// The source pixel `(x, y)`'s index in `values`.
@@ -569,30 +584,64 @@ impl SourceRead<'_> {
     /// into `out`, `rows.len()` rows of `dw` pixels: each pixel is computed as the whole read
     /// computes it, so that reads of consecutive row ranges give the whole read, whatever the
     /// ranges. `values` need only hold the source rows [`Self::source_rows`] gives for `rows`.
+    /// `retained` is as for [`Self::read_with_retained`].
     pub fn read_rows<T: Send>(
         &self,
         dw: usize,
         dh: usize,
         rows: std::ops::Range<usize>,
         out: &mut [T],
+        retained: usize,
         f: impl Fn(f64) -> T + Sync + Send,
-    ) {
-        let Some((w, r0, r1)) = self.rows_window(dw, dh, &rows) else { return };
+    ) -> Result<()> {
+        // The window's output rows `a..b` among those read.
+        let Some((w, a, b)) = self.rows_window(dw, dh, &rows) else { return Ok(()) };
         let (ow, oh) = w.out_size;
         let is_valid = |i: usize| self.valid.is_none_or(|m| m[i]);
+        let output_bytes = std::mem::size_of_val(out);
         // The destination rows the source covers, among those read.
-        let first = w.out_off.1 + r0 - rows.start;
-        let lines = &mut out[first * dw..(first + r1 - r0) * dw];
+        let first = w.out_off.1 + a - rows.start;
+        let start = (first * dw).min(out.len());
+        let end = ((first + b - a) * dw).min(out.len());
+        let rows = &mut out[start..end];
         let x0 = w.out_off.0;
-        if w.req_size.0 == ow && w.req_size.1 == oh {
-            crate::par::chunks_mut(lines, dw, |k, line| {
-                let sy = w.req_off.1 + r0 + k;
-                if sy >= self.height {
+        if self.copies(&w) {
+            let [c0, r0, c1, r1] = self.copy_span(&w);
+            crate::par::chunks_mut(rows, dw, |k, line| {
+                let r = a + k;
+                if !(r0..r1).contains(&r) {
                     return;
                 }
+                let row = self.at(w.req_off.0, w.req_off.1 + r);
+                for c in c0..c1 {
+                    if is_valid(row + c) {
+                        line[x0 + c] = f(self.values.get(row + c));
+                    }
+                }
+            });
+            return Ok(());
+        }
+        // The destination pixels written, relative to the window, and the source pixels read.
+        let [c0, r0, c1, r1] = self.written(&w);
+        let [sx0, sy0, sx1, sy1] = self.cover();
+        if sx1 <= sx0 || sy1 <= sy0 {
+            return Ok(());
+        }
+        let (fx, fy, fw, fh) = (w.dreq_off.0, w.dreq_off.1, w.dreq_size.0, w.dreq_size.1);
+        if self.resampling == Resampling::Nearest {
+            let incx = fw / ow as f64;
+            let incy = fh / oh as f64;
+            crate::par::chunks_mut(rows, dw, |k, line| {
+                let r = a + k;
+                if !(r0..r1).contains(&r) {
+                    return;
+                }
+                let sy = nearest_row(r, fy, incy, sy0, sy1);
+                let mut sxf = 0.5 * incx + fx + NEAREST_EPS;
                 for c in 0..ow {
-                    let sx = w.req_off.0 + c;
-                    if sx >= self.width {
+                    let sx = sxf.max(sx0 as f64).min((sx1 - 1) as f64) as usize;
+                    sxf += incx;
+                    if !(c0..c1).contains(&c) {
                         continue;
                     }
                     let i = self.at(sx, sy);
@@ -601,34 +650,26 @@ impl SourceRead<'_> {
                     }
                 }
             });
-            return;
+            return Ok(());
         }
-        let (fx, fy, fw, fh) = (w.dreq_off.0, w.dreq_off.1, w.dreq_size.0, w.dreq_size.1);
-        if self.resampling == Resampling::Nearest {
-            let incx = fw / ow as f64;
-            crate::par::chunks_mut(lines, dw, |k, line| {
-                let sy = nearest_row(r0 + k, fy, fh / oh as f64, self.height);
-                let mut sxf = 0.5 * incx + fx + NEAREST_EPS;
-                for c in 0..ow {
-                    let sx = sxf.max(0.0).min((self.width - 1) as f64) as usize;
-                    sxf += incx;
-                    let i = self.at(sx, sy);
-                    if is_valid(i) {
-                        line[x0 + c] = f(self.values.get(i));
-                    }
-                }
-            });
-            return;
-        }
+        let retained = retained
+            .checked_add(output_bytes)
+            .ok_or_else(|| Error::ResourceLimit("a resampling working set is too large to allocate".into()))?;
         let res = if self.resampling == Resampling::Average {
-            gdal_average_with_origin(self, w.req_off, (fx, fy, fw, fh), (ow, oh), None, r0..r1)
+            gdal_average_with_origin(self, w.req_off, (fx, fy, fw, fh), (ow, oh), None, retained, a..b)
         } else {
-            resample_window(self, (fx, fy, fw, fh), (ow, oh), r0..r1)
-        };
-        crate::par::chunks_mut(lines, dw, |r, line| {
-            for c in 0..ow {
-                match res[r * ow + c] {
-                    Some(v) => line[x0 + c] = f(if self.working_float { v } else { convert_value(v, self.src_type) }),
+            resample_window(self, (fx, fy, fw, fh), (ow, oh), retained, a..b)
+        }?;
+        // A `sum` adds shares of source pixels, which neither the source type's precision nor its
+        // range holds: it is passed on as it is, for `f` to store in the output's type.
+        let keep = self.working_float || self.resampling == Resampling::Sum;
+        crate::par::chunks_mut(rows, dw, |k, line| {
+            if !(r0..r1).contains(&(a + k)) {
+                return;
+            }
+            for c in c0..c1 {
+                match res[k * ow + c] {
+                    Some(v) => line[x0 + c] = f(if keep { v } else { convert_value(v, self.src_type) }),
                     None => {
                         if let Some(v) = self.invalid_value {
                             line[x0 + c] = f(v);
@@ -637,9 +678,10 @@ impl SourceRead<'_> {
                 }
             }
         });
+        Ok(())
     }
 
-    /// The window of a whole read of `dw × dh` pixels, and the rows `r0..r1` of its output block
+    /// The window of a whole read of `dw × dh` pixels, and the rows `a..b` of its output block
     /// (from `out_off.1`) among the destination rows `rows`; `None` when it draws none of them.
     fn rows_window(&self, dw: usize, dh: usize, rows: &std::ops::Range<usize>) -> Option<(Window, usize, usize)> {
         let w = self.window(dw as f64, dh as f64, dw, dh)?;
@@ -660,19 +702,33 @@ impl SourceRead<'_> {
     /// pixels ([`Self::read_rows`]) uses: `None` when it uses none. Only the window's
     /// geometry is used, not `values`.
     pub fn source_rows(&self, dw: usize, dh: usize, rows: std::ops::Range<usize>) -> Option<std::ops::Range<usize>> {
-        let (w, r0, r1) = self.rows_window(dw, dh, &rows)?;
+        let (w, a, b) = self.rows_window(dw, dh, &rows)?;
         let (ow, oh) = w.out_size;
-        let range = if w.req_size.0 == ow && w.req_size.1 == oh {
-            w.req_off.1 + r0..(w.req_off.1 + r1).min(self.height)
+        let range = if self.copies(&w) {
+            let [_, r0, _, r1] = self.copy_span(&w);
+            let (a, b) = (a.max(r0), b.min(r1));
+            if a >= b {
+                return None;
+            }
+            w.req_off.1 + a..w.req_off.1 + b
         } else {
-            let (fx, fy, fw, fh) = (w.dreq_off.0, w.dreq_off.1, w.dreq_size.0, w.dreq_size.1);
+            let [_, r0, _, r1] = self.written(&w);
+            let [sx0, sy0, sx1, sy1] = self.cover();
+            if sx1 <= sx0 || sy1 <= sy0 {
+                return None;
+            }
+            let win = (w.dreq_off.0, w.dreq_off.1, w.dreq_size.0, w.dreq_size.1);
             match self.resampling {
                 Resampling::Nearest => {
-                    let incy = fh / oh as f64;
-                    nearest_row(r0, fy, incy, self.height)..nearest_row(r1 - 1, fy, incy, self.height) + 1
+                    let (a, b) = (a.max(r0), b.min(r1));
+                    if a >= b {
+                        return None;
+                    }
+                    let incy = win.3 / oh as f64;
+                    nearest_row(a, win.1, incy, sy0, sy1)..nearest_row(b - 1, win.1, incy, sy0, sy1) + 1
                 }
-                Resampling::Average => gdal_average_rows(self, w.req_off, (fw / ow as f64, fh / oh as f64), (ow, oh), r0..r1),
-                _ => resample_rows(self, (fx, fy, fw, fh), (ow, oh), r0..r1),
+                Resampling::Average => gdal_average_rows(self, w.req_off, win, (ow, oh), a..b),
+                _ => resample_rows(self, win, (ow, oh), a..b),
             }
         };
         (range.start < range.end).then_some(range)
@@ -687,16 +743,111 @@ impl SourceRead<'_> {
         if ow == 0 || oh == 0 {
             return Ok(None);
         }
-        if w.req_size != w.out_size {
+        if !self.copies(&w) {
             return Err(());
         }
-        // Source pixels past the source's edges, and rows past the destination's, are not read.
-        let cols = ow.min(self.width.saturating_sub(w.req_off.0));
-        let rows = oh.min(self.height.saturating_sub(w.req_off.1)).min(dh.saturating_sub(w.out_off.1));
+        // Source pixels past the source's edges (or, within the rectangles, outside them), and
+        // rows past the destination's, are not read.
+        let [c0, r0, c1, r1] = self.copy_span(&w);
+        let cols = c1 - c0;
+        let rows = (r1 - r0).min(dh.saturating_sub(w.out_off.1 + r0));
         if cols == 0 || rows == 0 {
             return Ok(None);
         }
-        Ok(Some(PlainCopy { src: w.req_off, dst_x: w.out_off.0, cols, dst_rows: w.out_off.1..w.out_off.1 + rows }))
+        let (src, dst_y) = ((w.req_off.0 + c0, w.req_off.1 + r0), w.out_off.1 + r0);
+        Ok(Some(PlainCopy { src, dst_x: w.out_off.0 + c0, cols, dst_rows: dst_y..dst_y + rows }))
+    }
+
+    /// Whether a read through `w` copies source pixels one for one: only a window of the same
+    /// scale, which requests as many source pixels as it writes, by `nearest` when each
+    /// destination pixel's centre is in the source pixel copied, and by the other methods on
+    /// whole offsets only. Within its rectangles, a `sum` copies only into destination pixels
+    /// wholly inside `dst_rect`. Another window is resampled at its offset: a `sum` shares each
+    /// source pixel by the area inside each destination pixel.
+    fn copies(&self, w: &Window) -> bool {
+        const EPSILON: f64 = 1e-10;
+        let whole = |f: f64, i: usize| (f - i as f64).abs() <= EPSILON;
+        let same_scale = whole(w.dreq_size.0, w.out_size.0) && whole(w.dreq_size.1, w.out_size.1);
+        let aligned = whole(w.dreq_off.0, w.req_off.0) && whole(w.dreq_off.1, w.req_off.1);
+        if w.req_size != w.out_size || !same_scale {
+            return false;
+        }
+        // The source pixel holding the first destination pixel's centre.
+        let nearest = |f: f64, i: usize| (f + 0.5 + EPSILON).floor() == i as f64;
+        match self.resampling {
+            Resampling::Nearest => nearest(w.dreq_off.0, w.req_off.0) && nearest(w.dreq_off.1, w.req_off.1),
+            Resampling::Sum => aligned && (!self.within_rects || self.inside(w)),
+            _ => aligned,
+        }
+    }
+
+    /// Whether each destination pixel of `w` is wholly inside `dst_rect`.
+    fn inside(&self, w: &Window) -> bool {
+        const EPSILON: f64 = 1e-10;
+        let [dxo, dyo, dxs, dys] = self.dst_rect;
+        let (x0, y0) = (w.out_off.0 as f64, w.out_off.1 as f64);
+        let (x1, y1) = (x0 + w.out_size.0 as f64, y0 + w.out_size.1 as f64);
+        dxo <= x0 + EPSILON && x1 <= dxo + dxs + EPSILON && dyo <= y0 + EPSILON && y1 <= dyo + dys + EPSILON
+    }
+
+    /// The source window a read's areas are clipped to, `[x0, y0, x1, y1]`: within its
+    /// rectangles, `src_rect`, otherwise none.
+    fn src_bounds(&self) -> [f64; 4] {
+        if !self.within_rects {
+            return [f64::NEG_INFINITY, f64::NEG_INFINITY, f64::INFINITY, f64::INFINITY];
+        }
+        let [x, y, xs, ys] = self.src_rect;
+        [x, y, x + xs, y + ys]
+    }
+
+    /// The source pixels a read uses, `[x0, y0, x1, y1]`: within its rectangles, those that meet
+    /// `src_rect`, otherwise all.
+    fn cover(&self) -> [usize; 4] {
+        if !self.within_rects {
+            return [0, 0, self.width, self.height];
+        }
+        const EPSILON: f64 = 1e-10;
+        let [x0, y0, x1, y1] = self.src_bounds();
+        let span = |lo: f64, hi: f64, n: usize| {
+            let a = (lo + EPSILON).floor().clamp(0.0, n as f64) as usize;
+            (a, ((hi - EPSILON).ceil().clamp(0.0, n as f64) as usize).max(a))
+        };
+        let ((x0, x1), (y0, y1)) = (span(x0, x1, self.width), span(y0, y1, self.height));
+        [x0, y0, x1, y1]
+    }
+
+    /// The destination pixels a read through `w` writes, `[c0, r0, c1, r1]` relative to the
+    /// window: within its rectangles, a method sampling a point writes only those whose centres
+    /// are inside `dst_rect` (a centre on its left or top edge is inside, on its right or bottom
+    /// edge outside).
+    fn written(&self, w: &Window) -> [usize; 4] {
+        let (ow, oh) = w.out_size;
+        if !self.within_rects || self.resampling.is_area_based() {
+            return [0, 0, ow, oh];
+        }
+        const EPSILON: f64 = 1e-10;
+        let [dxo, dyo, dxs, dys] = self.dst_rect;
+        // The first pixel whose centre is at `edge` or past it.
+        let first = |edge: f64, off: usize, n: usize| ((edge - 0.5 - EPSILON).ceil() - off as f64).clamp(0.0, n as f64) as usize;
+        let span = |lo: f64, hi: f64, off: usize, n: usize| {
+            let a = first(lo, off, n);
+            (a, first(hi, off, n).max(a))
+        };
+        let ((c0, c1), (r0, r1)) = (span(dxo, dxo + dxs, w.out_off.0, ow), span(dyo, dyo + dys, w.out_off.1, oh));
+        [c0, r0, c1, r1]
+    }
+
+    /// The destination pixels a copy through `w` writes, `[c0, r0, c1, r1]` relative to the
+    /// window: those [`Self::written`] gives whose source pixels are among those it uses.
+    fn copy_span(&self, w: &Window) -> [usize; 4] {
+        let [c0, r0, c1, r1] = self.written(w);
+        let [sx0, sy0, sx1, sy1] = self.cover();
+        let span = |lo: usize, hi: usize, s0: usize, s1: usize, off: usize| {
+            let a = lo.max(s0.saturating_sub(off));
+            (a, hi.min(s1.saturating_sub(off)).max(a))
+        };
+        let ((c0, c1), (r0, r1)) = (span(c0, c1, sx0, sx1, w.req_off.0), span(r0, r1, sy0, sy1, w.req_off.1));
+        [c0, r0, c1, r1]
     }
 
     /// `VRTSimpleSource::GetSrcDstWindow()` for a request covering the whole destination.
@@ -838,9 +989,10 @@ impl SourceRead<'_> {
 const NEAREST_EPS: f64 = 1e-10;
 
 /// The source row of output row `r` (from the window's output offset) of a nearest-neighbour
-/// read at source rows `fy + incy * (r + 0.5)`, as GDAL rounds it.
-fn nearest_row(r: usize, fy: f64, incy: f64, height: usize) -> usize {
-    ((r as f64 + 0.5) * incy + fy + NEAREST_EPS).max(0.0).min((height - 1) as f64) as usize
+/// read at source rows `fy + incy * (r + 0.5)`, as GDAL rounds it, among the source rows
+/// `sy0..sy1` the read uses.
+fn nearest_row(r: usize, fy: f64, incy: f64, sy0: usize, sy1: usize) -> usize {
+    ((r as f64 + 0.5) * incy + fy + NEAREST_EPS).max(sy0 as f64).min((sy1 - 1) as f64) as usize
 }
 
 /// A read of source pixels one for one ([`SourceRead::plain_copy`]): source pixel
@@ -967,17 +1119,58 @@ fn gdal_chunks(
     chunks
 }
 
-/// The source rows [`gdal_average_with_origin`] reads for the output rows `rows`: those of the
-/// chunks the rows are in, whose validity decides how all their pixels are averaged.
-fn gdal_average_rows(
+/// Reserve optional Float64 source-resampling samples (reference: GDAL 3.13.3).
+/// They coexist with the destination and borrowed source/mask buffers.
+fn resampling_values(s: &SourceRead, width: usize, height: usize, retained: usize) -> Result<Vec<Option<f64>>> {
+    let what = "a source resampling working set";
+    let n = crate::dataset::fallible::len(&[width, height], what)?;
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+    let bytes = n
+        .checked_mul(std::mem::size_of::<Option<f64>>())
+        .filter(|&n| n <= isize::MAX as usize)
+        .and_then(|n| n.checked_add(retained))
+        .and_then(|n| n.checked_add(s.values.byte_len()))
+        .and_then(|n| n.checked_add(s.valid.map_or(0, |v| v.len())));
+    crate::dataset::fallible::check_usable(bytes, || format!("{what} is too large to allocate")).map_err(Error::ResourceLimit)?;
+    Ok(crate::dataset::fallible::filled(n, None, what)?)
+}
+
+/// The chunks [`gdal_average_with_origin`] averages a request in ([`gdal_chunks`]): within its
+/// rectangles (`clip`), each reads only the source pixels the read uses.
+fn average_chunks(
     s: &SourceRead,
     req_off: (usize, usize),
     ratio: (f64, f64),
     out: (usize, usize),
+    clip: bool,
+) -> Vec<([usize; 4], [usize; 4])> {
+    let mut chunks = gdal_chunks(s, req_off, ratio, out, 0);
+    if clip {
+        let cover = s.cover();
+        for (_, src) in &mut chunks {
+            let [cx0, cy0, cx1, cy1] = *src;
+            let (cx0, cy0) = (cx0.max(cover[0]), cy0.max(cover[1]));
+            *src = [cx0, cy0, cx1.min(cover[2]).max(cx0), cy1.min(cover[3]).max(cy0)];
+        }
+    }
+    chunks
+}
+
+/// The source rows [`gdal_average_with_origin`] (without an `origin`) reads for the output rows
+/// `rows`: those of the chunks the rows are in, whose validity decides how all their pixels are
+/// averaged.
+fn gdal_average_rows(
+    s: &SourceRead,
+    req_off: (usize, usize),
+    win: (f64, f64, f64, f64),
+    out: (usize, usize),
     rows: std::ops::Range<usize>,
 ) -> std::ops::Range<usize> {
+    let ratio = (win.2 / out.0 as f64, win.3 / out.1 as f64);
     let (mut y0, mut y1) = (usize::MAX, 0);
-    for (dst, src) in gdal_chunks(s, req_off, ratio, out, 0) {
+    for (dst, src) in average_chunks(s, req_off, ratio, out, s.within_rects) {
         if dst[1] < rows.end && rows.start < dst[1] + dst[3] {
             y0 = y0.min(src[1]);
             y1 = y1.max(src[3]);
@@ -1000,13 +1193,14 @@ pub(crate) fn gdal_average_with_origin(
     win: (f64, f64, f64, f64),
     out: (usize, usize),
     origin: Option<[f64; 8]>,
+    retained: usize,
     rows: std::ops::Range<usize>,
-) -> Vec<Option<f64>> {
+) -> Result<Vec<Option<f64>>> {
     let (fx, fy, fw, fh) = win;
     let (ow, oh) = out;
-    let mut res = vec![None; ow * rows.len()];
+    let mut res = resampling_values(s, ow, rows.len(), retained)?;
     if ow == 0 || oh == 0 {
-        return res;
+        return Ok(res);
     }
     let ratio = (fw / ow as f64, fh / oh as f64);
     // Offsets are relative to the request's integer origin, as in GDAL.
@@ -1032,7 +1226,15 @@ pub(crate) fn gdal_average_with_origin(
     };
     let val = |x: usize, y: usize| wt.cast(s.values.get(s.at(x, y)));
     let valid = |x: usize, y: usize| s.valid.is_none_or(|m| m[s.at(x, y)]);
-    for (dst, src) in gdal_chunks(s, req_off, ratio, out, 0) {
+    // Within its rectangles, a read averages the part of each destination pixel inside them:
+    // footprints are clipped to `src_rect`, request-relative `[x0, y0, x1, y1]`, and only the
+    // source pixels that meet it are read.
+    let clip = (origin.is_none() && s.within_rects).then(|| {
+        let [x0, y0, x1, y1] = s.src_bounds();
+        let (ox, oy) = (req_off.0 as f64, req_off.1 as f64);
+        [x0 - ox, y0 - oy, x1 - ox, y1 - oy]
+    });
+    for (dst, src) in average_chunks(s, req_off, ratio, out, clip.is_some()) {
         let [dx0, dy0, nx, ny] = dst;
         // Chunks outside the rows read: the whole output's chunks, so that each pixel is computed
         // as for the whole output (the chunk's validity decides how it is averaged).
@@ -1063,14 +1265,21 @@ pub(crate) fn gdal_average_with_origin(
             left: f64,
             right: f64,
             full: f64,
+            empty: bool,
         }
         let mut spacing_two = true;
         let mut last_x1 = -1i64;
         let xs: Vec<SrcX> = (dx0..dx0 + nx)
             .map(|i| {
                 let a = delta.0 + (i as f64 + o[0]) * ratio.0;
-                let x0 = ((a + 1e-8) as i64).max(rx0);
                 let b = delta.0 + (i as f64 + o[0] + 1.) * ratio.0;
+                let (a, b, clipped) = match clip {
+                    Some(c) if a < c[0] || b > c[2] => (a.max(c[0]), b.min(c[2]), true),
+                    _ => (a, b, false),
+                };
+                // A clipped footprint is not two whole pixels.
+                spacing_two &= !clipped;
+                let x0 = ((a + 1e-8) as i64).max(rx0);
                 let mut x1 = (b - 1e-8).ceil() as i64;
                 if x1 == x0 {
                     x1 += 1;
@@ -1087,7 +1296,7 @@ pub(crate) fn gdal_average_with_origin(
                     spacing_two = false;
                 }
                 last_x1 = x1;
-                SrcX { x0, x1, left, right, full }
+                SrcX { x0, x1, left, right, full, empty: clipped && b <= a }
             })
             .collect();
         // Absolute source coordinates of request-relative ones.
@@ -1095,15 +1304,22 @@ pub(crate) fn gdal_average_with_origin(
         let ay = |y: i64| (y - source_origin.1) as usize;
         for j in dy0.max(rows.start)..(dy0 + ny).min(rows.end) {
             let a = delta.1 + (j as f64 + o[1]) * ratio.1;
-            let y0 = ((a + 1e-8) as i64).max(ry0);
             let b = delta.1 + (j as f64 + o[1] + 1.) * ratio.1;
+            let (a, b, clipped) = match clip {
+                Some(c) if a < c[1] || b > c[3] => (a.max(c[1]), b.min(c[3]), true),
+                _ => (a, b, false),
+            };
+            if clipped && b <= a {
+                continue;
+            }
+            let y0 = ((a + 1e-8) as i64).max(ry0);
             let mut y1 = (b - 1e-8).ceil() as i64;
             if y1 == y0 {
                 y1 += 1;
             }
             y1 = y1.min(ry1);
             let line = &mut res[(j - rows.start) * ow..(j - rows.start + 1) * ow];
-            if spacing_two && y1 == y0 + 2 && !masked {
+            if spacing_two && !clipped && y1 == y0 + 2 && !masked {
                 // A factor of two without nodata.
                 let (r0, r1) = (ay(y0), ay(y0 + 1));
                 let quad = |c: usize| {
@@ -1157,7 +1373,7 @@ pub(crate) fn gdal_average_with_origin(
                 full_col += (y1 - y0 - 2) as f64;
                 full_col += top;
             }
-            for (c, sx) in xs.iter().enumerate() {
+            for (c, sx) in xs.iter().enumerate().filter(|(_, sx)| !sx.empty) {
                 let (mut total, mut total_weight, mut mul) = (0.0, 0.0, 1.0);
                 if !masked {
                     let mut inv = 1.0;
@@ -1232,57 +1448,95 @@ pub(crate) fn gdal_average_with_origin(
             }
         }
     }
-    res
+    Ok(res)
 }
 
-/// Resamples a floating-point source window to `out` pixels as GDAL's overview code does
-/// (`GDALRasterIOResampled()`): separable convolution kernels stretched when downsampling,
-/// coverage-weighted averages, or the most frequent value.
-/// The source rows `[start, stop)` of output row `r` of an area method: the rows its footprint
-/// `fy + r * ry .. + ry` overlaps.
-fn area_rows(r: usize, fy: f64, ry: f64, height: usize) -> (usize, usize) {
+/// Peak area/convolution scratch, including concurrent rows and vector growth.
+/// Reference: GDAL 3.13.3 area kernels; storage follows this implementation's value/weight pairs.
+fn resampling_scratch_bytes(s: &SourceRead, ratio: (f64, f64), out: (usize, usize)) -> Option<usize> {
+    if out.0 == 0 || out.1 == 0 {
+        return Some(0);
+    }
+    if !s.resampling.is_area_based() {
+        let radius = s.resampling.radius().max(1) as f64;
+        let taps = |ratio: f64, limit: usize| ((2.0 * radius * ratio.max(1.0)).ceil() as usize).saturating_add(2).min(limit);
+        let columns = taps(ratio.0, s.width);
+        let rows = taps(ratio.1, s.height);
+        // Horizontal taps are kept for every output column; each concurrent row holds
+        // vertical weights and a row of Option<f64> intermediate values.
+        let horizontal =
+            columns.checked_mul(std::mem::size_of::<f64>())?.checked_add(std::mem::size_of::<(usize, Vec<f64>)>())?.checked_mul(out.0)?;
+        let per_row = rows.checked_mul(std::mem::size_of::<f64>() + std::mem::size_of::<Option<f64>>())?;
+        let workers = out.1.min(crate::par::threads());
+        return per_row.checked_mul(workers)?.checked_add(horizontal).filter(|&n| n <= isize::MAX as usize);
+    }
+    let columns = (ratio.0.ceil() as usize).saturating_add(1).min(s.width);
+    let rows = (ratio.1.ceil() as usize).saturating_add(1).min(s.height);
+    let samples = columns.checked_mul(rows)?;
+    if samples == 0 {
+        return Some(0);
+    }
+    let capacity = samples.max(4).checked_next_power_of_two()?;
+    let values = capacity.checked_mul(std::mem::size_of::<(f64, f64)>())?;
+    // A growing vector can retain its old half-capacity while requesting the new buffer.
+    let growing_values = values.checked_add(values / 2)?;
+    let extra = match s.resampling {
+        Resampling::Mode => {
+            let distinct = match s.values {
+                super::BandView::U8(_) | super::BandView::I8(_) => samples.min(256),
+                super::BandView::U16(_) | super::BandView::I16(_) => samples.min(65536),
+                _ => samples,
+            };
+            let counts = distinct.max(4).checked_next_power_of_two()?.checked_mul(std::mem::size_of::<(f64, f32)>())?;
+            counts.checked_add(counts / 2)?
+        }
+        // Stable sorting may allocate auxiliary storage for the contributing pairs.
+        Resampling::Med | Resampling::Q1 | Resampling::Q3 => samples.checked_mul(std::mem::size_of::<(f64, f64)>())?,
+        _ => 0,
+    };
+    let per_row = growing_values.max(values.checked_add(extra)?);
+    let workers = if out.1 == 1 { 1 } else { out.1.min(crate::par::threads()) };
+    per_row.checked_mul(workers).filter(|&bytes| bytes <= isize::MAX as usize)
+}
+
+/// Output row `r` of an area method: its footprint `fy + r * ry .. + ry` clipped to the rows
+/// `bounds` of the source window, and the source rows `[start, stop)` it overlaps.
+fn area_rows(r: usize, fy: f64, ry: f64, bounds: (f64, f64), height: usize) -> (f64, f64, usize, usize) {
     let y0 = fy + r as f64 * ry;
     let y1 = y0 + ry;
+    let (y0, y1) = (y0.max(bounds.0), y1.min(bounds.1));
     let iy0 = (y0 + 1e-8).floor().max(0.0) as usize;
     let iy1 = ((y1 - 1e-8).ceil() as usize).min(height).max(iy0 + 1).min(height);
-    (iy0, iy1)
+    (y0, y1, iy0, iy1)
 }
 
-/// The kernel taps of output pixel `dst` along an axis of `size` source pixels: the first source
-/// pixel, the number of taps and the kernel's scale and centre.
-fn kernel_taps(method: Resampling, dst: usize, ratio: f64, off: f64, size: usize) -> (usize, usize, f64, f64) {
+/// The kernel taps of output pixel `dst` along an axis, on the source pixels `[lo, hi)` the read
+/// uses: the first source pixel, the one past the last, and the kernel's scale and centre.
+fn kernel_taps(method: Resampling, dst: usize, ratio: f64, off: f64, lo: usize, hi: usize) -> (usize, usize, f64, f64) {
     let radius = method.radius().max(1) as f64;
     let center = (dst as f64 + 0.5) * ratio + off;
     let scale = if 1.0 / ratio >= 1.0 { 1.0 } else { 1.0 / ratio };
     let r = radius / scale;
-    let start = ((center - r + 0.5).floor() as i64).max(0) as usize;
-    let stop = ((center + r + 0.5) as i64).min(size as i64).max(start as i64) as usize;
-    (start, stop - start, scale, center)
+    let start = ((center - r + 0.5).floor() as i64).max(lo as i64) as usize;
+    let stop = ((center + r + 0.5) as i64).min(hi as i64).max(start as i64) as usize;
+    (start, stop, scale, center)
 }
 
 /// The source rows [`resample_window`] reads for the output rows `rows` (of `out.1`).
 fn resample_rows(s: &SourceRead, win: (f64, f64, f64, f64), out: (usize, usize), rows: std::ops::Range<usize>) -> std::ops::Range<usize> {
     let (_, fy, _, fh) = win;
     let ry = fh / out.1 as f64;
+    let [_, by0, _, by1] = s.src_bounds();
+    let [_, sy0, _, sy1] = s.cover();
     let (mut y0, mut y1) = (usize::MAX, 0);
+    // The rows read grow with the output row: the first and last rows give them all.
     for r in [rows.start, rows.end - 1] {
-        let area = matches!(
-            s.resampling,
-            Resampling::Average
-                | Resampling::Rms
-                | Resampling::Mode
-                | Resampling::Min
-                | Resampling::Max
-                | Resampling::Med
-                | Resampling::Q1
-                | Resampling::Q3
-                | Resampling::Sum
-        );
-        let (a, b) = if area {
-            area_rows(r, fy, ry, s.height)
+        let (a, b) = if s.resampling.is_area_based() {
+            let (_, _, iy0, iy1) = area_rows(r, fy, ry, (by0, by1), s.height);
+            (iy0, iy1)
         } else {
-            let (start, taps, _, _) = kernel_taps(s.resampling, r, ry, fy, s.height);
-            (start, start + taps)
+            let (start, stop, _, _) = kernel_taps(s.resampling, r, ry, fy, sy0, sy1);
+            (start, stop)
         };
         y0 = y0.min(a);
         y1 = y1.max(b);
@@ -1290,15 +1544,28 @@ fn resample_rows(s: &SourceRead, win: (f64, f64, f64, f64), out: (usize, usize),
     if y0 >= y1 { 0..0 } else { y0..y1 }
 }
 
-/// [`resample_window`]'s output rows `rows` (of `out.1`), `rows.len()` rows of `out.0` values.
-fn resample_window(s: &SourceRead, win: (f64, f64, f64, f64), out: (usize, usize), rows: std::ops::Range<usize>) -> Vec<Option<f64>> {
+/// Resamples a floating-point source window to `out` pixels as GDAL's overview code does
+/// (`GDALRasterIOResampled()`): separable convolution kernels stretched when downsampling,
+/// coverage-weighted averages, or the most frequent value. A `sum` adds each valid source pixel
+/// times the share of its area inside the destination pixel. Only the output rows `rows` (of
+/// `out.1`) are computed, `rows.len()` rows of `out.0` values, each as for the whole output.
+fn resample_window(
+    s: &SourceRead,
+    win: (f64, f64, f64, f64),
+    out: (usize, usize),
+    retained: usize,
+    rows: std::ops::Range<usize>,
+) -> Result<Vec<Option<f64>>> {
     let (fx, fy, fw, fh) = win;
     let (ow, oh) = out;
     let (rx, ry) = (fw / ow as f64, fh / oh as f64);
     let is_valid = |i: usize| s.valid.is_none_or(|m| m[i]);
-    let mut res = vec![None; ow * rows.len()];
+    let scratch = resampling_scratch_bytes(s, (rx, ry), (ow, rows.len()))
+        .and_then(|scratch| retained.checked_add(scratch))
+        .ok_or_else(|| Error::ResourceLimit("resampling scratch is too large to allocate".into()))?;
+    let mut res = resampling_values(s, ow, rows.len(), scratch)?;
     if ow == 0 || oh == 0 {
-        return res;
+        return Ok(res);
     }
     match s.resampling {
         Resampling::Average
@@ -1310,16 +1577,19 @@ fn resample_window(s: &SourceRead, win: (f64, f64, f64, f64), out: (usize, usize
         | Resampling::Q1
         | Resampling::Q3
         | Resampling::Sum => {
+            // Within its rectangles, a destination pixel takes the part of its area inside them.
+            let [bx0, by0, bx1, by1] = s.src_bounds();
             crate::par::chunks_mut(&mut res, ow, |k, line| {
-                let r = rows.start + k;
                 let mut vals: Vec<(f64, f64)> = Vec::new();
-                let y0 = fy + r as f64 * ry;
-                let y1 = y0 + ry;
+                let (y0, y1, iy0, iy1) = area_rows(rows.start + k, fy, ry, (by0, by1), s.height);
                 for (c, cell) in line.iter_mut().enumerate() {
                     let x0 = fx + c as f64 * rx;
                     let x1 = x0 + rx;
+                    let (x0, x1) = (x0.max(bx0), x1.min(bx1));
+                    if s.within_rects && (x1 <= x0 || y1 <= y0) {
+                        continue;
+                    }
                     vals.clear();
-                    let (iy0, iy1) = area_rows(r, fy, ry, s.height);
                     let ix0 = (x0 + 1e-8).floor().max(0.0) as usize;
                     let ix1 = ((x1 - 1e-8).ceil() as usize).min(s.width).max(ix0 + 1).min(s.width);
                     for y in iy0..iy1 {
@@ -1330,7 +1600,8 @@ fn resample_window(s: &SourceRead, win: (f64, f64, f64, f64), out: (usize, usize
                                 continue;
                             }
                             let wx = (x1.min(x as f64 + 1.0) - x0.max(x as f64)).max(0.0);
-                            let weight = if s.resampling == Resampling::Average || s.resampling == Resampling::Rms { wx * wy } else { 1.0 };
+                            let weight =
+                                if matches!(s.resampling, Resampling::Average | Resampling::Rms | Resampling::Sum) { wx * wy } else { 1.0 };
                             if weight > 0.0 {
                                 vals.push((s.values.get(i), weight));
                             }
@@ -1341,33 +1612,44 @@ fn resample_window(s: &SourceRead, win: (f64, f64, f64, f64), out: (usize, usize
             });
         }
         method => {
-            let taps = |dst: usize, ratio: f64, off: f64, size: usize| -> (usize, Vec<f64>) {
-                let (start, n, scale, center) = kernel_taps(method, dst, ratio, off, size);
-                let w = (start..start + n).map(|p| method.weight(scale * (p as f64 - center + 0.5))).collect();
+            // A kernel's taps on the source pixels the read uses, `[lo, hi)`.
+            let taps = |dst: usize, ratio: f64, off: f64, lo: usize, hi: usize| -> (usize, Vec<f64>) {
+                let (start, stop, scale, center) = kernel_taps(method, dst, ratio, off, lo, hi);
+                let w = (start..stop).map(|p| method.weight(scale * (p as f64 - center + 0.5))).collect();
                 (start, w)
             };
-            let xt: Vec<(usize, Vec<f64>)> = (0..ow).map(|c| taps(c, rx, fx, s.width)).collect();
+            let [sx0, sy0, sx1, sy1] = s.cover();
+            let xt: Vec<(usize, Vec<f64>)> = (0..ow).map(|c| taps(c, rx, fx, sx0, sx1)).collect();
             let negative_weights = matches!(method, Resampling::Cubic | Resampling::Lanczos);
+            // GDAL's work type is `float` for these types (`GDALGetOvrWorkDataType`), `double` else:
+            // the result is rounded to float for them. The sums themselves stay in f64.
+            let single = matches!(s.src_type, DataType::U8 | DataType::U16 | DataType::I8 | DataType::I16 | DataType::F32);
+            let work = |v: f64| if single { v as f32 as f64 } else { v };
             crate::par::chunks_mut(&mut res, ow, |k, line| {
-                let (y0, wys) = taps(rows.start + k, ry, fy, s.height);
+                let (y0, wys) = taps(rows.start + k, ry, fy, sy0, sy1);
+                // GDAL's `GDALResampleChunk_ConvolutionT` filters rows first: each row is the
+                // average of its valid pixels by their horizontal weights, or invalid when it has
+                // none (or too few consecutive ones for a kernel with negative weights). The
+                // column of rows is then the average of its valid rows by their vertical weights,
+                // invalid by the same rules. With nodata, a pass keeps a total weight above 0.0,
+                // with no epsilon, as GDAL 3.13.3 does (`dfWeightSum > 0.0` in both passes of
+                // `GDALResampleChunk_ConvolutionT`, gcore/overview.cpp).
+                let mut rows: Vec<Option<f64>> = Vec::with_capacity(wys.len());
                 for c in 0..ow {
                     let (x0, wxs) = &xt[c];
-                    let (mut acc, mut wsum) = (0.0, 0.0);
-                    let mut nan = false;
-                    for (j, wy) in wys.iter().enumerate() {
+                    rows.clear();
+                    for j in 0..wys.len() {
                         let row = s.at(0, y0 + j);
-                        // GDAL filters rows first, adding `value * weight * mask` for every
-                        // pixel: an infinite nodata value (weight 0) makes the row NaN, and a
-                        // NaN row the result, unless the row has no valid pixel (or too few
-                        // consecutive ones for a kernel with negative weights) and is skipped.
-                        let (mut alpha, mut infinite) = (0.0, false);
+                        let (mut acc, mut wsum) = (0.0, 0.0);
+                        // An infinite nodata value (weight 0) makes the row NaN, as GDAL adds
+                        // `value * weight * mask` for every pixel.
+                        let mut infinite = false;
                         let (mut run, mut longest) = (0, 0);
                         for (i, wx) in wxs.iter().enumerate() {
                             let idx = row + x0 + i;
                             if is_valid(idx) {
-                                acc += s.values.get(idx) * wx * wy;
-                                wsum += wx * wy;
-                                alpha += wx;
+                                acc += s.values.get(idx) * wx;
+                                wsum += wx;
                                 run += 1;
                                 longest = longest.max(run);
                             } else {
@@ -1376,19 +1658,61 @@ fn resample_window(s: &SourceRead, win: (f64, f64, f64, f64), out: (usize, usize
                             }
                         }
                         let skipped = negative_weights && longest < wxs.len() / 2;
-                        nan |= infinite && alpha > 0.0 && !skipped;
+                        rows.push(if skipped || (s.valid.is_some() && wsum <= 0.0) {
+                            None
+                        } else if infinite {
+                            Some(f64::NAN)
+                        } else if wsum != 0.0 {
+                            Some(acc / wsum)
+                        } else {
+                            Some(acc)
+                        });
                     }
-                    if wsum != 0.0 && (s.valid.is_none() || wsum > 1e-10) {
-                        line[c] = Some(if nan { f64::NAN } else { acc / wsum });
+                    let (mut acc, mut wsum) = (0.0, 0.0);
+                    let (mut run, mut longest) = (0, 0);
+                    for (h, wy) in rows.iter().zip(&wys) {
+                        if let Some(h) = h {
+                            acc += h * wy;
+                            wsum += wy;
+                            run += 1;
+                            longest = longest.max(run);
+                        } else {
+                            run = 0;
+                        }
+                    }
+                    if s.valid.is_some() {
+                        if !(negative_weights && longest < wys.len() / 2) && wsum > 0.0 {
+                            line[c] = Some(work(acc / wsum));
+                        }
+                    } else if wsum != 0.0 {
+                        line[c] = Some(work(acc / wsum));
                     }
                 }
             });
         }
     }
-    res
+    Ok(res)
 }
 
 // ─── A small XML reader ─────────────────────────────────────────────────────────────────────────
+
+/// Refuse undeclared capabilities before inspecting source headers or pixels.
+pub(crate) fn validate_supplied_sources(root: &xml::Element, sources: &std::collections::HashMap<String, crate::LazyRaster>) -> Result<()> {
+    if matches!(root.name.as_str(), "SourceFilename" | "SourceDataset" | "DEMPath") {
+        let name = if root.name == "DEMPath" { root.text.trim() } else { root.text.as_str() };
+        if !sources.contains_key(name) {
+            return Err(missing_supplied_source(name));
+        }
+    }
+    for child in &root.children {
+        validate_supplied_sources(child, sources)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn missing_supplied_source(name: &str) -> Error {
+    Error::InvalidArgument(format!("VRT source must be supplied in the source map: {}", crate::vsi::redact_diagnostic_location(name)))
+}
 
 pub(crate) mod xml {
     use crate::{Error, Result};
@@ -1629,16 +1953,386 @@ mod tests {
             resampling: Resampling::Nearest,
             working_float: false,
             invalid_value: None,
+            within_rects: true,
         };
         let mut out = vec![-1.0; 48];
-        r.read(8, 6, &mut out, |v| v);
+        r.read(8, 6, &mut out, |v| v).unwrap();
         assert_eq!(out[8 + 2], 0.0);
         assert_eq!(out[4 * 8 + 5], 15.0);
         assert_eq!(out[0], -1.0);
         // Downsampling by 2 with average.
         let r = SourceRead { dst_rect: [0.0, 0.0, 2.0, 2.0], resampling: Resampling::Average, ..r };
         let mut out = vec![-1.0; 4];
-        r.read(2, 2, &mut out, |v| v);
+        r.read(2, 2, &mut out, |v| v).unwrap();
         assert_eq!(out, vec![2.5, 4.5, 10.5, 12.5]);
+    }
+
+    /// Interpolating kernels weigh nodata pixels as GDAL does: each source row is averaged over
+    /// its valid pixels by their horizontal weights, then the rows over the valid ones by their
+    /// vertical weights, rather than all valid weights at once. The expected values are those of
+    /// `gdalbuildvrt -r <method> -tr 5 5` (GDAL 3.13.3) read with `gdal_translate`, for a 20 x 20
+    /// Float32 tile of 10 m pixels whose pixel (row 7, column 9) is nodata.
+    #[test]
+    fn kernels_average_each_row_of_a_source_with_nodata_over_its_valid_pixels() {
+        let mut values: Vec<f64> = (0..400).map(|k| ((k % 37) * 3 + k / 20) as f64).collect();
+        values[7 * 20 + 9] = -9999.0;
+        let valid: Vec<bool> = values.iter().map(|v| *v != -9999.0).collect();
+        let read = |resampling| {
+            let r = SourceRead {
+                values: crate::ops::BandView::F64(&values),
+                valid: Some(&valid),
+                width: 20,
+                height: 20,
+                row0: 0,
+                src_type: DataType::F32,
+                src_rect: [0.0, 0.0, 20.0, 20.0],
+                dst_rect: [0.0, 0.0, 40.0, 40.0],
+                resampling,
+                working_float: false,
+                invalid_value: None,
+                within_rects: true,
+            };
+            let mut out = vec![f64::NAN; 1600];
+            r.read(40, 40, &mut out, |v| v).unwrap();
+            out
+        };
+        // The 16 pixels whose bilinear kernel reaches the nodata pixel, rows 13 to 16 and
+        // columns 17 to 20. Weighing all valid weights at once gave 47.6 for the first and up to
+        // 20.3 more than GDAL at (row 15, column 18).
+        #[rustfmt::skip]
+        let bilinear = [
+            45.0625, 46.1875, 48.8125, 49.9375,
+            19.6875, 20.0625, 24.9375, 25.3125,
+            22.4375, 22.8125, 27.6875, 28.0625,
+            53.3125, 54.4375, 57.0625, 58.1875,
+        ];
+        let out = read(Resampling::Bilinear);
+        for (i, expected) in bilinear.iter().enumerate() {
+            let (row, col) = (13 + i / 4, 17 + i % 4);
+            assert_eq!(out[row * 40 + col], *expected, "bilinear ({row}, {col})");
+        }
+        let out = read(Resampling::Cubic);
+        for ((row, col), expected) in [((12, 16), 69.85305786132812), ((14, 18), -7.288028717041016), ((16, 20), 63.35245132446289)] {
+            let got = out[row * 40 + col];
+            assert!((got - expected).abs() <= 1e-5, "cubic ({row}, {col}): {got} vs {expected}");
+        }
+    }
+
+    /// A source resampled with `sum` gives each destination pixel the part of each source pixel
+    /// that lies inside it.
+    #[test]
+    fn sum_resampling_shares_each_source_pixel_by_the_area_inside_each_destination_pixel() {
+        let values: Vec<f64> = (1..=9).map(f64::from).collect();
+        // 2 × 2 pixels into 4 × 4: a quarter of a source pixel in each.
+        let r = SourceRead {
+            values: crate::ops::BandView::F64(&values[..4]),
+            valid: None,
+            width: 2,
+            height: 2,
+            row0: 0,
+            src_type: DataType::F32,
+            src_rect: [0.0, 0.0, 2.0, 2.0],
+            dst_rect: [0.0, 0.0, 4.0, 4.0],
+            resampling: Resampling::Sum,
+            working_float: false,
+            invalid_value: None,
+            within_rects: true,
+        };
+        let mut out = vec![-1.0; 16];
+        r.read(4, 4, &mut out, |v| v).unwrap();
+        let quarters: Vec<f64> =
+            [1.0, 1.0, 2.0, 2.0, 1.0, 1.0, 2.0, 2.0, 3.0, 3.0, 4.0, 4.0, 3.0, 3.0, 4.0, 4.0].iter().map(|v| v / 4.0).collect();
+        assert_eq!(out, quarters);
+        // 3 × 3 pixels into 2 × 2: a source pixel whole, halves of two and a quarter of one in each.
+        let r = SourceRead {
+            values: crate::ops::BandView::F64(&values),
+            width: 3,
+            height: 3,
+            src_rect: [0.0, 0.0, 3.0, 3.0],
+            dst_rect: [0.0, 0.0, 2.0, 2.0],
+            ..r
+        };
+        let mut out = vec![-1.0; 4];
+        r.read(2, 2, &mut out, |v| v).unwrap();
+        assert_eq!(out, vec![5.25, 8.25, 14.25, 17.25]);
+    }
+
+    /// A `sum` read of a source window that starts a fraction of a pixel in, or spans a fraction
+    /// of a pixel more than the destination, gives each destination pixel the share of each source
+    /// pixel inside it. Only a window of whole pixels, one per destination pixel, is copied.
+    #[test]
+    fn sum_resampling_shares_source_pixels_of_a_window_with_fractional_edges() {
+        let values: Vec<f64> = (1..=9).map(|v| f64::from(v) * 10.0).collect();
+        // What a destination pixel covering `[x0, x1] × [y0, y1]` of the 3 × 3 source holds.
+        let share = |x0: f64, x1: f64, y0: f64, y1: f64| -> f64 {
+            let mut total = 0.0;
+            for (i, v) in values.iter().enumerate() {
+                let (x, y) = ((i % 3) as f64, (i / 3) as f64);
+                total += v * (x1.min(x + 1.0) - x0.max(x)).max(0.0) * (y1.min(y + 1.0) - y0.max(y)).max(0.0);
+            }
+            total
+        };
+        let base = SourceRead {
+            values: crate::ops::BandView::F64(&values),
+            valid: None,
+            width: 3,
+            height: 3,
+            row0: 0,
+            src_type: DataType::F64,
+            src_rect: [0.0, 0.0, 2.0, 2.0],
+            dst_rect: [0.0, 0.0, 2.0, 2.0],
+            resampling: Resampling::Sum,
+            working_float: false,
+            invalid_value: None,
+            within_rects: true,
+        };
+        for src_rect in [[0.25, 0.0, 2.0, 2.0], [0.0, 0.25, 2.0, 2.0], [0.0, 0.0, 2.25, 2.0], [0.0, 0.0, 2.0, 2.25]] {
+            let r = SourceRead { src_rect, ..base };
+            let mut out = vec![-1.0; 4];
+            r.read(2, 2, &mut out, |v| v).unwrap();
+            let [x, y, w, h] = src_rect;
+            let (sx, sy) = (w / 2.0, h / 2.0);
+            let expected: Vec<f64> = (0..4)
+                .map(|i| {
+                    let (c, r) = ((i % 2) as f64, (i / 2) as f64);
+                    share(x + c * sx, x + (c + 1.0) * sx, y + r * sy, y + (r + 1.0) * sy)
+                })
+                .collect();
+            assert_eq!(out, expected, "{src_rect:?}");
+            assert_eq!(r.plain_copy(2, 2), Err(()), "{src_rect:?}");
+        }
+        // `[10, 20, 30]` read from x = 0.25.
+        let r = SourceRead { src_rect: [0.25, 0.0, 2.0, 2.0], ..base };
+        let mut out = vec![-1.0; 4];
+        r.read(2, 2, &mut out, |v| v).unwrap();
+        assert_eq!(out[..2], [12.5, 22.5]);
+        let r = SourceRead { src_rect: [1.0, 1.0, 2.0, 2.0], ..base };
+        assert_eq!(r.plain_copy(2, 2), Ok(Some(PlainCopy { src: (1, 1), dst_x: 0, cols: 2, dst_rows: 0..2 })));
+    }
+
+    /// A `sum` read is not rounded to the source's type: its fractions, and sums beyond that
+    /// type's range, reach the caller, which stores them in the output's type. A Byte pixel of 1
+    /// upsampled to 2 × 2 gives four 0.25 in a floating-point output, and four Byte pixels of 200
+    /// summed into one give 800 in a UInt16 output.
+    #[test]
+    fn sum_resampling_is_not_rounded_to_the_source_type() {
+        let one = [1.0];
+        let r = SourceRead {
+            values: crate::ops::BandView::F64(&one),
+            valid: None,
+            width: 1,
+            height: 1,
+            row0: 0,
+            src_type: DataType::U8,
+            src_rect: [0.0, 0.0, 1.0, 1.0],
+            dst_rect: [0.0, 0.0, 2.0, 2.0],
+            resampling: Resampling::Sum,
+            working_float: false,
+            invalid_value: None,
+            within_rects: true,
+        };
+        let mut quarters = vec![-1.0; 4];
+        r.read(2, 2, &mut quarters, |v| v).unwrap();
+        let two_hundreds = [200.0; 4];
+        let r = SourceRead {
+            values: crate::ops::BandView::F64(&two_hundreds),
+            width: 2,
+            height: 2,
+            src_rect: [0.0, 0.0, 2.0, 2.0],
+            dst_rect: [0.0, 0.0, 1.0, 1.0],
+            ..r
+        };
+        let mut total = vec![-1.0; 1];
+        r.read(1, 1, &mut total, |v| convert_value(v, DataType::U16)).unwrap();
+        assert_eq!((quarters, total), (vec![0.25; 4], vec![800.0]));
+    }
+
+    /// Within its rectangles, a read copies source pixels one for one only where a copy is what
+    /// its method gives, along rows as along columns, over `[10, 20, 30, 40]`. A window a quarter
+    /// pixel in is resampled, but by `nearest`. A window of whole pixels, 2.5 pixels long, is
+    /// copied into the pixels whose centres it covers (`nearest`, `bilinear`) or into all those it
+    /// meets (`average`), and shared by area by a `sum`. A window from 0.6 placed at 0.25 has as
+    /// many source pixels as it writes, but the pixels nearest the centres start a pixel before.
+    #[test]
+    fn a_read_within_its_rectangles_copies_only_what_its_method_gives() {
+        let values = [10.0, 20.0, 30.0, 40.0];
+        for along_row in [true, false] {
+            // The source's size, and the destination's.
+            let ((width, height), (dw, dh)) = if along_row { ((4, 1), (3, 1)) } else { ((1, 4), (1, 3)) };
+            let rect = |off: f64, len: f64| if along_row { [off, 0.0, len, 1.0] } else { [0.0, off, 1.0, len] };
+            let copy = |n: usize| {
+                let (cols, rows) = if along_row { (n, 1) } else { (1, n) };
+                PlainCopy { src: (0, 0), dst_x: 0, cols, dst_rows: 0..rows }
+            };
+            let (quarter_in, whole) = ((rect(0.25, 2.0), rect(0.0, 2.0)), (rect(0.0, 2.5), rect(0.0, 2.5)));
+            for ((src_rect, dst_rect), resampling, expected, copied) in [
+                (quarter_in, Resampling::Nearest, [10.0, 20.0, -1.0], Some(2)),
+                (quarter_in, Resampling::Bilinear, [12.5, 22.5, -1.0], None),
+                (quarter_in, Resampling::Average, [12.5, 22.5, -1.0], None),
+                (whole, Resampling::Nearest, [10.0, 20.0, -1.0], Some(2)),
+                (whole, Resampling::Bilinear, [10.0, 20.0, -1.0], Some(2)),
+                (whole, Resampling::Average, [10.0, 20.0, 30.0], Some(3)),
+                (whole, Resampling::Sum, [10.0, 20.0, 15.0], None),
+                ((rect(0.6, 2.5), rect(0.25, 2.5)), Resampling::Nearest, [10.0, 20.0, 30.0], None),
+            ] {
+                let r = SourceRead {
+                    values: crate::ops::BandView::F64(&values),
+                    valid: None,
+                    width,
+                    height,
+                    row0: 0,
+                    src_type: DataType::F64,
+                    src_rect,
+                    dst_rect,
+                    resampling,
+                    working_float: false,
+                    invalid_value: None,
+                    within_rects: true,
+                };
+                let mut out = vec![-1.0; 3];
+                r.read(dw, dh, &mut out, |v| v).unwrap();
+                let case = format!("{resampling:?} {src_rect:?} at {dst_rect:?}");
+                assert_eq!(out, expected, "{case}");
+                assert_eq!(r.plain_copy(dw, dh), copied.map(|n| Some(copy(n))).ok_or(()), "{case}");
+            }
+        }
+    }
+
+    /// Within its rectangles, `nearest` reads no source pixel past the `SrcRect`, even for a
+    /// destination pixel whose centre is inside the `DstRect` by less than the tolerance its
+    /// sample takes: the first pixel of `[10, 20, 30]` upsampled 2.5 times into a `DstRect` 1.5e-10
+    /// pixel longer, whose last centre samples the `SrcRect`'s edge.
+    #[test]
+    fn nearest_reads_no_pixel_past_the_src_rect_at_its_edge() {
+        let values = [10.0, 20.0, 30.0];
+        let r = SourceRead {
+            values: crate::ops::BandView::F64(&values),
+            valid: None,
+            width: 3,
+            height: 1,
+            row0: 0,
+            src_type: DataType::F64,
+            src_rect: [0.0, 0.0, 1.0, 1.0],
+            dst_rect: [0.0, 0.0, 2.5 + 1.5e-10, 1.0],
+            resampling: Resampling::Nearest,
+            working_float: false,
+            invalid_value: None,
+            within_rects: true,
+        };
+        let mut out = vec![-1.0; 3];
+        r.read(3, 1, &mut out, |v| v).unwrap();
+        assert_eq!(out, [10.0; 3]);
+    }
+
+    /// A VRT source reads only the pixels that meet its `SrcRect` and places them only inside its
+    /// `DstRect`, whatever their offsets. A window of the same size with a fractional offset is
+    /// resampled by the source's method, `nearest` picking the nearest pixel. A method sampling a
+    /// point writes only the pixels whose centres are inside the `DstRect`; a method over an area
+    /// gives a pixel partly inside it the part of the source inside it. Over the one-row sources
+    /// `[10, 20, 30]` and `[10, 20, 30, 40]`, through each kind of source, opened, read lazily,
+    /// read by windows of one pixel and materialized; -1, the band's nodata, is where the source
+    /// writes nothing.
+    #[test]
+    fn a_source_reads_only_its_src_rect_into_its_dst_rect() {
+        let dir = tempfile::tempdir().unwrap();
+        let write_source = |values: &[f64]| {
+            let path = dir.path().join(format!("source{}.tif", values.len())).to_string_lossy().into_owned();
+            let grid = Grid { width: values.len(), height: 1, geo_transform: [0.0, 1.0, 0.0, 1.0, 0.0, -1.0] };
+            let ds =
+                crate::ops::build_raster(grid, vec![values.to_vec()], DataType::F32, None, &SpatialRef::default(), convert_value).unwrap();
+            crate::write_raster_dataset(&ds, &path, &Default::default()).unwrap();
+            path
+        };
+        let (three, four) = (write_source(&[10.0, 20.0, 30.0]), write_source(&[10.0, 20.0, 30.0, 40.0]));
+        // (source, band width, SrcRect x offset, DstRect x offset, each method's row): both
+        // rectangles are 2 x 1 pixels.
+        let cases = [
+            (
+                &three,
+                2,
+                0.25,
+                0.0,
+                [
+                    ("nearest", vec![10.0, 20.0]),
+                    ("bilinear", vec![12.5, 22.5]),
+                    ("average", vec![12.5, 22.5]),
+                    ("sum", vec![12.5, 22.5]),
+                    ("max", vec![20.0, 30.0]),
+                    ("min", vec![10.0, 20.0]),
+                ],
+            ),
+            (
+                &three,
+                3,
+                0.0,
+                0.25,
+                [
+                    ("nearest", vec![10.0, 20.0, -1.0]),
+                    ("bilinear", vec![10.0, 17.5, -1.0]),
+                    ("average", vec![10.0, 17.5, 20.0]),
+                    ("sum", vec![7.5, 17.5, 5.0]),
+                    ("max", vec![10.0, 20.0, 20.0]),
+                    ("min", vec![10.0, 10.0, 20.0]),
+                ],
+            ),
+            (
+                &four,
+                3,
+                1.0,
+                0.5,
+                [
+                    ("nearest", vec![20.0, 30.0, -1.0]),
+                    ("bilinear", vec![20.0, 25.0, -1.0]),
+                    ("average", vec![20.0, 25.0, 30.0]),
+                    ("sum", vec![10.0, 25.0, 15.0]),
+                    ("max", vec![20.0, 30.0, 30.0]),
+                    ("min", vec![20.0, 20.0, 30.0]),
+                ],
+            ),
+        ];
+        let mut wrong = Vec::new();
+        for (path, width, sx, dx, methods) in &cases {
+            let average = methods.iter().find(|(m, _)| *m == "average").map(|(_, row)| row).unwrap();
+            let sources = methods
+                .iter()
+                .flat_map(|(method, row)| ["SimpleSource", "ComplexSource", "KernelFilteredSource"].map(|tag| (tag, Some(*method), row)))
+                .chain([("AveragedSource", None, average)]);
+            for (tag, method, expected) in sources {
+                let resampling = method.map(|m| format!(" resampling=\"{m}\"")).unwrap_or_default();
+                // A kernel of one pixel of weight 1 leaves the source as it is.
+                let kernel = if tag == "KernelFilteredSource" { "<Kernel><Size>1</Size><Coefs>1</Coefs></Kernel>" } else { "" };
+                let text = format!(
+                    "<VRTDataset rasterXSize=\"{width}\" rasterYSize=\"1\"><VRTRasterBand dataType=\"Float32\" band=\"1\">\
+                     <NoDataValue>-1</NoDataValue><{tag}{resampling}><SourceFilename relativeToVRT=\"0\">{path}</SourceFilename>\
+                     <SourceBand>1</SourceBand><SrcRect xOff=\"{sx}\" yOff=\"0\" xSize=\"2\" ySize=\"1\"/>\
+                     <DstRect xOff=\"{dx}\" yOff=\"0\" xSize=\"2\" ySize=\"1\"/>{kernel}</{tag}></VRTRasterBand></VRTDataset>"
+                );
+                let file = dir.path().join("read.vrt");
+                std::fs::write(&file, &text).unwrap();
+                let file = file.to_string_lossy().into_owned();
+                let mut lazy = crate::open_raster_lazy(&file).unwrap();
+                let pixel = |c: usize| crate::Window::new(c, 0, 1, 1);
+                let mut reads = vec![
+                    ("opened", crate::open_raster(&file).unwrap().raster.data.to_f64_vec()),
+                    ("read lazily", lazy.read().unwrap().raster.data.to_f64_vec()),
+                    (
+                        "read by windows of one pixel",
+                        (0..*width).map(|c| lazy.read_window(pixel(c), &Default::default()).unwrap().raster.data.to_f64_vec()[0]).collect(),
+                    ),
+                ];
+                // `VrtDataset` reads every kind of source but a kernel-filtered one.
+                if tag != "KernelFilteredSource" {
+                    let materialized = VrtDataset::from_xml(&text).unwrap().materialize(dir.path()).unwrap();
+                    reads.push(("materialized", materialized.raster.data.to_f64_vec()));
+                }
+                let source = method.map_or(tag.to_string(), |m| format!("{tag} {m}"));
+                for (how, got) in reads {
+                    if &got != expected {
+                        wrong.push(format!("{source}, SrcRect x {sx} at x {dx}, {how}: {got:?}, not {expected:?}"));
+                    }
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{} reads differ:\n{}", wrong.len(), wrong.join("\n"));
     }
 }

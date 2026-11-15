@@ -2,12 +2,13 @@
 
 A tile server encodes its tiles with rasterio's writers, `MemoryFile().open(driver="WEBP", ...)`
 with the creation options `quality` and `lossless`. terrio had no WEBP writer, so every WEBP tile
-failed. Its writer is lossless only (pure Rust): it writes a lossless file whatever `LOSSLESS`,
-`QUALITY` and `EXACT` say, so its pixels are compared with those of GDAL's `LOSSLESS=YES` file.
-GDAL (rasterio 1.5.0, GDAL 3.12.1) is the oracle. Skipped without rasterio.
+failed. Default and explicit lossless output retain exact pixels. Requested lossy output
+uses VP8 with exact alpha; GDAL independently decodes the files. Locally validated with GDAL 3.13.3;
+lossy bytes and rate/distortion are not expected to match libwebp. Skipped without rasterio.
 """
 
 import re
+import struct
 
 import numpy as np
 import pytest
@@ -24,7 +25,11 @@ pytestmark = pytest.mark.filterwarnings("ignore:Dataset has no geotransform")
 
 # GDAL's messages (`WEBPDataset::CreateCopy`).
 _BANDS = "WEBP driver doesn't support {} bands. Must be 3 (RGB) or 4 (RGBA) bands."
-_TYPE = "WEBP driver doesn't support data type UInt16. Only eight bit byte bands supported."
+_TYPE = "WEBP driver doesn't support data type UInt16. " + (
+    "Only UInt8 bands supported."
+    if terrio.gdal_compat() == "3.13"
+    else "Only eight bit byte bands supported."
+)
 
 
 def _encode(memfile, driver, data, **options):
@@ -57,13 +62,12 @@ def _arrays():
 @pytest.mark.parametrize(
     "options",
     [
-        {"quality": 75, "lossless": False},
         {},
         {"LOSSLESS": "YES", "QUALITY": "5"},
         {"lossless": True, "exact": 0},
         {"lossless": True, "exact": 1},
     ],
-    ids=["tile-server-profile", "defaults", "lossless", "exact-0", "exact-1"],
+    ids=["defaults", "lossless", "exact-0", "exact-1"],
 )
 def test_a_webp_tile_holds_the_rendered_pixels(options):
     """Every sample, the RGB under fully transparent pixels included; GDAL's `LOSSLESS=YES`
@@ -96,6 +100,90 @@ def test_an_opaque_alpha_band_reads_back_as_three_bands_as_in_gdal():
     )
     assert ours.shape == gdals.shape == (3, 64, 64)
     np.testing.assert_array_equal(ours, rgb)
+
+
+@pytest.mark.parametrize("rgba", [False, True])
+def test_requested_lossy_quality_changes_bytes_and_keeps_alpha(tmp_path, rgba):
+    """Path and memory writers honor quality, with independent GDAL decoding."""
+    rgb, _, alpha = _arrays()
+    data = np.concatenate([rgb, alpha[None]]) if rgba else rgb
+    outputs = []
+    for options in ({"quality": 10}, {"QUALITY": 75.5, "LOSSLESS": "NO"}):
+        encoded = _encode(MemoryFile, "WEBP", data, **options)
+        assert b"VP8 " in encoded
+        path = str(tmp_path / "lossy.webp")
+        with terrio.rio.open(
+            path, "w", driver="WEBP", width=64, height=64, count=len(data), dtype="uint8", **options
+        ) as dst:
+            dst.write(data)
+        with open(path, "rb") as f:
+            assert f.read() == encoded
+        decoded = _gdal_read(encoded)
+        assert decoded.shape == data.shape
+        assert np.any(decoded[:3] != data[:3])
+        if rgba:
+            np.testing.assert_array_equal(decoded[3], alpha)
+        with terrio.rio.open(path) as ours:
+            assert ours.tags(ns="IMAGE_STRUCTURE")["COMPRESSION_REVERSIBILITY"] == "LOSSY"
+            np.testing.assert_array_equal(ours.read(), decoded)
+        outputs.append(encoded)
+    assert outputs[0] != outputs[1]
+    assert len(outputs[0]) < len(outputs[1])
+
+
+def test_lossy_opaque_alpha_is_omitted():
+    rgb, _, _ = _arrays()
+    data = np.concatenate([rgb, np.full((1, 64, 64), 255, "uint8")])
+    encoded = _encode(MemoryFile, "WEBP", data, lossless=False)
+    assert encoded[8:16] == b"WEBPVP8 "
+    decoded = _gdal_read(encoded)
+    assert decoded.shape == rgb.shape
+
+
+def test_real_landsat_webp_quality(data_dir):
+    """Real Landsat RGB: independent GDAL decoding, not libwebp encoder parity."""
+    with rasterio.open(data_dir / "landsat7.tif") as source:
+        data = source.read([1, 2, 3], window=rasterio.windows.Window(500, 500, 128, 128))
+    assert data.dtype == np.uint8 and data.shape == (3, 128, 128)
+    low = _encode(MemoryFile, "WEBP", data, quality=10)
+    high = _encode(MemoryFile, "WEBP", data, quality=90)
+    assert low != high
+    assert len(low) < len(high)
+    for encoded in (low, high):
+        expected = _gdal_read(encoded)
+        with MemoryFile(encoded, ext=".webp") as mem, mem.open() as actual:
+            np.testing.assert_array_equal(actual.read(), expected)
+
+
+@pytest.mark.parametrize("alpha_mode", ["feathered", "noise"])
+def test_real_rgba_alpha_payload_is_exact_and_no_larger_than_raw(data_dir, alpha_mode):
+    with rasterio.open(data_dir / "landsat7.tif") as src:
+        rgb = src.read([1, 2, 3], window=rasterio.windows.Window(500, 500, 128, 128))
+    if alpha_mode == "noise":
+        alpha = np.random.default_rng(31).integers(0, 256, (128, 128), dtype="uint8")
+    else:
+        alpha = np.full((128, 128), 255, dtype="uint8")
+        alpha[:, :16] = 0
+        alpha[:, 16:32] = 128
+    data = np.concatenate([rgb, alpha[None]])
+    encoded = _encode(MemoryFile, "WEBP", data, quality=75)
+    offset = 12
+    while offset + 8 <= len(encoded):
+        tag = encoded[offset : offset + 4]
+        size = struct.unpack_from("<I", encoded, offset + 4)[0]
+        if tag == b"ALPH":
+            payload = encoded[offset + 8 : offset + 8 + size]
+            break
+        offset += 8 + size + (size & 1)
+    else:
+        pytest.fail("missing ALPH chunk")
+    assert len(payload) <= alpha.size + 1
+    if alpha_mode == "feathered":
+        assert payload[0] == 1 and len(payload) < alpha.size // 10
+    expected = _gdal_read(encoded)
+    np.testing.assert_array_equal(expected[3], alpha)
+    with MemoryFile(encoded, ext=".webp") as mem, mem.open() as actual:
+        np.testing.assert_array_equal(actual.read(), expected)
 
 
 def test_a_webp_written_by_terrio_reads_back_as_gdal_reads_it(tmp_path):
@@ -138,3 +226,69 @@ def test_webp_refuses_what_gdal_refuses(shape, dtype, options, message):
         _encode(GdalMemoryFile, "WEBP", data, **options)
     with pytest.raises(RasterioIOError, match=re.escape(message)):
         _encode(MemoryFile, "WEBP", data, **options)
+
+
+@pytest.mark.parametrize("quality", ["abc", "", "high", "50abc", " ", "75.5%", "--1"])
+@pytest.mark.parametrize("surface", ["memory", "path", "native"])
+@pytest.mark.parametrize("lossless", [True, False])
+def test_webp_refuses_malformed_quality(tmp_path, quality, surface, lossless):
+    """Reject malformed numbers instead of silently selecting quality zero.
+
+    Args:
+        tmp_path: Directory for path-based output.
+        quality: A creation option that cannot be parsed as a complete number.
+        surface: The memory, path or native raster writing API.
+        lossless: Whether lossless encoding is explicitly selected.
+    """
+    data = np.zeros((3, 4, 4), dtype="uint8")
+    message = re.escape(f"QUALITY={quality} is not a legal value.")
+    if surface == "native":
+        raster = terrio.Raster.from_array(data, (0, 1, 0, 4, 0, -1))
+        with pytest.raises(terrio.InvalidArgumentError, match=message):
+            raster.write(
+                str(tmp_path / "tile.webp"),
+                driver="WEBP",
+                options={"QUALITY": quality, "LOSSLESS": "YES" if lossless else "NO"},
+            )
+    elif surface == "memory":
+        with pytest.raises(RasterioIOError, match=message):
+            _encode(MemoryFile, "WEBP", data, quality=quality, lossless=lossless)
+    else:
+        with pytest.raises(RasterioIOError, match=message):
+            with terrio.rio.open(
+                tmp_path / "tile.webp",
+                "w",
+                driver="WEBP",
+                width=4,
+                height=4,
+                count=3,
+                dtype="uint8",
+                quality=quality,
+                lossless=lossless,
+            ) as target:
+                target.write(data)
+
+
+@pytest.mark.parametrize(
+    ("quality", "canonical"),
+    [
+        ("0", "0"),
+        ("100", "100"),
+        ("75.5", "75.5"),
+        (" 75.5 ", "75.5"),
+        ("7.5e1", "75"),
+        ("nan", "75"),
+    ],
+)
+def test_webp_numeric_quality_keeps_its_encoding(quality, canonical):
+    """Retain numeric quality values and the historical NaN default.
+
+    Args:
+        quality: A complete numeric string, including whitespace or NaN.
+        canonical: The equivalent numeric encoding quality.
+    """
+    rgb, _, _ = _arrays()
+    actual = _encode(MemoryFile, "WEBP", rgb, quality=quality)
+    expected = _encode(MemoryFile, "WEBP", rgb, quality=canonical)
+    assert b"VP8 " in actual
+    assert actual == expected

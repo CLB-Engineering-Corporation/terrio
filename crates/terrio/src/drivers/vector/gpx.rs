@@ -8,6 +8,7 @@
 //! `course`/`speed` fields instead of links). Simple `<extensions>` elements become extra fields
 //! named `prefix_name`.
 
+use super::in_wgs84;
 use super::xml::{self, Element};
 use crate::Result;
 use wbvector::{Coord, Feature, FieldDef, FieldType, FieldValue, Geometry, GeometryType, Layer};
@@ -148,7 +149,7 @@ pub fn read(path: &str) -> Result<Vec<Layer>> {
 
 /// Parses GPX text.
 pub fn parse(text: &str) -> Result<Vec<Layer>> {
-    let root = xml::parse(text)?;
+    let root = xml::parse_document(text, "gpx", "GPX")?;
     let gpx10 = root.attr("version").is_some_and(|v| v.trim() == "1.0");
     let mut waypoints = Builder::new("waypoints", GeometryType::Point, &point_fields(gpx10, false));
     let mut routes = Builder::new("routes", GeometryType::LineString, &line_fields());
@@ -331,15 +332,6 @@ fn point_attrs(c: &Coord) -> String {
 #[cfg(test)]
 fn to_string(layer: &Layer) -> Result<String> {
     Ok(format!("{HEADER}{}</gpx>\n", body(layer, None)?))
-}
-
-/// A layer in WGS 84, reprojected when its CRS is another one.
-fn in_wgs84(layer: &Layer) -> Result<std::borrow::Cow<'_, Layer>> {
-    let srs = crate::crs::SpatialRef::from_layer(layer);
-    if srs.is_unknown() || srs.epsg == Some(4326) {
-        return Ok(std::borrow::Cow::Borrowed(layer));
-    }
-    Ok(std::borrow::Cow::Owned(crate::vector::reproject_layer(layer, &crate::crs::SpatialRef::from_epsg(4326)?)?))
 }
 
 fn int_field(layer: &Layer, f: &Feature, n: &str) -> Option<i64> {

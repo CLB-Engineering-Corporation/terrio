@@ -1,9 +1,9 @@
 [workspace]
 resolver = "3"
-members = ["crates/*", "python", "js"]
+members = ["crates/*", "python", "js", "js/fetch", "js/zarr"]
 
 [workspace.package]
-version = "0.6.1"
+version = "0.9.0"
 edition = "2024"
 license = "MIT"
 rust-version = "1.90"
@@ -17,27 +17,29 @@ memmap2 = "0.9"
 # Every driver, without remote inputs (whose HTTPS is `ring`): the members that link them say so
 # (`remote`, a default feature of terrio, terrio-cli and the Python package), so
 # `--no-default-features` builds them without C. The zstd C library is opt-in (`libzstd-*`, `parquet-zstd`).
-terrio = { path = "crates/terrio", version = "0.6.1", default-features = false, features = ["drivers"] }
-terrio-crs = { path = "crates/terrio-crs", version = "0.2.1", default-features = false }
+terrio = { path = "crates/terrio", version = "0.9.0", default-features = false, features = ["drivers"] }
+terrio-crs = { path = "crates/terrio-crs", version = "0.2.4", default-features = false }
 # For the Python package (not published to crates.io), so without a version to keep in step.
 terrio-cli = { path = "crates/terrio-cli", default-features = false }
 
 # Format drivers, coordinate reference systems
 wbraster = "0.2.1"
-# KMZ always; GeoParquet and OSM PBF with terrio's `parquet` and `osm` features.
-wbvector = { version = "0.1.6", features = ["kmz"] }
+# Without its optional readers (KMZ, with its zip 0.6; GeoParquet; OSM PBF): terrio's own drivers
+# read those formats.
+wbvector = "0.1.6"
 wbprojection = "0.3.3"
 # Karney's geodesics, for the ellipsoidal gnomonic projection (pure Rust).
 geographiclib-rs = { version = "0.2.7", default-features = false }
 # Planar topology, buffering, validity and polygon repair, without native libraries.
 geo = { version = "0.33.1", default-features = false, features = ["spade"] }
-# Candidate lookup for polygon overlays; the same pure-Rust R-tree used by geo.
-rstar = "0.13.0"
+# Candidate lookup for polygon overlays, pure Rust. geo 0.33 still uses rstar 0.12, so a build has
+# both.
+rstar = "0.14.0"
 # Delaunay and constrained triangulations for hulls and linear gridding; the version geo uses.
 spade = "2.15.1"
 
 # Native CAD codecs, sequential on every target (including WebAssembly).
-acadrust = { version = "=0.6.7", default-features = false }
+acadrust = { version = "=0.6.8", default-features = false }
 
 flatgeobuf = { version = "6", default-features = false }
 # The version flatgeobuf's generated code is built with.
@@ -60,8 +62,6 @@ quick-xml = "0.42"
 # Multi-byte DBF code pages (CP932, CP936, CP949, CP950) of shapefiles, with the differences of
 # GDAL's iconv recoding applied on top (drivers/vector/shapefile_cjk.rs).
 encoding_rs = "0.8.35"
-# OpenStreetMap PBF decoding, the version wbvector uses.
-osmpbfreader = "0.19"
 # Its Zstandard (zstd 0.13, a C library) is enabled by terrio-crs's `libzstd` feature only, for
 # terrio-crs built on its own: terrio decodes GeoTIFF Zstandard itself (zstd 0.14 or `ruzstd`).
 tiff = { version = "0.11", features = ["webp"] }
@@ -80,21 +80,22 @@ lz4_flex = { version = "0.14", default-features = false, features = ["alloc", "s
 ruzstd = { package = "zstd-rust", git = "https://github.com/gpt-cmdr/zstd-rs", rev = "e716f7375fceb321fb603db1e97721bf72be1ca2" }
 # 0.10 reads HDF5 files written in the earliest format with version 1/2 compound datatypes
 # (every HEC-RAS geometry and plan file, among others) and old fill value messages
-# (roteiro-gis/netcdf-rust#95). The HEC-RAS engine uses the same hdf5-reader 0.10.1, so a build
-# compiles one HDF5 reader.
-netcdf-reader = { version = "0.10.1", default-features = false, features = ["netcdf4"] }
-hdf5-reader = { version = "0.10.1", default-features = false }
+# (roteiro-gis/netcdf-rust#95). netcdf-reader, hdf5-reader and the HEC-RAS engine move together
+# (netcdf-reader 0.12 and ras-commander-fast-hdf 0.4 use hdf5-reader 0.12), so a build compiles
+# one HDF5 reader.
+netcdf-reader = { version = "0.12.1", default-features = false, features = ["netcdf4"] }
+hdf5-reader = { version = "0.12.1", default-features = false }
 # HEC-RAS geometry and plan HDF files (the `hecras` feature): the read-only engine behind
 # ras-commander. It owns every HEC-RAS rule, layer name and field name (its Arrow layer catalog);
-# terrio's driver only translates its values. 0.3.0 is the first release with the Arrow layer API.
-ras-commander-fast-hdf = { version = "0.3.0", default-features = false, features = ["hdf", "mesh", "results"] }
+# terrio's driver only translates its values. 0.3.0 was the first release with the Arrow layer API.
+ras-commander-fast-hdf = { version = "0.4.0", default-features = false, features = ["hdf", "mesh", "results"] }
 # The portable decoder: the same pixels on every platform, closer to libjpeg's than its SIMD paths.
 jpeg-decoder = { version = "0.3", default-features = false, features = ["platform_independent"] }
 # GeoPackage JPEG tiles; the version wbraster already uses.
 jpeg-encoder = "0.7"
 # WebP tiles of PMTiles and MBTiles archives; the version tiff already uses.
 image-webp = "0.2"
-# Pure-Rust WebP encoder for GeoTIFF/COG; already used transitively by wbgeotiff.
+# Pure-Rust WebP encoder for GeoTIFF/COG (wbgeotiff still uses 0.2).
 webp-rust = "0.3.2"
 openjp2 = { version = "0.6", default-features = false, features = ["std"] }
 # GeoTIFF compressions GDAL writes and the tiff crate does not read: LERC, JPEG XL and LZMA (XZ).
@@ -108,7 +109,7 @@ zune-core = "0.5"
 jxl-oxide = { version = "0.12", default-features = false }
 # AVIF tiles: a pure-Rust port of dav1d, without its assembly so that it builds for WebAssembly.
 rusty_av1d = { version = "1.2", default-features = false, features = ["bitdepth_8"] }
-lzma-rust2 = { version = "0.24", default-features = false, features = ["std", "xz"] }
+lzma-rust2 = { version = "0.25", default-features = false, features = ["std", "xz"] }
 zstd = "0.14"
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }
@@ -119,13 +120,30 @@ same-file = "1.0.6"
 tar = { version = "0.4", default-features = false }
 # POSIX file locks for in-place SQLite updates (Unix).
 libc = "0.2"
-zip = { version = "9", default-features = false, features = ["deflate"] }
+# Deflate through flate2 and zlib-rs only: `deflate` adds zopfli, which zip uses only for
+# compression levels above 9, and terrio never sets a level.
+zip = { version = "9.1", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 # HTTPS with `rustls` and `ring` (C and assembly) in every native build (CLB fork; see
-# docs/CONSOLIDATION-2026-11.md, "Upstream migration: C dependencies").
+# docs/CONSOLIDATION-2026-11.md, "Upstream migration: C dependencies"). Upstream supplies
+# `rustls-graviola` on x86-64 and AArch64, which panics on CPUs without AVX2, ADX or BMI2.
 ureq = { version = "3", default-features = false, features = ["gzip", "rustls", "rustls-webpki-roots"] }
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }
+# Test-only original DER snapshot for constrained-anchor regressions; update with webpki-roots.
+webpki-root-certs = "=1.0.11"
+webpki-roots = "1"
 hmac = "0.13"
 sha2 = "0.11"
 clap = { version = "4", features = ["derive"] }
+# Win32 file APIs (file identity, reparse points, file locks), where Unix builds use `libc`.
+windows-sys = "0.61.2"
+# Adler-32 for the zlib streams of `deflate_compress`.
+zlib-rs = "0.6"
+# GRIB2's CCSDS packing (template 5.42).
+rust-aec = "0.1.1"
+# Session secrets of the command line; the wasm64 module's custom backend.
+getrandom = "0.4"
+# Silences drivers' diagnostic prints on the command line's standard output.
+gag = "1"
 # LASzip compression of point clouds (LAZ, COPC), pure Rust.
 laz = "0.13"
 # E57 laser scans, pure Rust.

@@ -8,8 +8,8 @@
 //!
 //! Reading makes one layer per feature type, with a `gml_id` field, field types from the
 //! application schema (`.xsd` next to the file) or inferred from the values, geometries in GML 2
-//! or 3 encodings, and the CRS from `srsName`. Coordinates in latitude/longitude order (an EPSG
-//! geographic CRS named by URN or URL) are swapped into longitude/latitude.
+//! or 3 encodings, and the CRS from `srsName`. Authority-order names (URNs or modern URLs)
+//! with north/east axes are normalized to GIS XY, including northing-first projected CRSs.
 //!
 //! Writing produces GML 3.2 with an `.xsd` schema, like GDAL's default output.
 
@@ -209,10 +209,42 @@ fn parse_impl(root: &Element, xsd: Option<&Element>, compiled: Option<&Applicati
             .filter_map(|raw| raw.geometry)
             .find_map(srs_name_of)
             .or_else(|| root.child("boundedBy").and_then(|node| node.find("Envelope")).and_then(|node| node.attr("srsName")));
-        let srs = srs_name.and_then(|srs| parse_srs_name(srs).ok());
-        let swap = srs_name.is_some_and(lat_lon_order) && srs.as_ref().is_some_and(SpatialRef::is_geographic);
+        let srs = match srs_name {
+            // A partially recognized compound reference would attach the wrong CRS to
+            // three-dimensional coordinates. Refuse the entire declaration instead.
+            Some(name)
+                if {
+                    let upper = name.trim().to_ascii_uppercase();
+                    upper.starts_with("URN:OGC:DEF:CRS,") || (upper.starts_with("EPSG:") && upper.contains('+'))
+                } =>
+            {
+                Some(parse_srs_name(name)?)
+            }
+            Some(name) => match parse_srs_name(name) {
+                Ok(srs) => Some(srs),
+                Err(_) => {
+                    let shown = crate::vsi::redact_diagnostic_location(name);
+                    let shown: String = shown.chars().take(120).flat_map(char::escape_debug).collect();
+                    crate::warnings::warn(format!("GML srsName '{shown}' cannot be resolved; reading features without a CRS"));
+                    None
+                }
+            },
+            None => None,
+        };
+        let swap = srs_name.is_some_and(authority_axis_order) && srs.as_ref().is_some_and(SpatialRef::has_north_east_axis_order);
+        let dimension = if srs.as_ref().is_some_and(|srs| srs.compound_parts().is_some()) { 3 } else { 2 };
         if let Some(srs) = &srs {
             srs.apply_to_layer(&mut layer);
+        }
+        // One layer uses one coordinate convention. Refuse conflicting declarations,
+        // including nested geometry members, before applying its shared XY normalization.
+        for raw in &raws {
+            if let Some(node) = raw.geometry {
+                check_geometry_reference(node, srs_name, srs.as_ref(), swap)?;
+                if dimension == 3 {
+                    validate_geometry_dimensions(node, dimension)?;
+                }
+            }
         }
         for (fid, raw) in raws.iter().enumerate() {
             let mut attributes = vec![FieldValue::Null; fields.len() + 1];
@@ -234,7 +266,7 @@ fn parse_impl(root: &Element, xsd: Option<&Element>, compiled: Option<&Applicati
             }
             let geometry = raw
                 .geometry
-                .and_then(|geometry_node| geometry(geometry_node, 2))
+                .and_then(|geometry_node| geometry(geometry_node, dimension))
                 .map(|geometry| if swap { swap_xy(geometry) } else { geometry });
             layer.push(Feature { fid: fid as u64, geometry, attributes });
         }
@@ -244,6 +276,86 @@ fn parse_impl(root: &Element, xsd: Option<&Element>, compiled: Option<&Applicati
         return Err(Error::InvalidData("GML: no features".into()));
     }
     Ok(layers)
+}
+
+fn validate_geometry_dimensions(node: &Element, dimension: usize) -> Result<()> {
+    let dimension = node.attr("srsDimension").and_then(|value| value.parse().ok()).unwrap_or(dimension);
+    match node.name.as_str() {
+        "MultiPoint" | "MultiLineString" | "MultiCurve" | "MultiPolygon" | "MultiSurface" | "CompositeSurface" | "MultiGeometry"
+        | "GeometryCollection" => {
+            for member in &node.children {
+                if member.name.ends_with("Members") {
+                    for child in &member.children {
+                        validate_geometry_dimensions(child, dimension)?;
+                    }
+                } else if member.name.ends_with("Member")
+                    && let Some(child) = member.children.first()
+                {
+                    validate_geometry_dimensions(child, dimension)?;
+                }
+            }
+            Ok(())
+        }
+        "OrientableSurface" => {
+            if let Some(surface) = node.find("Polygon").or_else(|| node.find("Surface")) {
+                validate_geometry_dimensions(surface, dimension)?;
+            }
+            Ok(())
+        }
+        "Polygon" | "Surface" => {
+            let patch = node.find("PolygonPatch").unwrap_or(node);
+            for boundary in patch
+                .children
+                .iter()
+                .filter(|child| matches!(child.name.as_str(), "exterior" | "outerBoundaryIs" | "interior" | "innerBoundaryIs"))
+            {
+                validate_coordinate_dimensions(boundary, dimension)?;
+            }
+            Ok(())
+        }
+        "Point" | "LineString" | "Curve" | "LinearRing" | "CompositeCurve" => validate_coordinate_dimensions(node, dimension),
+        _ => Ok(()),
+    }
+}
+
+fn validate_coordinate_dimensions(node: &Element, dimension: usize) -> Result<()> {
+    let dimension = node.attr("srsDimension").and_then(|value| value.parse().ok()).unwrap_or(dimension);
+    if matches!(node.name.as_str(), "pos" | "posList") {
+        let dimension = dimension.max(2);
+        let mut count = 0usize;
+        for value in node.text.split_ascii_whitespace() {
+            value.parse::<f64>().map_err(|_| Error::InvalidData("GML: invalid coordinate value".into()))?;
+            count += 1;
+        }
+        if !count.is_multiple_of(dimension) {
+            return Err(Error::InvalidData(format!("GML: {count} coordinate values do not form complete {dimension}-dimensional tuples")));
+        }
+    } else if !matches!(node.name.as_str(), "coordinates" | "coord") {
+        for child in &node.children {
+            validate_coordinate_dimensions(child, dimension)?;
+        }
+    }
+    Ok(())
+}
+
+fn check_geometry_reference(node: &Element, reference: Option<&str>, layer_srs: Option<&SpatialRef>, swap: bool) -> Result<()> {
+    if let Some(name) = node.attr("srsName")
+        && Some(name) != reference
+    {
+        let srs = parse_srs_name(name).map_err(|_| Error::Unsupported("GML: a differing geometry CRS cannot be resolved".into()))?;
+        let layer_srs =
+            layer_srs.ok_or_else(|| Error::Unsupported("GML: layer CRS is unresolved; cannot validate a differing geometry CRS".into()))?;
+        if !layer_srs.same_as(&srs) {
+            return Err(Error::Unsupported("GML: mixed coordinate reference systems within a layer".into()));
+        }
+        if (authority_axis_order(name) && srs.has_north_east_axis_order()) != swap {
+            return Err(Error::Unsupported("GML: mixed coordinate axis conventions within a layer".into()));
+        }
+    }
+    for child in &node.children {
+        check_geometry_reference(child, reference, layer_srs, swap)?;
+    }
+    Ok(())
 }
 
 fn value(v: &str, t: FieldType) -> FieldValue {
@@ -287,18 +399,17 @@ pub(crate) fn parse_srs_name(name: &str) -> Result<SpatialRef> {
             && !code.is_empty()
             && code.bytes().all(|byte| byte.is_ascii_digit())
         {
-            return SpatialRef::parse(&format!("EPSG:{code}"));
+            return SpatialRef::parse_literal(&format!("EPSG:{code}"));
         }
     }
-    SpatialRef::parse(name)
+    SpatialRef::parse_literal(name)
 }
 
-/// Whether a srsName form declares the authority's axis order (latitude first for EPSG geographic
-/// CRSs): URNs and `http://www.opengis.net/def/crs/` URLs, but not `EPSG:4326` or the old
-/// `epsg.xml#4326` URLs.
-pub(crate) fn lat_lon_order(srs_name: &str) -> bool {
+/// EPSG, ESRI and IAU URNs and modern URLs declare authority axis order.
+/// Short identifiers, legacy EPSG URLs and OGC CRS84/CRS27/CRS83 retain XY.
+pub(crate) fn authority_axis_order(srs_name: &str) -> bool {
     let s = srs_name.to_ascii_lowercase();
-    (s.starts_with("urn:") || s.contains("/def/crs/")) && s.contains("epsg")
+    (s.starts_with("urn:") || s.contains("/def/crs/")) && ["epsg", "esri", "iau_2015"].iter().any(|authority| s.contains(authority))
 }
 
 fn swap_xy(g: Geometry) -> Geometry {
@@ -440,8 +551,9 @@ pub fn geometry(e: &Element, dim: usize) -> Option<Geometry> {
 pub fn write(layer: &Layer, path: &str) -> Result<()> {
     let p = Path::new(path);
     let schema_name = p.with_extension("xsd").file_name().and_then(|s| s.to_str()).unwrap_or("schema.xsd").to_string();
+    let text = to_string(layer, &schema_name)?;
     std::fs::write(p.with_extension("xsd"), xsd(layer))?;
-    std::fs::write(path, to_string(layer, &schema_name))?;
+    std::fs::write(path, text)?;
     Ok(())
 }
 
@@ -515,13 +627,42 @@ fn xsd(layer: &Layer) -> String {
 }
 
 /// Encodes a layer as GML 3.2 referring to the application schema file `schema` (none when empty).
-pub fn to_string(layer: &Layer, schema: &str) -> String {
+pub fn to_string(layer: &Layer, schema: &str) -> Result<String> {
     let name = element_name(&layer.name);
-    let code = super::naming_epsg(layer);
-    let geographic = SpatialRef::from_layer(layer).is_geographic();
-    // EPSG geographic CRSs named by URN take latitude first.
-    let swap = code.is_some() && geographic;
-    let srs = code.map(|c| format!(r#" srsName="urn:ogc:def:crs:EPSG::{c}""#)).unwrap_or_default();
+    let reference = SpatialRef::from_layer(layer);
+    let authority = match reference.authority() {
+        // A refused ESRI claim must not fall back to a nested geographic EPSG identifier.
+        Some(("ESRI", _)) => reference.trusted_esri().map(|code| ("ESRI", code)),
+        Some((authority, code)) if authority != "EPSG" => Some((authority, code)),
+        _ => super::naming_epsg(layer).map(|code| ("EPSG", code)),
+    }
+    // A horizontal code alone cannot name a retained compound definition.
+    .filter(|(authority, code)| {
+        reference.compound_parts().is_none_or(|parts| {
+            SpatialRef::parse_literal(&format!("{authority}:{code}")).ok().and_then(|s| s.compound_parts()) == Some(parts)
+        })
+    });
+    if authority.is_none() && !reference.is_unknown() {
+        return Err(Error::Unsupported(
+            "GML cannot name this layer's CRS: reproject to a named CRS or use a format that stores CRS definitions".into(),
+        ));
+    }
+    // Only a resolvable authority declares recoverable authority axes. Keep unknown codes
+    // in the legacy XY naming convention, so reading them cannot silently transpose coordinates.
+    let canonical = authority.and_then(|(authority, code)| SpatialRef::parse_literal(&format!("{authority}:{code}")).ok());
+    let swap = canonical.as_ref().is_some_and(SpatialRef::has_north_east_axis_order);
+    let srs = authority
+        .map(|(authority, code)| {
+            let name = if canonical.is_some() {
+                format!("urn:ogc:def:crs:{authority}::{code}")
+            } else {
+                let name = format!("{authority}:{code}");
+                crate::warnings::warn(format!("GML writes unresolved srsName '{name}'; Terrio will read it without a CRS"));
+                name
+            };
+            format!(r#" srsName="{name}""#)
+        })
+        .unwrap_or_default();
     let fields = written_fields(layer);
     let mut s = String::new();
     let _ = write!(
@@ -572,7 +713,7 @@ pub fn to_string(layer: &Layer, schema: &str) -> String {
         let _ = writeln!(s, "    </ogr:{name}>\n  </ogr:featureMember>");
     }
     s.push_str("</ogr:FeatureCollection>\n");
-    s
+    Ok(s)
 }
 
 fn pos_list(s: &mut String, cs: &[Coord], close: bool, swap: bool) {
@@ -668,6 +809,277 @@ mod tests {
     use super::*;
 
     #[test]
+    fn unresolved_gml_names_warn_and_preserve_coordinates() {
+        for name in ["EPSG:5800", "urn:ogc:def:crs:EPSG::5800", "urn:ogc:def:crs:FOO::1"] {
+            crate::warnings::take();
+            let text = format!(
+                "<FeatureCollection><featureMember><p><geom><Point srsName=\"{name}\"><pos>12000 34000</pos></Point></geom></p></featureMember></FeatureCollection>"
+            );
+            let layers = parse(&xml::parse(&text).unwrap(), None).unwrap();
+            assert!(SpatialRef::from_layer(&layers[0]).is_unknown());
+            assert_eq!(layers[0].features[0].geometry, Some(Geometry::point(12000., 34000.)));
+            let warnings = crate::warnings::take();
+            assert_eq!(warnings.len(), 1);
+            assert!(warnings[0].contains(name));
+            assert!(warnings[0].contains("cannot be resolved"));
+        }
+    }
+
+    /// GDAL 3.12.1 reads the IAU URN's latitude-first coordinates back in GIS XY order.
+    #[test]
+    fn named_non_epsg_authorities_preserve_coordinates() {
+        for name in ["ESRI:102003", "IAU_2015:49900"] {
+            let mut layer = Layer::new("points");
+            SpatialRef::parse_literal(name).unwrap().apply_to_layer(&mut layer);
+            layer.push(Feature { fid: 0, geometry: Some(Geometry::point(12., 34.)), attributes: vec![] });
+            let text = to_string(&layer, "").unwrap();
+            let restored = parse(&xml::parse(&text).unwrap(), None).unwrap();
+            assert_eq!(SpatialRef::from_layer(&restored[0]).authority(), SpatialRef::from_layer(&layer).authority());
+            assert_eq!(restored[0].features[0].geometry, layer.features[0].geometry);
+        }
+    }
+
+    /// GDAL 3.13.3 keeps both compound components and normalizes only horizontal XY.
+    #[test]
+    fn compound_urns_keep_vertical_metadata_and_coordinates() {
+        for (horizontal, vertical, pos, xy) in
+            [(2154, 5720, (652_000.0, 6_862_000.0), (652_000.0, 6_862_000.0)), (4269, 5713, (52.0, 4.0), (4.0, 52.0))]
+        {
+            let name = format!("urn:ogc:def:crs,crs:EPSG::{horizontal},crs:EPSG::{vertical}");
+            let text = format!(
+                "<FeatureCollection><featureMember><point><geom><Point srsName=\"{name}\" srsDimension=\"3\"><pos>{} {} 35</pos></Point></geom></point></featureMember></FeatureCollection>",
+                pos.0, pos.1
+            );
+            let layers = parse(&xml::parse(&text).unwrap(), None).unwrap();
+            let layer = &layers[0];
+            assert_eq!(layer.crs_wkt(), SpatialRef::compound(horizontal, vertical).unwrap().to_wkt().as_deref());
+            assert_eq!(layer.features[0].geometry, Some(Geometry::Point(Coord { x: xy.0, y: xy.1, z: Some(35.0), m: None })));
+        }
+    }
+
+    /// Compound CRS axes supply the implicit dimension; explicit GML dimensions still win.
+    #[test]
+    fn compound_geometry_dimensions_preserve_height_without_an_explicit_dimension() {
+        let srs = "urn:ogc:def:crs,crs:EPSG::4269,crs:EPSG::5713";
+        for (geometry, expected) in [
+            ("<Point><pos>52 4 35</pos></Point>", Geometry::Point(Coord { x: 4., y: 52., z: Some(35.), m: None })),
+            (
+                "<LineString><posList>52 4 35 53 5 36</posList></LineString>",
+                Geometry::LineString(vec![Coord { x: 4., y: 52., z: Some(35.), m: None }, Coord { x: 5., y: 53., z: Some(36.), m: None }]),
+            ),
+            ("<Point srsDimension=\"2\"><pos>52 4</pos></Point>", Geometry::point(4., 52.)),
+            ("<Point srsDimension=\"3\"><pos>52 4 35</pos></Point>", Geometry::Point(Coord { x: 4., y: 52., z: Some(35.), m: None })),
+        ] {
+            let text = format!(
+                "<FeatureCollection><boundedBy><Envelope srsName=\"{srs}\"/></boundedBy><featureMember><p><geom>{geometry}</geom></p></featureMember></FeatureCollection>"
+            );
+            let layers = parse(&xml::parse(&text).unwrap(), None).unwrap();
+            assert_eq!(layers[0].features[0].geometry, Some(expected));
+        }
+    }
+
+    #[test]
+    fn incomplete_compound_coordinate_tuples_are_refused_instead_of_truncated() {
+        for geometry in [
+            "<Point><pos>52 4</pos></Point>",
+            "<LineString><posList>52 4 53 5</posList></LineString>",
+            "<MultiPoint><pointMember><Point><pos>52 4</pos></Point></pointMember></MultiPoint>",
+        ] {
+            let text = format!(
+                "<FeatureCollection><boundedBy><Envelope srsName=\"EPSG:4269+5713\"/></boundedBy><featureMember><p><geom>{geometry}</geom></p></featureMember></FeatureCollection>"
+            );
+            let error = parse(&xml::parse(&text).unwrap(), None).unwrap_err();
+            assert!(matches!(error, Error::InvalidData(ref message) if message.contains("complete 3-dimensional tuples")), "{error}");
+        }
+    }
+
+    /// GDAL 3.13.3 compound syntax identifies both components; Terrio stores one CRS per layer.
+    #[test]
+    fn compound_geometry_references_must_agree_with_the_layer() {
+        let first = "urn:ogc:def:crs,crs:EPSG::2154,crs:EPSG::5720";
+        for second in ["EPSG:2154+5720", "urn:ogc:def:crs,crs:EPSG:6.6:2154,crs:EPSG::5720"] {
+            let text = format!(
+                "<FeatureCollection><featureMember><point><geom><Point srsName=\"{first}\" srsDimension=\"3\"><pos>1 2 35</pos></Point></geom></point></featureMember><featureMember><point><geom><Point srsName=\"{second}\" srsDimension=\"3\"><pos>3 4 36</pos></Point></geom></point></featureMember></FeatureCollection>"
+            );
+            let layers = parse(&xml::parse(&text).unwrap(), None).unwrap();
+            assert_eq!(layers[0].features.len(), 2);
+            assert_eq!(layers[0].crs_wkt(), SpatialRef::compound(2154, 5720).unwrap().to_wkt().as_deref());
+            assert_eq!(layers[0].features[1].geometry, Some(Geometry::Point(Coord { x: 3., y: 4., z: Some(36.), m: None })));
+        }
+        let second = "urn:ogc:def:crs,crs:EPSG::2154,crs:EPSG::5773";
+        for geometry in [
+            format!(
+                "<Point srsName=\"{first}\"><pos>1 2 35</pos></Point></geom></point></featureMember><featureMember><point><geom><Point srsName=\"{second}\"><pos>3 4 36</pos></Point>"
+            ),
+            format!(
+                "<MultiPoint srsName=\"{first}\"><pointMember><Point srsName=\"{second}\" srsDimension=\"3\"><pos>3 4 36</pos></Point></pointMember></MultiPoint>"
+            ),
+        ] {
+            let text =
+                format!("<FeatureCollection><featureMember><point><geom>{geometry}</geom></point></featureMember></FeatureCollection>");
+            let error = parse(&xml::parse(&text).unwrap(), None).unwrap_err();
+            assert!(matches!(error, Error::Unsupported(ref message) if message.contains("mixed coordinate reference systems")), "{error}");
+        }
+    }
+
+    #[test]
+    fn unsupported_compound_urns_are_errors_instead_of_partial_metadata() {
+        for name in [
+            "urn:ogc:def:crs,crs:IGNF::LAMB93,crs:EPSG::5720",
+            "urn:ogc:def:crs,crs:EPSG::2154,crs:EPSG::999999999",
+            "urn:ogc:def:crs,crs:EPSG::2154",
+            "EPSG:4979+5720",
+            "EPSG:5720+5713",
+            "EPSG:+2154+5720",
+        ] {
+            let text = format!(
+                "<FeatureCollection><featureMember><point><geom><Point srsName=\"{name}\"><pos>1 2</pos></Point></geom></point></featureMember></FeatureCollection>"
+            );
+            assert!(parse(&xml::parse(&text).unwrap(), None).is_err(), "{name}");
+        }
+    }
+
+    /// Metadata references use literal CRS syntax, including GDAL 3.13.3 WKT definitions.
+    #[test]
+    #[cfg(fs)]
+    fn geometry_metadata_does_not_follow_local_crs_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("definition.wkt");
+        std::fs::write(&path, SpatialRef::from_epsg(2154).unwrap().to_wkt().unwrap()).unwrap();
+        let name = path.to_str().unwrap();
+        assert!(SpatialRef::parse(name).is_ok(), "the control is a readable CRS definition");
+        assert!(parse_srs_name(name).is_err(), "geometry metadata must remain literal");
+    }
+
+    /// GDAL 3.12.1 exposes EPSG:6708 GML coordinates in traditional easting, northing order.
+    #[test]
+    fn authority_order_projected_coordinates_become_easting_northing() {
+        let text = r#"<gml:FeatureCollection xmlns:gml="http://www.opengis.net/gml/3.2" xmlns:ex="http://example.org/ex"><gml:featureMember><ex:p gml:id="p.1"><ex:name>a</ex:name><ex:geom><gml:Point srsName="urn:ogc:def:crs:EPSG::6708" gml:id="g.1"><gml:pos>4823832.72 561996.39</gml:pos></gml:Point></ex:geom></ex:p></gml:featureMember></gml:FeatureCollection>"#;
+        let layers = parse(&xml::parse(text).unwrap(), None).unwrap();
+        assert_eq!(layers[0].crs_epsg(), Some(6708));
+        assert_eq!(layers[0].features[0].geometry, Some(Geometry::point(561_996.39, 4_823_832.72)));
+    }
+
+    /// GDAL 3.12.1 honors authority order only for URNs and modern CRS URLs.
+    #[test]
+    fn authority_identifier_forms_preserve_xy_controls() {
+        for (code, authority, xy) in [
+            (6708, (4_823_832.72, 561_996.39), (561_996.39, 4_823_832.72)),
+            (7792, (561_996.39, 4_823_832.72), (561_996.39, 4_823_832.72)),
+            (4326, (43.56, 12.24), (12.24, 43.56)),
+        ] {
+            for (name, pos) in [
+                (format!("urn:ogc:def:crs:EPSG::{code}"), authority),
+                (format!("urn:x-ogc:def:crs:EPSG:{code}"), authority),
+                (format!("http://www.opengis.net/def/crs/EPSG/0/{code}"), authority),
+                (format!("http://www.opengis.net/gml/srs/epsg.xml#{code}"), xy),
+                (format!("EPSG:{code}"), xy),
+            ] {
+                let text = format!(
+                    "<FeatureCollection><featureMember><point><geom><Point srsName=\"{name}\" srsDimension=\"3\"><pos>{} {} 7</pos></Point></geom></point></featureMember></FeatureCollection>",
+                    pos.0, pos.1
+                );
+                let layer = &parse(&xml::parse(&text).unwrap(), None).unwrap()[0];
+                assert_eq!(layer.crs_epsg(), Some(code), "{name}");
+                assert_eq!(layer.features[0].geometry, Some(Geometry::Point(Coord { x: xy.0, y: xy.1, z: Some(7.0), m: None })), "{name}");
+            }
+        }
+    }
+
+    /// GDAL 3.12.1 reads EPSG:6708 GML output in N-E authority order, including its envelope.
+    #[test]
+    fn northing_first_projected_gml_writes_authority_order() {
+        let mut layer = Layer::new("places").with_epsg(6708);
+        layer.push(Feature {
+            fid: 0,
+            geometry: Some(Geometry::Point(Coord { x: 561_996.39, y: 4_823_832.72, z: Some(7.0), m: None })),
+            attributes: vec![],
+        });
+        let text = to_string(&layer, "").unwrap();
+        assert!(text.contains(">4823832.72 561996.39 7<"), "{text}");
+        assert!(text.contains("<gml:lowerCorner>4823832.72 561996.39</gml:lowerCorner>"), "{text}");
+        let restored = &parse(&xml::parse(&text).unwrap(), None).unwrap()[0];
+        assert_eq!(restored.features[0].geometry, layer.features[0].geometry);
+        assert_eq!(restored.crs_epsg(), Some(6708));
+    }
+
+    /// GDAL 3.13.3 uses the emitted EPSG URN's axes even when source WKT has no AXIS clauses.
+    #[test]
+    fn gml_writer_uses_emitted_authority_axes_when_source_axes_are_absent() {
+        let mut layer = Layer::new("places").with_epsg(4326);
+        layer.set_crs_wkt(Some(
+            r#"GEOGCS["WGS 84",DATUM["WGS_1984",SPHEROID["WGS 84",6378137,298.257223563]],PRIMEM["Greenwich",0],UNIT["degree",0.0174532925199433],AUTHORITY["EPSG","4326"]]"#.into(),
+        ));
+        layer.push(Feature { fid: 0, geometry: Some(Geometry::point(12.24, 43.56)), attributes: vec![] });
+        let text = to_string(&layer, "").unwrap();
+        assert!(text.contains("urn:ogc:def:crs:EPSG::4326"), "{text}");
+        assert!(text.contains(">43.56 12.24<"), "{text}");
+        let restored = &parse(&xml::parse(&text).unwrap(), None).unwrap()[0];
+        assert_eq!(restored.features[0].geometry, layer.features[0].geometry);
+    }
+
+    #[test]
+    fn gml_refuses_an_esri_code_that_conflicts_with_stored_parameters() {
+        let canonical = SpatialRef::parse_literal("ESRI:102003").unwrap().to_wkt().unwrap();
+        let changed = canonical.replace(r#"PARAMETER["longitude_of_center",-96]"#, r#"PARAMETER["longitude_of_center",-95]"#);
+        assert_ne!(changed, canonical);
+        let mut layer = Layer::new("places");
+        // GML attaches srsName to an envelope or geometry, so the success control needs one.
+        layer.push(Feature { fid: 0, geometry: Some(Geometry::point(12., 34.)), attributes: vec![] });
+        layer.set_crs_wkt(Some(changed));
+        assert!(matches!(to_string(&layer, ""), Err(Error::Unsupported(message)) if message.contains("cannot name")));
+        layer.set_crs_wkt(Some(canonical));
+        assert!(to_string(&layer, "").unwrap().contains("urn:ogc:def:crs:ESRI::102003"));
+    }
+
+    #[test]
+    fn gml_writer_retains_xy_when_authority_is_unknown() {
+        assert!(SpatialRef::from_epsg(999999).is_err());
+        let geographic = r#"GEOGCS["Custom geographic",DATUM["Custom",SPHEROID["Sphere",6371000,0]],PRIMEM["Greenwich",0],UNIT["degree",0.0174532925199433],AXIS["Latitude",NORTH],AXIS["Longitude",EAST],AUTHORITY["EPSG","999999"]]"#;
+        let projected = format!(
+            r#"PROJCS["Custom projected",{geographic},PROJECTION["Transverse_Mercator"],PARAMETER["latitude_of_origin",0],PARAMETER["central_meridian",0],PARAMETER["scale_factor",1],PARAMETER["false_easting",0],PARAMETER["false_northing",0],UNIT["metre",1],AXIS["Northing",NORTH],AXIS["Easting",EAST],AUTHORITY["EPSG","999999"]]"#
+        );
+        for wkt in [geographic, projected.as_str()] {
+            let mut layer = Layer::new("places").with_epsg(999999);
+            layer.set_crs_wkt(Some(wkt.into()));
+            layer.push(Feature { fid: 0, geometry: Some(Geometry::point(12.24, 43.56)), attributes: vec![] });
+            let text = to_string(&layer, "").unwrap();
+            assert!(text.contains(r#"srsName="EPSG:999999""#), "{text}");
+            assert!(text.contains(">12.24 43.56<"), "{text}");
+            let restored = &parse(&xml::parse(&text).unwrap(), None).unwrap()[0];
+            assert_eq!(restored.features[0].geometry, layer.features[0].geometry);
+        }
+    }
+
+    #[test]
+    fn unresolved_layer_crs_refuses_differing_geometry_references_explicitly() {
+        let text = r#"<FeatureCollection><featureMember><p><geom><Point srsName="EPSG:999999"><pos>1 2</pos></Point></geom></p></featureMember><featureMember><p><geom><Point srsName="EPSG:4326"><pos>3 4</pos></Point></geom></p></featureMember></FeatureCollection>"#;
+        let error = parse(&xml::parse(text).unwrap(), None).unwrap_err();
+        assert!(matches!(error, Error::Unsupported(ref message) if message.contains("layer CRS is unresolved")), "{error}");
+    }
+
+    #[test]
+    fn mixed_geometry_axis_conventions_are_refused_including_nested_members() {
+        let collection = |body: &str| format!("<FeatureCollection>{body}</FeatureCollection>");
+        let point = |srs: &str, pos: &str| format!("<Point srsName=\"{srs}\"><pos>{pos}</pos></Point>");
+        let feature = |geometry: &str| format!("<featureMember><p><geom>{geometry}</geom></p></featureMember>");
+        let urn = point("urn:ogc:def:crs:EPSG::6708", "4823832.72 561996.39");
+        let short = point("EPSG:6708", "561996.39 4823832.72");
+        let unknown = point("EPSG:999999", "561996.39 4823832.72");
+        for body in [
+            format!("{}{}", feature(&urn), feature(&short)),
+            feature(&format!("<MultiPoint><pointMember>{urn}</pointMember><pointMember>{unknown}</pointMember></MultiPoint>")),
+            feature(&format!("<MultiPoint><pointMember>{urn}</pointMember><pointMember>{short}</pointMember></MultiPoint>")),
+        ] {
+            let result = parse(&xml::parse(&collection(&body)).unwrap(), None);
+            assert!(matches!(result, Err(Error::Unsupported(_))));
+        }
+        // Identifier styles can mix when both describe the same effective E/N convention.
+        let body = format!("{}{}", feature(&point("urn:ogc:def:crs:EPSG::7792", "1 2")), feature(&point("EPSG:7792", "3 4")));
+        assert_eq!(parse(&xml::parse(&collection(&body)).unwrap(), None).unwrap()[0].features.len(), 2);
+    }
+
+    #[test]
     fn reads_gml2_and_gml3() {
         let gml2 = r#"<wfs:FeatureCollection xmlns:wfs="w" xmlns:gml="http://www.opengis.net/gml" xmlns:x="x"><gml:featureMember><x:roads fid="r.1"><x:name>A</x:name><x:lanes>2</x:lanes>
             <x:geom><gml:MultiLineString srsName="EPSG:4326"><gml:lineStringMember><gml:LineString><gml:coordinates>1,2 3,4</gml:coordinates></gml:LineString></gml:lineStringMember></gml:MultiLineString></x:geom></x:roads></gml:featureMember></wfs:FeatureCollection>"#;
@@ -751,7 +1163,7 @@ mod tests {
             geometry: Some(Geometry::point(10.5, 45.0)),
             attributes: vec![FieldValue::Text("A & B".into()), FieldValue::Float(1.5)],
         });
-        let text = to_string(&l, "places.xsd");
+        let text = to_string(&l, "places.xsd").unwrap();
         let schema = xml::parse(&xsd(&l)).unwrap();
         let back = &parse(&xml::parse(&text).unwrap(), Some(&schema)).unwrap()[0];
         assert_eq!(back.features[0].geometry, Some(Geometry::point(10.5, 45.0)));

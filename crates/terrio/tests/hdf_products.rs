@@ -7,7 +7,10 @@
 //! The files come from `scripts/fetch_test_data.sh` (GDAL's test files in `gdal_hdf5` and
 //! `gdal_netcdf`; NASA products in `hdfeos5`, fetched only with Earthdata Login credentials). The
 //! tests skip themselves without `TERRIO_TEST_DATA` or the files. The trailing `bands` files are in
-//! `tests/data/netcdf_bands` (`scripts/make_netcdf_bands_fixtures.py`).
+//! `tests/data/netcdf_bands` (`scripts/make_netcdf_bands_fixtures.py`), the `_Unsigned` ones in
+//! `tests/data/netcdf_unsigned` and `tests/data/netcdf_int64_unsigned`
+//! (`scripts/make_netcdf_unsigned_fixtures.py`, `scripts/make_netcdf_int64_unsigned_fixtures.py`),
+//! the variable order ones in `tests/data/netcdf_order` (`scripts/make_netcdf_order_fixtures.py`).
 
 // Geotransforms as `gdalinfo` prints them, digit for digit.
 #![allow(clippy::excessive_precision)]
@@ -237,6 +240,103 @@ fn netcdf_trailing_bands() {
         let gdal: Vec<(String, String)> =
             e["geolocation"].as_object().unwrap().iter().map(|(k, v)| (k.clone(), v.as_str().unwrap().to_string())).collect();
         assert_eq!(items, gdal, "{case}");
+    }
+}
+
+/// netCDF-4 variables and groups (`scripts/make_netcdf_order_fixtures.py`): defined in reverse
+/// name order with object headers out of that order, listed in definition order; written without
+/// link creation order, listed in name order. The subdatasets as GDAL 3.12.2 lists them, in
+/// `expected.json`.
+#[test]
+fn netcdf4_variable_order() {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data/netcdf_order");
+    let text = std::fs::read_to_string(dir.join("expected.json")).unwrap();
+    let expected: serde_json::Value = serde_json::from_str(&text).unwrap();
+    for (file, gdal) in expected.as_object().unwrap() {
+        let path = dir.join(file).to_string_lossy().into_owned();
+        let terrio::info::Info::Raster(info) = terrio::info::info_path(&path, &Default::default()).unwrap() else {
+            panic!("{file}: not a raster")
+        };
+        let names: Vec<&str> = info.subdatasets.iter().map(|s| s.name.rsplit(':').next().unwrap()).collect();
+        let gdal: Vec<&str> = gdal.as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
+        assert_eq!(names, gdal, "{file}");
+    }
+}
+
+/// Classic formats retain netCDF variable-ID order. Classic and 64-bit offset were checked
+/// against GDAL 3.13.3; it does not recognize this CDF5 fixture, checked against netCDF4's IDs.
+#[test]
+fn classic_netcdf_variables_keep_definition_order() {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data/netcdf_order");
+    for name in ["classic_order.nc", "offset64_order.nc", "cdf5_order.nc"] {
+        let path = dir.join(name).to_string_lossy().into_owned();
+        let terrio::info::Info::Raster(info) = terrio::info::info_path(&path, &Default::default()).unwrap() else {
+            panic!("{name}: not a raster")
+        };
+        let names: Vec<_> = info.subdatasets.iter().map(|s| s.name.rsplit(':').next().unwrap()).collect();
+        assert_eq!(names, ["zulu", "alpha", "middle"], "{name}");
+    }
+}
+
+/// An unqualified multi-variable open selects the first data variable in listing order.
+/// GDAL 3.13.3 exposes only a zero-band container for this file; Terrio intentionally also
+/// provides the first raster. Its samples and nodata match GDAL's explicit `zulu` subdataset.
+#[test]
+fn netcdf_default_raster_follows_definition_order() {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data/netcdf_order/definition_order.nc");
+    let implicit = open(&path.to_string_lossy());
+    let explicit = open(&format!("NETCDF:\"{}\":zulu", path.display()));
+    assert_eq!(implicit.nodata(), Some(-1.0));
+    assert_eq!(implicit.raster.data.to_f64_vec(), vec![2.0, 3.0, 0.0, 1.0]);
+    assert_eq!(implicit.raster.data.to_f64_vec(), explicit.raster.data.to_f64_vec());
+    assert_eq!(implicit.geo_transform(), explicit.geo_transform());
+    assert_eq!(implicit.crs().epsg, explicit.crs().epsg);
+}
+
+/// `Short` variables flagged `_Unsigned` whose `valid_range`, or `valid_min` and `valid_max`, hold
+/// `[9200, -9536]` in the variable's signed type, as GOES ABI L2 products do
+/// (`scripts/make_netcdf_unsigned_fixtures.py`): the bounds are read as unsigned too (9200 to
+/// 56000), so only the pixels outside them are nodata, as GDAL 3.12.2 reads them. The expected
+/// pixels, the bottom row first as for any file without a geotransform, are in `expected.json`,
+/// which the script writes.
+#[test]
+fn netcdf_unsigned_valid_range() {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data/netcdf_unsigned");
+    let text = std::fs::read_to_string(dir.join("expected.json")).unwrap();
+    let expected: serde_json::Value = serde_json::from_str(&text).unwrap();
+    let path = dir.join("valid_range.nc");
+    for var in ["valid_range", "valid_min_max"] {
+        let ds = open(&format!("NETCDF:\"{}\":{var}", path.display()));
+        assert_eq!(ds.data_type_name(), "UInt16", "{var}");
+        assert_eq!(ds.nodata(), Some(65535.0), "{var}");
+        let gdal: Vec<f64> = expected[var].as_array().unwrap().iter().map(|v| v.as_f64().unwrap()).collect();
+        assert_eq!(ds.raster.data.to_f64_vec(), gdal, "{var}");
+    }
+}
+
+/// `Int64` variables flagged `_Unsigned`, which GDAL reads as `Int64` (with netCDF's default
+/// nodata without `_FillValue`), and `Short` variables whose
+/// `valid_range`, or `valid_min` and `valid_max`, are inverted (`[10, -10]`, or `[-100, 100]` read
+/// as unsigned), which GDAL ignores (`scripts/make_netcdf_int64_unsigned_fixtures.py`): the pixels
+/// and nodata GDAL 3.12.2 reads.
+#[test]
+fn netcdf_int64_unsigned_and_inverted_ranges() {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data/netcdf_int64_unsigned/ranges.nc");
+    // GDAL's pixels, the bottom row first as for any file without a geotransform: none masked.
+    let signed = [-9.0, -2.0, -1.0, 30000.0, 5.0, 10.0, 1000.0, -10.0];
+    let unsigned = [65527.0, 65534.0, 65535.0, 30000.0, 5.0, 10.0, 1000.0, 65526.0];
+    for (var, data_type, nodata, gdal) in [
+        ("int64_unsigned", "Int64", -1.0, signed),
+        ("int64_unsigned_inverted_range", "Int64", -1.0, signed),
+        ("short_inverted_range", "Int16", -1.0, signed),
+        ("short_inverted_min_max", "Int16", -1.0, signed),
+        ("short_unsigned_straddling_range", "UInt16", 65535.0, unsigned),
+        ("int64_unsigned_default_fill", "Int64", -9223372036854775806.0, signed),
+    ] {
+        let ds = open(&format!("NETCDF:\"{}\":{var}", path.display()));
+        assert_eq!(ds.data_type_name(), data_type, "{var}");
+        assert_eq!(ds.nodata(), Some(nodata), "{var}");
+        assert_eq!(ds.raster.data.to_f64_vec(), gdal, "{var}");
     }
 }
 

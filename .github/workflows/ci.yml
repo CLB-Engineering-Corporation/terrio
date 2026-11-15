@@ -13,6 +13,8 @@ permissions:
   contents: read
 
 env:
+  # Keep the sidecar rasterio wheel compatible with this reference; see docs/testing.md.
+  GDAL_REFERENCE_VERSION: "3.12.2"
   CARGO_TERM_COLOR: always
   # CI restores dependencies; per-checkout incremental state is larger and not reused.
   CARGO_INCREMENTAL: 0
@@ -68,6 +70,62 @@ jobs:
       - uses: actions/checkout@v7
       - uses: fsfe/reuse-action@v6
 
+  # Known vulnerabilities (RustSec advisories) in the crates Cargo.lock and fuzz/Cargo.lock (the
+  # lockfile of the fuzz targets, a workspace of their own) pin, on every pull request and push:
+  # advisories are published without the code changing. Unmaintained and unsound crates are listed
+  # without failing it. It compiles nothing and fetches the advisory database on each run, so it has
+  # no cache.
+  audit:
+    name: RustSec advisories
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      # The latest release: an older one can fail to read newer advisories.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      # With .cargo/audit.toml, which ignores five advisories of wbraster's dependencies.
+      - run: cargo audit
+      - run: cargo audit --no-fetch --file fuzz/Cargo.lock
+      # cargo audit ignores an advisory by its ID, in every version of the crate. Without the
+      # config (read from the working directory), the only vulnerabilities in either lockfile may be
+      # those five, in zip 8.6.0 and ruzstd 0.8.3: another crate or version, or a new advisory for
+      # these two, fails.
+      - name: The ignored advisories are only wbraster's
+        working-directory: ${{ runner.temp }}
+        run: |
+          failed=0
+          for lock in Cargo.lock fuzz/Cargo.lock; do
+            cargo audit --no-fetch --json --file "$GITHUB_WORKSPACE/$lock" > audit.json || true
+            jq -e '.vulnerabilities.list' audit.json > /dev/null
+            found=$(jq -r '.vulnerabilities.list[] | "\(.package.name)@\(.package.version) \(.advisory.id)"' audit.json)
+            echo "$lock:"
+            echo "$found"
+            unexpected=$(echo "$found" | grep -vxE 'zip@8\.6\.0 RUSTSEC-2026-0(367|368|369|429)|ruzstd@0\.8\.3 RUSTSEC-2026-0344' || true)
+            if [ -n "$unexpected" ]; then
+              echo "::error::$lock: vulnerabilities other than wbraster's five (zip 8.6.0, ruzstd 0.8.3): ${unexpected//$'\n'/, }"
+              failed=1
+            fi
+          done
+          exit "$failed"
+
+  # The fuzz targets (fuzz/), which only `cargo fuzz` builds, with a nightly toolchain: checked
+  # against their own lockfile as it is (--locked), so that a change to terrio that breaks them, or
+  # a dependency change fuzz/Cargo.lock does not follow, fails. To bring that lockfile to the
+  # versions of the root one: cp Cargo.lock fuzz/Cargo.lock, then
+  # cargo update --manifest-path fuzz/Cargo.toml --workspace.
+  fuzz:
+    name: Fuzz targets
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+      - run: cargo check --manifest-path fuzz/Cargo.toml --locked --bins
+
   # Linux only: Windows runs in ci-platforms.yml, on every push to main and, for pull requests, by
   # hand or with the label ci:windows or ci:all. macOS runs there only by hand or with ci:macos.
   # The npm package and the conformance report run in ci-extended.yml, on the same terms (labels
@@ -81,12 +139,13 @@ jobs:
         os: [ubuntu-latest]
     steps:
       - uses: actions/checkout@v7
-      # Two jobs died of a full disk while compiling, and their logs were lost: a notice records the
-      # space they started with. The toolchains removed are ones these jobs do not use.
+      # Jobs have died of a full disk while compiling (especially on AWS-hosted runners, which
+      # start with less free space than Azure-hosted runners), losing their logs: a notice records
+      # the space they started with. The toolchains removed are ones these jobs do not use.
       - name: Reclaim runner disk
         run: |
           echo "::notice title=Free disk at start::$(df -h --output=size,used,avail . | tail -1)"
-          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
           echo "::notice title=Free disk after reclaiming::$(df -h --output=size,used,avail . | tail -1)"
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -105,19 +164,20 @@ jobs:
         if: always()
         run: |
           df -h .
-          du -sh target 2>/dev/null || echo "no target directory"
+          if [ -d target ]; then du -sh target; else echo "no target directory"; fi
 
   gdal:
     name: GDAL backend (feature build)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      # Two jobs died of a full disk while compiling, and their logs were lost: a notice records the
-      # space they started with. The toolchains removed are ones these jobs do not use.
+      # Jobs have died of a full disk while compiling (especially on AWS-hosted runners, which
+      # start with less free space than Azure-hosted runners), losing their logs: a notice records
+      # the space they started with. The toolchains removed are ones these jobs do not use.
       - name: Reclaim runner disk
         run: |
           echo "::notice title=Free disk at start::$(df -h --output=size,used,avail . | tail -1)"
-          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
           echo "::notice title=Free disk after reclaiming::$(df -h --output=size,used,avail . | tail -1)"
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -127,7 +187,7 @@ jobs:
         with:
           environment-name: gdal-backend
           # The GDAL the real-data job compares with, and the drivers the tests use.
-          create-args: libgdal-core=3.12.2 proj=9.8.1 libgdal-hdf4 libgdal-hdf5 libgdal-netcdf libgdal-kea
+          create-args: libgdal-core=${{ env.GDAL_REFERENCE_VERSION }} proj=9.8.1 libgdal-hdf4 libgdal-hdf5 libgdal-netcdf libgdal-kea
           cache-environment: true
       - name: Point the build at GDAL
         run: |
@@ -140,6 +200,10 @@ jobs:
           echo "RUSTFLAGS=-C link-arg=-Wl,-rpath,$prefix/lib" >> "$GITHUB_ENV"
       - run: pkg-config --modversion gdal
       - run: cargo clippy -p terrio -p terrio-cli --all-targets --features gdal -- -D warnings
+      # The `gdal` feature without the default features: the features job checks each of the
+      # others on its own, and has no GDAL. The backend's tests run in that build too.
+      - run: cargo clippy -p terrio --no-default-features --features gdal -- -D warnings
+      - run: cargo test -p terrio --no-default-features --features gdal --test gdal_backend
       - run: cargo test -p terrio -p terrio-cli --features gdal
 
   msrv:
@@ -156,12 +220,29 @@ jobs:
       - run: cargo check --workspace --all-targets --locked
       - run: cargo check -p terrio-crs --all-targets --locked
       - run: cargo check -p terrio-crs --all-targets --all-features --locked
+      # Cargo enables a dependency's features for the whole build: serde_json's `preserve_order`
+      # in terrio-crs would reorder the JSON of every crate built with it. The PROJJSON tests run
+      # here without it, as a dependent builds terrio-crs (the workspace's `terrio` enables it).
+      - name: terrio-crs does not enable serde_json's preserve_order
+        run: |
+          cargo tree -p terrio-crs --all-features -e features -i serde_json --locked > "$RUNNER_TEMP/serde_json.txt"
+          grep -q '^serde_json v' "$RUNNER_TEMP/serde_json.txt"
+          ! grep preserve_order "$RUNNER_TEMP/serde_json.txt"
+      - run: cargo test -p terrio-crs --locked --test projjson_key_order --test projjson_export --test projjson
 
   api-docs:
     name: API docs and packaging
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+      - name: Catalog changes bump the version relative to the protected base
+        if: github.event_name == 'pull_request'
+        env:
+          CLI_CATALOG_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          git fetch --no-tags --depth=1 origin "$CLI_CATALOG_BASE_SHA"
+          python3 -m unittest discover -s scripts/tests -p test_cli_catalog_version.py
+          python3 scripts/check_cli_catalog_version.py --base "$CLI_CATALOG_BASE_SHA"
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Documentation builds without warnings (missing docs included)
@@ -224,15 +305,26 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: wasm32-unknown-unknown
+          targets: wasm32-unknown-unknown,wasm32-wasip1
       - uses: Swatinem/rust-cache@v2
       - run: cargo build -p terrio --target wasm32-unknown-unknown
       - uses: taiki-e/install-action@v2
         with:
           tool: wasm-pack
+      - name: Install checksum-pinned wasm-opt
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash scripts/install_binaryen_ci.sh
       - uses: actions/setup-node@v7
         with:
           node-version: 22
+      # terrio.dev/web: the command line on WASI, run in Node.js on the page's WASI runtime.
+      - name: Test the command line in the browser build (WASI)
+        env:
+          RUSTFLAGS: -C link-arg=-zstack-size=8388608
+        run: |
+          cargo build -p terrio-cli --bin terrio --target wasm32-wasip1
+          TERRIO_WASM=target/wasm32-wasip1/debug/terrio.wasm node --test web/tests/runtime.test.mjs web/tests/paths.test.mjs
       - name: Build and test the npm package (Node.js)
         run: |
           node --test js/tests/build.test.mjs
@@ -243,6 +335,11 @@ jobs:
         run: |
           wasm-pack build js --release --target nodejs --out-dir pkg-node/core --out-name terrio --no-pack -- --no-default-features --features core
           TERRIO_JS_PKG=../pkg-node/core/terrio.js node --test js/tests/node.test.mjs
+      # The Zarr-only module, `terrio-js/zarr` (its own crate, js/zarr).
+      - name: Build and test terrio-js/zarr (Node.js)
+        run: |
+          wasm-pack build js/zarr --release --target nodejs --out-dir ../pkg-node/zarr --out-name terrio --no-pack
+          node --test js/tests/zarr.test.mjs
 
   # The cargo features (see crates/terrio/Cargo.toml): each builds on its own, and so does the
   # core without them, natively and for WebAssembly.
@@ -391,6 +488,28 @@ jobs:
           name: wheel-${{ matrix.os }}
           path: python/dist/*.whl
 
+  cog-sidecar-parity:
+    name: external COG overview parity
+    needs: python
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: wheel-ubuntu-latest
+          path: dist
+      # This wheel bundles its own GDAL; changing GDAL_REFERENCE_VERSION does not change it.
+      - name: Install the wheel and reference implementations
+        run: python -m pip install pytest rasterio==1.5.2 rio-cogeo==7.0.4 dist/*.whl
+      - name: Compare external overviews with the reference
+        working-directory: python
+        run: |
+          python -c "import os, rasterio, rio_cogeo.cogeo; print('Reference GDAL:', rasterio.__gdal_version__); assert rasterio.__gdal_version__ == os.environ['GDAL_REFERENCE_VERSION'], rasterio.__gdal_version__"
+          python -m pytest -v tests/test_cog_validate.py::test_external_overviews_agree_with_rio_cogeo
+
   # The Rust and Python tests on real data. The comparison scripts (point clouds, conformance) are
   # in ci-extended.yml, with the same GDAL environment and data; this job saves the data cache.
   real-data:
@@ -400,6 +519,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+      # This job builds the full workspace in debug mode, builds the Python wheel in release mode,
+      # and installs a micromamba GDAL environment plus test data (~38 GB total). Reclaim unused
+      # pre-installed toolchains so AWS-hosted runners do not run out of disk space.
+      - name: Reclaim runner disk
+        run: |
+          echo "::notice title=Free disk at start::$(df -h --output=size,used,avail . | tail -1)"
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          echo "::notice title=Free disk after reclaiming::$(df -h --output=size,used,avail . | tail -1)"
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: mamba-org/setup-micromamba@v3
@@ -408,7 +535,7 @@ jobs:
           # The reference: the EPSG table and test points come from GDAL 3.12.2 and PROJ 9.8.1, and
           # newer EPSG databases change some transformations. rasterio comes from pip (with its
           # bundled GDAL), as conda-forge has none for GDAL 3.12.2 with PROJ 9.8.
-          create-args: gdal=3.12.2 libgdal-core=3.12.2 proj=9.8.1 libgdal-arrow-parquet libgdal-jp2openjpeg libgdal-netcdf libgdal-hdf5 libgdal-grib numpy pip pytest maturin pyproj pdal laspy lazrs-python pyarrow geopandas shapely
+          create-args: gdal=${{ env.GDAL_REFERENCE_VERSION }} libgdal-core=${{ env.GDAL_REFERENCE_VERSION }} proj=9.8.1 libgdal-arrow-parquet libgdal-jp2openjpeg libgdal-netcdf libgdal-hdf5 libgdal-grib numpy pip pytest maturin pyproj pdal laspy lazrs-python pyarrow geopandas shapely
           cache-environment: true
       - name: Benchmark harness regression tests
         shell: micromamba-shell {0}
@@ -417,7 +544,7 @@ jobs:
         with:
           path: terrio-data
           # Holds the datum shift and geoid grids of scripts/proj_grids.txt too (230 MB).
-          key: terrio-data-gdal3.12.2-proj9.8.1-${{ hashFiles('scripts/fetch_test_data.sh', 'scripts/gen_epsg_points.py', 'scripts/proj_grids.txt') }}
+          key: terrio-data-gdal${{ env.GDAL_REFERENCE_VERSION }}-proj9.8.1-${{ hashFiles('scripts/fetch_test_data.sh', 'scripts/gen_epsg_points.py', 'scripts/proj_grids.txt') }}
       - name: Fetch test data
         shell: micromamba-shell {0}
         run: scripts/fetch_test_data.sh terrio-data
@@ -425,7 +552,7 @@ jobs:
         # With pip, on top of the cached environment: terrio.rio is compared with rasterio, and
         # terrio.xarray with rioxarray.
         shell: micromamba-shell {0}
-        run: python -m pip install "jsonschema>=4.18" rasterio xarray "dask[array]" rioxarray zarr scipy pytest-xdist
+        run: python -m pip install "jsonschema>=4.18" rasterio xarray "dask[array]" rioxarray zarr scipy pytest-xdist openpyxl
       # nextest runs the test binaries in parallel, where cargo test runs them one at a time.
       - uses: taiki-e/install-action@v2
         with:
@@ -438,6 +565,15 @@ jobs:
           cargo test --workspace --doc
           cargo test -p terrio-crs
           cargo test -p terrio-crs --all-features
+      - name: XLSX workbook interoperability
+        shell: micromamba-shell {0}
+        run: |
+          cargo build -p terrio-cli
+          cargo build -p terrio --example xlsx_workbook
+          python scripts/conformance.py terrio-data --terrio target/debug/terrio --only xlsx-workbook --strict --output xlsx-workbook.md
+      - name: XLSX workbook summary
+        if: ${{ always() && hashFiles('xlsx-workbook.md') != '' }}
+        run: cat xlsx-workbook.md >> "$GITHUB_STEP_SUMMARY"
       - name: Python bindings against GDAL
         shell: micromamba-shell {0}
         env:
@@ -451,3 +587,8 @@ jobs:
         run: |
           python scripts/compare_xarray_with_rioxarray.py terrio-data --output xarray.md
           cat xarray.md >> "$GITHUB_STEP_SUMMARY"
+      - name: Disk use of the build
+        if: always()
+        run: |
+          df -h .
+          if [ -d target ]; then du -sh target; else echo "no target directory"; fi

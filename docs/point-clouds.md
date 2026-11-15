@@ -123,9 +123,11 @@ and the other dimensions in terrio's own.
 ## Larger than memory
 
 `terrio convert` (to every point cloud format: LAS, LAZ, COPC, PLY, E57 and EPT), `terrio info
---stats`, `terrio grid` (the statistics), `terrio filter range` and `terrio filter expression`
-read and write points in chunks (`--chunk-points`, a million by default), so their memory does
-not grow with the file. On a 3.05 GB LAS file of 101.7 million points:
+--stats`, `terrio grid` (the statistics), `terrio filter range` and `terrio filter expression` read
+and write points in chunks (`--chunk-points`, a million by default), so their memory does not grow
+with the file. `terrio filter hexbin` also reads points in chunks (`--chunk-points`), keeping a
+count per occupied hexagon, so its memory grows with the number of occupied hexagons rather than
+the point count. On a 3.05 GB LAS file of 101.7 million points:
 
 | Command | Time | Peak memory |
 |---|---:|---:|
@@ -149,6 +151,15 @@ LAS point formats 4, 5, 9 and 10 locate each point's waveform in the waveform da
 the file or in a `.wdp` file next to it. terrio reads the wave packet descriptors and a point's
 samples (`PointCloudReader::waveform`, `PointCloudFile.waveform` in Python), and keeps the
 packets when the points are written to LAS or LAZ (and the `.wdp` file next to a converted file).
+
+## File inputs and directories
+
+Point-cloud operations that take an individual file reject local directories with
+an explicit message: select a point-cloud file, or an EPT dataset's `ept.json`.
+This validation is shared by the CLI and Python readers across LAS, LAZ, COPC,
+PLY and E57. A directory-input error does not imply that its drive is inaccessible.
+Missing files and genuine file-access errors retain their existing I/O errors.
+For directory batching with CSF, see [CSF directory input](#csf-directory-input).
 
 ## Filters
 
@@ -283,6 +294,39 @@ terrio filter overlay tile.laz zoned.laz --datasource zones.gpkg --dimension Cla
 terrio filter dem tile.laz near.laz --raster dem.tif --limits "Z[2:2]"
 terrio filter hexbin bridge.copc.laz footprint.geojson --edge-size 1.4 --threshold 3 --no-smooth --density hexagons.geojson
 ```
+
+### CSF directory input
+
+`filter csf` also accepts a local directory of LAS/LAZ files, including COPC.
+It classifies each regular file separately, sorted by platform path ordering
+(not natural numeric ordering), and keeps its filename in the output directory.
+The output format follows its extension, except that detected COPC content remains
+COPC even with an ordinary `.laz` filename; a `.las` tile is written as LAS.
+This preservation is specific to batch
+mode: single-file CSF chooses the format from the requested output extension, so
+a COPC input written to `output.laz` becomes ordinary LAZ.
+Extension matching is case-insensitive.
+Subdirectories, symbolic links, macOS AppleDouble sidecars (`._*`) and other file
+types are skipped; other dot-prefixed LAS/LAZ filenames are included. The scan is
+not recursive. The output directory is created when needed and may be a child of the
+input directory. For example, on Windows:
+
+```powershell
+terrio filter csf --cloth-resolution=2 'D:\Downloads' 'D:\Downloads\Nova pasta'
+```
+
+An empty input directory, an output path that is a file, an output directory
+that resolves to the input directory, or any existing output filename is refused
+before processing. Planned filenames that collide under the output filesystem's
+case or Unicode rules are also refused. The output directory may have been created
+before a refusal, including when resolving directory aliases. Input files are
+preserved. Each tile is staged in the output directory and published without
+replacing an existing file. A failed read, classification or write stops the batch
+and removes the incomplete tile; earlier completed outputs remain. CSF processes one
+whole tile at a time, so memory use depends on the largest tile. The directory
+batch input is a CLI convenience specific to CSF; other filters still take file
+paths or URLs. The library and Python CSF methods operate on individual point-cloud
+values. Selected filenames that are not UTF-8 are rejected before processing.
 
 ## COPC, local or remote
 

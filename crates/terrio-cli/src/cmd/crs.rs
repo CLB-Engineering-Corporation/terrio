@@ -1,11 +1,15 @@
 // Written to match the behavior of:
 //   GDAL v3.13.3:
 //     doc/source/programs/gdaltransform.rst
+//   PROJ 9.8.1:
+//     docs/source/apps/projinfo.rst (--list-crs)
 // No code is translated from these sources.
 
-//! `terrio crs`.
+//! `terrio crs` and `terrio list-crs`.
 
-use terrio::crs::{SpatialRef, TransformOptions, Transformer};
+use clap::builder::TypedValueParser;
+use std::io::Write;
+use terrio::crs::{AUTHORITIES, AxisOrder, CrsKind, CrsQuery, SpatialRef, TransformOptions, Transformer, list_crs};
 
 #[derive(clap::Args)]
 pub struct Args {
@@ -17,8 +21,18 @@ pub struct Args {
     wkt: bool,
     /// Print only the PROJJSON definition, so that the output is a PROJJSON file (refused for a CRS
     /// it would describe wrongly).
-    #[arg(long, conflicts_with_all = ["to", "wkt", "coords", "dimension", "transform_options", "s_coord_epoch", "t_coord_epoch"])]
+    #[arg(long, conflicts_with_all = ["to", "wkt", "proj4", "wkt1_strict", "coords", "dimension", "transform_options", "s_coord_epoch", "t_coord_epoch"])]
     projjson: bool,
+    /// Print only the PROJ string, as `projinfo -o PROJ` writes it (an error for a CRS PROJ has
+    /// none for, such as an engineering CRS). It leaves out what a PROJ string cannot hold, such as
+    /// the datum transformation of an EPSG CRS: keep the code or WKT to keep the CRS.
+    #[arg(long, conflicts_with_all = ["to", "wkt", "wkt1_strict", "coords", "dimension", "transform_options", "s_coord_epoch", "t_coord_epoch"])]
+    proj4: bool,
+    /// Print only the WKT 1 without GDAL's PROJ4 extension, for formats whose readers ignore it
+    /// (a `.prj` file), as PROJ's `WKT1_GDAL` (an error where WKT 1 needs the extension, such as a
+    /// datum grid, or PROJ writes no WKT 1, such as a geographic 3D CRS).
+    #[arg(long, conflicts_with_all = ["to", "wkt", "coords", "dimension", "transform_options", "s_coord_epoch", "t_coord_epoch"])]
+    wkt1_strict: bool,
     /// Transform coordinates into this CRS. Reads `x y` pairs from the arguments, or lines of
     /// `x y`, `x y z` or `x y z t` (t: a decimal year) from standard input when none are given,
     /// as `gdaltransform` does (printing `transformation failed.` for a point that fails).
@@ -51,19 +65,47 @@ pub fn run(a: Args) -> terrio::Result<()> {
         println!("{}", src.to_projjson()?);
         return Ok(());
     }
+    if a.wkt1_strict {
+        let wkt = src
+            .to_wkt1_strict()
+            .ok_or_else(|| terrio::Error::InvalidArgument(format!("{} has no WKT 1 without the PROJ4 extension", src.label())))?;
+        println!("{}", terrio::crs::escape_nul(&wkt));
+        return Ok(());
+    }
+    if a.proj4 {
+        let proj = src.to_proj4().ok_or_else(|| terrio::Error::InvalidArgument(format!("{} has no PROJ string", src.label())))?;
+        println!("{proj}");
+        return Ok(());
+    }
     let Some(to) = a.to else {
-        println!("{}", src.label());
+        println!("{}", terrio::crs::escape_nul(&src.label()));
         if let Some(name) = src.name() {
-            println!("Name: {name}");
+            println!("Name: {}", terrio::crs::escape_nul(&name));
         }
         println!("Geographic: {}", src.is_geographic());
         if src.is_geocentric() {
             println!("Geocentric: true");
         }
+        let axes = match src.axis_order() {
+            AxisOrder::EastNorth => "east, north",
+            AxisOrder::NorthEast => "north, east",
+            AxisOrder::Other => "other",
+            _ => "unknown",
+        };
+        println!("Axis order: {axes}");
+        if let Some(body) = src.body() {
+            println!("Body: {body}");
+        }
+        if let Some(p) = src.projection_params() {
+            println!(
+                "Method: {} (lon_0={} lat_0={} k_0={} x_0={} y_0={} prime meridian={} a={} b={} metres per unit={})",
+                p.method, p.lon_0, p.lat_0, p.k_0, p.x_0, p.y_0, p.prime_meridian, p.a, p.b, p.to_meter
+            );
+        }
         if a.wkt
             && let Some(w) = src.to_wkt()
         {
-            println!("{w}");
+            println!("{}", terrio::crs::escape_nul(&w));
         }
         return Ok(());
     };
@@ -108,6 +150,67 @@ pub fn run(a: Args) -> terrio::Result<()> {
         let nums: Vec<f64> = line.split([' ', ',', '\t']).filter(|s| !s.is_empty()).filter_map(|s| s.parse().ok()).collect();
         if nums.len() >= 2 && print(&nums).is_err() {
             println!("transformation failed.");
+        }
+    }
+    Ok(())
+}
+
+#[derive(clap::Args)]
+pub struct ListArgs {
+    /// Words the CRSs must match, whatever their case: each in the name, or beginning the code or
+    /// `AUTHORITY:CODE` (`Albers`, `3577`, `EPSG:3577`, `gda94 albers`). Every CRS when none.
+    text: Vec<String>,
+    /// List only the CRSs of this authority (repeatable).
+    #[arg(long, value_name = "AUTHORITY", value_parser = authority_parser(), ignore_case = true)]
+    authority: Vec<String>,
+    /// List only the CRSs of this kind (repeatable).
+    #[arg(long, value_name = "KIND", value_parser = kind_parser(), ignore_case = true)]
+    kind: Vec<CrsKind>,
+    /// List deprecated CRSs too, marked `[deprecated]`.
+    #[arg(long, visible_alias = "allow-deprecated")]
+    include_deprecated: bool,
+    /// Print JSON: an array of `{authority, code, name, kind, deprecated, area_name, bounds,
+    /// projection_method, celestial_body}`, bounds being west, south, east and north in degrees.
+    #[arg(long)]
+    json: bool,
+}
+
+/// The authorities `--authority` accepts, whatever their case.
+fn authority_parser() -> impl TypedValueParser<Value = String> {
+    clap::builder::PossibleValuesParser::new(AUTHORITIES).map(|a| a.to_string())
+}
+
+/// The kinds `--kind` accepts, whatever their case.
+fn kind_parser() -> impl TypedValueParser<Value = CrsKind> {
+    clap::builder::PossibleValuesParser::new(CrsKind::ALL.map(CrsKind::as_str))
+        .try_map(|k: String| k.parse::<CrsKind>().map_err(|e| e.to_string()))
+}
+
+/// Lists registry CRSs, one per line as `projinfo --list-crs` prints them: `EPSG:3577 "GDA94 /
+/// Australian Albers"`, then ` [deprecated]` for a deprecated CRS.
+pub fn list(a: ListArgs) -> terrio::Result<()> {
+    let query =
+        CrsQuery { authorities: a.authority, kinds: a.kind, include_deprecated: a.include_deprecated, text: Some(a.text.join(" ")) };
+    let entries = list_crs(&query);
+    if a.json {
+        let json = serde_json::to_string_pretty(&entries).map_err(|e| terrio::Error::InvalidData(e.to_string()))?;
+        // As the listing below, a closed pipe (`| head`) ends the output.
+        if let Err(error) = writeln!(std::io::stdout().lock(), "{json}")
+            && error.kind() != std::io::ErrorKind::BrokenPipe
+        {
+            return Err(error.into());
+        }
+        return Ok(());
+    }
+    let mut out = std::io::stdout().lock();
+    for e in entries {
+        let deprecated = if e.deprecated { " [deprecated]" } else { "" };
+        // A closed pipe (`| head`) ends the listing.
+        if let Err(error) = writeln!(out, "{}:{} \"{}\"{deprecated}", e.authority, e.code, e.name) {
+            if error.kind() == std::io::ErrorKind::BrokenPipe {
+                break;
+            }
+            return Err(error.into());
         }
     }
     Ok(())

@@ -5,7 +5,6 @@ overview a read chooses and the warp of each read are GDAL's own. Skipped withou
 """
 
 import math
-import re
 
 import numpy as np
 import pytest
@@ -17,10 +16,13 @@ from rasterio.enums import Resampling as RR  # noqa: E402
 from rasterio.vrt import WarpedVRT as RasterioVRT  # noqa: E402
 from rasterio.windows import Window as RW  # noqa: E402
 
+import terrio  # noqa: E402
 import terrio.rio as trio  # noqa: E402
 from terrio.rio.enums import Resampling as TR  # noqa: E402
 from terrio.rio.vrt import WarpedVRT  # noqa: E402
 from terrio.rio.windows import Window as TW  # noqa: E402
+
+pytestmark = pytest.mark.usefixtures("gdal_warp_grid")
 
 
 @pytest.fixture(scope="module")
@@ -409,6 +411,12 @@ RPC_CASES = [
 ]
 
 
+def _inner(written):
+    """The pixels whose four neighbours are written (`(bands, rows, cols)`), none on the border."""
+    p = np.pad(written, ((0, 0), (1, 1), (1, 1)))
+    return p[:, :-2, 1:-1] & p[:, 2:, 1:-1] & p[:, 1:-1, :-2] & p[:, 1:-1, 2:]
+
+
 @pytest.mark.parametrize(
     "name,options",
     # rgb.tif: three bands with a nodata value.
@@ -448,6 +456,21 @@ def test_rpc_source_matches_rasterio(rpc_dir, monkeypatch, name, options):
     np.testing.assert_allclose(t_t, g_t, rtol=1e-12, atol=0)
     for i, (a, b) in enumerate(zip(g_reads, t_reads, strict=True)):
         assert a.shape == b.shape and a.dtype == b.dtype, i
+        if i in (2, 3) and options.get("resampling") == RR.average:
+            # terrio weighs each source pixel at a footprint's edge by its part inside the source
+            # window (#703): in the reads at a reduced size, warped by `average` onto coarser
+            # grids, the pixels along the edge of the warped footprint (written, beside an
+            # unwritten pixel or the border) follow those weights, and are checked for being
+            # written and within 39 (read 2) and 11 (read 3); the others exactly. The 0s of these
+            # reads are their unwritten pixels: image.tif's few 0s leave no written pixel at 0.
+            # Bounds are the observed maximum absolute Byte differences for these exact reduced
+            # fixture reads after #703, not a derived error bound or general parity tolerance.
+            written = a != 0
+            assert np.array_equal(written, b != 0), f"read {i}: written elsewhere"
+            edge = written & ~_inner(written)
+            change = np.abs(a[edge].astype(int) - b[edge].astype(int)).max(initial=0)
+            assert change <= {2: 39, 3: 11}[i], f"read {i}: an edge pixel differs by {change}"
+            a, b = a[~edge], b[~edge]
         assert np.array_equal(a, b), (
             f"read {i}: {np.count_nonzero(a != b)} of {a.size} pixels differ"
         )
@@ -702,14 +725,16 @@ def rotated_sources(tmp_path_factory):
 
 # The type of a warped VRT without `dtype`, as rasterio 1.5.0 (GDAL 3.12.1) gives it: the source's
 # widened to hold the nodata value (`GDALWarpResolveWorkingDataType()`, from Byte: an Int8 source
-# gives Int16), for `nodata=` and for `src_nodata=` alone; `src_nodata=` with `nodata=None` keeps
-# the source's type when it cannot hold the value (GDAL drops it).
+# gives Int16; GDAL 3.13 starts from the source's type, so Int8 holding -7 stays Int8), for
+# `nodata=` and for `src_nodata=` alone; `src_nodata=` with `nodata=None` keeps the source's type
+# when it cannot hold the value (GDAL drops it).
+_INT8 = "int8" if terrio.gdal_compat() == "3.13" else "int16"
 WIDENED = [
     ("uint8", -1, "int16", "uint8"),
     ("uint8", 300, "uint16", "uint8"),
     ("uint8", -2.5, "float32", "uint8"),
     ("uint8", float("nan"), "float64", "uint8"),
-    ("int8", -7, "int16", "int16"),
+    ("int8", -7, _INT8, _INT8),
     ("uint16", -1, "int32", "uint16"),
     ("int16", 40000, "int32", "int16"),
     ("uint32", -1, "int64", "uint32"),

@@ -18,14 +18,32 @@ An archive named without a member opens its main dataset: the first file, by nam
 kind found among vector layers, rasters and point clouds (LAS, LAZ, COPC, PLY, E57), so
 `terrio info tile.las.zip` reads the LAS file inside.
 
+Archives with duplicate member names are refused as invalid data before reading or extracting
+members. This applies to whole archives, `/vsizip/` members, byte buffers, and XLSX or KMZ
+containers, including duplicate names outside the selected dataset. A later entry cannot silently
+replace an earlier one. The optional GDAL backend does not retry these ambiguous archives.
+
 ## Reading in place
 
 GeoTIFFs and COGs are opened lazily: `terrio info` fetches the header only, and window or overview
-reads fetch only the tiles they touch, merging adjacent ranges into one request. PMTiles archives
+reads fetch only the tiles they touch, merging adjacent ranges into one request (including GeoTIFF
+members of seek-optimized ZIP archives, SOZip, over `/vsizip//vsicurl/`). PMTiles archives,
 Zarr stores, JPEG 2000, GRIB, SRTM HGT, STAC tiled assets, COPC and EPT are read in place too
-(below). Other formats are downloaded to a temporary
+(below), and WFS (`WFS:`), OGC API Features (`OAPIF:`) and ArcGIS feature-service queries
+(`ESRIJSON`, `ESRIPBF`) are read page by page (see [Formats](formats.md#vectors)). Other formats are downloaded to a temporary
 directory first; a remote shapefile's `.shx`, `.dbf`, `.prj` and `.cpg`
 come with it.
+
+A full lazy TIFF open reads the image-directory chain, including overview and mask metadata.
+An unreadable directory or required next-directory pointer fails the open with its read cause;
+it does not silently return partial metadata. This can reject damaged TIFFs whose base image
+another reader can recover. File inventory, copy, rename and deletion use first-image metadata
+and do not require readable later directories. Failed HTTP directory reads, including short
+range responses, do not trigger a whole-file retry during translation.
+Best-effort metadata queries and eager first-image reads retain the metadata collected before
+a later directory fails. The native eager pixel decoder still requires the first directory's
+final pointer. Translation through the optional GDAL backend can recover a base image that
+GDAL can read despite that missing pointer.
 
 ```sh
 terrio info https://prd-tnm.s3.amazonaws.com/StagedProducts/Elevation/1/TIFF/current/n40w106/USGS_1_n40w106.tif
@@ -51,10 +69,13 @@ terrio convert --oo ZOOM_LEVEL=5 https://.../zcta.pmtiles zcta_z5.gpkg
 Zarr stores (v2 and v3, GeoZarr included) are read in place over HTTP(S), S3, Google Cloud
 Storage and Azure: opening reads the metadata (all of it in one request when the store has
 consolidated metadata, v2's `.zmetadata` or the `consolidated_metadata` of a v3 root group), and a
-window reads only the chunks it touches, in parallel. In a sharded v3 array, a window reads each
-shard's index, then the inner chunks it needs, nearby ones in one range request. Missing chunks
-read as the fill value. A store is recognized by a path component ending in `.zarr`, or named as
-GDAL names it: `ZARR:"store"` or `ZARR:"store":/group/array`, the store a URL, an `s3://`, `gs://`
+window reads only the chunks it touches, in parallel: up to 32 requests in flight a read,
+whatever the number of cores (natively; in WebAssembly, as many as the thread pool runs), fewer
+when their chunks would take more than half the memory the process can use, and none more once
+one fails. Reads running at once (threads of a Python program, a tile server) each have their
+own. In a sharded v3 array, a window reads each shard's index, then the inner chunks it needs,
+nearby ones in one range request. Missing chunks read as the fill value. A store is recognized by
+a path component ending in `.zarr`, or named as GDAL names it: `ZARR:"store"` or `ZARR:"store":/group/array`, the store a URL, an `s3://`, `gs://`
 or `az://` object or a `/vsicurl/`, `/vsis3/`, `/vsigs/` or `/vsiaz/` name. A path may also name
 an array or a group inside the store (`.../S2A_....zarr/measurements/reflectance/r10m/b02`); the
 coordinate arrays and the GeoZarr attributes of the groups above it are found as GDAL finds them.
@@ -147,7 +168,68 @@ A STAC document chooses where its links lead, so links are followed with limits:
   followed, for ranged reads, requests with headers and `POST` requests alike), and a redirect to
   another origin is an error unless `TERRIO_STAC_FOLLOW_CROSS_ORIGIN=YES`;
 - a search made with `GET` is not continued with a `POST` its page asks for
-  (`TERRIO_STAC_ALLOW_POST=YES` allows it); one made with `method=POST` is.
+  (`TERRIO_STAC_ALLOW_POST=YES` allows it); one made with `method=POST` is;
+- a STAC document that is not on the local file system does not name local files: an asset href
+  of a remote item that is a local path, a `file://` URL or a `/vsizip/` path into a local archive
+  is an error for `STAC:` and is left out of a `STACIT:` mosaic (STACTA items are held to the same
+  rule), and a remote document's links never lead to local files, even with
+  `TERRIO_STAC_FOLLOW_CROSS_ORIGIN=YES`.
+
+Remote STAC documents, STACIT mosaics and STACTA tile templates require
+`TERRIO_STAC_ALLOW_CREDENTIALED_ASSETS=YES` before their cloud assets can use configured
+credentials. This includes S3 keys and shared AWS profiles, Azure SAS/bearer tokens, and configured
+HTTP headers (including path-specific headers). Any custom header is treated as potential
+authentication because API keys can use arbitrary names. Ordinary HTTP document/asset chains on
+the same origin retain their header authentication; cloud URI assets require consent even in the same
+bucket/account. Cloud URI document chains also require consent for configured HTTP headers.
+Local documents retain credentialed access.
+For catalog-link traversal, the exemption uses each fetched document's final response origin,
+including after redirects. Subdataset names keep the caller's requested location, so a redirect
+does not add a server-issued signed URL to those names. These names are live references; reopening
+can observe changed server results. Following a
+cross-origin child requires `TERRIO_STAC_FOLLOW_CROSS_ORIGIN=YES` and already sends configured
+headers to that child. Nested raster/asset-selected documents instead retain their selecting
+origin throughout the scoped asset read. Actual clients check the credentials they resolved before
+sending each request. Redirect crossings remain attached to deferred readers and cached downloads.
+A cache origin change discards older parts, and document reads reject mixed-origin bytes.
+Once that asset chain crosses origins, nested sources
+require consent for configured headers even if they point back to the original origin.
+
+Checks run while parsing the document, including assets that were not selected, so metadata listing
+also requires consent when such assets are declared. Deferred mosaic opens and concrete tile URLs
+and nested native raster sources are checked too. Cached readers retain the original consent
+requirement, even after credentials are removed or unsigned reads are enabled. Export, overview
+metadata and resampled reads enforce it before source I/O; parallel readers carry the policy and
+the options in effect when the read starts. Native object fetchers keep the headers, credentials
+and endpoints captured when they are created; a later `terrio.Env` scope does not replace those
+request settings. STAC credential consent remains a read-time decision: an active read's
+`TERRIO_STAC_ALLOW_CREDENTIALED_ASSETS` setting can grant or revoke permission without changing
+the captured credentials. Sharing uses owned alpha metadata rather than seeking the TIFF again. Azure URI documents retain provider authentication for relative targets within the
+configured endpoint, including after a same-origin path redirect. Without credentials,
+public cloud hrefs remain usable. With AWS credentials configured, `AWS_NO_SIGN_REQUEST=YES` keeps
+public S3 reads unsigned and does not require the opt-in (custom authentication headers still need
+consent). A signature already in an href and public Planetary Computer signing are not ambient user
+credentials.
+
+Refusals are terminal. Named `STAC:`, `STACIT:` and `STACTA:` documents are not reinterpreted by
+GDAL after a native error, for local and remote document locations alike; individual raster assets
+can use the GDAL backend with explicit credential consent when selected by a remote document. Every
+such GDAL asset read requires the opt-in, even for an apparently public URL: GDAL can follow nested
+sources or use credentials unknown to the native reader. Public formats handled by native readers
+retain unsigned access without the opt-in. Recognized remote STAC reader errors, including malformed
+JSON that identifies STAC metadata, also do not select a second pointer parser. Ordinary non-STAC
+remote documents retain their existing fallback behavior. Remote STAC reader errors that would
+otherwise permit pointer fallback are reported as `InvalidArgument`, preserving the redacted
+native cause. Malformed JSON containing a STAC marker is conservatively treated as a pointer
+document, even when that marker cannot be verified as a top-level field. Explicit `GDAL:` opens delegate to GDAL's
+own policies. The optional backend additionally checks its explicitly configured cloud credential
+sources and credential-bearing keys in the selected AWS profile and selected
+credential/configuration files. Existing credential files that cannot be read are treated
+conservatively as configured; the check does not query an identity metadata service to discover
+credentials. See [GDAL's cloud authentication
+options](https://gdal.org/en/stable/user/virtual_file_systems.html). The opt-in never permits an
+asset href pointing directly at a local file. Consenting to a GDAL asset read also trusts the nested
+sources GDAL follows; native per-source checks cannot run inside GDAL.
 
 A STAC item of tiled assets (GDAL's STACTA, see [Formats](formats.md#stac)) opens from its URL
 or as `STACTA:"item-url":asset`: the item is fetched, then the headers of the first tile when the
@@ -195,25 +277,83 @@ The GDAL variable is read when the terrio one is not set.
 | `TERRIO_HTTP_BLOCK_SIZE` (bytes) | `CPL_VSIL_CURL_CHUNK_SIZE` | 65536 |
 | `TERRIO_HTTP_CACHE_SIZE` (bytes): the block cache of each open file, and the process-wide cache | `CPL_VSIL_CURL_CACHE_SIZE` | 67108864 |
 | `TERRIO_HTTP_USERAGENT` | `GDAL_HTTP_USERAGENT` | `terrio/VERSION` |
+| `TERRIO_HTTP_CAINFO` (additional PEM CA bundle) | `GDAL_HTTP_CAINFO` | none |
+| `TERRIO_HTTP_MULTIRANGE`: `PARALLEL` requests the byte runs of one read up to 8 at once; `SERIAL` one after another; `SINGLE_GET` (one multipart request in GDAL, not supported) as `SERIAL`; any other value is `PARALLEL` | `GDAL_HTTP_MULTIRANGE` | `PARALLEL` |
 | `TERRIO_HTTP_LOG=YES` (log each request) | `CPL_CURL_VERBOSE` | off |
 | `TERRIO_JSON_MAX_SIZE` (bytes; `K`, `M`, `G` suffixes): the largest JSON document fetched whole | `CPL_JSON_MAX_SIZE` | 100 MB |
 
 Transient errors (connection failures, HTTP 429, 500, 502, 503, 504) are retried with backoff.
 Signatures and SAS tokens are hidden in logs and error messages.
 
+Native HTTPS reads trust the compiled Mozilla roots by default. To add a private
+or organization CA, set `TERRIO_HTTP_CAINFO` to a PEM certificate bundle. Its
+certificates supplement the compiled roots, retaining Mozilla-applied name
+constraints even when a public root is duplicated in the bundle. Certificate-chain
+and hostname verification remain enabled. The CLI and MCP use the same native HTTP client.
+Python can scope the setting to a read:
+
+```python
+import terrio.rio as rio
+
+with rio.Env(TERRIO_HTTP_CAINFO="/absolute/path/to/organization-ca.pem"):
+    with rio.open("https://data.example.org/elevation.tif") as dataset:
+        values = dataset.read(1, window=((0, 128), (0, 128)))
+```
+
+`GDAL_HTTP_CAINFO` is an alias with the usual scoped-option precedence. Rust
+callers can set `http::HttpOptions::ca_bundle` for an explicit client. Missing,
+empty or malformed explicit bundle files refuse HTTPS rather than falling back to
+default trust; plain HTTP is unaffected. Blank option values are treated as unset,
+while an existing empty file is an error. Bundle paths must be absolute; a relative
+path refuses HTTPS rather than depending on a mutable working directory. Bundles are read
+when a connection pool is built, and different bundle paths isolate connections
+and cached responses. HTTP and HTTPS CONNECT proxies are supported; SOCKS support
+is not enabled for this connector.
+To rotate a bundle in a running process, configure a new path; editing a file
+does not reload existing pools, including a pool retaining a failed bundle load.
+This option does not read `SSL_CERT_FILE`,
+`SSL_CERT_DIR` or the system trust store. Browser/WebAssembly reads continue to
+use the browser's TLS and trust configuration.
+
+Redirects are followed, up to 10 of them. `TERRIO_HTTP_FOLLOW_CROSS_ORIGIN=NO` keeps the
+requests of a read on the origin of its URL (scheme, host and port): a redirect to another origin
+is refused before anything is sent there, by an error naming the option, and redirects within the
+origin are still followed. Any other value does the same, except `YES` (`TRUE`, `ON`, `1`) and an
+empty or blank value: these, and the option unset (the default), follow redirects to any origin.
+S3 bucket-region discovery also obeys this rule: set `AWS_REGION` to the bucket's region
+before opening a non-default-region bucket under `NO`, since changing from the global Amazon
+endpoint to its regional host changes the origin.
+The optional GDAL backend cannot enforce this policy for its opaque nested reads. While
+origin-only redirects are selected, GDAL reads (including automatic fallbacks and explicit
+`GDAL:` opens) are refused; native readers continue to work.
+The option applies to every request a read sends: ranged reads, files and documents fetched
+whole, listings of object stores, WFS and feature-service requests, and the token fetch that
+signs STAC assets. It is read when a file is opened or fetched, from the environment (the CLI)
+or, for the calling thread, from `terrio.rio.Env` or `config::push_scope`. A STAC link follows
+`TERRIO_STAC_FOLLOW_CROSS_ORIGIN` ([STAC](#stac)); with `YES`, it follows redirects as a read
+does, so this option keeps it on its origin too. OGC API Features requests stay on their origin
+either way. In WebAssembly, `openUrl` sends its requests through the host's `fetch`, which
+follows redirects itself; a `fetch` that refuses them (`redirect: "error"`) keeps reads on their
+origin.
+
 The first request of a remote file asks for its first 16,384 bytes, as GDAL's `/vsicurl/` does:
 a file that is not what its name says (64 MiB of noise named `.tif`, say) is refused after them,
-not downloaded. A remote `.json` or `.geojson` document opened as a raster is identified by its
+not downloaded. A feature-service query (`f=json`, `f=pjson`, `f=pbf` or `resultRecordCount=`)
+or a WFS `GetFeature` URL is not requested at all when no allowed driver could read its answer:
+for a vector open, when the list leaves out the ESRIJSON, ESRIPBF, GeoJSON and GML drivers (and
+GDAL, with the `gdal` feature), and for `open` and `info`, every raster driver too. A remote
+`.json` or `.geojson` document opened as a raster is identified by its
 first 32,768 bytes, as GDAL's STACTA and STACIT drivers identify one: unless they show a STAC
 document, it is refused after them rather than fetched whole to be read as GeoJSON. A remote file
 opened as a raster whose name points to no raster driver (`x`, `x.bin`, `dir.json/x`, a vector
 file's name) or to a labelled raw raster, read with a `.hdr` a remote file comes without (ENVI's
 `.dat`, `.bsq`, `.bip`; EHdr's `.bil`, `.flt`), is judged by its first 16,384 bytes too: it is
-downloaded whole only when they show a format the whole read takes under that name (an HDF5,
-netCDF or GRIB file named for no raster driver, a Surfer 6 binary grid under either), and is
-otherwise refused after them (GDAL refuses a document after 49,152): a document, and also a PNG,
-a JPEG or a STAC item so named, which terrio reads under their own names, and a TIFF for the whole
-read (a lazy open, as `rio.open`'s, reads a TIFF of any name by range). `info` judges the names it
+downloaded whole only when they show a format the whole read takes under that name (PNG, JPEG,
+TIFF, HDF5, netCDF or GRIB named for no raster driver, or a Surfer 6 binary grid under either).
+Other documents and STAC items are refused after that probe (GDAL refuses a document after
+49,152 bytes). Whole-raster and generic dataset opens intentionally download the complete
+extensionless image, including TIFF. For large remote TIFFs, use `open_raster(..., lazy=True)`
+or `rio.open`: their window and overview reads work by range under any name. `info` judges the names it
 reads by content alone the same way. The refusal, and the errors of a whole read that follows,
 name the dataset as it was given, not its local copy. With `TERRIO_WBRASTER_FALLBACK=YES` (for
 `info`, also `TERRIO_WBVECTOR_FALLBACK=YES`), a file named for no driver is still downloaded whole,
@@ -232,6 +372,22 @@ Bodies fetched whole are capped: a JSON document at `CPL_JSON_MAX_SIZE` (GDAL's 
 an object store's listing (remote Zarr groups) at 64 MiB, a STAC signing token response at 64 KiB.
 
 ## Decoded block cache
+
+Native parallel TIFF reads also retain spare decoders so that later windows avoid rereading
+their chunk tables. This is separate from the decoded block cache. All readers share a
+256 MiB spare-decoder budget by default. Set `TERRIO_TIFF_SPARE_CACHEMAX` before the first
+window read to change it (bytes, optional `K`, `M`, or `G` suffixes); `0` disables spare
+retention. Invalid values use the default. This process-wide setting ignores thread-local
+`terrio.rio.Env` options. A larger budget can avoid repeatedly reopening decoders when several
+large rasters are read in turn, at the cost of retaining more memory.
+
+Positive budgets retain one reader's own spares even when they alone exceed the budget,
+up to one per worker thread. Idle decoders of other readers are evicted least recently used
+first. Each spare is charged for its chunk tables, retained JPEG coding tables and a fixed
+16 KiB overhead. Accounting uses loaded directory metadata without copying or rereading
+the JPEG table payload. Active decoders, the reader's primary decoder, archive buffers and other allocations
+are outside this budget; it does not cap total process memory. An uncountable decoder is
+dropped rather than retained without its chunk tables being charged.
 
 The decoded tiles and strips of lazy GeoTIFF and COG reads, remote or local, are kept in memory
 process-wide, as GDAL's block cache keeps the blocks it decodes. A window read again decodes only
@@ -253,6 +409,65 @@ old pixels with chunks decoded from the new ones, so close its readers before ch
 and open them again afterwards. A remote file
 opened again decodes its chunks anew, but from the bytes the HTTP cache above may still hold for its
 URL: `terrio::http::clear_cache` (Python: `terrio.clear_http_cache()`) drops them.
+
+## Allowed drivers
+
+`TERRIO_ALLOWED_DRIVERS` limits the drivers datasets may be opened with, for files you do not trust:
+
+- **Value.** A comma-separated list of driver names, in any case (`GTiff`, `gtiff`), where
+  `JP2OpenJPEG`, `JPEG2000`, `JP2KAK`, `JP2ECW` and `JP2MRSID` all name `JP2`. Unset, it restricts
+  nothing. Set but empty or blank, or to bytes that are not UTF-8, it allows no driver.
+- **Scope.** It applies to every kind of dataset, rasters, vectors and point clouds alike.
+- **Writes and appends.** The list restricts readers, not output encoders. Writing a new dataset
+  does not require its output driver to be allowed. An EPT append reads the existing dataset and
+  its tiles: EPT and, for LASzip tiles, LAZ must be allowed before locking the dataset or recovering
+  an interrupted update, including the codecs declared by committed staged metadata. Direct
+  GeoPackage encoder writes, including vector `convert --append`, do not consult the reader list.
+  That encoder updates SQLite tables directly, without opening the target through a Terrio dataset
+  reader. EPT append uses Terrio readers to inspect existing tiles, so the reader policy applies.
+  Operations that open the existing GeoPackage to rewrite it (`repack`, layer renames and
+  `edit_in_place`) do check the vector list. The list is not a filesystem write policy.
+- **With `set_allowed_drivers`.** When a list is also set with
+  `terrio::formats::set_allowed_drivers` (Python: `terrio.set_allowed_drivers`), a driver must be
+  in both. That function keeps a list for each kind, rasters, vectors and point clouds, and a list
+  set without a kind applies to all three.
+- **Set for one thread** (Python's `terrio.rio.Env`, `terrio::config::push_scope`), it only narrows
+  the list outside the scope, the environment's and an outer scope's: the scope allows the drivers
+  both name. A scope that unsets the option leaves the list outside in force. The environment's
+  list applies even when it is set after the scope. Zonal statistics applies the calling
+  thread's scoped options when it opens and reads raster paths on helper threads. A read of an
+  EPT point cloud applies them when it fetches and reads the nodes.
+
+`terrio::formats::allowed_drivers` (Python: `terrio.allowed_drivers()`) gives the drivers allowed on
+the calling thread.
+
+## Declared sizes
+
+A file of a few hundred kilobytes can declare gigabytes of pixels. For files you do not trust,
+these options bound what a raster may declare; a raster that declares more is refused when it is
+opened, with a resource error (Python's `ResourceLimitError`) naming the option:
+
+| Variable | Refuses a raster declaring more than | Default |
+|---|---|---|
+| `TERRIO_MAX_DECLARED_BYTES` | this many bytes of pixels (width x height x bands x bytes per sample) | unset |
+| `TERRIO_MAX_BANDS` | this many bands | unset |
+
+Each is a positive integer, set in the environment or for one thread (Python's `terrio.rio.Env`,
+`terrio::config::push_scope`), where it applies instead of the environment's value. See
+[Rasters](formats.md#rasters) for the opens that apply them and the readers that refuse a raster
+only once read.
+
+CLI commands use these process-environment settings rather than per-command flags,
+so one policy applies to every raster-opening operation. For example:
+
+```sh
+TERRIO_MAX_DECLARED_BYTES=1073741824 TERRIO_MAX_BANDS=64 terrio info dem.tif
+```
+
+For MCP, put the same variables in the server process's environment (the `env` entry
+in the client's server configuration), or export them before starting the server.
+They apply to every tool call handled by that server; individual tool arguments do
+not expose separate limit settings.
 
 ## Managing files
 

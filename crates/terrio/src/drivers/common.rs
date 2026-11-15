@@ -14,6 +14,18 @@ use std::path::{Path, PathBuf};
 use wbraster::raster::RasterData;
 use wbraster::{CrsInfo, DataType, Raster, RasterConfig};
 
+/// A complete finite JPEG quality in 1..=100, truncating fractional values for the encoder.
+/// Unlike GDAL 3.12.1's standalone JPEG parser, numeric prefixes are not accepted.
+pub(crate) fn jpeg_quality(value: &str) -> Result<u8> {
+    value
+        .trim()
+        .parse::<f64>()
+        .ok()
+        .filter(|q| q.is_finite() && (1.0..=100.0).contains(q))
+        .map(|q| q as u8)
+        .ok_or_else(|| Error::InvalidArgument(format!("QUALITY={value} is not a legal value in the range 1-100.")))
+}
+
 /// How the bands of a raw raster are interleaved.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Interleave {
@@ -71,10 +83,15 @@ macro_rules! typed {
 /// Decodes raw samples into band-major raster data.
 pub(crate) fn decode(bytes: &[u8], l: &Layout) -> Result<RasterData> {
     let size = l.data_type.size_bytes();
-    let n = l.cols * l.rows * l.bands;
+    let n = l
+        .cols
+        .checked_mul(l.rows)
+        .and_then(|v| v.checked_mul(l.bands))
+        .ok_or_else(|| Error::InvalidData("raster dimensions overflow".into()))?;
+    let need = n.checked_mul(size).ok_or_else(|| Error::InvalidData("raster byte length overflow".into()))?;
     let body = bytes.get(l.offset..).unwrap_or_default();
-    if body.len() < n * size {
-        return Err(Error::InvalidData(format!("expected {} bytes of pixels, found {}", n * size, body.len())));
+    if body.len() < need {
+        return Err(Error::InvalidData(format!("expected {need} bytes of pixels, found {}", body.len())));
     }
     macro_rules! go {
         ($t:ty, $v:ident) => {{
@@ -192,6 +209,8 @@ impl RawRaster {
 
     /// Reads every sample: the dataset as read whole.
     pub(crate) fn read(self) -> Result<RasterDataset> {
+        // What the header declares, before the samples are read (see `crate::declared`).
+        crate::declared::check_dataset(&self.header)?;
         let mut ds = self.header;
         let l = &self.window.layout;
         let all: Vec<usize> = (1..=l.bands).collect();
@@ -233,14 +252,20 @@ impl RawWindow {
         let stride = if l.interleave == Interleave::Bip { l.bands } else { 1 };
         let span = if window.width == 0 { 0 } else { ((window.width - 1) * stride + 1) * size };
         // Each row of each band read: its offset in the file and in the window, in file order.
-        let mut rows = Vec::with_capacity(window.height * bands.len());
-        for (i, &b) in bands.iter().enumerate() {
-            let stored = self.stored_bands.as_ref().and_then(|s| s.get(b - 1).copied()).unwrap_or(b - 1);
-            for r in 0..window.height {
-                let row = window.y + r;
-                let file_row = if l.bottom_up { l.rows - 1 - row } else { row };
-                let sample = l.interleave.index(stored, file_row, window.x, l.cols, l.rows, l.bands);
-                rows.push((l.offset as u64 + (sample * size) as u64, (i * window.height + r) * window.width));
+        // A window with no samples (zero width, or no bands) reads nothing, whatever its height: its
+        // rows are not listed, so a huge height cannot size the list. Otherwise every row is at
+        // most `n` (the width is at least 1), so `height * bands` is within the checked sample count.
+        let mut rows = Vec::new();
+        if n > 0 {
+            rows.reserve_exact(window.height * bands.len());
+            for (i, &b) in bands.iter().enumerate() {
+                let stored = self.stored_bands.as_ref().and_then(|s| s.get(b - 1).copied()).unwrap_or(b - 1);
+                for r in 0..window.height {
+                    let row = window.y + r;
+                    let file_row = if l.bottom_up { l.rows - 1 - row } else { row };
+                    let sample = l.interleave.index(stored, file_row, window.x, l.cols, l.rows, l.bands);
+                    rows.push((l.offset as u64 + (sample * size) as u64, (i * window.height + r) * window.width));
+                }
             }
         }
         rows.sort_unstable();
@@ -487,18 +512,18 @@ pub(crate) fn read_prj(path: &Path) -> Option<CrsInfo> {
     crs_from_text(&text)
 }
 
-/// A CRS from WKT, a PROJ string or an EPSG reference.
+/// A literal CRS from stored metadata: WKT, a PROJ string or an authority reference.
+/// Dataset text must not name a local file to read for a definition.
 pub(crate) fn crs_from_text(text: &str) -> Option<CrsInfo> {
     let text = text.trim();
     // A WKT whose outermost node carries an EPSG identifier (WKT2 `ID`, WKT1 `AUTHORITY`).
     if let Some(code) = root_epsg(text) {
-        let mut info = CrsInfo::from_epsg(code);
-        if info.wkt.is_none() {
-            info.wkt = Some(text.to_string());
-        }
-        return Some(info);
+        // The registry's WKT for the code when the stored text is wbraster's or the registry's;
+        // otherwise the stored text, as for other WKT a file holds with a code.
+        let stored = CrsInfo { epsg: Some(code), wkt: Some(text.to_string()), proj4: None };
+        return Some(CrsInfo { epsg: Some(code), wkt: crate::crs::raster_crs_wkt(&stored), proj4: None });
     }
-    let mut s = SpatialRef::parse(text).ok()?;
+    let mut s = SpatialRef::parse_literal(text).ok()?;
     if s.is_unknown() {
         return None;
     }
@@ -521,7 +546,7 @@ pub(crate) fn crs_from_text(text: &str) -> Option<CrsInfo> {
             s.epsg = None;
         }
     }
-    Some(CrsInfo { epsg: s.epsg, wkt: s.wkt.or_else(|| s.epsg.and_then(|c| wbprojection::to_ogc_wkt(c).ok())), proj4: s.proj4 })
+    Some(CrsInfo { epsg: s.epsg, wkt: s.wkt.or_else(|| s.epsg.and_then(|c| crate::crs::epsg_crs_info(c).wkt)), proj4: s.proj4 })
 }
 
 /// The EPSG code in the identifier that closes a WKT's outermost node.
@@ -575,7 +600,7 @@ fn esri_name_epsg(wkt: &str) -> Option<u32> {
 /// else its ESRI code).
 pub(crate) fn spatial_ref(crs: &CrsInfo) -> SpatialRef {
     let epsg = crs.epsg.or_else(|| crs.wkt.as_deref().and_then(crs_from_text).and_then(|c| c.epsg));
-    SpatialRef { epsg, wkt: crs.wkt.clone(), proj4: crs.proj4.clone(), esri: None }.with_esri()
+    SpatialRef { epsg, wkt: crate::crs::raster_crs_wkt(crs), proj4: crs.proj4.clone(), esri: None }.with_esri()
 }
 
 /// The CRS as WKT that GDAL recognizes.
@@ -656,6 +681,9 @@ pub(crate) struct Pam {
     pub dataset_nodata: Option<f64>,
     /// Explicit band nodata, with one-based band indices.
     pub band_nodata: Vec<(usize, f64)>,
+    /// Band color interpretations (`ColorInterp`) other than `Undefined`, with one-based band
+    /// indices, as GDAL names them: `Alpha`, `Red`...
+    pub band_color_interp: Vec<(usize, String)>,
 }
 
 /// Reads the `.aux.xml` sidecar of a dataset, if there is one.
@@ -693,9 +721,24 @@ pub(crate) fn parse_pam(xml: &str) -> Pam {
                 .collect()
         })
         .unwrap_or_default();
+    let band_color_interp: Vec<(usize, String)> = root
+        .as_ref()
+        .map(|root| {
+            root.children
+                .iter()
+                .filter(|e| e.name == "PAMRasterBand")
+                .filter_map(|e| {
+                    // GDAL keeps the file's interpretation over an `Undefined` one.
+                    let name = crate::geotiff::color_interpretation(&e.child("ColorInterp")?.text);
+                    (name != "Undefined").then_some(())?;
+                    Some((e.attr("band")?.parse::<usize>().ok()?, name.to_string()))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
     let dataset_nodata = root.as_ref().and_then(|root| root.child("NoDataValue").and_then(|e| parse_f64(&e.text)));
     let nodata = band_nodata.iter().find(|(b, _)| *b == 1).map(|(_, v)| *v).or(dataset_nodata);
-    Pam { crs, geo_transform, nodata, dataset_nodata, band_nodata }
+    Pam { crs, geo_transform, nodata, dataset_nodata, band_nodata, band_color_interp }
 }
 
 /// Records differing band nodata for TIFF, which has only one embedded nodata tag.
@@ -783,19 +826,54 @@ pub(crate) fn write_band_nodata_pam(path: &Path, values: &[Option<f64>]) -> Resu
 }
 
 /// Writes the CRS to a `.aux.xml` sidecar, as GDAL does for formats without a CRS of their own.
+/// Without a CRS, the sidecar is removed instead (see [`write_pam_with`]).
 pub(crate) fn write_pam(path: &Path, crs: &CrsInfo) -> Result<()> {
     write_pam_with(path, Some(crs), None, 0)
 }
 
-/// Writes a `.aux.xml` sidecar with a CRS and a nodata value for each of `bands` bands. Nothing
-/// is written when there is nothing to record.
+/// Writes a `.aux.xml` sidecar with a CRS and a nodata value for each of `bands` bands. When there
+/// is nothing to record, a sidecar already there is removed instead: it describes an image written
+/// earlier at `path`, and its CRS or nodata value would be read as the new image's. The sidecar is
+/// named after the whole file name, so no other image shares it.
 pub(crate) fn write_pam_with(path: &Path, crs: Option<&CrsInfo>, nodata: Option<f64>, bands: usize) -> Result<()> {
-    if let Some(xml) = pam_xml(crs, nodata, bands) {
-        let mut aux = path.as_os_str().to_owned();
-        aux.push(".aux.xml");
-        std::fs::write(aux, xml)?;
+    let mut aux = path.as_os_str().to_owned();
+    aux.push(".aux.xml");
+    match pam_xml(crs, nodata, bands) {
+        Some(xml) => std::fs::write(aux, xml)?,
+        None => match std::fs::remove_file(aux) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(pam_cleanup_error(path, e)),
+            _ => {}
+        },
     }
     Ok(())
+}
+
+/// Do not leave a newly replaced image readable beside stale PAM metadata on cleanup failure.
+/// Removing the output normally suffices. A directory may permit overwriting an existing file
+/// but not removing it; in that case truncate the writable output. Report mitigation failures too.
+fn pam_cleanup_error(path: &Path, cleanup: std::io::Error) -> Error {
+    match std::fs::metadata(path) {
+        Ok(metadata) if !metadata.is_file() => return cleanup.into(),
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return cleanup.into(),
+        Err(error) => {
+            return Error::Io(std::io::Error::new(
+                cleanup.kind(),
+                format!("{cleanup}; could not inspect the new output to invalidate it ({error})"),
+            ));
+        }
+    }
+    match std::fs::remove_file(path) {
+        Ok(()) => cleanup.into(),
+        Err(remove) if remove.kind() == std::io::ErrorKind::NotFound => cleanup.into(),
+        Err(remove) => match std::fs::OpenOptions::new().write(true).truncate(true).open(path) {
+            Ok(_) => cleanup.into(),
+            Err(invalidate) => Error::Io(std::io::Error::new(
+                cleanup.kind(),
+                format!("{cleanup}; could not remove the new output ({remove}) or invalidate it ({invalidate})"),
+            )),
+        },
+    }
 }
 
 /// The text of a `.aux.xml` sidecar with a CRS and a nodata value for each of `bands` bands;
@@ -807,7 +885,7 @@ pub(crate) fn pam_xml(crs: Option<&CrsInfo>, nodata: Option<f64>, bands: usize) 
     }
     let mut xml = String::from("<PAMDataset>\n");
     if let Some(wkt) = wkt {
-        let wkt = wkt.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;");
+        let wkt = xml_escape(&wkt);
         xml.push_str(&format!("  <SRS dataAxisToSRSAxisMapping=\"1,2\">{wkt}</SRS>\n"));
     }
     if let Some(nd) = nodata {
@@ -822,20 +900,435 @@ pub(crate) fn pam_xml(crs: Option<&CrsInfo>, nodata: Option<f64>, bands: usize) 
     Some(xml)
 }
 
-fn xml_unescape(s: &str) -> String {
+/// Decodes the five predefined XML entities.
+pub(crate) fn xml_unescape(s: &str) -> String {
     s.replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", "\"").replace("&apos;", "'").replace("&amp;", "&")
+}
+
+/// Escapes `&`, `<`, `>` and `"` for XML text and attribute values; `'` is kept, as GDAL's
+/// metadata writers keep it. [`crate::drivers::vector::xml::escape`] also escapes `'`.
+pub(crate) fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
 }
 
 /// A raster whose geotransform is GDAL's default (no georeferencing).
 pub(crate) const NO_GEOTRANSFORM: [f64; 6] = [0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
 
+/// Whether creation options leave a raster its geotransform: not with terrio's
+/// `GEOREFERENCED=NO`, given to a raster that has none (any value but `YES`, `TRUE`, `ON` or `1`,
+/// the last one given counting). Without a geotransform and without a CRS, a writer writes no
+/// georeferencing: no GeoTIFF tie point, GeoJP2 box or world file.
+pub(crate) fn georeferenced(creation_options: &[(String, String)]) -> bool {
+    creation_options
+        .iter()
+        .rev()
+        .find(|(k, _)| k.eq_ignore_ascii_case("GEOREFERENCED"))
+        .is_none_or(|(_, v)| matches!(v.to_ascii_uppercase().as_str(), "YES" | "TRUE" | "ON" | "1"))
+}
+
+/// Preserve a source's absent transform unless the output explicitly assigns one.
+pub(crate) fn keep_unreferenced(options: &mut crate::RasterWriteOptions, path: &str, present: bool) {
+    let driver = options.driver.or_else(|| crate::formats::RasterDriver::for_extension(path));
+    if matches!(
+        driver,
+        Some(
+            crate::formats::RasterDriver::GTiff
+                | crate::formats::RasterDriver::Cog
+                | crate::formats::RasterDriver::JP2
+                | crate::formats::RasterDriver::PNG
+                | crate::formats::RasterDriver::JPEG
+                | crate::formats::RasterDriver::WEBP
+        )
+    ) && !present
+        && options.geo_transform.is_none()
+        && !options.creation_options.iter().any(|(key, _)| key.eq_ignore_ascii_case("GEOREFERENCED"))
+    {
+        options.creation_options.push(("GEOREFERENCED".into(), "NO".into()));
+    }
+}
+
+/// Whether a raster written to a format that keeps its georeferencing beside the pixels (a
+/// GeoJP2 box, a world file) gets it: unless it has no geotransform (`georeferenced` false) and
+/// no CRS. A CRS alone is still written, with the raster's unit-pixel grid.
+pub(crate) fn writes_georeferencing(r: &Raster, georeferenced: bool) -> bool {
+    georeferenced || !spatial_ref(&r.crs).is_unknown()
+}
+
 /// GDAL's WKT of WGS 84 in latitude, longitude order (`SRS_WKT_WGS84_LAT_LONG`), which it gives
 /// the geolocation arrays of swaths.
 pub(crate) const WGS84_LAT_LONG_WKT: &str = "GEOGCS[\"WGS 84\",DATUM[\"WGS_1984\",SPHEROID[\"WGS 84\",6378137,298.257223563,AUTHORITY[\"EPSG\",\"7030\"]],AUTHORITY[\"EPSG\",\"6326\"]],PRIMEM[\"Greenwich\",0,AUTHORITY[\"EPSG\",\"8901\"]],UNIT[\"degree\",0.0174532925199433,AUTHORITY[\"EPSG\",\"9122\"]],AXIS[\"Latitude\",NORTH],AXIS[\"Longitude\",EAST],AUTHORITY[\"EPSG\",\"4326\"]]";
 
+/// Opens the file `path` for writing, creating it, without truncating a file already there: the
+/// writer overwrites it and ends it with [`Rewrite::finish`]. Truncating first would wait for the
+/// kernel to finish writing back the old pages, which stalls a write replacing a file written
+/// moments before; the file (its permissions, links and open handles) stays the same. A path that
+/// is not a regular file (`/dev/null`, a FIFO) is written as it was before, with no truncation.
+/// On Windows the file is still truncated when opened: a file another process maps cannot be
+/// shortened, so it is refused there, unchanged, rather than after its bytes are overwritten.
+///
+/// The file's first [`HEAD`] bytes, where formats with a signature put it (TIFF, BigTIFF, PNG,
+/// SQLite), are zeroed at once and written last, by [`Rewrite::finish`]: a write interrupted before
+/// (the process killed, the disk full) leaves no such file that opens as a raster of old and new
+/// bytes. Headerless data files rely on their header sidecar instead ([`write_headerless`]).
+pub(crate) fn create_replacing(path: impl AsRef<std::path::Path>) -> std::io::Result<Rewrite> {
+    rewrite(open_replacing(path)?)
+}
+
+/// The file `path` opened as [`create_replacing`] opens it, not yet changed (except on Windows,
+/// where the open truncates it).
+fn open_replacing(path: impl AsRef<std::path::Path>) -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new().write(true).create(true).truncate(cfg!(windows)).open(path)
+}
+
+/// [`create_replacing`] of a file [`open_replacing`] opened.
+fn rewrite(file: std::fs::File) -> std::io::Result<Rewrite> {
+    use std::io::Write;
+    let meta = file.metadata()?;
+    let regular = meta.is_file();
+    let mut rewrite = Rewrite { file, regular, finished: false, head: [0; HEAD], head_len: 0, pos: 0, end: 0, synced: false };
+    if regular && meta.len() > 0 {
+        // Dropped on a failure here, the rewrite empties the file, as for any failed write.
+        rewrite.file.write_all(&[0; HEAD][..meta.len().min(HEAD as u64) as usize])?;
+    }
+    Ok(rewrite)
+}
+
+/// The leading bytes [`Rewrite`] holds back until [`Rewrite::finish`].
+const HEAD: usize = 16;
+
+/// A file being written over ([`create_replacing`]). Dropped before [`Self::finish`] (a failed
+/// write), a regular file is emptied, so no mix of new and old bytes is left that could read as a
+/// raster.
+pub(crate) struct Rewrite {
+    file: std::fs::File,
+    /// A regular file, which can be cut to length; a device or a FIFO cannot.
+    regular: bool,
+    finished: bool,
+    /// The bytes written at offsets below [`HEAD`], written to the file by [`Self::finish`].
+    head: [u8; HEAD],
+    head_len: usize,
+    /// The writer's position.
+    pos: u64,
+    /// The end of the bytes written so far, where [`Self::finish`] ends the file if the writer
+    /// sought back from it.
+    end: u64,
+    /// Whether the file's own position is `pos` (not after a write or a seek within the head).
+    synced: bool,
+}
+
+impl Rewrite {
+    /// Ends the file at the furthest byte written (or the current position, past it), dropping what
+    /// remains of the previous file, and writes its first bytes.
+    pub(crate) fn finish(&mut self) -> std::io::Result<()> {
+        use std::io::{Seek, SeekFrom, Write};
+        if self.regular && !self.finished {
+            let end = self.pos.max(self.end);
+            self.file.seek(SeekFrom::Start(0))?;
+            self.file.write_all(&self.head[..self.head_len])?;
+            self.file.set_len(end)?;
+            self.file.seek(SeekFrom::Start(end))?;
+            self.synced = true;
+        }
+        self.finished = true;
+        Ok(())
+    }
+
+    /// Whether writes go to the file as they come: a device or FIFO, or a finished file.
+    fn direct(&self) -> bool {
+        !self.regular || self.finished
+    }
+}
+
+impl Drop for Rewrite {
+    fn drop(&mut self) {
+        if self.regular && !self.finished {
+            let _ = self.file.set_len(0);
+        }
+    }
+}
+
+impl std::io::Write for Rewrite {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        use std::io::{Seek, SeekFrom};
+        if !self.direct() && self.pos < HEAD as u64 {
+            let at = self.pos as usize;
+            let n = buf.len().min(HEAD - at);
+            self.head[at..at + n].copy_from_slice(&buf[..n]);
+            self.head_len = self.head_len.max(at + n);
+            self.pos += n as u64;
+            self.end = self.end.max(self.pos);
+            self.synced = false;
+            return Ok(n);
+        }
+        if !self.direct() && !self.synced {
+            self.file.seek(SeekFrom::Start(self.pos))?;
+            self.synced = true;
+        }
+        let n = self.file.write(buf)?;
+        self.pos += n as u64;
+        self.end = self.end.max(self.pos);
+        Ok(n)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.file.flush()
+    }
+}
+
+impl std::io::Seek for Rewrite {
+    fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+        use std::io::SeekFrom;
+        let to = match pos {
+            _ if self.direct() => self.file.seek(pos)?,
+            SeekFrom::Start(n) => n,
+            SeekFrom::Current(d) => self
+                .pos
+                .checked_add_signed(d)
+                .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "seek before the start"))?,
+            SeekFrom::End(_) => {
+                return Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "seek from the end of a file being written over"));
+            }
+        };
+        self.pos = to;
+        self.synced = self.direct();
+        Ok(to)
+    }
+}
+
+/// The header sidecar at `path` opened for writing, unchanged, to be emptied before the new data of
+/// its headerless data file is written: a write interrupted in the data then leaves no header that
+/// would open the file as a raster of old and new bytes. `None` when there is none to empty
+/// (missing, or not a regular file).
+fn open_header(path: impl AsRef<std::path::Path>) -> std::io::Result<Option<std::fs::File>> {
+    match std::fs::OpenOptions::new().write(true).open(path) {
+        Ok(f) if f.metadata()?.is_file() => Ok(Some(f)),
+        Ok(_) => Ok(None),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// [`write_replacing`] for a headerless data file at `path` whose header sidecar `header` the
+/// caller writes after it. The header, then the data file, are first opened, so a write refused
+/// there (a read-only file) leaves both as they were; the header is then emptied and the data goes
+/// over the old. Elsewhere than on Windows the data file opens unchanged, so the
+/// header is emptied before any of its bytes change; on Windows that open truncates it, as
+/// [`create_replacing`] does, so a data file another process maps is refused before the header
+/// is emptied.
+pub(crate) fn write_headerless(
+    path: impl AsRef<std::path::Path>,
+    header: impl AsRef<std::path::Path>,
+    bytes: impl AsRef<[u8]>,
+) -> std::io::Result<()> {
+    use std::io::Write;
+    let header = open_header(header)?;
+    // One open for the probe and the write: a second would wait on a FIFO whose reader left.
+    let data = open_replacing(path)?;
+    if let Some(f) = header {
+        f.set_len(0)?;
+    }
+    let mut file = rewrite(data)?;
+    file.write_all(bytes.as_ref())?;
+    file.finish()
+}
+
+/// [`std::fs::write`] through [`create_replacing`]: `bytes` written over the file at `path`.
+pub(crate) fn write_replacing(path: impl AsRef<std::path::Path>, bytes: impl AsRef<[u8]>) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut file = create_replacing(path)?;
+    file.write_all(bytes.as_ref())?;
+    file.finish()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A window with no samples reads nothing, however tall it is: a huge height does not size its
+    /// row list (the fuzzer's `raster_headers` target found this as a capacity overflow).
+    #[test]
+    fn a_window_without_samples_reads_nothing_however_tall() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("raw.bin");
+        std::fs::write(&path, [0u8; 4]).unwrap();
+        let window = RawWindow {
+            source: RawSource::File(path),
+            layout: Layout {
+                cols: 2,
+                rows: 2,
+                bands: 1,
+                data_type: DataType::U8,
+                little_endian: true,
+                interleave: Interleave::Bsq,
+                offset: 0,
+                bottom_up: false,
+            },
+            stored_bands: None,
+            inputs: Vec::new(),
+        };
+        let data = window.read_window(crate::Window { x: 0, y: 0, width: 0, height: usize::MAX / 2 }, &[1]).unwrap();
+        assert!(matches!(&data, RasterData::U8(samples) if samples.is_empty()));
+    }
+
+    /// A WKT whose root names an EPSG code is kept as stored, not replaced by the registry's text,
+    /// unless the stored text is the registry's or wbraster's generated WKT.
+    #[test]
+    fn a_root_epsg_wkt_keeps_its_stored_text() {
+        let stored = "GEOGCS[\"my WGS 84\",DATUM[\"WGS_1984\",SPHEROID[\"WGS 84\",6378137,298.257223563]],\
+            PRIMEM[\"Greenwich\",0],UNIT[\"degree\",0.0174532925199433],AUTHORITY[\"EPSG\",\"4326\"]]";
+        let info = crs_from_text(stored).unwrap();
+        assert_eq!(info.epsg, Some(4326));
+        assert_eq!(info.wkt.as_deref(), Some(stored));
+    }
+
+    /// Until finished, a file written over holds zeros where its signature goes, so an interrupted
+    /// write leaves nothing that opens as a raster; a patch of the header lands in the held bytes.
+    #[test]
+    fn a_rewrite_writes_its_signature_last() {
+        use std::io::{Seek, SeekFrom, Write};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("old.tif");
+        std::fs::write(&path, [b"II*\0".as_slice(), &[7u8; 60]].concat()).unwrap();
+        let mut w = create_replacing(&path).unwrap();
+        w.write_all(b"II*\0\0\0\0\0").unwrap();
+        w.write_all(&[1u8; 24]).unwrap();
+        let on_disk = std::fs::read(&path).unwrap();
+        assert_eq!(&on_disk[..HEAD], &[0u8; HEAD]);
+        assert_eq!(&on_disk[HEAD..32], &[1u8; 16]);
+        w.seek(SeekFrom::Start(4)).unwrap();
+        w.write_all(&[9, 0, 0, 0]).unwrap();
+        w.seek(SeekFrom::Start(32)).unwrap();
+        w.finish().unwrap();
+        let mut want = b"II*\0\x09\0\0\0".to_vec();
+        want.extend([1u8; 24]);
+        assert_eq!(std::fs::read(&path).unwrap(), want);
+    }
+
+    /// A header sidecar is emptied before its data file is written over; a missing one is fine.
+    #[test]
+    fn clearing_a_header_empties_it_and_skips_a_missing_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let (bin, hdr) = (dir.path().join("a.bin"), dir.path().join("a.hdr"));
+        std::fs::write(&hdr, "NROWS 2\nNCOLS 2\n").unwrap();
+        write_headerless(&bin, &hdr, [2u8; 4]).unwrap();
+        assert_eq!(std::fs::metadata(&hdr).unwrap().len(), 0);
+        let missing = dir.path().join("missing.hdr");
+        write_headerless(&bin, &missing, [3u8; 4]).unwrap();
+        assert_eq!(std::fs::read(&bin).unwrap(), [3u8; 4]);
+        assert!(!missing.exists());
+    }
+
+    /// A data file that cannot be opened for writing, or a header that cannot be emptied, leaves
+    /// both as they were, so the old raster still opens; writable ones get the new data and an
+    /// emptied header (written again after).
+    #[test]
+    fn a_refused_data_file_or_header_keeps_both() {
+        let dir = tempfile::tempdir().unwrap();
+        let (bin, hdr) = (dir.path().join("a.bin"), dir.path().join("a.hdr"));
+        std::fs::write(&bin, [1u8; 4]).unwrap();
+        std::fs::write(&hdr, "NROWS 2\nNCOLS 2\n").unwrap();
+        let read_only = |path: &std::path::Path, on: bool| {
+            let mut perms = std::fs::metadata(path).unwrap().permissions();
+            #[allow(clippy::permissions_set_readonly_false)]
+            perms.set_readonly(on);
+            std::fs::set_permissions(path, perms).unwrap();
+        };
+        for refused in [&bin, &hdr] {
+            read_only(refused, true);
+            if std::fs::OpenOptions::new().write(true).open(refused).is_ok() {
+                return; // root, or a file system ignoring permissions: nothing is refused
+            }
+            assert!(write_headerless(&bin, &hdr, [2u8; 4]).is_err());
+            assert_eq!(std::fs::read_to_string(&hdr).unwrap(), "NROWS 2\nNCOLS 2\n");
+            assert_eq!(std::fs::read(&bin).unwrap(), [1u8; 4]);
+            read_only(refused, false);
+        }
+        write_headerless(&bin, &hdr, [2u8; 4]).unwrap();
+        assert_eq!(std::fs::read(&bin).unwrap(), [2u8; 4]);
+        assert_eq!(std::fs::metadata(&hdr).unwrap().len(), 0);
+    }
+
+    /// On Windows a file written over is truncated when it is opened, as `File::create` did: a file
+    /// another process maps cannot be shortened, so it is refused there before any byte changes.
+    #[cfg(windows)]
+    #[test]
+    fn a_rewrite_on_windows_truncates_at_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let (bin, hdr) = (dir.path().join("a.bil"), dir.path().join("a.hdr"));
+        std::fs::write(&bin, vec![7u8; 1000]).unwrap();
+        let rewrite = create_replacing(&bin).unwrap();
+        assert_eq!(std::fs::metadata(&bin).unwrap().len(), 0);
+        drop(rewrite);
+        std::fs::write(&bin, vec![7u8; 1000]).unwrap();
+        std::fs::write(&hdr, "NROWS 1\n").unwrap();
+        write_headerless(&bin, &hdr, [2u8; 4]).unwrap();
+        assert_eq!(std::fs::read(&bin).unwrap(), [2u8; 4]);
+    }
+
+    /// A writer that seeks back to patch earlier bytes and finishes there keeps what it wrote past
+    /// that point: the file ends at the furthest byte written.
+    #[test]
+    fn a_rewrite_finished_after_seeking_back_keeps_its_end() {
+        use std::io::{Seek, SeekFrom, Write};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("old.bin");
+        std::fs::write(&path, vec![7u8; 100]).unwrap();
+        let mut w = create_replacing(&path).unwrap();
+        w.write_all(&[1u8; 40]).unwrap();
+        w.seek(SeekFrom::Start(20)).unwrap();
+        w.write_all(&[2u8; 2]).unwrap();
+        w.finish().unwrap();
+        let mut want = vec![1u8; 40];
+        want[20..22].copy_from_slice(&[2, 2]);
+        assert_eq!(std::fs::read(&path).unwrap(), want);
+    }
+
+    /// A headerless raster written to a FIFO opens it once: a reader sees all of its bytes, not the
+    /// end of file a second open would leave it waiting after.
+    #[cfg(unix)]
+    #[test]
+    fn a_headerless_raster_streams_to_a_fifo_through_one_open() {
+        use std::io::Read;
+        let dir = tempfile::tempdir().unwrap();
+        let (fifo, hdr) = (dir.path().join("a.bil"), dir.path().join("a.hdr"));
+        assert!(std::process::Command::new("mkfifo").arg(&fifo).status().unwrap().success());
+        let reader = {
+            let fifo = fifo.clone();
+            std::thread::spawn(move || {
+                let mut bytes = Vec::new();
+                std::fs::File::open(fifo).unwrap().read_to_end(&mut bytes).unwrap();
+                bytes
+            })
+        };
+        let (done, wrote) = std::sync::mpsc::channel();
+        std::thread::spawn(move || done.send(write_headerless(&fifo, &hdr, [5u8; 8]).is_ok()));
+        assert_eq!(wrote.recv_timeout(std::time::Duration::from_secs(10)), Ok(true), "the write did not end");
+        assert_eq!(reader.join().unwrap(), [5u8; 8]);
+    }
+
+    /// A device is written over as before, with no truncation to fail on.
+    #[cfg(unix)]
+    #[test]
+    fn writes_replacing_a_device_need_no_truncation() {
+        write_replacing("/dev/null", b"terrio").unwrap();
+    }
+
+    #[test]
+    fn a_rewrite_dropped_unfinished_is_emptied() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("old.tif");
+        std::fs::write(&path, vec![7u8; 1000]).unwrap();
+        let mut rewrite = create_replacing(&path).unwrap();
+        rewrite.write_all(b"new").unwrap();
+        drop(rewrite);
+        assert_eq!(std::fs::read(&path).unwrap(), b"");
+        std::fs::write(&path, vec![7u8; 1000]).unwrap();
+        let mut rewrite = create_replacing(&path).unwrap();
+        rewrite.write_all(b"new").unwrap();
+        rewrite.finish().unwrap();
+        drop(rewrite);
+        assert_eq!(std::fs::read(&path).unwrap(), b"new");
+    }
 
     #[test]
     fn pam_nodata_preserves_dataset_fallback_and_other_xml() {
@@ -848,7 +1341,7 @@ mod tests {
             "<PAMDataset>{metadata}<PAMRasterBand band=\"1\"><Description>band</Description><NoDataValue>-1</NoDataValue></PAMRasterBand><PAMRasterBand band=\"2\"/></PAMDataset>"
         );
         let dir = tempfile::tempdir().unwrap();
-        let mount = crate::memfs::Mount::new(Vec::new());
+        let mount = crate::memfs::Mount::new(Vec::new()).unwrap();
         for root in [dir.path(), mount.path()] {
             let path = root.join("output.tif");
             let aux = root.join("output.tif.aux.xml");
@@ -1117,7 +1610,7 @@ mod band_pam_tests {
     #[test]
     fn updates_disk_and_virtual_pam_without_reordering_mixed_content() {
         let dir = tempfile::tempdir().unwrap();
-        let mount = crate::memfs::Mount::new([]);
+        let mount = crate::memfs::Mount::new([]).unwrap();
         for root in [dir.path(), mount.path()] {
             let path = root.join("raster.tif");
             let aux = root.join("raster.tif.aux.xml");
@@ -1153,4 +1646,40 @@ mod dataset_pam_fallback_tests {
         super::super::nodata::apply(pam, &mut ds);
         assert_eq!(ds.band_nodata, vec![Some(-10.), Some(-20.)]);
     }
+
+    #[test]
+    fn band_color_interpretations_apply_but_undefined_ones_do_not() {
+        // As GDAL 3.13 reads them: names in any case, `Undefined` and bands beyond the raster's
+        // left out.
+        let pam = super::parse_pam(
+            "<PAMDataset><PAMRasterBand band=\"1\"><ColorInterp>Undefined</ColorInterp></PAMRasterBand><PAMRasterBand band=\"2\"><ColorInterp>alpha</ColorInterp></PAMRasterBand><PAMRasterBand band=\"3\"><ColorInterp>Red</ColorInterp></PAMRasterBand></PAMDataset>",
+        );
+        assert_eq!(pam.band_color_interp, vec![(2, "Alpha".to_string()), (3, "Red".to_string())]);
+        let mut ds = crate::ops::build_raster(
+            crate::ops::Grid { width: 1, height: 1, geo_transform: [0., 1., 0., 1., 0., -1.] },
+            vec![vec![1.], vec![2.]],
+            wbraster::DataType::F64,
+            None,
+            &Default::default(),
+            crate::ops::convert_value,
+        )
+        .unwrap();
+        super::super::nodata::apply(pam, &mut ds);
+        let colors: Vec<Option<&str>> = ds.band_metadata.iter().map(|b| b.color_interp.as_deref()).collect();
+        assert_eq!(colors, [None, Some("Alpha")]);
+    }
+}
+
+/// `/proc/self/fd` is not unlinkable but its regular-file target can still be truncated.
+#[cfg(all(test, target_os = "linux"))]
+#[test]
+fn failed_pam_cleanup_invalidates_an_output_that_cannot_be_unlinked() {
+    use std::io::Write;
+    use std::os::fd::AsRawFd;
+    let mut output = tempfile::tempfile().unwrap();
+    output.write_all(b"new image with stale metadata").unwrap();
+    let path = std::path::PathBuf::from(format!("/proc/self/fd/{}", output.as_raw_fd()));
+    let error = pam_cleanup_error(&path, std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+    assert!(matches!(error, Error::Io(e) if e.kind() == std::io::ErrorKind::PermissionDenied));
+    assert_eq!(output.metadata().unwrap().len(), 0);
 }

@@ -91,6 +91,11 @@ enum Command {
     Formats(cmd::formats::Args),
     /// Describe a CRS, or transform coordinates between two.
     Crs(cmd::crs::Args),
+    /// List the registry CRSs terrio resolves.
+    ///
+    /// The EPSG, ESRI and IAU_2015 CRSs, as `projinfo --list-crs` lists them, filtered by
+    /// authority, kind and words of the name or code; no network or PROJ needed.
+    ListCrs(cmd::crs::ListArgs),
     /// Burn vector geometries into a raster.
     Rasterize(cmd::rasterize::Args),
     /// Turn a raster band into polygons.
@@ -286,6 +291,10 @@ enum Command {
     Catalog(cmd::catalog::Args),
     /// Create a raster footprint index, with optional GTI metadata.
     RasterIndex(cmd::tile_index::RasterArgs),
+    /// Draw a raster or vector dataset as a PNG or in the terminal.
+    ///
+    /// Reads only the overview or rows the image needs, so large remote files are quick to preview.
+    Preview(cmd::preview::Args),
     /// Generate separate XYZ/TMS raster tiles in a directory.
     Tile(cmd::raster_tile::Args),
     /// Retile mosaics into overlapping files and pyramids.
@@ -316,7 +325,7 @@ enum Command {
     ///
     /// Combines panchromatic and spectral bands.
     Pansharpen(cmd::pansharpen::Args),
-    /// Single-observer visibility or minimum visible height.
+    /// Single or cumulative viewsheds and minimum visible height.
     ///
     /// Like gdal_viewshed.
     Viewshed(cmd::viewshed::Args),
@@ -419,6 +428,12 @@ enum Command {
     /// Serves a page on 127.0.0.1, with a form for every command, a file picker and the equivalent
     /// command line. Commands run on this computer as you; stop the server with Ctrl-C.
     Ui(ui::Args),
+    /// Pan and zoom a raster or vector dataset in your browser.
+    ///
+    /// Serves a map on 127.0.0.1 and draws the parts on screen as they are needed, so large and
+    /// remote datasets stay quick. It shows the data alone in its own grid, with no basemap. Stop
+    /// the server with Ctrl-C.
+    View(ui::ViewArgs),
 }
 
 /// Runs the command line `args` (the program name first) and returns the process exit code: 0 on
@@ -454,6 +469,7 @@ const STACK_SIZE: usize = 8 << 20;
 /// [`run_as`], on the calling thread.
 fn run_on_this_thread(args: Vec<OsString>, terrio: Option<Vec<OsString>>) -> i32 {
     let args = cmd::calc::rewrite_args(args);
+    let args = cmd::translate::rewrite_args(args);
     if let Some(catalog) = usage::requested(&args) {
         use std::io::Write;
         if let Err(error) = writeln!(std::io::stdout(), "{}", serde_json::to_string_pretty(&catalog).expect("JSON command catalog"))
@@ -476,6 +492,11 @@ fn run_on_this_thread(args: Vec<OsString>, terrio: Option<Vec<OsString>>) -> i32
         eprintln!("JSON usage is not available for this command");
         return 2;
     }
+    // MCP definitions come from a client: retain the host's grid directories without
+    // permitting a definition to name an arbitrary grid file outside that lookup policy.
+    if std::env::var_os("TERRIO_MCP_TOOL").is_some() {
+        terrio::crs::confine_grid_search_paths();
+    }
     let result = match cli.command {
         Command::Info(a) => cmd::info::run(a),
         Command::RpftocCreate(a) => cmd::rpftoc::run(&a),
@@ -495,6 +516,7 @@ fn run_on_this_thread(args: Vec<OsString>, terrio: Option<Vec<OsString>>) -> i32
         Command::Convert(a) => cmd::convert::run(a),
         Command::Formats(a) => cmd::formats::run(a),
         Command::Crs(a) => cmd::crs::run(a),
+        Command::ListCrs(a) => cmd::crs::list(a),
         Command::Rasterize(a) => cmd::rasterize::run(a),
         Command::Polygonize(a) => cmd::polygonize::run(a),
         Command::Centroid(a) => cmd::processing::centroid(a),
@@ -544,6 +566,7 @@ fn run_on_this_thread(args: Vec<OsString>, terrio: Option<Vec<OsString>>) -> i32
         Command::AttachPalette(a) => cmd::palette::attach(a),
         Command::Warp(a) => cmd::warp::run(a),
         Command::Catalog(a) => cmd::catalog::run(a),
+        Command::Preview(a) => cmd::preview::run(a),
         Command::Tile(a) => cmd::raster_tile::run(&a),
         Command::Retile(a) => cmd::raster_retile::run(a),
         Command::RasterIndex(a) | Command::GtiCreate(a) => cmd::tile_index::raster(a),
@@ -576,6 +599,7 @@ fn run_on_this_thread(args: Vec<OsString>, terrio: Option<Vec<OsString>>) -> i32
         Command::Vsi(a) => cmd::vsi::run(a),
         Command::Mcp => serve_mcp(terrio),
         Command::Ui(a) => serve_ui(a, terrio),
+        Command::View(a) => ui::view(a),
     };
     for w in terrio::warnings::take() {
         eprintln!("terrio: warning: {w}");

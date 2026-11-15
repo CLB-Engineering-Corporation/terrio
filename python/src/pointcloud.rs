@@ -244,8 +244,8 @@ pub(crate) fn convert_points(
 ) -> PyResult<()> {
     let options = pointcloud::ConvertOptions {
         read: read_options(bounds, z_range, classes, returns, max_level, resolution, max_points)?,
-        assign_srs: a_srs.map(SpatialRef::parse).transpose().py()?,
-        target_srs: t_srs.map(SpatialRef::parse).transpose().py()?,
+        assign_srs: a_srs.map(SpatialRef::parse_literal).transpose().py()?,
+        target_srs: t_srs.map(SpatialRef::parse_literal).transpose().py()?,
         write: PointWriteOptions {
             point_format,
             minor_version,
@@ -312,8 +312,8 @@ pub(crate) fn append_points(
 ) -> PyResult<()> {
     let options = pointcloud::ConvertOptions {
         read: read_options(bounds, z_range, classes, returns, None, None, None)?,
-        assign_srs: a_srs.map(SpatialRef::parse).transpose().py()?,
-        target_srs: t_srs.map(SpatialRef::parse).transpose().py()?,
+        assign_srs: a_srs.map(SpatialRef::parse_literal).transpose().py()?,
+        target_srs: t_srs.map(SpatialRef::parse_literal).transpose().py()?,
         write: PointWriteOptions { copc_leaf_points: leaf_points, copc_memory_points: memory_points, ..Default::default() },
         chunk_points,
         append: true,
@@ -645,7 +645,7 @@ pub(crate) fn grid_points(
 ) -> PyResult<crate::raster::PyRaster> {
     let options = grid_options(resolution, method, stat, dimension, radius, power, window_size, bin_mode, bounds, nodata, ot)?;
     let read = read_options(None, None, classes, returns, None, None, None)?;
-    let srs = a_srs.map(SpatialRef::parse).transpose().py()?;
+    let srs = a_srs.map(SpatialRef::parse_literal).transpose().py()?;
     let ds = py
         .detach_result(|| {
             let mut r = pointcloud::open_points(path)?;
@@ -729,7 +729,7 @@ impl PyPointCloud {
                 d.values = d.values.cast(t);
             }
         }
-        let crs = crs.map(SpatialRef::parse).transpose().py()?.unwrap_or_default();
+        let crs = crs.map(SpatialRef::parse_literal).transpose().py()?.unwrap_or_default();
         Ok(Self { inner: pointcloud::from_dimensions(dims, crs) })
     }
 
@@ -815,13 +815,14 @@ impl PyPointCloud {
     #[pyo3(signature = (*, bounds=None, z_range=None, classes=None, returns=None))]
     fn filter(
         &self,
+        py: Python<'_>,
         bounds: Option<(f64, f64, f64, f64)>,
         z_range: Option<(f64, f64)>,
         classes: Option<Vec<u8>>,
         returns: Option<Vec<String>>,
     ) -> PyResult<Self> {
         let o = read_options(bounds, z_range, classes, returns, None, None, None)?;
-        Ok(Self { inner: self.inner.filter(&o.filter) })
+        Ok(Self { inner: py.detach_result(|| Ok(self.inner.filter(&o.filter))).py()? })
     }
 
     /// Reprojects the points into another CRS: `x` and `y`, and `z` when both CRSs have heights
@@ -833,7 +834,7 @@ impl PyPointCloud {
     /// Returns:
     ///     PointCloud: The reprojected points.
     fn reproject(&self, py: Python<'_>, crs: &str) -> PyResult<Self> {
-        let dst = SpatialRef::parse(crs).py()?;
+        let dst = SpatialRef::parse_literal(crs).py()?;
         let mut inner = self.inner.clone();
         crate::with_warnings(py, || inner.reproject(&dst))?;
         Ok(Self { inner })
@@ -964,9 +965,9 @@ impl PyPointCloud {
     ///
     /// Returns:
     ///     PointCloud: The points that pass.
-    fn range(&self, limits: &str) -> PyResult<Self> {
+    fn range(&self, py: Python<'_>, limits: &str) -> PyResult<Self> {
         let ranges = DimRange::parse_list(limits).py()?;
-        Ok(Self { inner: filters::range(&self.inner, &ranges).py()? })
+        Ok(Self { inner: py.detach_result(|| filters::range(&self.inner, &ranges)).py()? })
     }
 
     /// Poisson sampling, as PDAL's `filters.sample`: keeps each point, in order, at least
@@ -1294,7 +1295,7 @@ impl PyPointCloud {
             points: points.unwrap_or_default(),
             distance,
             outside,
-            a_srs: a_srs.map(SpatialRef::parse).transpose().py()?,
+            a_srs: a_srs.map(SpatialRef::parse_literal).transpose().py()?,
         };
         Ok(Self { inner: py.detach_result(|| filters::crop(&self.inner, &o)).py()? })
     }
@@ -1676,13 +1677,13 @@ impl PyPointCloud {
     /// Returns:
     ///     PointCloud: The point.
     #[pyo3(signature = (dimension, *, minmax="max"))]
-    fn locate(&self, dimension: &str, minmax: &str) -> PyResult<Self> {
+    fn locate(&self, py: Python<'_>, dimension: &str, minmax: &str) -> PyResult<Self> {
         let min = match minmax.to_ascii_lowercase().as_str() {
             "min" => true,
             "max" => false,
             _ => return Err(invalid(format!("invalid minmax '{minmax}': use min or max"))),
         };
-        Ok(Self { inner: filters::locate(&self.inner, dimension, min).py()? })
+        Ok(Self { inner: py.detach_result(|| filters::locate(&self.inner, dimension, min)).py()? })
     }
 
     /// The points within the interquartile fences of a dimension, as PDAL's `filters.iqr`.
@@ -1694,8 +1695,8 @@ impl PyPointCloud {
     /// Returns:
     ///     PointCloud: The points kept.
     #[pyo3(signature = (dimension, *, k=1.5))]
-    fn iqr(&self, dimension: &str, k: f64) -> PyResult<Self> {
-        Ok(Self { inner: filters::iqr(&self.inner, dimension, k).py()? })
+    fn iqr(&self, py: Python<'_>, dimension: &str, k: f64) -> PyResult<Self> {
+        Ok(Self { inner: py.detach_result(|| filters::iqr(&self.inner, dimension, k)).py()? })
     }
 
     /// The points within `k` median absolute deviations of the median of a dimension, as
@@ -1709,8 +1710,8 @@ impl PyPointCloud {
     /// Returns:
     ///     PointCloud: The points kept.
     #[pyo3(signature = (dimension, *, k=2.0, mad_multiplier=1.4862))]
-    fn mad(&self, dimension: &str, k: f64, mad_multiplier: f64) -> PyResult<Self> {
-        Ok(Self { inner: filters::mad(&self.inner, dimension, k, mad_multiplier).py()? })
+    fn mad(&self, py: Python<'_>, dimension: &str, k: f64, mad_multiplier: f64) -> PyResult<Self> {
+        Ok(Self { inner: py.detach_result(|| filters::mad(&self.inner, dimension, k, mad_multiplier)).py()? })
     }
 
     /// The points within a range of a raster's values, as PDAL's `filters.dem`; the raster is
@@ -1726,7 +1727,7 @@ impl PyPointCloud {
     ///     PointCloud: The points kept.
     #[pyo3(signature = (raster, limits, *, band=1))]
     fn dem(&self, py: Python<'_>, raster: &Bound<'_, PyAny>, limits: &str, band: usize) -> PyResult<Self> {
-        let ds = raster_arg(raster)?;
+        let ds = raster_arg(py, raster)?;
         let limits = DimRange::parse(limits).py()?;
         Ok(Self { inner: py.detach_result(|| filters::dem(&self.inner, &ds, &limits, band)).py()? })
     }
@@ -1743,7 +1744,7 @@ impl PyPointCloud {
     ///     PointCloud: The points, with the values.
     #[pyo3(signature = (raster, *, dimensions=None))]
     fn colorization(&self, py: Python<'_>, raster: &Bound<'_, PyAny>, dimensions: Option<&Bound<'_, PyAny>>) -> PyResult<Self> {
-        let ds = raster_arg(raster)?;
+        let ds = raster_arg(py, raster)?;
         let spec = strings(dimensions)?.join(",");
         let dims = if spec.trim().is_empty() { BandDimension::rgb() } else { BandDimension::parse_list(&spec).py()? };
         Ok(Self { inner: py.detach_result(|| filters::colorization(&self.inner, &ds, &dims)).py()? })
@@ -1860,9 +1861,9 @@ impl PyPointCloud {
     /// Returns:
     ///     Layer: The layer.
     #[pyo3(signature = (dimensions=None, name=None))]
-    fn to_layer(&self, dimensions: Option<Vec<String>>, name: Option<String>) -> PyResult<crate::vector::PyLayer> {
+    fn to_layer(&self, py: Python<'_>, dimensions: Option<Vec<String>>, name: Option<String>) -> PyResult<crate::vector::PyLayer> {
         let options = pointcloud::vector::ToLayerOptions { name, dimensions: dimensions.unwrap_or_default(), two_d: false };
-        Ok(crate::vector::PyLayer::from(pointcloud::vector::to_layer(&self.inner, &options).py()?))
+        Ok(crate::vector::PyLayer::from(py.detach_result(|| pointcloud::vector::to_layer(&self.inner, &options)).py()?))
     }
 
     fn __repr__(&self) -> String {
@@ -1894,12 +1895,16 @@ fn write_options(
 
 /// A string or a list of strings, as a list.
 /// A raster given as a path or a `Raster`, whole in memory.
-fn raster_arg(v: &Bound<'_, PyAny>) -> PyResult<terrio::RasterDataset> {
+fn raster_arg(py: Python<'_>, v: &Bound<'_, PyAny>) -> PyResult<terrio::RasterDataset> {
     if let Ok(path) = v.extract::<String>() {
-        return terrio::open_raster(&path).py();
+        return py.detach_result(|| terrio::open_raster(&path)).py();
     }
-    let mut r = v.extract::<PyRefMut<'_, crate::raster::PyRaster>>()?;
-    r.with_dataset(|ds| Ok(ds.clone())).py()
+    let mut shared = v.extract::<PyRefMut<'_, crate::raster::PyRaster>>()?.inner.shared();
+    py.detach_result(|| match shared.dataset() {
+        Some(ds) => Ok(ds.clone()),
+        None => shared.read(),
+    })
+    .py()
 }
 
 /// A vector layer given as a path (its layer `layer`, or the first), a `Layer` or a
@@ -1913,7 +1918,7 @@ fn layer_arg(py: Python<'_>, v: &Bound<'_, PyAny>, layer: Option<String>) -> PyR
     };
     if let Ok(path) = v.extract::<String>() {
         let options = terrio::VectorOpenOptions { layers: layer.iter().cloned().collect(), ..Default::default() };
-        return pick(terrio::open_vector(&path, &options).py()?.layers);
+        return pick(py.detach_result(|| terrio::open_vector(&path, &options)).py()?.layers);
     }
     if let Ok(l) = v.extract::<PyRef<'_, crate::vector::PyLayer>>() {
         return Ok(l.inner.clone());
@@ -1941,9 +1946,9 @@ fn strings(v: Option<&Bound<'_, PyAny>>) -> PyResult<Vec<String>> {
 /// Returns:
 ///     PointCloud: The points of all.
 #[pyfunction]
-pub(crate) fn merge_points(clouds: Vec<PyRef<'_, PyPointCloud>>) -> PyResult<PyPointCloud> {
+pub(crate) fn merge_points(py: Python<'_>, clouds: Vec<PyRef<'_, PyPointCloud>>) -> PyResult<PyPointCloud> {
     let clouds: Vec<pointcloud::PointCloud> = clouds.iter().map(|c| c.inner.clone()).collect();
-    Ok(PyPointCloud { inner: filters::merge(&clouds).py()? })
+    Ok(PyPointCloud { inner: py.detach_result(|| filters::merge(&clouds)).py()? })
 }
 
 /// Registers the point cloud functions and classes.

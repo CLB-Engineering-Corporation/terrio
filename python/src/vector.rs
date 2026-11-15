@@ -18,10 +18,32 @@ pub struct PyLayer {
 /// A dataset's shared styles: each id with its OGR style string.
 pub(crate) type StyleTable = std::sync::Arc<Vec<(String, String)>>;
 
+/// The shared GeoJSON writer's naming policy for a dataframe's CRS.
+///
+/// Args:
+///     crs: The dataframe's WKT definition.
+///
+/// Returns:
+///     str | None: Its GeoJSON CRS name, omitted for WGS 84 or an unknown CRS.
+///
+/// Raises:
+///     UnsupportedError: The retained definition cannot be named in GeoJSON.
+#[pyfunction(name = "_geojson_crs_name")]
+pub(crate) fn geojson_crs_name(crs: &str) -> PyResult<Option<String>> {
+    let mut layer = Layer::new("crs");
+    SpatialRef::parse_literal(crs).py()?.apply_to_layer(&mut layer);
+    terrio::GeoJsonOptions::default().crs_name(&layer).py()
+}
+
 impl From<Layer> for PyLayer {
     fn from(inner: Layer) -> Self {
         Self { inner, style_table: StyleTable::default() }
     }
+}
+
+/// Apply the same optional consumer-side parser as pyogrio without changing stored CRS.
+pub(crate) fn dataframe_crs(py: Python<'_>, crs: Option<&str>, fallback: Option<&str>, normalize: bool) -> PyResult<Option<String>> {
+    py.import("terrio._crs")?.call_method1("dataframe_crs", (crs, normalize, fallback))?.extract()
 }
 
 impl PyLayer {
@@ -117,7 +139,7 @@ impl PyVectorDataset {
 }
 
 /// Converts an attribute value to a Python object.
-fn value_to_py<'py>(py: Python<'py>, v: &FieldValue) -> PyResult<Bound<'py, PyAny>> {
+pub(crate) fn value_to_py<'py>(py: Python<'py>, v: &FieldValue) -> PyResult<Bound<'py, PyAny>> {
     Ok(match v {
         FieldValue::Integer(i) => i.into_pyobject(py)?.into_any(),
         FieldValue::Float(f) => f.into_pyobject(py)?.into_any(),
@@ -133,7 +155,7 @@ fn layer_from_geojson_text(text: &str, name: Option<&str>, crs: Option<&str>) ->
     let mut layer = terrio::memory::parse_geojson_layer(text.as_bytes(), "layer").py()?;
     layer.name = name.unwrap_or("layer").to_string();
     let crs = match crs {
-        Some(c) => SpatialRef::parse(c).py()?,
+        Some(c) => SpatialRef::parse_literal(c).py()?,
         None => SpatialRef::from_epsg(4326).py()?,
     };
     layer.set_crs_epsg(crs.epsg);
@@ -304,14 +326,16 @@ impl PyLayer {
     /// Converts the layer to a GeoDataFrame, through WKB geometries. Needs geopandas.
     ///
     /// Returns:
-    ///     geopandas.GeoDataFrame: The features, with the layer's CRS.
+    ///     geopandas.GeoDataFrame: The features, with the layer's CRS when usable.
+    ///         An unparseable definition is omitted with a warning.
     ///
     /// Raises:
     ///     ImportError: If geopandas is not installed.
     fn to_geopandas<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let gpd = py.import("geopandas")?;
         let kwargs = PyDict::new(py);
-        kwargs.set_item("crs", self.crs_wkt().map(|w| SpatialRef::from_layer(&self.inner).authority_code().unwrap_or(w)))?;
+        let crs = crs_string(&SpatialRef::from_layer(&self.inner));
+        kwargs.set_item("crs", dataframe_crs(py, crs.as_deref(), self.inner.crs_wkt(), true)?)?;
         let geometry = gpd.getattr("GeoSeries")?.call_method("from_wkb", (self.to_wkb(py)?,), Some(&kwargs))?;
         let kwargs = PyDict::new(py);
         kwargs.set_item("geometry", geometry)?;
@@ -399,7 +423,7 @@ impl PyLayer {
     /// Raises:
     ///     CRSError: If a CRS is unknown or cannot be parsed.
     fn to_crs(&self, py: Python<'_>, crs: &str) -> PyResult<Self> {
-        let dst = SpatialRef::parse(crs).py()?;
+        let dst = SpatialRef::parse_literal(crs).py()?;
         let inner = &self.inner;
         Ok(Self { inner: py.detach_result(|| terrio::vector::reproject_layer(inner, &dst)).py()?, style_table: self.style_table.clone() })
     }
@@ -455,7 +479,7 @@ impl PyLayer {
         options.citygml_lod0_surface = crate::ops::parse_citygml_lod0_surface(citygml_lod0_surface)?;
         options.kmz.resources = kmz_resources.into_iter().flatten().map(|(path, bytes)| (path, bytes.to_vec())).collect();
         let layer = self.prepare_write(&mut options, style_table, path);
-        py.detach_result(|| terrio::write_vector(std::slice::from_ref(layer.as_ref()), path, &options)).py()
+        crate::with_warnings(py, || terrio::write_vector(std::slice::from_ref(layer.as_ref()), path, &options))
     }
 
     /// Encodes the layer in a file format, in memory.
@@ -475,6 +499,10 @@ impl PyLayer {
     ///     return a ZIP archive (MIME `application/zip`) with geometry, index, attributes,
     ///     encoding and CRS members. Bare `.shp` names and unsupported DBF values
     ///     (including text over 254 UTF-8 bytes) raise an error.
+    ///     GML is a standalone XML document without its XSD sidecar. Readers infer
+    ///     field types, so typed round trips (including Integer64, dates and booleans)
+    ///     are not guaranteed. Use filesystem writing to retain the schema. Native MapInfo
+    ///     output requires `.mif.zip` or `.tab.zip`; bare `.mif` and `.tab` are refused.
     #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (filename="layer.geojson", driver=None, *, kmz_resources=None, style_table=None, preserve_declared_geometry_type=false, cityjson_version=None, citygml_version=None, citygml_lod0_surface=None))]
     fn to_bytes<'py>(
@@ -497,7 +525,7 @@ impl PyLayer {
         options.kmz.resources = kmz_resources.into_iter().flatten().map(|(path, bytes)| (path, bytes.to_vec())).collect();
         let layer = self.prepare_write(&mut options, style_table, filename);
         let bytes =
-            py.detach_result(|| terrio::memory::write_vector_bytes(std::slice::from_ref(layer.as_ref()), filename, &options)).py()?;
+            crate::with_warnings(py, || terrio::memory::write_vector_bytes(std::slice::from_ref(layer.as_ref()), filename, &options))?;
         Ok(PyBytes::new(py, &bytes))
     }
 }
@@ -595,6 +623,6 @@ impl PyVectorDataset {
         } else {
             self.layer_copies(py)
         };
-        py.detach_result(|| terrio::write_vector(&layers, path, &options)).py()
+        crate::with_warnings(py, || terrio::write_vector(&layers, path, &options))
     }
 }

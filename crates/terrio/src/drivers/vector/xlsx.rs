@@ -38,21 +38,21 @@ use std::io::{Read, Write as _};
 use wbvector::{Coord, Feature, FieldDef, FieldType, FieldValue, Geometry, GeometryType, Layer};
 
 /// Excel's limits on a worksheet.
-const MAX_ROWS: usize = 1_048_576;
-const MAX_COLUMNS: usize = 16_384;
-const MAX_CELL_TEXT_UTF16: usize = 32_767;
+pub(super) const MAX_ROWS: usize = 1_048_576;
+pub(super) const MAX_COLUMNS: usize = 16_384;
+pub(super) const MAX_CELL_TEXT_UTF16: usize = 32_767;
 const MAX_SHEET_NAME: usize = 31;
 /// The most relationships or sheets a workbook part may declare: they hold memory before any cell.
-const MAX_WORKBOOK_ENTRIES: usize = 65_536;
+pub(super) const MAX_WORKBOOK_ENTRIES: usize = 65_536;
 /// GDAL's limits on the empty rows a gap between two rows makes.
 const MAX_ROW_GAP: usize = 10_000;
 const MAX_GAP_CELLS: usize = 100_000;
 /// The most a workbook's part may expand to, and the most cells (blank ones in the table included)
 /// a workbook may hold: an untrusted file is refused rather than exhausting memory.
-const MAX_PART_BYTES: u64 = 2 << 30;
+pub(super) const MAX_PART_BYTES: u64 = 2 << 30;
 /// The most a workbook's sheets may expand to together.
-const MAX_SHEET_BYTES: u64 = 4 * MAX_PART_BYTES;
-const MAX_CELLS: usize = 100_000_000;
+pub(super) const MAX_SHEET_BYTES: u64 = 4 * MAX_PART_BYTES;
+pub(super) const MAX_CELLS: usize = 100_000_000;
 /// What a row costs against that limit, for the row entry and feature it holds even without a cell.
 const ROW_CELLS: usize = 4;
 /// The bytes of a cell's text that cost as much as another cell.
@@ -68,7 +68,7 @@ const MAX_SERIAL: f64 = 3_650_000.0;
 
 /// What a cell holds, as GDAL's driver classifies it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CellKind {
+pub(super) enum CellKind {
     /// A column skipped by a cell reference: no cell at all.
     Gap,
     Text,
@@ -372,7 +372,7 @@ impl<'a> SheetTable<'a> {
 
 /// The year-to-second parts of a serial date: its day since 1970, and its milliseconds in the day.
 /// `None` for numbers that are no dates.
-fn serial_parts(value: &str, date1904: bool) -> Option<(i64, i64)> {
+pub(super) fn serial_parts(value: &str, date1904: bool) -> Option<(i64, i64)> {
     let serial: f64 = value.trim().parse().ok()?;
     if !serial.is_finite() || serial.abs() >= MAX_SERIAL {
         return None;
@@ -534,7 +534,7 @@ fn table_layer(mut table: SheetTable<'_>, name: &str, date1904: bool, table_budg
     Ok(layer)
 }
 
-fn take_cells(budget: &mut usize, cells: usize) -> Result<()> {
+pub(super) fn take_cells(budget: &mut usize, cells: usize) -> Result<()> {
     *budget =
         budget.checked_sub(cells).ok_or_else(|| Error::ResourceLimit(format!("XLSX: the workbook holds more than {MAX_CELLS} cells")))?;
     Ok(())
@@ -563,7 +563,7 @@ fn merged_ranges(text: &str, part: &str, budget: &mut usize) -> Result<Vec<(usiz
 }
 
 /// A workbook part as text, refused when it would expand past the limit.
-fn read_part<R: Read + std::io::Seek>(zip: &mut zip::ZipArchive<R>, name: &str) -> Result<Option<String>> {
+pub(super) fn read_part<R: Read + std::io::Seek>(zip: &mut zip::ZipArchive<R>, name: &str) -> Result<Option<String>> {
     let mut file = match zip.by_name(name) {
         Ok(file) => file,
         Err(zip::result::ZipError::FileNotFound) => return Ok(None),
@@ -593,19 +593,19 @@ fn read_part<R: Read + std::io::Seek>(zip: &mut zip::ZipArchive<R>, name: &str) 
     }))
 }
 
-fn attribute(e: &BytesStart<'_>, local_name: &str) -> Option<String> {
+pub(super) fn attribute(e: &BytesStart<'_>, local_name: &str) -> Option<String> {
     e.attributes()
         .flatten()
         .find(|a| a.key.local_name().as_ref() == local_name)
         .and_then(|a| a.normalized_value(quick_xml::XmlVersion::Implicit1_0).ok().map(|v| v.into_owned()))
 }
 
-fn xml_error(part: &str, e: impl std::fmt::Display) -> Error {
+pub(super) fn xml_error(part: &str, e: impl std::fmt::Display) -> Error {
     Error::InvalidData(format!("XLSX: cannot parse '{part}': {e}"))
 }
 
 /// The text of a `&name;` or `&#n;` reference.
-fn reference_text(r: &quick_xml::events::BytesRef<'_>) -> Option<char> {
+pub(super) fn reference_text(r: &quick_xml::events::BytesRef<'_>) -> Option<char> {
     r.resolve_char_ref().ok().flatten().or(match &**r {
         "amp" => Some('&'),
         "lt" => Some('<'),
@@ -622,7 +622,7 @@ fn directory(part: &str) -> &str {
 }
 
 /// A relationship's target as a part name, from the directory of the part it belongs to.
-fn resolve_target(base: &str, target: &str) -> String {
+pub(super) fn resolve_target(base: &str, target: &str) -> String {
     let path = if let Some(absolute) = target.strip_prefix('/') {
         absolute.trim_start_matches('/').to_string()
     } else {
@@ -723,7 +723,7 @@ fn workbook_sheets<R: Read + std::io::Seek>(zip: &mut zip::ZipArchive<R>) -> Res
     }
 }
 
-fn shared_strings(text: &str, budget: &mut usize) -> Result<Vec<String>> {
+pub(super) fn shared_strings(text: &str, budget: &mut usize) -> Result<Vec<String>> {
     let part = "sharedStrings.xml";
     let mut reader = quick_xml::Reader::from_str(text);
     let mut strings = Vec::new();
@@ -775,7 +775,7 @@ fn unquoted_format(code: &str) -> String {
 }
 
 /// The kind of value each cell style holds: from its number format, as GDAL's driver tells it.
-fn style_kinds(text: &str) -> Result<Vec<CellKind>> {
+pub(super) fn style_kinds(text: &str) -> Result<Vec<CellKind>> {
     let part = "styles.xml";
     let mut reader = quick_xml::Reader::from_str(text);
     let mut formats: HashMap<i32, CellKind> = HashMap::new();
@@ -1003,12 +1003,17 @@ fn read_sheet(text: &str, part: &str, shared: &SharedParts, table: &mut SheetTab
 
 /// Reads a workbook from a file.
 pub fn read(path: &str, only: &[String], options: &XlsxOptions) -> Result<Vec<Layer>> {
-    parse(std::fs::read(path)?, only, options)
+    parse_named(std::fs::read(path)?, only, options, Some(path))
 }
 
 /// Parses a workbook held in memory: a layer per worksheet in workbook order, or only the sheets
 /// `only` names when it is not empty.
 pub fn parse(bytes: Vec<u8>, only: &[String], options: &XlsxOptions) -> Result<Vec<Layer>> {
+    parse_named(bytes, only, options, None)
+}
+
+/// Parses selected sheets while retaining the source filename for its single-sheet alias.
+pub(crate) fn parse_named(bytes: Vec<u8>, only: &[String], options: &XlsxOptions, path: Option<&str>) -> Result<Vec<Layer>> {
     if options.first_row == 0 {
         return Err(Error::InvalidArgument("XLSX: the first row to read counts from 1".into()));
     }
@@ -1016,7 +1021,10 @@ pub fn parse(bytes: Vec<u8>, only: &[String], options: &XlsxOptions) -> Result<V
         return Err(Error::InvalidArgument("XLSX: the last row to read is before the first".into()));
     }
     let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes))?;
+    crate::vfs::check_unique_zip_names(&zip)?;
     let WorkbookParts { sheets, date1904, strings: strings_part, styles: styles_part } = workbook_sheets(&mut zip)?;
+    let names: Vec<&str> = sheets.iter().map(|(name, _)| name.as_str()).collect();
+    let selected = crate::dataset::layer_selection(only, &names, path, false)?;
     let (mut budget, mut table_budget) = (MAX_CELLS, MAX_CELLS);
     let mut strings = Vec::new();
     for name in strings_part.iter().map(String::as_str).chain(["xl/sharedStrings.xml", "xl/SharedStrings.xml"]) {
@@ -1034,11 +1042,9 @@ pub fn parse(bytes: Vec<u8>, only: &[String], options: &XlsxOptions) -> Result<V
     }
     let shared = SharedParts { strings, styles };
     let mut layers = Vec::with_capacity(sheets.len());
-    // Naming no sheet here leaves the caller to report the names there are.
-    let filter = sheets.iter().any(|(name, _)| only.contains(name));
     let mut sheet_bytes = 0u64;
-    for (name, part) in sheets {
-        if filter && !only.contains(&name) {
+    for ((name, part), keep) in sheets.into_iter().zip(selected) {
+        if !keep {
             continue;
         }
         let mut table = SheetTable::new(options);
@@ -1073,10 +1079,10 @@ pub(crate) fn looks_like(bytes: &[u8], name: &str) -> bool {
 
 // Writing
 
-const XML_HEADER: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n";
-const MAIN_NS: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
-const OD_RELS: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
-const PACKAGE: &str = "http://schemas.openxmlformats.org/package/2006";
+pub(super) const XML_HEADER: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n";
+pub(super) const MAIN_NS: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+pub(super) const OD_RELS: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+pub(super) const PACKAGE: &str = "http://schemas.openxmlformats.org/package/2006";
 
 /// Style indexes in [`STYLES`].
 const STYLE_DATE: u8 = 1;
@@ -1160,12 +1166,12 @@ const STYLES: &str = "<numFmts count=\"6\">\n\
 <cellStyles count=\"1\"><cellStyle name=\"Normal\" xfId=\"0\" builtinId=\"0\"/></cellStyles>\n";
 
 /// Whether XML 1.0 can hold a character.
-fn xml_legal(c: char) -> bool {
+pub(super) fn xml_legal(c: char) -> bool {
     (c >= ' ' && !matches!(c, '\u{FFFE}' | '\u{FFFF}')) || matches!(c, '\t' | '\n' | '\r')
 }
 
 /// Text as XML: escaped, without the characters XML cannot hold.
-fn xml_text(s: &str) -> String {
+pub(super) fn xml_text(s: &str) -> String {
     let text =
         if s.chars().all(xml_legal) { xml::escape(s) } else { xml::escape(&s.chars().filter(|&c| xml_legal(c)).collect::<String>()) };
     // A parser turns a raw carriage return into a line feed.
@@ -1174,14 +1180,14 @@ fn xml_text(s: &str) -> String {
 
 /// The shared strings table being written.
 #[derive(Default)]
-struct StringTable {
+pub(super) struct StringTable {
     indexes: HashMap<String, usize>,
     strings: Vec<String>,
     count: usize,
 }
 
 impl StringTable {
-    fn index(&mut self, s: &str) -> usize {
+    pub(super) fn index(&mut self, s: &str) -> usize {
         self.count += 1;
         if let Some(&i) = self.indexes.get(s) {
             return i;
@@ -1192,7 +1198,7 @@ impl StringTable {
         i
     }
 
-    fn to_xml(&self) -> String {
+    pub(super) fn to_xml(&self) -> String {
         let mut out = format!("{XML_HEADER}<sst xmlns=\"{MAIN_NS}\" count=\"{}\" uniqueCount=\"{}\">\n", self.count, self.strings.len());
         for s in &self.strings {
             let space = if s.trim() != s { " xml:space=\"preserve\"" } else { "" };
@@ -1204,7 +1210,7 @@ impl StringTable {
 }
 
 /// A column's letters, from 0.
-fn column_letters(mut column: usize) -> String {
+pub(super) fn column_letters(mut column: usize) -> String {
     let mut letters = Vec::new();
     loop {
         letters.push(b'A' + (column % 26) as u8);
@@ -1219,7 +1225,7 @@ fn column_letters(mut column: usize) -> String {
 
 /// Excel's serial of a day since 1970: dates before its phantom 1900-02-29 are a serial lower, and
 /// it has none for dates before 1900.
-fn excel_serial_days(days: i64) -> Option<i64> {
+pub(super) fn excel_serial_days(days: i64) -> Option<i64> {
     let serial = days + UNIX_EPOCH_SERIAL;
     match serial {
         ..2 => None,
@@ -1230,7 +1236,7 @@ fn excel_serial_days(days: i64) -> Option<i64> {
 
 /// A date-time's wall clock as milliseconds since 1970, without its UTC offset: spreadsheets have no
 /// time zones, and the value reads back as it was written.
-fn wall_clock_millis(s: &str) -> Option<i64> {
+pub(super) fn wall_clock_millis(s: &str) -> Option<i64> {
     let time = s.get(10..)?;
     let end = time.char_indices().skip(1).find(|(_, c)| matches!(c, 'Z' | '+' | '-')).map_or(time.len(), |(i, _)| i);
     datetime::parse_datetime(&s[..10 + end])
@@ -1311,7 +1317,7 @@ fn value_cell(out: &mut String, reference: &str, value: &FieldValue, styles: &Ce
 }
 
 /// The columns written before a layer's fields for its geometries.
-fn geometry_header(layer: &Layer, options: &XlsxOptions) -> Result<Vec<&'static str>> {
+pub(super) fn geometry_header(layer: &Layer, options: &XlsxOptions) -> Result<Vec<&'static str>> {
     let geometries = || layer.features.iter().filter_map(|f| f.geometry.as_ref());
     Ok(match options.geometry {
         CsvGeometry::None => vec![],
@@ -1326,7 +1332,7 @@ fn geometry_header(layer: &Layer, options: &XlsxOptions) -> Result<Vec<&'static 
     })
 }
 
-fn geometry_values(feature: &Feature, header: &[&str]) -> Vec<FieldValue> {
+pub(super) fn geometry_values(feature: &Feature, header: &[&str]) -> Vec<FieldValue> {
     match (header, &feature.geometry) {
         ([], _) => vec![],
         (["WKT"], Some(g)) => vec![FieldValue::Text(wkt::format(g))],
@@ -2184,6 +2190,9 @@ mod tests {
             ("COLUMN_WIDTH", "0"),
             ("COLUMN_WIDTH", "wide"),
             ("CREATION_TIME", "soon"),
+            ("CREATION_TIME", "2024-02-30T03:04:05Z"),
+            ("CREATION_TIME", "2024-01-02T03:04:05z"),
+            ("CREATION_TIME", "+024-01-02T03:04:05Z"),
             ("CREATION_TIME", "2024-01-02T99:99:99Z"),
             ("CREATION_TIME", "2024-01-02T03:04:05+01:00junk12"),
             ("DATE_FORMAT", ""),

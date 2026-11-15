@@ -14,16 +14,12 @@
 //! `make-point`, `create` and `export-schema`).
 
 use super::processing::{VectorInput, VectorOutput};
-use terrio::crs::SpatialRef;
+use super::srs;
 use terrio::formats::VectorDriver;
 use terrio::ops::concat::{ConcatMode, ConcatOptions, ConcatSource, FieldStrategy};
 use terrio::ops::partition::{PartitionOptions, PartitionScheme, PartitionWriteMode};
 use terrio::ops::vector_schema::{self as vs, FieldSelector, OgrSchema, OgrType};
 use terrio::{Error, Result};
-
-fn srs(s: &Option<String>) -> Result<Option<SpatialRef>> {
-    s.as_deref().map(SpatialRef::parse).transpose()
-}
 
 fn driver(format: Option<&str>) -> Result<Option<VectorDriver>> {
     format.map(|f| VectorDriver::from_name(f).ok_or_else(|| Error::InvalidArgument(format!("unknown vector format '{f}'")))).transpose()
@@ -32,7 +28,7 @@ fn driver(format: Option<&str>) -> Result<Option<VectorDriver>> {
 #[derive(clap::Args)]
 pub struct ConcatArgs {
     /// The input vector datasets, then the output dataset. `@FILE` reads input paths from FILE,
-    /// one per line.
+    /// one per line, and a file name with `*` or `?` matches the files of its folder.
     #[arg(required = true, num_args = 2.., value_name = "INPUT... OUTPUT")]
     paths: Vec<String>,
     /// Read only this layer of each input (repeat for several). By default, every layer.

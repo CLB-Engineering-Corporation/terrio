@@ -84,13 +84,31 @@ def test_from_array_2d_and_bool():
     assert r.read(1).sum() == 12
 
 
+@pytest.mark.parametrize(
+    "view",
+    [
+        lambda a: a[:, ::-1, ::2],
+        lambda a: np.asfortranarray(a),
+        lambda a: a.transpose(0, 2, 1),
+    ],
+    ids=["reversed_strided", "fortran", "transposed"],
+)
+@pytest.mark.parametrize("dtype", ["float32", "int16", "uint64"])
+def test_from_array_non_contiguous(view, dtype):
+    a = np.arange(2 * 6 * 8, dtype=dtype).reshape(2, 6, 8)
+    v = view(a)
+    out = terrio.Raster.from_array(v, (0, 1, 0, 0, 0, -1)).read()
+    assert out.dtype == v.dtype
+    np.testing.assert_array_equal(out, np.ascontiguousarray(v))
+
+
 def test_from_array_rejects_bad_input():
     with pytest.raises(terrio.InvalidArgumentError):
         terrio.Raster.from_array(np.zeros(5), TRANSFORM)
     with pytest.raises(terrio.InvalidArgumentError):
         terrio.Raster.from_array(np.zeros((2, 2)), (0, 1, 2, 0, 0.5, 1))
     with pytest.raises(terrio.InvalidArgumentError):
-        terrio.Raster.from_array(np.zeros((2, 2), dtype=np.complex64), TRANSFORM)
+        terrio.Raster.from_array(np.zeros((2, 2), dtype="U1"), TRANSFORM)
     with pytest.raises(terrio.CRSError):
         terrio.Raster.from_array(np.zeros((2, 2)), TRANSFORM, crs="not a crs")
 
@@ -230,7 +248,11 @@ def test_rasterize_and_polygonize(tmp_path):
     assert (a == 3).sum() == (a == 7).sum() > 0
     out = tmp_path / "burned.tif"
     terrio.rasterize(layer, str(out), burn=1, ts=(15, 5), nodata=255)
-    assert 0 < terrio.open_raster(str(out)).read(1).sum() < 75
+    written = terrio.open_raster(str(out))
+    assert written.nodata == 255
+    values = written.read(1)
+    assert set(np.unique(values)) == {1, 255}
+    assert 0 < np.count_nonzero(values != 255) < 75
     polys = terrio.polygonize(r, field="v")
     assert polys.geometry_type == "Polygon"
     assert sorted(polys.columns()["v"]) == [3, 7]
@@ -653,6 +675,28 @@ def test_sql_expressions_distinct_summary():
     assert feature["properties"] == {"n": 3, "total": 4}
     assert feature["geometry"] is None
     assert len(terrio.sql(src, "SELECT DISTINCT v FROM layer")) == 2
+    for statement in [
+        "SELECT v,v AS v FROM layer",
+        "SELECT v AS n,COUNT(*) AS n FROM layer GROUP BY v",
+    ]:
+        with pytest.raises(ValueError, match="duplicate output field"):
+            terrio.sql(src, statement)
+    grouped = terrio.sql(
+        src, "SELECT v, COUNT(*) AS n, SUM(v) AS total FROM layer GROUP BY v ORDER BY v"
+    ).to_geojson()["features"]
+    assert [f["properties"] for f in grouped] == [
+        {"v": None, "n": 1, "total": None},
+        {"v": 2, "n": 2, "total": 4},
+    ]
+    assert all(f["geometry"] is None for f in grouped)
+    spatial = terrio.sql(
+        src,
+        "SELECT ST_Centroid(ST_Buffer(geometry,1)) AS shape, "
+        "ST_Area(geometry) AS area FROM layer LIMIT 1",
+    ).to_geojson()["features"][0]
+    assert spatial["properties"] == {"area": 0.0}
+    assert spatial["geometry"]["type"] == "Point"
+    assert spatial["geometry"]["coordinates"] == pytest.approx([0, 0], abs=1e-12)
 
 
 @pytest.mark.parametrize("center", [False, True])

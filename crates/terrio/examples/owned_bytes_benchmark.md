@@ -31,11 +31,15 @@ This is not RSS, allocator usable size, cumulative allocation traffic, or a
 browser memory measurement. It excludes JS memory, allocator fragmentation and
 native allocations bypassing Rust's global allocator. Reallocation measures
 logical requested live sizes, not transient allocator implementation copies.
-The dependency's Vec-to-Arc conversion still copies; this is not zero-copy.
+With hdf5-reader 0.12.1, BytesStorage retains the Vec without copying it. The
+JavaScript-to-Vec copy and decoded-array allocations remain.
 Correctness coverage for real producer userblocks and malformed inputs lives in
 `multidim::netcdf::tests::owned_*`; the optional hdf5-userblock case prepends a synthetic 512-byte userblock.
 
 ## Measured on 2026-11-02
+
+Historical results with the older reader dependency, before its Vec retention
+improvement. These figures do not describe the current 0.12.1 dependency.
 
 Windows 11 Pro for Workstations 10.0.26300, x86_64 MSVC, rustc 1.99.1
 (58cf8f9c3), dev profile with debug=0, two Cargo jobs; no dependency changes.
@@ -68,3 +72,24 @@ hdf5,owned,201331605,201331796,603995025,402663229,201356999
 hdf5-userblock,old,201332117,201332316,805327662,603995346,201356999
 hdf5-userblock,owned,201332117,201332318,603996571,402664253,201357551
 ```
+
+## Rechecked on 2026-11-05 with readers 0.12.1
+
+Windows x86_64 GNU, rustc 1.99.1, debug symbols disabled, 8 MiB input
+parameter. One fresh process per format/mode; every decoded value was checked.
+These are requested Rust heap bytes, not browser memory or RSS. The dependency
+now retains a Vec without copying; the old binding expression still makes an
+extra input clone. Larger inputs and repeated timing runs were not measured.
+
+```csv
+format,mode,input,peak_delta,retained_delta
+classic,old,8388688,16779912,8390875
+classic,owned,8388688,8391224,8390875
+hdf5,old,25170836,50404138,25202169
+hdf5,owned,25170836,25233302,25202169
+hdf5-userblock,old,25171348,50404650,25202169
+hdf5-userblock,owned,25171348,25233854,25202721
+```
+
+The owned path removes one payload-sized clone. Keeping the userblock also
+retains its 512 bytes and the offset wrapper. No throughput claim follows.

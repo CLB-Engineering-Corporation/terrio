@@ -14,6 +14,7 @@
 
 mod analysis;
 mod dataset_files;
+mod geojson;
 mod gpkg_maintenance;
 mod grid;
 mod inspection;
@@ -29,6 +30,7 @@ mod pointcloud;
 mod query;
 mod raster_tile;
 mod remote;
+mod render;
 mod rpftoc;
 #[cfg(feature = "threads")]
 mod threads;
@@ -44,7 +46,7 @@ use std::rc::{Rc, Weak};
 use terrio::crs::{SpatialRef, TransformOptions, Transformer};
 use terrio::formats::{RasterDriver, VectorDriver};
 use terrio::ops::vector_filter::VectorTranslateOptions;
-use terrio::{DataType, Layer, LazyRaster, RasterDataset, RasterWriteOptions, VectorWriteOptions, Window, WindowOptions};
+use terrio::{Layer, LazyRaster, RasterDataset, RasterWriteOptions, VectorWriteOptions, Window, WindowOptions};
 use wasm_bindgen::prelude::*;
 use wbraster::raster::RasterData;
 
@@ -90,6 +92,9 @@ const FEATURES: &[(&str, bool)] = &[
     ("zarr", cfg!(feature = "zarr")),
 ];
 
+/// Converts a JavaScript exception into a `JsError` with its message.
+pub(crate) use terrio_js_fetch::js_error;
+
 /// Converts a terrio error into a JavaScript `Error`. Formats this build leaves out say which
 /// module has them.
 fn js_err(e: terrio::Error) -> JsError {
@@ -129,6 +134,58 @@ pub(crate) fn parse_options<T: serde::de::DeserializeOwned + Default>(options: &
     }
     let text: String = js_sys::JSON::stringify(options).map_err(|_| JsError::new("invalid options"))?.into();
     serde_json::from_str(&text).map_err(|e| JsError::new(&format!("options: {e}")))
+}
+
+/// The `overview` option of a resampled read: an overview number or `"AUTO"`, `"AUTO-n"`,
+/// `"NONE"`.
+#[derive(Deserialize)]
+#[serde(untagged)]
+pub(crate) enum OverviewArg {
+    Level(usize),
+    Name(String),
+}
+
+impl OverviewArg {
+    /// The selection, `AUTO` when the option is not given.
+    pub(crate) fn selection(arg: Option<&Self>) -> terrio::Result<terrio::ops::overview::OverviewSelection> {
+        use terrio::ops::overview::OverviewSelection;
+        Ok(match arg {
+            None => OverviewSelection::Auto,
+            Some(Self::Level(i)) => OverviewSelection::Level(*i),
+            Some(Self::Name(n)) => OverviewSelection::parse(n)?,
+        })
+    }
+}
+
+/// Options of `readResampled` and `readResampledMasks`.
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase", default, deny_unknown_fields)]
+pub(crate) struct ResampledArgs {
+    /// The bands, from 1 (all by default).
+    bands: Option<Vec<usize>>,
+    /// The source window `[colOff, rowOff, width, height]` in full-resolution pixels, possibly
+    /// fractional (the whole raster by default).
+    window: Option<[f64; 4]>,
+    /// The output `[width, height]`.
+    size: Option<[usize; 2]>,
+    /// The resampling method (nearest by default).
+    resampling: Option<String>,
+    /// The stored resolution read.
+    overview: Option<OverviewArg>,
+}
+
+impl ResampledArgs {
+    /// The read's options.
+    pub(crate) fn options(&self) -> terrio::Result<terrio::ResampledReadOptions> {
+        let [w, h] = self.size.ok_or_else(|| terrio::Error::InvalidArgument("size [width, height] is required".into()))?;
+        Ok(terrio::ResampledReadOptions {
+            bands: self.bands.clone().unwrap_or_default(),
+            window: self.window.map(|[x, y, w, h]| (x, y, w, h)),
+            size: (w, h),
+            resampling: self.resampling.as_deref().map(terrio::ops::Resampling::parse).transpose()?.unwrap_or_default(),
+            overview: OverviewArg::selection(self.overview.as_ref())?,
+        })
+    }
 }
 
 /// A shallow copy of an options object without `key`, whose value is not read (the value itself
@@ -189,8 +246,16 @@ fn typed_array(data: RasterData) -> JsValue {
     }
 }
 
+/// `{ data, masks }`: pixels as a typed array of their type, masks as a `Uint8Array`.
+pub(crate) fn data_and_masks(data: RasterData, masks: &[u8]) -> JsValue {
+    let out = js_sys::Object::new();
+    let _ = js_sys::Reflect::set(&out, &"data".into(), &typed_array(data));
+    let _ = js_sys::Reflect::set(&out, &"masks".into(), &js_sys::Uint8Array::from(masks));
+    out.into()
+}
+
 /// Pixels from a typed array.
-fn raster_data(array: &JsValue) -> Result<RasterData, JsError> {
+pub(crate) fn raster_data(array: &JsValue) -> Result<RasterData, JsError> {
     macro_rules! try_types {
         ($($t:ident => $v:ident),*) => {
             $(if let Some(a) = array.dyn_ref::<js_sys::$t>() {
@@ -204,22 +269,6 @@ fn raster_data(array: &JsValue) -> Result<RasterData, JsError> {
         Float32Array => F32, Float64Array => F64
     );
     Err(JsError::new("expected a typed array (Uint8Array, Int16Array, Float32Array...)"))
-}
-
-/// The JavaScript name of a pixel type's typed array element, as in `Float32Array`.
-fn dtype_name(t: DataType) -> &'static str {
-    match t {
-        DataType::U8 => "uint8",
-        DataType::I8 => "int8",
-        DataType::U16 => "uint16",
-        DataType::I16 => "int16",
-        DataType::U32 => "uint32",
-        DataType::I32 => "int32",
-        DataType::U64 => "uint64",
-        DataType::I64 => "int64",
-        DataType::F32 => "float32",
-        DataType::F64 => "float64",
-    }
 }
 
 /// Options for [`Dataset::to_bytes`], as a JavaScript object.
@@ -392,15 +441,31 @@ impl Dataset {
     }
 }
 
+/// Pushes configuration overrides for this module's calling thread. Values are strings; null
+/// unsets an option in this scope. Pair with `popConfig` in `finally`. Scopes also apply to
+/// subsequent reads and nested source opens; they are shared by calls on the same thread.
+#[wasm_bindgen(js_name = pushConfig)]
+pub fn push_config(options: JsValue) -> Result<(), JsError> {
+    terrio::config::push_scope(parse_options::<HashMap<String, Option<String>>>(&options)?);
+    Ok(())
+}
+
+/// Removes the calling thread's innermost configuration scope; returns whether one existed.
+#[wasm_bindgen(js_name = popConfig)]
+pub fn pop_config() -> bool {
+    terrio::config::pop_scope()
+}
+
 /// Opens serialized VRT XML with a map of source file names to Uint8Array bytes.
-/// Source GeoTIFFs and VRT pixel windows are read lazily, including in WebAssembly.
+/// Every reference must be mapped; missing entries never open files or URLs. A
+/// mapped source that is itself a VRT is opened against the same map; STAC, STACTA
+/// and STACIT documents are refused. Source GeoTIFFs and VRT pixel windows are read lazily, including in WebAssembly.
 #[wasm_bindgen(js_name = openVrt)]
 pub fn open_vrt(xml: &str, sources: JsValue) -> Result<Dataset, JsError> {
-    let description = terrio::ops::vrt::VirtualRaster::from_xml(xml).map_err(js_err)?;
     if !sources.is_object() || sources.is_null() {
         return Err(JsError::new("sources must map filenames to Uint8Array bytes"));
     }
-    let mut resolved = std::collections::HashMap::new();
+    let mut supplied = std::collections::HashMap::new();
     let object = js_sys::Object::from(sources);
     for name in js_sys::Object::keys(&object).iter() {
         let key = name.as_string().ok_or_else(|| JsError::new("invalid source name"))?;
@@ -408,10 +473,9 @@ pub fn open_vrt(xml: &str, sources: JsValue) -> Result<Dataset, JsError> {
             .map_err(|_| JsError::new("cannot read VRT source map"))?
             .dyn_into::<js_sys::Uint8Array>()
             .map_err(|_| JsError::new("source values must be Uint8Array bytes"))?;
-        let reader = terrio::memory::open_raster_lazy_bytes(bytes.to_vec(), &key).map_err(js_err)?;
-        resolved.insert(key, reader);
+        supplied.insert(key, terrio::ops::vrt::SuppliedSource::Bytes(bytes.to_vec()));
     }
-    Ok(Dataset::from_lazy(description.into_lazy(std::path::Path::new(""), resolved).map_err(js_err)?))
+    Ok(Dataset::from_lazy(terrio::ops::vrt::VirtualRaster::open_supplied(xml, &supplied).map_err(js_err)?))
 }
 
 /// Opens a dataset from its bytes. `filename`'s extension tells the format (`dem.tif`,
@@ -446,6 +510,10 @@ pub fn open(bytes: Vec<u8>, filename: &str) -> Result<Dataset, JsError> {
 struct VectorOpenOptions {
     /// Only these layers, by name.
     layers: Option<Vec<String>>,
+    /// Live features skipped from each selected layer.
+    skip_features: usize,
+    /// Maximum live features retained from each selected layer, including zero.
+    max_features: Option<usize>,
     /// Driver open options by their GDAL names (`{ CELL_SUMMARIES: "Maximum Water Surface",
     /// TIME_STEP: "12" }`), as `terrio convert --oo` takes them.
     open_options: Option<std::collections::BTreeMap<String, serde_json::Value>>,
@@ -453,7 +521,8 @@ struct VectorOpenOptions {
 
 /// Opens a vector dataset from its bytes, with driver open options. `filename` names the file
 /// (its extension tells the format when the content does not); `options` takes `layers` (names)
-/// and `openOptions`, the driver's open options by their GDAL names: the CSV and XLSX options, the
+/// `skipFeatures` and `maxFeatures` (a range per selected layer), and `openOptions`,
+/// the driver's open options by their GDAL names: the CSV and XLSX options, the
 /// tile archive options and those of the HECRAS driver for HEC-RAS geometry and plan HDF files
 /// (`CELL_SUMMARIES`, `TIME_STEP`, ...). A list option takes a comma-separated string or an
 /// array of names.
@@ -464,7 +533,12 @@ struct VectorOpenOptions {
 #[wasm_bindgen(js_name = openVector)]
 pub fn open_vector(bytes: Vec<u8>, filename: &str, options: JsValue) -> Result<Dataset, JsError> {
     let o: VectorOpenOptions = parse_options(&options)?;
-    let mut open = terrio::VectorOpenOptions { layers: o.layers.unwrap_or_default(), ..Default::default() };
+    let mut open = terrio::VectorOpenOptions {
+        layers: o.layers.unwrap_or_default(),
+        skip_features: o.skip_features,
+        max_features: o.max_features,
+        ..Default::default()
+    };
     for (key, value) in o.open_options.unwrap_or_default() {
         // A list option may be given as an array of names, joined as its comma-separated form.
         let value = match &value {
@@ -533,7 +607,7 @@ pub fn raster_from_array(
     if g.len() != 6 || g[2] != 0.0 || g[4] != 0.0 || g[1] <= 0.0 || g[5] >= 0.0 {
         return Err(JsError::new("transform must be a north-up GDAL geotransform of 6 numbers"));
     }
-    let crs = crs.as_deref().map(SpatialRef::parse).transpose().map_err(js_err)?.unwrap_or_default();
+    let crs = crs.as_deref().map(SpatialRef::parse_literal).transpose().map_err(js_err)?.unwrap_or_default();
     let cfg = terrio::RasterConfig {
         cols: width,
         rows: height,
@@ -543,7 +617,7 @@ pub fn raster_from_array(
         crs: crs.to_crs_info(),
         ..Default::default()
     };
-    let mut raster = terrio::Raster::from_data_native(cfg, data).map_err(|e| js_err(e.into()))?;
+    let mut raster = terrio::raster_from_data(cfg, data).map_err(js_err)?;
     raster.x_min = g[0];
     raster.cell_size_x = g[1];
     raster.cell_size_y = -g[5];
@@ -561,7 +635,7 @@ pub fn from_geojson(geojson: JsValue, name: Option<String>, crs: Option<String>)
     };
     let mut layer = terrio::memory::parse_geojson_layer(text.as_bytes(), "layer").map_err(js_err)?;
     layer.name = name.unwrap_or_else(|| "layer".into());
-    let crs = SpatialRef::parse(crs.as_deref().unwrap_or("EPSG:4326")).map_err(js_err)?;
+    let crs = SpatialRef::parse_literal(crs.as_deref().unwrap_or("EPSG:4326")).map_err(js_err)?;
     crs.apply_to_layer(&mut layer);
     Ok(Dataset::from_layers(vec![layer], VectorDriver::GeoJSON))
 }
@@ -664,7 +738,7 @@ impl Dataset {
     /// The pixel type: `uint8`, `int16`, `float32`...
     #[wasm_bindgen(getter)]
     pub fn dtype(&self) -> Result<String, JsError> {
-        Ok(dtype_name(self.raster()?.data_type()).into())
+        Ok(self.raster()?.data_type().as_str().into())
     }
 
     /// The raster's nodata value, or `undefined`.
@@ -716,6 +790,44 @@ impl Dataset {
         Ok(typed_array(ds.raster.data))
     }
 
+    /// Reads a window into an output of another size, as GDAL's `RasterIO` reads it
+    /// (`gdal_translate -outsize`): from the overview it would choose, resampled with its kernels,
+    /// invalid pixels (masked, nodata, transparent) carrying no weight. Returns a typed array of
+    /// the raster's own type, band after band, row after row.
+    ///
+    /// Options: `size` (`[width, height]`, required), `bands` (from 1, all by default), `window`
+    /// (`[colOff, rowOff, width, height]` in full-resolution pixels, possibly fractional; the
+    /// whole raster by default), `resampling` (`nearest`, the default, `bilinear`, `cubic`,
+    /// `cubicspline`, `lanczos`, `average`, `rms`, `mode`) and `overview` (`"AUTO"`, the
+    /// default, `"AUTO-n"`, `"NONE"` or an overview number, as `gdal_translate -ovr`).
+    #[wasm_bindgen(js_name = readResampled)]
+    pub fn read_resampled(&self, options: JsValue) -> Result<JsValue, JsError> {
+        let o = parse_options::<ResampledArgs>(&options)?.options().map_err(js_err)?;
+        let ds = self.raster()?.read_resampled(&o).map_err(js_err)?;
+        Ok(typed_array(ds.raster.data))
+    }
+
+    /// Reads the mask bands of the bands `readResampled` reads, with the same options, as GDAL's
+    /// `GetMaskBand()->RasterIO()`: a `Uint8Array`, band after band, 0 for invalid pixels and 255
+    /// for valid ones (or values between where a kernel resampled the mask). Bands with a nodata
+    /// value are read for their masks: `readResampledWithMasks` reads both without reading twice.
+    #[wasm_bindgen(js_name = readResampledMasks)]
+    pub fn read_resampled_masks(&self, options: JsValue) -> Result<js_sys::Uint8Array, JsError> {
+        let o = parse_options::<ResampledArgs>(&options)?.options().map_err(js_err)?;
+        let masks = self.raster()?.read_resampled_masks(&o).map_err(js_err)?;
+        Ok(js_sys::Uint8Array::from(&masks[..]))
+    }
+
+    /// Reads what `readResampled` and `readResampledMasks` read, at once (same options):
+    /// `{ data, masks }`. Nodata masks are computed from the pixels read, rather than from a
+    /// second read of their bands.
+    #[wasm_bindgen(js_name = readResampledWithMasks)]
+    pub fn read_resampled_with_masks(&self, options: JsValue) -> Result<JsValue, JsError> {
+        let o = parse_options::<ResampledArgs>(&options)?.options().map_err(js_err)?;
+        let (ds, masks) = self.raster()?.read_resampled_with_masks(&o).map_err(js_err)?;
+        Ok(data_and_masks(ds.raster.data, &masks))
+    }
+
     /// The vector layer names.
     #[wasm_bindgen(js_name = layerNames)]
     pub fn layer_names(&self) -> Result<Vec<String>, JsError> {
@@ -742,7 +854,7 @@ impl Dataset {
     #[wasm_bindgen(js_name = toGeoJSON)]
     pub fn to_geojson(&self, layer: JsValue) -> Result<JsValue, JsError> {
         let l = self.resolved_layer(&layer)?;
-        js_sys::JSON::parse(&wbvector::geojson::to_string(&l)).map_err(|_| JsError::new("invalid GeoJSON"))
+        geojson::feature_collection(&l)
     }
 
     /// A vector layer (by name or position, the first by default) as an Arrow IPC stream, with
@@ -807,7 +919,7 @@ impl Dataset {
             promote_to_3d: o.promote_to_3d,
             ..Default::default()
         };
-        let t_srs = o.t_srs.as_deref().map(SpatialRef::parse).transpose().map_err(js_err)?;
+        let t_srs = o.t_srs.as_deref().map(SpatialRef::parse_literal).transpose().map_err(js_err)?;
         match &mut *self.inner.borrow_mut() {
             Inner::Raster(r) => {
                 if o.layers.is_some()
@@ -1006,8 +1118,8 @@ pub fn transform_points(
         return Err(JsError::new("xs, ys and zs differ in length"));
     }
     let o: TransformPointsOptions = parse_options(&options)?;
-    let src = SpatialRef::parse(src_crs).map_err(js_err)?;
-    let dst = SpatialRef::parse(dst_crs).map_err(js_err)?;
+    let src = SpatialRef::parse_literal(src_crs).map_err(js_err)?;
+    let dst = SpatialRef::parse_literal(dst_crs).map_err(js_err)?;
     let opts = TransformOptions {
         source_coordinate_epoch: o.s_coord_epoch,
         target_coordinate_epoch: o.t_coord_epoch,
@@ -1053,7 +1165,7 @@ pub fn register_grid(name: &str, bytes: Vec<u8>) {
 /// without EPSG code).
 #[wasm_bindgen(js_name = describeCrs)]
 pub fn describe_crs(crs: &str) -> Result<JsValue, JsError> {
-    let s = SpatialRef::parse(crs).map_err(js_err)?;
+    let s = SpatialRef::parse_literal(crs).map_err(js_err)?;
     to_js(&serde_json::json!({
         "epsg": s.epsg,
         "esri": s.esri,
@@ -1065,10 +1177,77 @@ pub fn describe_crs(crs: &str) -> Result<JsValue, JsError> {
     }))
 }
 
+/// One string, or an array of them.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum OneOrMany {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl OneOrMany {
+    fn into_vec(self) -> Vec<String> {
+        match self {
+            OneOrMany::One(s) => vec![s],
+            OneOrMany::Many(v) => v,
+        }
+    }
+}
+
+/// Options for [`list_crs`], as a JavaScript object.
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase", default, deny_unknown_fields)]
+struct ListCrsOptions {
+    /// An authority (`"EPSG"`, `"ESRI"`, `"IAU_2015"`) or an array of them.
+    authority: Option<OneOrMany>,
+    /// A kind or an array of kinds.
+    kind: Option<OneOrMany>,
+    include_deprecated: bool,
+}
+
+/// The CRSs of the registries terrio carries (EPSG, ESRI and IAU_2015), for searchable CRS
+/// pickers, as GDAL's `OSRGetCRSInfoListFromDatabase` describes them (PROJ 9.8.1's database, EPSG
+/// v12.029): `[{ authority, code, name, kind, deprecated, area_name, bounds, projection_method,
+/// celestial_body }]`, in order of authority and code, `bounds` being `[west, south, east, north]`
+/// in degrees. `` `${authority}:${code}` `` is a CRS the other functions take.
+///
+/// `text`: words each CRS must match, whatever their case: in the name, or beginning the code or
+/// `AUTHORITY:CODE` (`"Albers"`, `"3577"`, `"EPSG:3577"`); every CRS when `undefined`. Options:
+/// `authority` (`"EPSG"`, `"ESRI"`, `"IAU_2015"`, or an array), `kind` (`"geographic_2d"`,
+/// `"geographic_3d"`, `"geocentric"`, `"projected"`, `"vertical"`, `"compound"`, `"other"`, or an
+/// array) and `includeDeprecated`.
+#[wasm_bindgen(js_name = listCrs)]
+pub fn list_crs(text: Option<String>, options: JsValue) -> Result<JsValue, JsError> {
+    let o: ListCrsOptions = parse_options(&options)?;
+    let kinds = o.kind.map(OneOrMany::into_vec).unwrap_or_default();
+    let kinds =
+        kinds.iter().map(|k| k.parse::<terrio::crs::CrsKind>()).collect::<Result<Vec<_>, _>>().map_err(|e| JsError::new(&e.to_string()))?;
+    let authorities = o.authority.map(OneOrMany::into_vec).unwrap_or_default();
+    terrio::crs::check_authorities(&authorities).map_err(|e| JsError::new(&e.to_string()))?;
+    let query = terrio::crs::CrsQuery { authorities, kinds, include_deprecated: o.include_deprecated, text };
+    to_js(&terrio::crs::list_crs(&query))
+}
+
 /// The PROJJSON v0.7 of a CRS; throws for a CRS it would describe wrongly.
 #[wasm_bindgen(js_name = crsToProjjson)]
 pub fn crs_to_projjson(crs: &str) -> Result<String, JsError> {
-    SpatialRef::parse(crs).and_then(|s| s.to_projjson()).map_err(js_err)
+    SpatialRef::parse_literal(crs).and_then(|s| s.to_projjson()).map_err(js_err)
+}
+
+/// The PROJ string of a CRS as PROJ 9.8.1 writes it (`projinfo -o PROJ`), `undefined` for a CRS
+/// PROJ has none for (an engineering CRS). Like PROJ's, it leaves out the datum transformation of
+/// an EPSG CRS: keep the code or WKT to keep the CRS.
+#[wasm_bindgen(js_name = crsToProj4)]
+pub fn crs_to_proj4(crs: &str) -> Result<Option<String>, JsError> {
+    SpatialRef::parse_literal(crs).map(|s| s.to_proj4()).map_err(js_err)
+}
+
+/// The WKT 1 of a CRS without GDAL's `EXTENSION["PROJ4", ...]`, for formats whose readers ignore
+/// it (a `.prj` file), as PROJ 9.8.1 exports `WKT1_GDAL`; `undefined` where WKT 1 needs the
+/// extension (a datum grid) or PROJ writes no WKT 1 (a geographic 3D CRS).
+#[wasm_bindgen(js_name = crsToWkt1Strict)]
+pub fn crs_to_wkt1_strict(crs: &str) -> Result<Option<String>, JsError> {
+    SpatialRef::parse_literal(crs).map(|s| s.to_wkt1_strict()).map_err(js_err)
 }
 
 /// The formats terrio reads and writes: `[{ name, long_name, kind, extensions, read, write }]`.

@@ -524,12 +524,7 @@ impl Read for MemberReader {
 }
 impl std::io::Seek for MemberReader {
     fn seek(&mut self, from: std::io::SeekFrom) -> std::io::Result<u64> {
-        let pos = match from {
-            std::io::SeekFrom::Start(pos) => i128::from(pos),
-            std::io::SeekFrom::Current(offset) => i128::from(self.pos) + i128::from(offset),
-            std::io::SeekFrom::End(offset) => i128::from(self.len) + i128::from(offset),
-        };
-        self.pos = u64::try_from(pos).map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid archive member seek"))?;
+        self.pos = crate::sparse::seek_position(self.pos, self.len, from)?;
         Ok(self.pos)
     }
 }
@@ -550,7 +545,14 @@ pub(crate) fn with_seekable<T>(path: &str, operation: impl FnOnce(&mut dyn ReadS
 }
 pub(crate) fn tiff_has_transform(path: &str) -> Result<bool> {
     with_seekable(path, |reader| {
-        crate::geotiff::read_geo_tags_from(reader)
+        crate::geotiff::read_first_geo_tags_from(reader)
+            .map_err(|error| {
+                if error.kind() == std::io::ErrorKind::InvalidData {
+                    Error::InvalidData(format!("TIFF: {error}"))
+                } else {
+                    Error::Io(error)
+                }
+            })?
             .map(|tags| tags.geo_transform.is_some())
             .ok_or_else(|| Error::InvalidData("cannot read TIFF georeferencing tags".into()))
     })

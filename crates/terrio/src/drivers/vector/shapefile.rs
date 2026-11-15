@@ -20,7 +20,9 @@
 //! strings.
 
 use super::profile::LayerProfile;
+use super::stored_crs::quote_text;
 use crate::crs::SpatialRef;
+use crate::ops::simplify::open_ring;
 use crate::{Error, Result};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -28,9 +30,100 @@ use wbvector::{Coord, Feature, FieldDef, FieldType, FieldValue, Geometry, Geomet
 
 const NULL_SHAPE: i32 = 0;
 
-/// Finds a sidecar file (`dbf`, `prj`, `cpg`) next to the `.shp`, in either letter case.
-fn sidecar(base: &Path, ext: &str) -> Option<PathBuf> {
-    [ext.to_string(), ext.to_ascii_uppercase()].into_iter().map(|e| base.with_extension(e)).find(|p| p.exists())
+/// The geometry output path: replace a recognized vector or companion extension with `.shp`,
+/// or append `.shp` to other names. An existing `.shp` retains its case.
+/// Derive sidecars from this full path so unknown dotted suffixes remain part of the basename.
+pub(crate) fn output_path(path: &str) -> PathBuf {
+    let path = Path::new(path);
+    let extension = path.extension().and_then(|e| e.to_str()).unwrap_or_default();
+    if extension.eq_ignore_ascii_case("shp") {
+        path.to_path_buf()
+    } else if crate::formats::VectorDriver::for_extension(&path.to_string_lossy()).is_some()
+        || ["shx", "dbf", "prj", "cpg"].iter().any(|e| extension.eq_ignore_ascii_case(e))
+    {
+        path.with_extension("shp")
+    } else {
+        let mut name = path.as_os_str().to_os_string();
+        name.push(".shp");
+        name.into()
+    }
+}
+
+/// Component spellings, preferring lowercase then uppercase before mixed-case extensions.
+fn component_variants(path: &Path, ext: &str) -> impl Iterator<Item = PathBuf> {
+    let upper = (1usize << ext.len()) - 1;
+    [0, upper].into_iter().chain(1..upper).map(move |mask| {
+        let extension: String =
+            ext.bytes().enumerate().map(|(i, c)| if mask & (1 << i) != 0 { c.to_ascii_uppercase() } else { c } as char).collect();
+        path.with_extension(extension)
+    })
+}
+
+/// Finds a sidecar file (`dbf`, `prj`, `cpg`) next to the `.shp`, including mixed case.
+pub(crate) fn sidecar(path: &Path, ext: &str) -> Option<PathBuf> {
+    component_variants(path, ext).find(|p| p.exists())
+}
+
+/// Removes superseded spellings after creating all replacement files. `path` is the SHP path.
+pub(crate) fn remove_stale_components(path: &Path, has_prj: bool) -> Result<()> {
+    for ext in ["shp", "shx", "dbf", "cpg", "prj"] {
+        let keep = (ext != "prj" || has_prj).then(|| if ext == "shp" { path.to_path_buf() } else { path.with_extension(ext) });
+        #[cfg(unix)]
+        let identity = keep.as_ref().map(std::fs::metadata).transpose()?.map(|metadata| {
+            use std::os::unix::fs::MetadataExt;
+            (metadata.dev(), metadata.ino())
+        });
+        #[cfg(not(unix))]
+        let canonical = keep.as_ref().map(std::fs::canonicalize).transpose()?;
+        for candidate in component_variants(path, ext) {
+            if !candidate.exists() || keep.as_ref() == Some(&candidate) {
+                continue;
+            }
+            // Different spellings can name the replacement itself on a case-insensitive filesystem.
+            #[cfg(unix)]
+            let same_file = identity.is_some_and(|kept| {
+                use std::os::unix::fs::MetadataExt;
+                std::fs::metadata(&candidate).is_ok_and(|actual| (actual.dev(), actual.ino()) == kept)
+            });
+            #[cfg(not(unix))]
+            let same_file = canonical.as_ref().is_some_and(|kept| std::fs::canonicalize(&candidate).is_ok_and(|actual| &actual == kept));
+            if same_file {
+                continue;
+            }
+            std::fs::remove_file(candidate)?;
+        }
+    }
+    Ok(())
+}
+
+/// Decode a present `.prj` without silently treating unreadable text as a missing CRS.
+/// Invalid UTF-8 remains unsupported; never guess an encoding or alter a CRS name.
+pub(crate) fn decode_prj(bytes: Vec<u8>, name: &str) -> Option<String> {
+    match String::from_utf8(bytes) {
+        Ok(text) => Some(text),
+        Err(error) => {
+            let name = quote_text(name);
+            crate::warnings::warn(format!("{name} is not UTF-8 text ({}): the layer is read without a CRS", error.utf8_error()));
+            None
+        }
+    }
+}
+
+/// Read a sidecar that was found next to a Shapefile. Absence is handled by the caller.
+pub(crate) fn read_prj(path: &Path) -> Option<String> {
+    match std::fs::read(path) {
+        Ok(bytes) => decode_prj(bytes, &path.display().to_string()),
+        Err(error) => {
+            warn_prj_read_error(&path.to_string_lossy(), &error);
+            None
+        }
+    }
+}
+
+/// Report a present sidecar whose payload cannot be read, including an archive member.
+pub(crate) fn warn_prj_read_error(name: &str, error: &impl std::fmt::Display) {
+    let name = quote_text(name);
+    crate::warnings::warn(format!("{name} cannot be read ({error}): the layer is read without a CRS"));
 }
 
 /// How the rings of a polygon record make polygons: the methods of GDAL's
@@ -102,46 +195,49 @@ fn method_from_env(get: impl Fn(&str) -> Option<String>) -> Option<OrganizePolyg
 
 /// Reads a shapefile. `path` names the `.shp` file.
 pub fn read(path: &str, options: &ShapefileOptions) -> Result<Layer> {
-    let base = Path::new(path).with_extension("");
+    let base = Path::new(path);
     let shp = std::fs::read(path)?;
-    let dbf = sidecar(&base, "dbf").map(std::fs::read).transpose()?;
-    let prj = sidecar(&base, "prj").and_then(|p| std::fs::read_to_string(p).ok());
+    let dbf = sidecar(base, "dbf").map(std::fs::read).transpose()?;
+    let prj = sidecar(base, "prj").as_deref().and_then(read_prj);
     if prj.is_some() {
         crate::crs::prefetch();
     }
-    let cpg = sidecar(&base, "cpg").and_then(|p| std::fs::read_to_string(p).ok());
-    let name = base.file_name().and_then(|s| s.to_str()).unwrap_or("layer");
+    let cpg = sidecar(base, "cpg").and_then(|p| std::fs::read_to_string(p).ok());
+    let name = base.file_stem().and_then(|s| s.to_str()).unwrap_or("layer");
     parse(&shp, dbf.as_deref(), prj.as_deref(), cpg.as_deref(), name, options).map_err(|e| match e {
         Error::InvalidData(m) if m == "not a shapefile" => Error::InvalidData(format!("'{path}' is not a shapefile")),
         e => e,
     })
 }
 
-/// Reads the features `skip..skip + max` of a shapefile (`max` `None`: to the end), numbered as
-/// [`read`] numbers them, reading only their records: DBF records by position (they have a fixed
-/// size), and SHP records at the offsets the `.shx` index gives (through a scan of the record
-/// headers, without decoding the others, when there is no `.shx`). Memory follows the range,
-/// not the file.
+/// Reads up to `max` live features after skipping `skip` live features (`None`: to the end).
+/// Deleted DBF slots count toward physical FIDs, but not toward either range bound.
+/// Only the selected SHP records and DBF attributes are decoded. Finding their positions scans
+/// DBF deletion flags and uses the `.shx` index, or scans SHP headers when the index is absent.
+/// Memory holds the SHP offset index, the selected features, DBF/SHP record buffers and up to
+/// 64 KiB for scanning short DBF rows. Wide rows retain sparse one-byte flag reads.
+/// Every deep page scans the skipped physical prefix: short rows read that prefix in buffered
+/// blocks, while wide rows require one flag read/seek per slot. No per-file deletion index is cached.
 pub fn read_range(path: &str, skip: usize, max: Option<usize>, options: &ShapefileOptions) -> Result<Layer> {
     use std::io::{Read, Seek, SeekFrom};
     let method = options.method();
     let not_a_shapefile = || Error::InvalidData(format!("'{path}' is not a shapefile"));
-    let base = Path::new(path).with_extension("");
-    let name = base.file_name().and_then(|s| s.to_str()).unwrap_or("layer");
+    let base = Path::new(path);
+    let name = base.file_stem().and_then(|s| s.to_str()).unwrap_or("layer");
     let mut shp = std::io::BufReader::new(std::fs::File::open(path)?);
     let shp_len = shp.get_ref().metadata()?.len();
     let mut head = [0u8; 100];
     shp.read_exact(&mut head).map_err(|_| not_a_shapefile())?;
     let mut layer = header_layer(&head, name).map_err(|_| not_a_shapefile())?;
-    let prj = sidecar(&base, "prj").and_then(|p| std::fs::read_to_string(p).ok());
+    let prj = sidecar(base, "prj").as_deref().and_then(read_prj);
     if prj.is_some() {
         crate::crs::prefetch();
     }
-    let cpg = sidecar(&base, "cpg").and_then(|p| std::fs::read_to_string(p).ok());
+    let cpg = sidecar(base, "cpg").and_then(|p| std::fs::read_to_string(p).ok());
 
     // Where each record of the .shp starts: from the .shx when it indexes the file, else a scan
     // of the record headers.
-    let shx = sidecar(&base, "shx").map(std::fs::read).transpose()?.filter(|x| x.len() >= 100 && (x.len() - 100) % 8 == 0);
+    let shx = sidecar(base, "shx").map(std::fs::read).transpose()?.filter(|x| x.len() >= 100 && (x.len() - 100) % 8 == 0);
     let offsets: Vec<u64> = match &shx {
         Some(x) => x[100..].as_chunks::<8>().0.iter().map(|e| 2 * u64::from(u32::from_be_bytes([e[0], e[1], e[2], e[3]]))).collect(),
         None => {
@@ -158,10 +254,10 @@ pub fn read_range(path: &str, skip: usize, max: Option<usize>, options: &Shapefi
         }
     };
 
-    let (fields, dbf_total, mut dbf) = match sidecar(&base, "dbf") {
+    let (fields, dbf_total, mut dbf) = match sidecar(base, "dbf") {
         Some(p) => {
-            let mut f = std::io::BufReader::new(std::fs::File::open(p)?);
-            let len = f.get_ref().metadata()?.len();
+            let mut f = std::fs::File::open(p)?;
+            let len = f.metadata()?.len();
             let mut first = [0u8; 32];
             f.read_exact(&mut first).map_err(|_| Error::InvalidData("truncated .dbf file".into()))?;
             let header_len = dbf_header_len(&first)?;
@@ -171,7 +267,10 @@ pub fn read_range(path: &str, skip: usize, max: Option<usize>, options: &Shapefi
             let l = dbf_layout(&header, cpg.as_deref())?;
             let held = (len as usize).saturating_sub(l.header_len) / l.record_len.max(1);
             let total = if l.record_len == 0 { 0 } else { l.count.min(held) };
-            (l.fields.clone(), total, Some((f, l)))
+            // Dense short records benefit from batched reads. Wide records keep sparse flag
+            // reads instead of fetching tens of KiB of skipped attributes for each flag.
+            let capacity = if l.record_len <= 256 { 64 * 1024 } else { 1 };
+            (l.fields.clone(), total, Some((std::io::BufReader::with_capacity(capacity, f), l)))
         }
         None => (Vec::new(), 0, None),
     };
@@ -179,30 +278,47 @@ pub fn read_range(path: &str, skip: usize, max: Option<usize>, options: &Shapefi
         layer.add_field(f);
     }
     let n = if dbf_total == 0 { offsets.len() } else { dbf_total.max(offsets.len()) };
-    let start = skip.min(n);
-    let end = max.map_or(n, |m| start.saturating_add(m).min(n));
-
-    // The DBF records of the range, read at their position.
-    let mut records: Vec<Vec<FieldValue>> = Vec::new();
-    if let Some((f, l)) = dbf.as_mut() {
-        let last = end.min(dbf_total);
-        if start < last {
-            let bytes = (last - start) * l.record_len;
-            let mut buf: Vec<u8> = Vec::new();
-            buf.try_reserve_exact(bytes).map_err(|_| Error::ResourceLimit(format!("cannot allocate {bytes} bytes for .dbf records")))?;
-            buf.resize(bytes, 0);
-            f.seek(SeekFrom::Start((l.header_len + start * l.record_len) as u64))?;
-            f.read_exact(&mut buf)?;
-            records.try_reserve_exact(last - start).map_err(|_| Error::ResourceLimit("cannot allocate .dbf records".into()))?;
-            records.extend(buf.chunks_exact(l.record_len).map(|r| l.record(r)));
-        }
-    }
-
     let width = layer.schema.len();
-    layer.features.try_reserve_exact(end - start).map_err(|_| Error::ResourceLimit("cannot allocate features".into()))?;
+    let bound = max.map_or(n.saturating_sub(skip), |m| m.min(n.saturating_sub(skip)));
+    layer.features.try_reserve_exact(bound).map_err(|_| Error::ResourceLimit("cannot allocate features".into()))?;
     let mut content = Vec::new();
-    let mut records = records.into_iter();
-    for fid in start..end {
+    let mut record = Vec::new();
+    let mut skipped = 0;
+    let mut dbf_position = dbf.as_ref().map_or(0, |(_, l)| l.header_len);
+    for fid in 0..n {
+        if max.is_some_and(|m| layer.features.len() >= m) {
+            break;
+        }
+        let mut flag = *b" ";
+        if let Some((f, l)) = dbf.as_mut().filter(|_| fid < dbf_total) {
+            // Skip within a bounded buffer when records are small, avoiding a seek/read pair
+            // per slot. Large strides still seek without reading skipped attribute payloads.
+            let position = l.header_len + fid * l.record_len;
+            f.seek_relative((position - dbf_position) as i64)?;
+            f.read_exact(&mut flag)?;
+            dbf_position = position + 1;
+            if flag[0] == b'*' {
+                continue;
+            }
+        }
+        if skipped < skip {
+            skipped += 1;
+            continue;
+        }
+        let attributes = if let Some((f, l)) = dbf.as_mut().filter(|_| fid < dbf_total) {
+            // The deletion flag was read above; decode only this selected live record.
+            if record.len() != l.record_len {
+                record.try_reserve_exact(l.record_len).map_err(|_| Error::ResourceLimit("cannot allocate a .dbf record".into()))?;
+                record.resize(l.record_len, 0);
+            }
+            record[0] = flag[0];
+            f.read_exact(&mut record[1..])?;
+            dbf_position += record.len() - 1;
+            l.record(&record)
+        } else {
+            // Missing DBF slots are live shapes with null attributes, not deletions.
+            vec![FieldValue::Null; width]
+        };
         let geometry = match offsets.get(fid) {
             Some(&at) if at + 8 <= shp_len => {
                 shp.seek(SeekFrom::Start(at + 4))?;
@@ -216,7 +332,6 @@ pub fn read_range(path: &str, skip: usize, max: Option<usize>, options: &Shapefi
             }
             _ => None,
         };
-        let attributes = records.next().unwrap_or_else(|| vec![FieldValue::Null; width]);
         layer.push(Feature { fid: fid as u64, geometry, attributes });
     }
     apply_prj(&mut layer, prj.as_deref());
@@ -257,7 +372,11 @@ pub fn parse(
     let mut geometries = geometries.into_iter();
     for fid in 0..n {
         let geometry = geometries.next().flatten();
-        let attributes = records.next().unwrap_or_else(|| vec![FieldValue::Null; layer.schema.len()]);
+        // Past the DBF's records, empty attributes; a record the DBF marks deleted (`None`) is
+        // skipped, and the next features keep their physical FIDs.
+        let Some(attributes) = records.next().unwrap_or_else(|| Some(vec![FieldValue::Null; layer.schema.len()])) else {
+            continue;
+        };
         layer.push(Feature { fid: fid as u64, geometry, attributes });
     }
     apply_prj(&mut layer, prj);
@@ -283,14 +402,21 @@ pub(crate) fn header_layer(shp: &[u8], name: &str) -> Result<Layer> {
 
 /// Sets a layer's CRS from a `.prj` file, as GDAL's Shapefile driver does (FindBestMatch()):
 /// the EPSG CRS the `.prj` is identified as, and otherwise its definition.
+///
+/// A definition is kept as it is when it has the form of one (see `stored_crs::definition`), whether terrio
+/// reads it or not, or when terrio reads it (`SpatialRef::parse_literal`) and it is not WKT: a
+/// PROJ string, PROJJSON. WKT goes by its form alone, since the parser reads its first root and
+/// not what follows. Any other text leaves the layer without a CRS, with a warning that quotes it;
+/// an empty `.prj` leaves it without, silently, as no `.prj` does. A leading byte-order mark is not
+/// part of the definition.
 pub(crate) fn apply_prj(layer: &mut Layer, prj: Option<&str>) {
-    if let Some(prj) = prj.filter(|s| !s.trim().is_empty()) {
-        match SpatialRef::from_wkt(prj.trim()).epsg.and_then(|code| SpatialRef::from_epsg(code).ok()) {
-            Some(s) => s.apply_to_layer(layer),
-            None => {
-                SpatialRef::from_wkt(prj.trim()).apply_to_layer(layer);
-                layer.set_crs_wkt(Some(prj.trim().to_string()));
-            }
+    let source = format!("{}.prj", layer.name);
+    let Some(prj) = prj.and_then(|text| super::stored_crs::definition(text, Some(&source))) else { return };
+    match SpatialRef::from_wkt(prj).epsg.and_then(|code| SpatialRef::from_epsg(code).ok()) {
+        Some(s) => s.apply_to_layer(layer),
+        None => {
+            SpatialRef::from_wkt(prj).apply_to_layer(layer);
+            layer.set_crs_wkt(Some(prj.to_string()));
         }
     }
 }
@@ -412,14 +538,6 @@ fn split_parts(parts: Vec<Vec<Coord>>) -> (Vec<Vec<Coord>>, bool) {
     let split = !pieces.is_empty();
     rings.extend(pieces);
     (rings, split)
-}
-
-/// A ring without the closing vertex its record repeats.
-fn open_ring(mut cs: Vec<Coord>) -> Ring {
-    if cs.len() > 1 && (cs[0].x, cs[0].y) == (cs[cs.len() - 1].x, cs[cs.len() - 1].y) {
-        cs.pop();
-    }
-    Ring::new(cs)
 }
 
 /// One polygon as a polygon, several as a multipolygon.
@@ -853,7 +971,7 @@ pub(crate) fn dbf_layout(d: &[u8], cpg: Option<&str>) -> Result<DbfLayout> {
         offset += width;
         pos += 32;
     }
-    Ok(DbfLayout { fields, layout, encoding, count, header_len, record_len })
+    Ok(DbfLayout { fields: super::unique_field_defs(fields).collect(), layout, encoding, count, header_len, record_len })
 }
 
 impl DbfLayout {
@@ -899,52 +1017,65 @@ impl DbfLayout {
     }
 }
 
+/// A physical DBF slot; None marks a deleted record.
+type DbfRecord = Option<Vec<FieldValue>>;
+
 /// Parses a `.dbf` file into field definitions and records.
-fn parse_dbf(d: &[u8], cpg: Option<&str>) -> Result<(Vec<FieldDef>, Vec<Vec<FieldValue>>)> {
+fn parse_dbf(d: &[u8], cpg: Option<&str>) -> Result<(Vec<FieldDef>, Vec<DbfRecord>)> {
     let l = dbf_layout(d, cpg)?;
+    let records = read_dbf_records(d, &l, |rec| l.record(rec))?;
+    Ok((l.fields, records))
+}
+
+/// Collect physical slots, invoking the record factory only for live records.
+fn read_dbf_records(d: &[u8], l: &DbfLayout, make_record: impl Fn(&[u8]) -> Vec<FieldValue> + Sync) -> Result<Vec<DbfRecord>> {
     // The header's record count is not trusted: only the records the file holds are read, and
     // their list is allocated fallibly.
     let held = d.len().saturating_sub(l.header_len) / l.record_len.max(1);
     let count = if l.record_len == 0 { 0 } else { l.count.min(held) };
-    let mut records: Vec<Vec<FieldValue>> = Vec::new();
+    let mut records: Vec<DbfRecord> = Vec::new();
     records
         .try_reserve_exact(count)
         .map_err(|_| Error::ResourceLimit(format!("the .dbf file declares {count} records, more than memory holds")))?;
-    // Every record below `count` is whole in the file; they are decoded in parallel into the
-    // list reserved above.
+    // Keep per-record vectors, decoded strings and dates on the caller's allocator arena.
+    // Returning pool-thread allocations here strands freed storage in those arenas when the
+    // caller drops the dataset and allocates its next working buffers (glibc; see #729).
+    // Every record below `count` is whole in the file.
     let record = |i: usize| {
         let start = l.header_len + i * l.record_len;
-        l.record(&d[start..start + l.record_len])
+        (d[start] != b'*').then(|| make_record(&d[start..start + l.record_len]))
     };
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(any(target_arch = "wasm32", all(target_os = "linux", target_env = "gnu")))]
+    records.extend((0..count).map(record));
+    #[cfg(not(any(target_arch = "wasm32", all(target_os = "linux", target_env = "gnu"))))]
     crate::par::install(|| {
         use rayon::prelude::*;
         #[allow(clippy::disallowed_methods)] // On terrio's pool, inside `par::install`.
         records.par_extend((0..count).into_par_iter().map(record));
     });
-    #[cfg(target_arch = "wasm32")]
-    records.extend((0..count).map(record));
-    Ok((l.fields, records))
+    Ok(records)
 }
 
-/// Writes a layer as a shapefile. `path` names the `.shp` file; the other files are written next
-/// to it.
+/// Writes a layer as a shapefile. Recognized vector or companion extensions become `.shp`;
+/// other names get `.shp` appended. Companion files are written next to that geometry file.
 pub fn write(layer: &Layer, path: &str) -> Result<()> {
-    let base = Path::new(path).with_extension("");
+    let geometry_path = output_path(path);
+    let base = geometry_path.as_path();
     let (shp, shx) = encode_shapes(layer)?;
-    std::fs::write(base.with_extension("shp"), shp)?;
+    std::fs::write(&geometry_path, shp)?;
     std::fs::write(base.with_extension("shx"), shx)?;
     std::fs::write(base.with_extension("dbf"), encode_dbf(layer)?)?;
     std::fs::write(base.with_extension("cpg"), "UTF-8")?;
     // The source definition when there is one; GDAL reads OGC WKT in `.prj` files too.
     let prj = super::output_wkt(layer);
+    let has_prj = prj.is_some();
     let prj_path = base.with_extension("prj");
     match prj {
         Some(wkt) => std::fs::write(prj_path, wkt)?,
         None if prj_path.exists() => std::fs::remove_file(prj_path)?,
         None => {}
     }
-    Ok(())
+    remove_stale_components(base, has_prj)
 }
 
 /// Writes one layer to a ZIP containing `.shp`, `.shx`, `.dbf`, `.cpg` and,
@@ -1427,6 +1558,66 @@ mod tests {
     use super::*;
     use wbvector::{Feature, FieldDef};
 
+    #[cfg(unix)]
+    #[test]
+    fn replacement_aliases_are_identified_by_file_identity() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("roads.SHP");
+        for ext in ["shp", "shx", "dbf", "cpg", "prj"] {
+            let lower = path.with_extension(ext);
+            let upper = path.with_extension(ext.to_ascii_uppercase());
+            std::fs::write(&lower, "replacement").unwrap();
+            if !upper.exists() {
+                std::fs::hard_link(&lower, &upper).unwrap();
+            }
+        }
+        remove_stale_components(&path, true).unwrap();
+        for ext in ["shp", "shx", "dbf", "cpg", "prj"] {
+            assert!(path.with_extension(ext).exists());
+            assert!(path.with_extension(ext.to_ascii_uppercase()).exists());
+        }
+        remove_stale_components(&path, false).unwrap();
+        assert!(!path.with_extension("prj").exists());
+        assert!(!path.with_extension("PRJ").exists());
+        assert!(path.exists());
+    }
+
+    /// glibc record storage is built on the calling thread; deleted slots are skipped.
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    #[test]
+    fn dbf_record_storage_is_built_on_the_calling_thread() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let mut layer = Layer::new("records");
+        layer.add_field(FieldDef::new("name", FieldType::Text));
+        layer.add_field(FieldDef::new("day", FieldType::Date));
+        for i in 0..128 {
+            layer.push(Feature {
+                fid: i,
+                geometry: None,
+                attributes: vec![FieldValue::Text(format!("record-{i}")), FieldValue::Date("2026-11-12".into())],
+            });
+        }
+        let mut bytes = encode_dbf(&layer).unwrap();
+        let layout = dbf_layout(&bytes, Some("UTF-8")).unwrap();
+        bytes[layout.header_len + 5 * layout.record_len] = b'*';
+        let caller = std::thread::current().id();
+        let worker_allocated = AtomicBool::new(false);
+        let calls = AtomicUsize::new(0);
+        let records = read_dbf_records(&bytes, &layout, |record| {
+            if std::thread::current().id() != caller {
+                worker_allocated.store(true, Ordering::Relaxed);
+            }
+            calls.fetch_add(1, Ordering::Relaxed);
+            layout.record(record)
+        })
+        .unwrap();
+        assert!(!worker_allocated.load(Ordering::Relaxed), "DBF record storage was allocated on a pool thread");
+        assert_eq!(calls.load(Ordering::Relaxed), 127);
+        assert_eq!(records.len(), 128);
+        assert!(records[5].is_none());
+        assert_eq!(records[6].as_ref().unwrap(), &layer.features[6].attributes);
+    }
+
     #[test]
     fn measure_ranges_exclude_missing_samples() {
         let coordinates = vec![
@@ -1779,6 +1970,144 @@ mod tests {
         assert_eq!(back.crs_wkt(), Some(custom));
     }
 
+    #[test]
+    fn a_prj_that_holds_no_crs_gives_the_layer_none_with_a_warning() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("p.shp");
+        let path = path.to_str().unwrap();
+        let mut l = Layer::new("p");
+        l.add_field(FieldDef::new("id", FieldType::Integer));
+        l.push(Feature { fid: 0, geometry: Some(Geometry::point(1.0, 2.0)), attributes: vec![FieldValue::Integer(1)] });
+        write(&l, path).unwrap();
+        let shp = std::fs::read(path).unwrap();
+        let dbf = std::fs::read(dir.path().join("p.dbf")).unwrap();
+        // The layer's EPSG code, its WKT and the warnings, through each reader of a `.prj`: a
+        // file (`read`), a page of one (`read_range`), a file in memory (`parse`) and a stream.
+        let read_with = |prj: &str| {
+            std::fs::write(dir.path().join("p.prj"), prj).unwrap();
+            let options = ShapefileOptions::default();
+            let stream = || Ok(crate::stream::open_layers(path, &Default::default(), 100)?.remove(0).layer().clone());
+            let readers: [&dyn Fn() -> Result<Layer>; 4] = [
+                &|| read(path, &options),
+                &|| read_range(path, 0, None, &options),
+                &|| parse(&shp, Some(&dbf), Some(prj), None, "p", &options),
+                &stream,
+            ];
+            let mut readings = Vec::new();
+            for reader in readers {
+                let _ = crate::warnings::take();
+                let layer = reader().unwrap();
+                readings.push((layer.crs_epsg(), layer.crs_wkt().map(str::to_string), crate::warnings::take()));
+            }
+            assert!(readings.windows(2).all(|w| w[0] == w[1]), "{prj:?}: {readings:?}");
+            readings.remove(0)
+        };
+        // Text that is not a CRS definition terrio reads: no CRS, and a warning naming the file
+        // and quoting the text, whitespace, control characters (ESC, BEL, the 8-bit CSI) and the
+        // invisible format characters (a right-to-left override, zero-width ones) as spaces. A
+        // `.prj` naming a file is not read through, and WKT followed by prose is not a definition,
+        // although the parser reads its first root.
+        let esri = r#"GEOGCS["GCS_WGS_1984",DATUM["D_WGS_1984",SPHEROID["WGS_1984",6378137.0,298.257223563]],PRIMEM["Greenwich",0.0],UNIT["Degree",0.0174532925199433]]"#;
+        let malformed = r#"GEOGCS["GCS_WGS_1984",DATUM["D_WGS_1984"(SPHEROID["WGS_1984",6378137,298.257223563]]]"#;
+        let named = dir.path().join("other.prj");
+        std::fs::write(&named, esri).unwrap();
+        let named = named.to_str().unwrap();
+        let named_quoted: String = named.chars().take(80).collect();
+        for (prj, quoted) in [
+            ("not a coordinate reference system", "not a coordinate reference system"),
+            ("http://example.com/crs\n", "http://example.com/crs"),
+            ("Projection GEOGRAPHIC\nDatum WGS84\nUnits DD", "Projection GEOGRAPHIC Datum WGS84 Units DD"),
+            ("\x1b[31mred\x1b[0m\x07\u{9b}2J", " [31mred [0m  2J"),
+            ("one line\u{2028}and another", "one line and another"),
+            ("hidden\u{E0041}\u{2061}text", "hidden  text"),
+            ("invoice\u{202E}fdp.exe\u{200B}\u{061C}\u{00AD}\u{FEFF}", "invoice fdp.exe    "),
+            ("PROJCS[\"x\"]\nnot a coordinate reference system", "PROJCS[\"x\"] not a coordinate reference system"),
+            ("ERROR:404", "ERROR:404"),
+            (malformed, &malformed[..80]),
+            (named, &named_quoted),
+        ] {
+            let warning = format!("p.prj holds no CRS definition terrio can read ('{quoted}'): the layer is read without a CRS");
+            assert_eq!(read_with(prj), (None, None, vec![warning]), "{prj:?}");
+        }
+        // EPSG identification must not bypass full-form validation.
+        for suffix in ["\nnotes", "[", "]"] {
+            let text = format!("{esri}{suffix}");
+            let (epsg, wkt, warnings) = read_with(&text);
+            assert_eq!((epsg, wkt), (None, None), "{text}");
+            assert_eq!(warnings.len(), 1, "{text}: {warnings:?}");
+        }
+        // An empty `.prj` (a byte-order mark alone included): no CRS, silently, as without one.
+        for prj in ["", " \r\n", "\u{feff}"] {
+            assert_eq!(read_with(prj), (None, None, vec![]), "{prj:?}");
+        }
+        // A byte-order mark is not part of the definition.
+        let (epsg, wkt, warnings) = read_with(&format!("\u{feff}{esri}"));
+        assert_eq!((epsg, warnings), (Some(4326), vec![]));
+        assert!(wkt.is_some_and(|w| w.starts_with(r#"GEOGCS["WGS 84""#)));
+        // Definitions terrio reads without an EPSG code are kept as they are, without a warning: a
+        // reference in either case, and WKT followed by another definition, on the next line or
+        // after a comma.
+        let custom = r#"PROJCS["custom",GEOGCS["WGS 84",DATUM["WGS_1984",SPHEROID["WGS 84",6378137,298.257223563]],PRIMEM["Greenwich",0],UNIT["degree",0.0174532925199433]],PROJECTION["Transverse_Mercator"],PARAMETER["latitude_of_origin",0],PARAMETER["central_meridian",15.5],PARAMETER["scale_factor",0.9996],PARAMETER["false_easting",500000],PARAMETER["false_northing",0],UNIT["metre",1]]"#;
+        let vertical = r#"VERTCS["NAVD_1988",VDATUM["North_American_Vertical_Datum_1988"],PARAMETER["Vertical_Shift",0.0],PARAMETER["Direction",1.0],UNIT["Meter",1.0]]"#;
+        for prj in [
+            custom,
+            "+proj=longlat +ellps=GRS80 +no_defs",
+            r#"PROJCS["x"]"#,
+            "epsg:4326",
+            "esri:102100",
+            "iau_2015:49900",
+            "ogc:crs84",
+            &format!("{custom}\n{vertical}"),
+            &format!("{custom},{vertical}"),
+        ] {
+            assert_eq!(read_with(&format!("{prj}\n")), (None, Some(prj.to_string()), vec![]), "{prj:?}");
+        }
+        // Conventional NUL / DOS EOF padding does not invalidate an otherwise complete WKT.
+        for padding in ["\0", "\x1a", "\0\r\n"] {
+            assert_eq!(read_with(&format!("{custom}{padding}")), (None, Some(custom.to_string()), vec![]));
+        }
+        // Engineering definitions retain their WKT without inventing an EPSG identity.
+        let engineering = r#"ENGCRS["site grid",EDATUM["site"],CS[Cartesian,2],AXIS["(E)",east],AXIS["(N)",north],LENGTHUNIT["metre",1]]"#;
+        for prj in [r#"LOCAL_CS["site grid",UNIT["metre",1]]"#, engineering, r#"ENGCRS["x"]"#] {
+            assert!(SpatialRef::parse_literal(prj).is_ok(), "{prj:?}");
+            assert_eq!(read_with(&format!("{prj}\n")), (None, Some(prj.to_string()), vec![]), "{prj:?}");
+        }
+        // Unsupported authorities and unknown codes retain definition-shaped metadata too.
+        for prj in ["IGNF:LAMB93", "ignf:LAMB93", "urn:ogc:def:crs:IGNF::LAMB93", "EPSG:999999"] {
+            assert!(SpatialRef::parse_literal(prj).is_err(), "{prj:?}");
+            assert_eq!(read_with(&format!("{prj}\n")), (None, Some(prj.to_string()), vec![]), "{prj:?}");
+        }
+    }
+
+    #[test]
+    fn unreadable_prj_sidecars_warn_instead_of_becoming_silent_absences() {
+        let _ = crate::warnings::take();
+        assert!(decode_prj(vec![0xff], "p.prj").is_none());
+        let warning = crate::warnings::take();
+        assert_eq!(warning.len(), 1);
+        assert!(warning[0].contains("p.prj is not UTF-8 text"));
+        assert!(warning[0].contains("invalid utf-8"));
+        assert_eq!(decode_prj("Réseau local".as_bytes().to_vec(), "p.prj").as_deref(), Some("Réseau local"));
+        assert!(crate::warnings::take().is_empty());
+        let directory = tempfile::tempdir().unwrap();
+        assert!(read_prj(directory.path()).is_none());
+        let warning = crate::warnings::take();
+        assert_eq!(warning.len(), 1);
+        assert!(warning[0].contains("cannot be read"));
+        assert!(warning[0].contains(&directory.path().display().to_string()));
+    }
+
+    #[test]
+    fn prj_warning_quotes_control_characters_in_the_layer_name() {
+        let _ = crate::warnings::take();
+        let mut layer = Layer::new("p\x1b\u{202e}");
+        apply_prj(&mut layer, Some("not a CRS"));
+        let warnings = crate::warnings::take();
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].starts_with("p  .prj holds no CRS"), "{warnings:?}");
+        assert!(!warnings[0].contains(['\x1b', '\u{202e}']));
+    }
+
     /// A `.dbf` of one text field holding `cell`, its header declaring `count` records and the
     /// language driver id `ldid`.
     fn dbf(cell: &[u8], count: u32, ldid: u8) -> Vec<u8> {
@@ -1799,9 +2128,10 @@ mod tests {
         d
     }
 
+    /// Decodes the generated single text cell for the encoding regressions.
     fn text(d: &[u8], cpg: Option<&str>) -> String {
         let (_, records) = parse_dbf(d, cpg).unwrap();
-        match &records[0][0] {
+        match &records[0].as_ref().unwrap()[0] {
             FieldValue::Text(s) => s.clone(),
             v => panic!("{v:?}"),
         }

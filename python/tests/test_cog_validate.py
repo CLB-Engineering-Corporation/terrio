@@ -112,11 +112,25 @@ def test_non_square_blocks_agree_with_rio_cogeo(tmp_path):
             if overviews:
                 dst.build_overviews(overviews, Resampling.average)
         paths.append(path)
+    compared = set()
     for path in paths:
         for strict in (False, True):
-            expected = cogeo.cog_validate(str(path), strict=strict, quiet=True)
             got = terrio.validate_cog(path, strict=strict)
+            try:
+                expected = cogeo.cog_validate(str(path), strict=strict, quiet=True)
+            except (IndexError, UnboundLocalError):
+                # rio-cogeo 5.4 and 7.0 fail on a sparse image none of whose scanned blocks is
+                # stored: terrio's verdict is that of the other tiled files without overviews.
+                assert path.name.startswith("sparse_"), path.name
+                warning = (
+                    "The file is greater than 512xH or 512xW, "
+                    "it is recommended to include internal overviews"
+                )
+                assert got == (not strict, [], [warning]), path.name
+                continue
             assert got == (expected[0], list(expected[1]), list(expected[2])), path.name
+            compared.add(path.name)
+    assert {p.name for p in paths if not p.name.startswith("sparse_")} <= compared
 
 
 def test_gdal_profile_uploaded_bytes_and_corruption(files):
@@ -193,6 +207,7 @@ def test_remote_gdal_auto_keeps_header_reads(tmp_path):
 
 
 def test_external_overviews_agree_with_rio_cogeo(tmp_path):
+    """Match rio-cogeo 7.0.4 with rasterio 1.5.2 (GDAL 3.12.2) for external overviews."""
     # GDAL takes every image of a .ovr sidecar as an overview: those GDAL builds (all flagged
     # reduced) and hand-made ones whose first image is not flagged, full resolution included.
     rasterio = pytest.importorskip("rasterio")
@@ -201,6 +216,7 @@ def test_external_overviews_agree_with_rio_cogeo(tmp_path):
     from rasterio.transform import from_origin
 
     def gtiff(name, width, height, overviews=None):
+        """Write a tiled reference image, optionally with internal overviews."""
         path = tmp_path / name
         profile = dict(
             driver="GTiff",

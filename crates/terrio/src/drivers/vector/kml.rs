@@ -15,11 +15,12 @@
 //! A `MultiGeometry` of one geometry type is a multi-part geometry, and ground overlays are
 //! polygons. Writing produces a Document per layer, each with its typed Schema.
 
+use super::in_wgs84;
 use super::kml_style;
 use super::xml::{self, Element};
 use crate::{Error, Result};
+use std::collections::HashMap;
 use std::fmt::Write as _;
-use std::io::Read as _;
 use wbvector::{Coord, Feature, FieldDef, FieldType, FieldValue, Geometry, GeometryType, Layer, Ring};
 
 const FIXED: &[(&str, FieldType)] = &[
@@ -42,6 +43,20 @@ const MAX_STYLE_DOCUMENTS: usize = 256;
 /// How many decompressed bytes of text those documents may take together. Their parsed form takes
 /// several times that, which WASM's memory has to hold too.
 const MAX_STYLE_DOCUMENT_BYTES: u64 = 64 << 20;
+/// How many decompressed bytes of text a KMZ archive's main document and the layer documents it
+/// links to may take together by default (`TERRIO_KMZ_MAX_SIZE`). Reading them takes at least
+/// twice that in memory, and a deflated document expands up to 1,032 times its size in the archive.
+const DEFAULT_MAX_KMZ_DOCUMENT_BYTES: u64 = 512 << 20;
+
+/// The bytes a KMZ archive's main and layer documents may take together: `TERRIO_KMZ_MAX_SIZE`,
+/// else 512 MiB; the budget [`read_document`] starts from. Members are also read within the
+/// archive limits (`crate::vfs::ZipLimits`).
+pub(crate) fn max_kmz_document_bytes() -> u64 {
+    crate::config::get("TERRIO_KMZ_MAX_SIZE").and_then(|v| v.trim().parse().ok()).unwrap_or(DEFAULT_MAX_KMZ_DOCUMENT_BYTES)
+}
+
+/// A duplicate-entry refusal is terminal, including for the optional GDAL backend.
+pub(crate) const AMBIGUOUS_KMZ: &str = "KMZ: the archive holds several entries with the same name, so its main document is ambiguous";
 
 /// A KML document's layers, and its style table: style ids and their OGR style strings.
 pub type Styled = (Vec<Layer>, Vec<(String, String)>);
@@ -56,15 +71,18 @@ pub fn read_styled(path: &str) -> Result<Styled> {
     parse_styled(&xml::decode(&std::fs::read(path)?), &stem(path))
 }
 
-/// Reads a KMZ file: its main document (`doc.kml`, or the first `.kml` file), and the documents
+/// Reads a KMZ file: its main document (its first `.kml` file at the root), and the documents
 /// in the archive it links to (GDAL writes one per layer under `layers/`).
+/// Without a `.kml` file at the root, its first `.kml` file is the main document. An archive
+/// holding two entries of the same name is refused.
 pub fn read_kmz(path: &str) -> Result<Vec<Layer>> {
     Ok(read_kmz_styled(path)?.0)
 }
 
 /// Reads a KMZ file with its style table.
 pub fn read_kmz_styled(path: &str) -> Result<Styled> {
-    parse_kmz_styled(std::fs::read(path)?, &stem(path))
+    // Only the archive's directory and the members read are loaded.
+    kmz_styled(std::io::BufReader::new(std::fs::File::open(path)?), &stem(path))
 }
 
 /// Parses a KMZ archive held in memory. `default_name` names a root layer without a name.
@@ -74,37 +92,113 @@ pub fn parse_kmz(bytes: Vec<u8>, default_name: &str) -> Result<Vec<Layer>> {
 
 /// Parses a KMZ archive held in memory, with the style table of its documents.
 pub fn parse_kmz_styled(bytes: Vec<u8>, default_name: &str) -> Result<Styled> {
-    let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes))?;
-    let names: Vec<String> = zip.file_names().filter_map(|n| n.ok().map(|n| n.into_owned())).collect();
-    let main = names
+    kmz_styled(std::io::Cursor::new(bytes), default_name)
+}
+
+/// The main document of a KMZ archive, its index and name: the first `.kml` entry at the archive's
+/// root, in the order of its entries, whatever its name (OGC KML 2.3, Annex C.1: "If more than one
+/// KML file exists at the root directory level, the first file entry (in unsorted order) shall be
+/// treated as the main KML file"); else, when the root holds none, its first `.kml` entry. A `\`
+/// separates folders too, as Windows tools write it.
+fn main_document<R: std::io::Read + std::io::Seek>(zip: &zip::ZipArchive<R>) -> Result<(usize, String)> {
+    let documents: Vec<(usize, String)> = (0..zip.len())
+        .filter_map(|i| match zip.name_for_index(i)? {
+            Ok(name) => Some((i, name.into_owned())),
+            Err(error) => {
+                crate::warnings::warn(format!("KMZ: entry {i} has an undecodable name and is skipped: {error}"));
+                None
+            }
+        })
+        .filter(|(_, name)| name.to_ascii_lowercase().ends_with(".kml"))
+        .collect();
+    let at_root = documents
         .iter()
-        .find(|n| n.eq_ignore_ascii_case("doc.kml"))
-        .or_else(|| names.iter().find(|n| n.to_ascii_lowercase().ends_with(".kml")))
-        .ok_or_else(|| Error::InvalidData("the KMZ archive holds no KML document".into()))?
-        .clone();
-    let mut read_limited = |name: &str, limit: u64| -> Result<String> {
-        let mut bytes = Vec::new();
-        zip.by_name(name)?.take(limit).read_to_end(&mut bytes)?;
-        Ok(xml::decode(&bytes))
-    };
-    let root = xml::parse(&read_limited(&main, u64::MAX)?)?;
+        .position(|(_, name)| {
+            let mut relative = name.as_str();
+            while let Some(rest) = relative.strip_prefix("./").or_else(|| relative.strip_prefix(".\\")) {
+                relative = rest;
+            }
+            !relative.contains(['/', '\\'])
+        })
+        .unwrap_or(0);
+    documents.into_iter().nth(at_root).ok_or_else(|| Error::InvalidData("the KMZ archive holds no KML document".into()))
+}
+
+/// Reads the KML document named `name` from a KMZ archive within `budget`, the bytes left of
+/// `TERRIO_KMZ_MAX_SIZE` for the archive's documents, and takes its bytes from it.
+///
+/// Args:
+///     zip: The archive, read within the archive limits.
+///     name: The document's member name.
+///     budget: The bytes the archive's documents may still take; reduced by this one's.
+///
+/// Returns:
+///     The document's text, or `Error::ResourceLimit` when it does not fit the budget.
+fn read_document<R: std::io::Read + std::io::Seek>(zip: &mut crate::vfs::LimitedZip<R>, name: &str, budget: &mut u64) -> Result<String> {
+    let index = zip.archive().index_for_name(name).ok_or_else(|| Error::InvalidData(format!("KMZ: '{name}' is not in the archive")))?;
+    read_document_at(zip, index, budget)
+}
+
+/// [`read_document`] for the member at `index`.
+pub(crate) fn read_document_at<R: std::io::Read + std::io::Seek>(
+    zip: &mut crate::vfs::LimitedZip<R>,
+    index: usize,
+    budget: &mut u64,
+) -> Result<String> {
+    // A document declaring more than is left is refused before it is read. One inflating past what
+    // it declares is refused by `read_index`, so no read goes past the budget.
+    let (name, declared, _) = zip.entry(index)?;
+    if declared > *budget {
+        return Err(Error::ResourceLimit(format!(
+            "KMZ: the archive's KML documents hold more than the {} bytes allowed (TERRIO_KMZ_MAX_SIZE), at '{name}'",
+            max_kmz_document_bytes()
+        )));
+    }
+    let bytes = zip.read_index(index, *budget)?;
+    *budget -= bytes.len() as u64;
+    Ok(xml::decode(&bytes))
+}
+
+/// [`parse_kmz_styled`] from a reader of the archive: within the archive limits
+/// (`crate::vfs::ZipLimits`) and, for the main and layer documents, `TERRIO_KMZ_MAX_SIZE`.
+fn kmz_styled<R: std::io::Read + std::io::Seek>(reader: R, default_name: &str) -> Result<Styled> {
+    // Preserve the KMZ diagnostic while the shared archive reader enforces uniqueness.
+    let mut zip = crate::vfs::LimitedZip::open(reader).map_err(|error| match error {
+        Error::InvalidData(message) if message == crate::vfs::AMBIGUOUS_ZIP => Error::InvalidData(AMBIGUOUS_KMZ.into()),
+        error => error,
+    })?;
+    let names: Vec<String> = zip.archive().file_names().filter_map(|n| n.ok().map(|n| n.into_owned())).collect();
+    let (main_index, main) = main_document(zip.archive())?;
+    let mut documents_budget = max_kmz_document_bytes();
+    let root = xml::parse_document(&read_document_at(&mut zip, main_index, &mut documents_budget)?, "kml", "KML")?;
     // The documents that are layers, each with its layer name.
     let mut links = Vec::new();
     root.find_all("NetworkLink", &mut links);
+    let archived: std::collections::HashSet<&str> = names.iter().map(String::as_str).collect();
+    // Each document is read, counted toward the budget and parsed once, however many links name
+    // it. Its first link supplies the default name; document and folder names are kept.
+    // The main document is not read again.
+    let mut linked = std::collections::HashSet::from([main.as_str()]);
     let mut documents: Vec<(String, Element, String)> = Vec::new();
     for link in links {
         let Some(href) = link.child("Link").or_else(|| link.child("Url")).and_then(|l| l.child_text("href")) else { continue };
         let href = href.trim_start_matches("./");
-        if let Some(member) = names.iter().find(|n| n.as_str() == href) {
-            let name = link.child_text("name").map_or_else(|| stem(member), str::to_string);
-            documents.push((member.clone(), xml::parse(&read_limited(member, u64::MAX)?)?, name));
+        if !archived.contains(href) || !linked.insert(href) {
+            continue;
         }
+        let name = link.child_text("name").map_or_else(|| stem(href), str::to_string);
+        documents.push((
+            href.to_string(),
+            xml::parse_document(&read_document(&mut zip, href, &mut documents_budget)?, "kml", "KML")?,
+            name,
+        ));
     }
     // The documents styles live in, as far as links from one to the next go. Each is read once here
-    // (a layer document a styleUrl names was also read above), and
-    // one that cannot be read, or past the limits, leaves its links as raw URLs.
+    // (a layer document a styleUrl names was also read above, and counts again toward
+    // `TERRIO_ZIP_MAX_SIZE`, though not toward the document budget), and
+    // one that cannot be read, or past the style budget, leaves its links as raw URLs. An archive
+    // past the archive limits is refused.
     let mut budget = MAX_STYLE_DOCUMENT_BYTES;
-    let archived: std::collections::HashSet<&str> = names.iter().map(String::as_str).collect();
     let mut members = kml_style::Members::new();
     let mut pending = kml_style::linked_members(&root, &main);
     for (member, document, _) in &documents {
@@ -115,7 +209,14 @@ pub fn parse_kmz_styled(bytes: Vec<u8>, default_name: &str) -> Result<Styled> {
             continue;
         }
         // One byte past the budget tells a document that does not fit from one that just does.
-        let Ok(text) = read_limited(&name, budget + 1) else { continue };
+        let text = match zip.read_name(&name, budget) {
+            Ok(bytes) => xml::decode(&bytes),
+            Err(e) if e.is_resource_refusal() => return Err(e),
+            // A member inflating past its declared size is refused only by the message
+            // `is_past_declared` matches. If zip rewords it, that member is skipped here like an
+            // unreadable one, not refused; the vfs tests pin the message.
+            Err(_) => continue,
+        };
         if text.len() as u64 > budget {
             budget = 0;
             continue;
@@ -127,10 +228,12 @@ pub fn parse_kmz_styled(bytes: Vec<u8>, default_name: &str) -> Result<Styled> {
     }
     let index = kml_style::index_members(&members);
     let mut table = Vec::new();
-    let mut layers = layers_of(&root, &main, &index, default_name, false, &mut table);
+    let mut known = HashMap::new();
+    let mut layers = layers_of(&root, &main, &index, default_name, false, &mut table, &mut known);
     for (member, document, name) in &documents {
-        layers.extend(layers_of(document, member, &index, name, true, &mut table));
+        layers.extend(layers_of(document, member, &index, name, true, &mut table, &mut known));
     }
+    make_layer_names_unique(&mut layers);
     Ok((layers, table))
 }
 
@@ -153,9 +256,11 @@ pub fn parse(text: &str, default_name: &str) -> Result<Vec<Layer>> {
 
 /// Parses KML text, with its style table.
 pub fn parse_styled(text: &str, default_name: &str) -> Result<Styled> {
-    let root = xml::parse(text)?;
+    let root = xml::parse_document(text, "kml", "KML")?;
     let mut table = Vec::new();
-    let layers = layers_of(&root, "", &kml_style::MemberIndex::new(), default_name, false, &mut table);
+    let mut known = HashMap::new();
+    let mut layers = layers_of(&root, "", &kml_style::MemberIndex::new(), default_name, false, &mut table, &mut known);
+    make_layer_names_unique(&mut layers);
     Ok((layers, table))
 }
 
@@ -169,6 +274,7 @@ fn layers_of(
     default_name: &str,
     root_layer: bool,
     table: &mut Vec<(String, String)>,
+    known: &mut HashMap<String, String>,
 ) -> Vec<Layer> {
     // The schemas, anywhere in the document, by id and by name.
     let mut schemas = Vec::new();
@@ -190,25 +296,39 @@ fn layers_of(
         }
     }
     let mut styles = kml_style::Styles::new(root, member, members);
-    styles.add_to(table);
-    let mut layers: Vec<Layer> = containers
+    styles.add_to(table, known);
+    containers
         .into_iter()
         .map(|(name, features, container)| {
             let mut l = layer(&name, &features, &schemas, &styles);
             l.extent = container_bounds(container);
             l
         })
-        .collect();
-    // Layer names must be unique.
-    for i in 1..layers.len() {
-        let mut n = 2;
-        let base = layers[i].name.clone();
-        while layers[..i].iter().any(|l| l.name == layers[i].name) {
-            layers[i].name = format!("{base} ({n})");
-            n += 1;
+        .collect()
+}
+
+/// Make names unique across a dataset: combined KMZ documents or one plain KML document.
+/// ASCII case variants collide as they do for SQLite/GeoPackage table names.
+fn make_layer_names_unique(layers: &mut [Layer]) {
+    // Layer names must be unique: a name an earlier layer has takes the first free suffix, ` (2)`,
+    // ` (3)`, and so on. Names are only ever added, so the suffixes a name found taken stay taken,
+    // and its next search resumes after the last suffix it took.
+    let mut taken = std::collections::HashSet::with_capacity(layers.len());
+    let mut next: HashMap<String, usize> = HashMap::new();
+    for layer in layers {
+        let key = layer.name.to_ascii_lowercase();
+        if taken.insert(key.clone()) {
+            continue;
         }
+        let n = next.entry(key).or_insert(2);
+        layer.name = loop {
+            let name = format!("{} ({n})", layer.name);
+            *n += 1;
+            if taken.insert(name.to_ascii_lowercase()) {
+                break name;
+            }
+        };
     }
-    layers
 }
 
 fn collect_schemas<'a>(e: &'a Element, out: &mut Vec<&'a Element>) {
@@ -574,14 +694,6 @@ fn data_fields(layer: &Layer) -> Vec<usize> {
     (0..layer.schema.len()).filter(|&i| !is_own_field(&layer.schema.fields()[i].name)).collect()
 }
 
-fn in_wgs84(layer: &Layer) -> Result<std::borrow::Cow<'_, Layer>> {
-    let srs = crate::crs::SpatialRef::from_layer(layer);
-    if srs.is_unknown() || srs.epsg == Some(4326) {
-        return Ok(std::borrow::Cow::Borrowed(layer));
-    }
-    Ok(std::borrow::Cow::Owned(crate::vector::reproject_layer(layer, &crate::crs::SpatialRef::from_epsg(4326)?)?))
-}
-
 fn schema(l: &Layer) -> String {
     let fields = data_fields(l);
     if fields.is_empty() {
@@ -816,10 +928,10 @@ fn write_geometry(s: &mut String, g: &Geometry, flags: &Flags) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Read as _;
 
     #[test]
     fn a_kmz_carries_the_files_its_styles_refer_to() {
-        use std::io::Read as _;
         let mut layer = Layer::new("pins").with_crs_epsg(4326);
         layer.add_field(FieldDef::new(kml_style::FIELD, FieldType::Text));
         layer.push(Feature {
@@ -991,6 +1103,37 @@ mod tests {
         assert!(shared.contains(r#"<Style id="base">"#), "{shared}");
     }
 
+    #[test]
+    fn many_layer_documents_with_their_own_styles_keep_first_definitions() {
+        // Regression for #631: each layer document brings a distinct style id. The table grows
+        // once per id, and the first definition wins when a later document reuses an id.
+        let main = concat!(
+            r#"<kml><Document><name>links</name>"#,
+            r#"<NetworkLink><Link><href>layers/m0.kml</href></Link></NetworkLink>"#,
+            r#"<NetworkLink><Link><href>layers/m1.kml</href></Link></NetworkLink>"#,
+            r#"<NetworkLink><Link><href>layers/m2.kml</href></Link></NetworkLink>"#,
+            r#"<NetworkLink><Link><href>layers/m3.kml</href></Link></NetworkLink>"#,
+            r#"</Document></kml>"#,
+        );
+        let m0 = r#"<kml><Document><Style id="s0"><LineStyle><color>ff0000ff</color><width>1</width></LineStyle></Style><Placemark><name>p</name><styleUrl>#s0</styleUrl><Point><coordinates>1,2</coordinates></Point></Placemark></Document></kml>"#;
+        let m1 = r#"<kml><Document><Style id="s1"><LineStyle><color>ff0000ff</color><width>2</width></LineStyle></Style><Placemark><name>p</name><styleUrl>#s1</styleUrl><Point><coordinates>1,2</coordinates></Point></Placemark></Document></kml>"#;
+        let m2 = r#"<kml><Document><Style id="s2"><LineStyle><color>ff0000ff</color><width>3</width></LineStyle></Style><Placemark><name>p</name><styleUrl>#s2</styleUrl><Point><coordinates>1,2</coordinates></Point></Placemark></Document></kml>"#;
+        // Redefines s0 with a different width; the table keeps width 1.
+        let m3 = r#"<kml><Document><Style id="s0"><LineStyle><color>ff0000ff</color><width>9</width></LineStyle></Style><Placemark><name>p</name><styleUrl>#s0</styleUrl><Point><coordinates>1,2</coordinates></Point></Placemark></Document></kml>"#;
+        let (layers, table) = parse_kmz_styled(
+            archive(&[("doc.kml", main), ("layers/m0.kml", m0), ("layers/m1.kml", m1), ("layers/m2.kml", m2), ("layers/m3.kml", m3)]),
+            "a",
+        )
+        .unwrap();
+        assert_eq!(layers.len(), 4);
+        assert_eq!(table.len(), 3);
+        assert!(table.iter().any(|(id, s)| id == "s0" && s.contains("w:1.000000px")), "{table:?}");
+        assert!(table.iter().any(|(id, _)| id == "s1"));
+        assert!(table.iter().any(|(id, _)| id == "s2"));
+        assert_eq!(style(&layers[0], 0), "@s0");
+        assert!(style(&layers[3], 0).contains("w:9.000000px"));
+    }
+
     /// A KMZ archive of the members given.
     fn archive(members: &[(&str, &str)]) -> Vec<u8> {
         let mut buf = std::io::Cursor::new(Vec::new());
@@ -1001,6 +1144,236 @@ mod tests {
         }
         zip.finish().unwrap();
         buf.into_inner()
+    }
+
+    /// A KMZ archive of deflated members.
+    fn deflated(members: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut buf = std::io::Cursor::new(Vec::new());
+        let mut zip = zip::ZipWriter::new(&mut buf);
+        for (name, bytes) in members {
+            zip.start_file(*name, zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated)).unwrap();
+            std::io::Write::write_all(&mut zip, bytes).unwrap();
+        }
+        zip.finish().unwrap();
+        buf.into_inner()
+    }
+
+    /// A KML document with one placemark, padded by a comment of `padding` spaces.
+    fn padded(padding: usize) -> Vec<u8> {
+        let mut text = b"<kml><Document><Placemark><Point><coordinates>1,2</coordinates></Point></Placemark><!--".to_vec();
+        text.resize(text.len() + padding, b' ');
+        text.extend_from_slice(b"--></Document></kml>");
+        text
+    }
+
+    /// A `NetworkLink` to `href`, with a `<name>` when `name` is not empty.
+    fn network_link(name: &str, href: &str) -> String {
+        let name = if name.is_empty() { String::new() } else { format!("<name>{name}</name>") };
+        format!("<NetworkLink>{name}<Link><href>{href}</href></Link></NetworkLink>")
+    }
+
+    /// Each layer's name and feature count.
+    fn summary(layers: &[Layer]) -> Vec<(&str, usize)> {
+        layers.iter().map(|l| (l.name.as_str(), l.features.len())).collect()
+    }
+
+    use crate::config::with_options;
+
+    #[test]
+    fn kmz_documents_are_read_within_the_document_budget() {
+        let kmz = deflated(&[("doc.kml", &padded(2 << 20))]);
+        assert!(kmz.len() < 16 << 10, "{} bytes", kmz.len());
+        // Within the default budget, the document reads.
+        assert_eq!(parse_kmz(kmz.clone(), "a").unwrap()[0].features.len(), 1);
+        let refused = with_options(&[("TERRIO_KMZ_MAX_SIZE", "1048576")], || parse_kmz(kmz.clone(), "a"));
+        assert!(
+            matches!(&refused, Err(Error::ResourceLimit(m)) if m.contains("TERRIO_KMZ_MAX_SIZE") && m.contains("doc.kml")),
+            "{refused:?}"
+        );
+        // A document of exactly the budget fits it.
+        let exact = padded(2 << 20).len().to_string();
+        assert!(with_options(&[("TERRIO_KMZ_MAX_SIZE", &exact)], || parse_kmz(kmz.clone(), "a")).is_ok());
+        // The main document and the layer documents it links to share the budget.
+        let main = br#"<kml><Document><NetworkLink><Link><href>layers/a.kml</href></Link></NetworkLink></Document></kml>"#;
+        let linked = deflated(&[("doc.kml", main), ("layers/a.kml", &padded(1 << 20))]);
+        assert_eq!(parse_kmz(linked.clone(), "a").unwrap()[0].features.len(), 1);
+        let budget = (padded(1 << 20).len() + main.len() - 1).to_string();
+        let refused = with_options(&[("TERRIO_KMZ_MAX_SIZE", &budget)], || parse_kmz(linked.clone(), "a"));
+        assert!(matches!(&refused, Err(Error::ResourceLimit(m)) if m.contains("layers/a.kml")), "{refused:?}");
+        // And the path read from a file.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("expansion.kmz");
+        std::fs::write(&path, &kmz).unwrap();
+        let refused = with_options(&[("TERRIO_KMZ_MAX_SIZE", "1048576")], || read_kmz(path.to_str().unwrap()));
+        assert!(refused.as_ref().is_err_and(Error::is_resource_refusal), "{refused:?}");
+    }
+
+    #[test]
+    fn kmz_archives_are_read_within_the_zip_limits() {
+        let kmz = deflated(&[("doc.kml", &padded(1 << 20))]);
+        let refused = with_options(&[("TERRIO_ZIP_MAX_RATIO", "10")], || parse_kmz(kmz.clone(), "a"));
+        assert!(matches!(&refused, Err(Error::ResourceLimit(m)) if m.contains("TERRIO_ZIP_MAX_RATIO")), "{refused:?}");
+        let refused = with_options(&[("TERRIO_ZIP_MAX_SIZE", "1000")], || parse_kmz(kmz.clone(), "a"));
+        assert!(matches!(&refused, Err(Error::ResourceLimit(m)) if m.contains("TERRIO_ZIP_MAX_SIZE")), "{refused:?}");
+        let many = deflated(&[("doc.kml", &padded(0)), ("a.txt", b""), ("b.txt", b"")]);
+        let refused = with_options(&[("TERRIO_ZIP_MAX_ENTRIES", "2")], || parse_kmz(many.clone(), "a"));
+        assert!(matches!(&refused, Err(Error::ResourceLimit(m)) if m.contains("TERRIO_ZIP_MAX_ENTRIES")), "{refused:?}");
+        assert!(parse_kmz(many, "a").is_ok());
+        // A style document past the archive limits refuses the archive, rather than its styles
+        // being left out.
+        let main = br#"<kml><Document><Placemark><styleUrl>styles.kml#s</styleUrl><Point><coordinates>1,2</coordinates></Point></Placemark></Document></kml>"#;
+        let mut styles = br#"<kml><Document><Style id="s"/><!--"#.to_vec();
+        styles.resize(styles.len() + (1 << 20), b' ');
+        styles.extend_from_slice(b"--></Document></kml>");
+        let styled = deflated(&[("doc.kml", main), ("styles.kml", &styles)]);
+        assert!(parse_kmz(styled.clone(), "a").is_ok());
+        let refused = with_options(&[("TERRIO_ZIP_MAX_RATIO", "50")], || parse_kmz(styled.clone(), "a"));
+        assert!(matches!(&refused, Err(Error::ResourceLimit(m)) if m.contains("styles.kml")), "{refused:?}");
+    }
+
+    #[test]
+    fn repeated_links_preserve_document_and_folder_layers() {
+        let point = "<Placemark><Point><coordinates>1,2</coordinates></Point></Placemark>";
+        for (document, expected) in [
+            (format!("<kml><Document><name>inside</name>{point}</Document></kml>"), vec![("inside", 1)]),
+            (format!("<kml><Document><Folder><name>folder</name>{point}</Folder></Document></kml>"), vec![("a", 0), ("folder", 1)]),
+            (format!("<kml><Document>{point}</Document></kml>"), vec![("a", 1)]),
+        ] {
+            // A later named link must not change the first unnamed link's default.
+            let first = network_link("", "layers/a.kml");
+            let repeated = format!("{first}{}", network_link("later", "./layers/a.kml"));
+            for links in [first, repeated] {
+                let main = format!("<kml><Document>{links}</Document></kml>");
+                let layers = parse_kmz(archive(&[("doc.kml", &main), ("layers/a.kml", &document)]), "main").unwrap();
+                assert_eq!(summary(&layers), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn a_document_linked_several_times_is_one_layer() {
+        // The first link to a document names its layer; the others, written with `./` or not, add
+        // none. A link to a member the archive does not hold is left out.
+        let links = [
+            network_link("first", "./layers/a.kml"),
+            network_link("missing", "layers/missing.kml"),
+            network_link("second", "layers/a.kml"),
+            network_link("", "layers/a.kml"),
+            network_link("", "layers/b.kml"),
+        ];
+        let main = format!("<kml><Document>{}</Document></kml>", links.concat());
+        let kmz = deflated(&[("doc.kml", main.as_bytes()), ("layers/a.kml", &padded(0)), ("layers/b.kml", &padded(0))]);
+        assert_eq!(summary(&parse_kmz(kmz, "main").unwrap()), [("first", 1), ("b", 1)]);
+    }
+
+    #[test]
+    fn a_document_linked_several_times_counts_once_toward_the_document_budget() {
+        let main = format!("<kml><Document>{}{}</Document></kml>", network_link("", "layers/a.kml"), network_link("", "./layers/a.kml"));
+        let member = padded(1 << 20);
+        let kmz = deflated(&[("doc.kml", main.as_bytes()), ("layers/a.kml", &member)]);
+        // A budget that holds doc.kml and the document once is enough.
+        let once = (main.len() + member.len()).to_string();
+        let read = with_options(&[("TERRIO_KMZ_MAX_SIZE", &once)], || parse_kmz(kmz.clone(), "main"));
+        let layers = read.unwrap_or_else(|e| panic!("refused within {once} bytes: {e}"));
+        assert_eq!(summary(&layers), [("a", 1)]);
+        // The document still counts toward it: a byte less refuses the archive.
+        let short = (main.len() + member.len() - 1).to_string();
+        let refused = with_options(&[("TERRIO_KMZ_MAX_SIZE", &short)], || parse_kmz(kmz.clone(), "main"));
+        assert!(matches!(&refused, Err(Error::ResourceLimit(m)) if m.contains("layers/a.kml")), "{refused:?}");
+    }
+
+    #[test]
+    fn a_link_to_the_main_document_adds_no_layer() {
+        let point = "<Placemark><Point><coordinates>1,2</coordinates></Point></Placemark>";
+        let main = format!("<kml><Document>{point}{}{}</Document></kml>", network_link("again", "doc.kml"), network_link("", "./doc.kml"));
+        let kmz = deflated(&[("doc.kml", main.as_bytes())]);
+        assert_eq!(summary(&parse_kmz(kmz, "main").unwrap()), [("main", 1)]);
+    }
+
+    /// A KML document named `name` holding `points` placemarks.
+    fn named(name: &str, points: usize) -> String {
+        let placemarks = "<Placemark><Point><coordinates>1,2</coordinates></Point></Placemark>".repeat(points);
+        format!("<kml><Document><name>{name}</name>{placemarks}</Document></kml>")
+    }
+
+    /// The main document is the first KML entry at the archive's root, in the order of its
+    /// entries, whatever its name (OGC KML 2.3, Annex C.1); one in a folder is the main document
+    /// only when the root holds none.
+    #[test]
+    fn the_main_document_is_the_first_kml_entry_at_the_archive_root() {
+        let (first, second) = (named("first", 1), named("second", 3));
+        for (members, expected) in [
+            (vec![("a.kml", first.as_str()), ("doc.kml", second.as_str())], [("first", 1)]),
+            (vec![("doc.kml", first.as_str()), ("a.kml", second.as_str())], [("first", 1)]),
+            (vec![("notes.txt", "-"), ("A.KML", first.as_str()), ("DOC.KML", second.as_str())], [("first", 1)]),
+            (vec![("files/b.kml", second.as_str()), ("files/doc.kml", second.as_str()), ("a.kml", first.as_str())], [("first", 1)]),
+            (vec![("notes.txt", "-"), ("files/a.kml", first.as_str()), ("files/doc.kml", second.as_str())], [("first", 1)]),
+            (vec![("files\\doc.kml", second.as_str()), ("a.kml", first.as_str())], [("first", 1)]),
+        ] {
+            let names: Vec<&str> = members.iter().map(|(name, _)| *name).collect();
+            assert_eq!(summary(&parse_kmz(archive(&members), "kmz").unwrap()), expected, "{names:?}");
+        }
+        let refused = parse_kmz(archive(&[("notes.txt", "-")]), "kmz");
+        assert!(matches!(&refused, Err(Error::InvalidData(m)) if m == "the KMZ archive holds no KML document"), "{refused:?}");
+    }
+
+    /// `kmz` with every `from` in its entries' names (and anywhere else) replaced by `to`, a name of
+    /// the same length: zip writers refuse a second entry of the same name, so it is written under
+    /// another.
+    fn renamed(kmz: &[u8], from: &str, to: &str) -> Vec<u8> {
+        assert_eq!(from.len(), to.len());
+        let mut out = kmz.to_vec();
+        let mut i = 0;
+        while let Some(at) = out[i..].windows(from.len()).position(|w| w == from.as_bytes()) {
+            out[i + at..i + at + to.len()].copy_from_slice(to.as_bytes());
+            i += at + to.len();
+        }
+        out
+    }
+
+    #[test]
+    fn leading_current_directory_components_leave_a_kml_at_the_archive_root() {
+        let (first, nested) = (named("first", 1), named("nested", 3));
+        for root in ["./doc.kml", "././doc.kml", r".\doc.kml"] {
+            let bytes = archive(&[("files/nested.kml", nested.as_str()), (root, first.as_str())]);
+            assert_eq!(summary(&parse_kmz(bytes, "kmz").unwrap()), [("first", 1)], "{root}");
+        }
+    }
+
+    /// An archive holding two entries of the same name is refused, whichever entries they are: the
+    /// zip reader keeps one entry per name, the last, so the first of two `doc.kml` could not be
+    /// told apart from it.
+    #[test]
+    fn an_archive_with_two_entries_of_one_name_is_refused() {
+        let (first, second) = (named("first", 1), named("second", 3));
+        let two_docs = renamed(&archive(&[("doc.kml", first.as_str()), ("dox.kml", second.as_str())]), "dox.kml", "doc.kml");
+        let two_icons =
+            renamed(&archive(&[("doc.kml", first.as_str()), ("files/a.png", "1"), ("files/b.png", "2")]), "files/b.png", "files/a.png");
+        for (label, kmz) in [("two doc.kml", two_docs), ("two files/a.png", two_icons)] {
+            let refused = parse_kmz(kmz.clone(), "kmz");
+            let message = "KMZ: the archive holds several entries with the same name, so its main document is ambiguous";
+            assert!(matches!(&refused, Err(Error::InvalidData(m)) if m == message), "{label}: {refused:?}");
+            // The same bytes read from a file.
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("duplicates.kmz");
+            std::fs::write(&path, &kmz).unwrap();
+            let refused = read_kmz(path.to_str().unwrap());
+            assert!(matches!(&refused, Err(Error::InvalidData(m)) if m == message), "{label}: {refused:?}");
+            // Public entry points must preserve the refusal even with the GDAL backend enabled.
+            let path = path.to_str().unwrap();
+            for refused in [
+                crate::open(path).map(|_| ()),
+                crate::open_vector(path, &Default::default()).map(|_| ()),
+                crate::list_layers(path).map(|_| ()),
+            ] {
+                assert!(matches!(&refused, Err(Error::InvalidData(m)) if m == message), "{label}: {refused:?}");
+            }
+        }
+        // Without the second name, the archive reads.
+        assert_eq!(
+            summary(&parse_kmz(archive(&[("doc.kml", first.as_str()), ("dox.kml", second.as_str())]), "kmz").unwrap()),
+            [("first", 1)]
+        );
     }
 
     fn pin(url: &str, inline: &str) -> String {
@@ -1085,5 +1458,77 @@ mod tests {
             let value = style(&layers[0], i);
             assert!(value.starts_with("PEN") || (value.starts_with('s') && value.ends_with(".kml#p")), "{value}");
         }
+    }
+
+    /// Dataset-wide selection names use the existing suffix policy (GDAL 3.13.3 comparison scope:
+    /// geometry/attributes only; these deterministic names are Terrio's reader policy).
+    #[test]
+    fn kmz_layer_names_are_unique_across_documents() {
+        let point = |x| format!("<Placemark><name>point {x}</name><Point><coordinates>{x},46</coordinates></Point></Placemark>");
+        let folder = |name: &str, x| format!("<Folder><name>{name}</name>{}</Folder>", point(x));
+        let link = |href| format!("<NetworkLink><name>roads</name><Link><href>{href}</href></Link></NetworkLink>");
+        let linked = format!("<kml><Document>{}{}</Document></kml>", point(3), folder("roads", 4));
+        let main = format!("<kml><Document>{}{}{}</Document></kml>", folder("roads (2)", 1), folder("roads", 2), link("layers/a.kml"));
+        let layers = parse_kmz(archive(&[("doc.kml", &main), ("layers/a.kml", &linked)]), "archive").unwrap();
+        assert_eq!(layers.iter().map(|l| l.name.as_str()).collect::<Vec<_>>(), ["roads (2)", "roads", "roads (3)", "roads (4)"]);
+        for (layer, x) in layers.iter().zip(1..=4) {
+            assert_eq!(layer.features[0].geometry, Some(Geometry::point(x as f64, 46.0)));
+        }
+        let main = format!("<kml><Document>{}{}</Document></kml>", link("layers/a.kml"), link("layers/b.kml"));
+        let simple = format!("<kml><Document>{}</Document></kml>", point(5));
+        let layers = parse_kmz(archive(&[("doc.kml", &main), ("layers/a.kml", &simple), ("layers/b.kml", &simple)]), "archive").unwrap();
+        assert_eq!(layers.iter().map(|l| l.name.as_str()).collect::<Vec<_>>(), ["roads", "roads (2)"]);
+    }
+
+    /// A document's layer names are made unique in document order, in a KML file and a KMZ
+    /// archive alike. A name an earlier layer has takes the first free suffix, ` (2)`, ` (3)`, and
+    /// so on, and a container without a name is named after its element. A suffix a name given
+    /// earlier holds is skipped, and a name given later is renamed when an earlier layer holds it,
+    /// generated or not.
+    #[test]
+    fn layer_names_are_made_unique_in_document_order() {
+        let point = "<Placemark><Point><coordinates>1,2</coordinates></Point></Placemark>";
+        let folder = |name: &str, inside: &str| match name {
+            "" => format!("<Folder>{point}{inside}</Folder>"),
+            name => format!("<Folder><name>{name}</name>{point}{inside}</Folder>"),
+        };
+        let nested = [folder("", ""), folder("roads (2)", ""), format!("<Document>{point}</Document>")].concat();
+        let containers = [
+            folder("roads", ""),
+            folder("", ""),
+            folder("roads", ""),
+            folder("", ""),
+            folder("Folder (3)", ""),
+            folder("", ""),
+            folder("Folder (2)", ""),
+            format!("<Document>{point}</Document>"),
+            folder("doc", ""),
+            folder("roads", &nested),
+            folder("", ""),
+        ]
+        .concat();
+        let doc = format!("<kml><Document><name>doc</name>{point}{containers}</Document></kml>");
+        let expected = [
+            "doc",
+            "roads",
+            "Folder",
+            "roads (2)",
+            "Folder (2)",
+            "Folder (3)",
+            "Folder (4)",
+            "Folder (2) (2)",
+            "Document",
+            "doc (2)",
+            "roads (3)",
+            "Folder (5)",
+            "roads (2) (2)",
+            "Document (2)",
+            "Folder (6)",
+        ];
+        let names = |layers: Vec<Layer>| layers.into_iter().map(|l| l.name).collect::<Vec<_>>();
+        assert_eq!(names(parse(&doc, "kml").unwrap()), expected);
+        assert_eq!(names(parse_kmz(archive(&[("doc.kml", &doc)]), "kmz").unwrap()), expected);
+        let plain = format!("<kml><Document>{}{}</Document></kml>", folder("Roads", ""), folder("roads", ""));
+        assert_eq!(names(parse(&plain, "kml").unwrap()), ["Roads", "roads (2)"]);
     }
 }
