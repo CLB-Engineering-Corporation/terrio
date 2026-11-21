@@ -31,6 +31,11 @@ commits after it (a7473c2). Upstream's own entries are below, unchanged.
   searches as level 9 of the C library does, and `LEVEL` 1 and 2 (`Fastest`) match as its level
   1 (its files were up to 3% smaller, and slower to write). Content that does not have the
   checksum its frame ends with is now an error in these paths, as it is with the C library.
+- Licensing: `zstd-rust` moves to gpt-cmdr/zstd-rs `de91207`, whose code is that of `e716f73`
+  but which declares `MIT AND BSD-3-Clause` for the parts adapted from Zstandard. `NOTICE`,
+  `crates/terrio/NOTICE` and `crates/terrio-crs/NOTICE` reproduce Zstandard's BSD notice, as its
+  license asks of binary distributions, and `LICENSE-THIRD-PARTY.md` lists `zstd-rust` under
+  that license too.
 - Zstandard with the zstd C library (`libzstd-geotiff`, a default feature, and the opt-in
   `libzstd-ept` and `libzstd-geoparquet`): a stream whose frames all record their size, as the C
   library's do, is decompressed in one call into a vector of that size, rather than through a

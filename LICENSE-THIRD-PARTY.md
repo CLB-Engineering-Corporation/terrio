@@ -13,7 +13,7 @@ LICENSE-THIRD-PARTY.md`, from `about.toml`.
 - Apache License 2.0 (262)
 - MIT License (71)
 - ISC License (20)
-- BSD 3-Clause "New" or "Revised" License (15)
+- BSD 3-Clause "New" or "Revised" License (16)
 - BSD 2-Clause "Simplified" License (9)
 - Mozilla Public License 2.0 (4)
 - Creative Commons Zero v1.0 Universal (2)
@@ -7350,6 +7350,7 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 Used by:
 
+- [zstd-rust 0.1.0](https://github.com/gpt-cmdr/zstd-rs)
 - [zstd-sys 2.1.3+zstd.1.5.7](https://github.com/gyscos/zstd-rs)
 
 ```text
