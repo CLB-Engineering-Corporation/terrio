@@ -6,9 +6,7 @@
 //! EOI width adjustment). This is an independent implementation, not a port.
 
 pub(super) struct Encoder {
-    // Packed (20-bit prefix/symbol key, 12-bit code). Code zero marks empty.
-    table: Vec<u32>,
-    successors: Vec<u8>,
+    hash: HashEncoder,
     // Only stored codes have witnesses. Offsets must support chunks above 4 GiB.
     starts: Vec<usize>,
     lengths: Vec<u16>,
@@ -17,19 +15,19 @@ pub(super) struct Encoder {
 
 impl Encoder {
     pub(super) fn new() -> Self {
-        Self { table: vec![0; 8192], successors: vec![0; 4096], starts: vec![0; 4096], lengths: vec![0; 4096], parents: vec![0; 4096] }
+        Self { hash: HashEncoder::new(), starts: vec![0; 4096], lengths: vec![0; 4096], parents: vec![0; 4096] }
     }
 
     /// Starts an independent strip/tile. No dictionary state crosses chunks.
     pub(super) fn encode(&mut self, data: &[u8]) -> Vec<u8> {
-        if profitable_chunk(data) { self.encode_chunk::<true>(data) } else { self.encode_plain(data) }
+        if profitable_chunk(data) { self.encode_chunk::<true>(data) } else { self.hash.encode(data) }
     }
 
     // The plain loop retains the hash encoder's iterator shape, with no witness
     // writes, candidate branches, or indexed cursor on its byte-hit path.
     fn encode_chunk<const SKIP: bool>(&mut self, data: &[u8]) -> Vec<u8> {
-        self.table.fill(0);
-        self.successors.fill(0);
+        self.hash.table.fill(0);
+        self.hash.successors.fill(0);
         let mut out = Bits { bytes: Vec::with_capacity(data.len().min(4096)), pending: 0, count: 0 };
         let mut width = 9;
         let mut next = 258u16;
@@ -46,17 +44,17 @@ impl Encoder {
                 let key = (u32::from(prefix) << 8) | u32::from(symbol);
                 let mut slot = (key.wrapping_mul(0x9e3779b1) >> 19) as usize;
                 loop {
-                    let entry = self.table[slot];
+                    let entry = self.hash.table[slot];
                     if entry == 0 {
                         // Weezl inserts entry 4096, then immediately clears; it
                         // can never be referenced and need not be stored.
                         // Compatibility: weezl 0.2.1 consumes a code but omits the
                         // seventeenth successor when promoting a sparse tree node.
-                        let count = &mut self.successors[usize::from(prefix)];
+                        let count = &mut self.hash.successors[usize::from(prefix)];
                         let omitted = *count == 16;
                         *count = count.saturating_add(1);
                         if next < 4096 && !omitted {
-                            self.table[slot] = (key << 12) | u32::from(next);
+                            self.hash.table[slot] = (key << 12) | u32::from(next);
                             if SKIP {
                                 let code = usize::from(next);
                                 let length = cursor - start + 1;
@@ -77,8 +75,8 @@ impl Encoder {
                         }
                         if next > 4096 {
                             out.put(256, width);
-                            self.table.fill(0);
-                            self.successors.fill(0);
+                            self.hash.table.fill(0);
+                            self.hash.successors.fill(0);
                             next = 258;
                             width = 9;
                             latest = [0; 4];
@@ -143,7 +141,24 @@ impl Encoder {
         );
         out.bytes
     }
-    fn encode_plain(&mut self, data: &[u8]) -> Vec<u8> {
+}
+
+// Keep the original hash dictionary layout and call boundary independent of
+// witness metadata. This path performs no candidate bookkeeping.
+struct HashEncoder {
+    // Packed (20-bit prefix/symbol key, 12-bit code). Code zero marks empty.
+    table: Vec<u32>,
+    successors: Vec<u8>,
+}
+
+impl HashEncoder {
+    fn new() -> Self {
+        Self { table: vec![0; 8192], successors: vec![0; 4096] }
+    }
+
+    // Keep LLVM from combining this hot loop with the much larger skip path.
+    #[inline(never)]
+    fn encode(&mut self, data: &[u8]) -> Vec<u8> {
         self.table.fill(0);
         self.successors.fill(0);
         let mut out = Bits { bytes: Vec::with_capacity(data.len().min(4096)), pending: 0, count: 0 };
@@ -288,7 +303,7 @@ mod tests {
         assert!(profitable_chunk(&run)); // on -> immediate success
         encoder.encode(&run);
         for input in [&noise, &later, &run] {
-            assert_eq!(encoder.encode_chunk::<true>(input), encoder.encode_plain(input));
+            assert_eq!(encoder.encode_chunk::<true>(input), encoder.hash.encode(input));
         }
         for size in 0..300 {
             encoder.encode(&noise[..size]);

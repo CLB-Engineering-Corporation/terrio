@@ -3944,7 +3944,9 @@ checks 32-byte period-four windows every four bytes within the first 256 bytes,
 then backs off to one window every 4096 bytes, starting at byte 256. A successful
 re-probe enables the verified long-match loop for that chunk; otherwise the
 original iterator-based hash loop runs without witness writes or candidate
-checks. This hint favors long Float32 NoData runs; missing a run affects speed
+checks. Its two-vector dictionary retains the original hash encoder layout;
+`inline(never)` keeps LLVM from merging that hot loop with the larger skip path.
+This hint favors long Float32 NoData runs; missing a run affects speed
 only. Metadata is rebuilt per chunk and dictionary clear, never shared between
 workers. It is not an entropy test or a universal performance guarantee: a
 sampled repetitive island can enable skips for an otherwise noisy chunk.
