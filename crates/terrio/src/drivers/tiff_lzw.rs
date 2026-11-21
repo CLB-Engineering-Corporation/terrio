@@ -22,6 +22,12 @@ impl Encoder {
 
     /// Starts an independent strip/tile. No dictionary state crosses chunks.
     pub(super) fn encode(&mut self, data: &[u8]) -> Vec<u8> {
+        if profitable_chunk(data) { self.encode_chunk::<true>(data) } else { self.encode_plain(data) }
+    }
+
+    // The plain loop retains the hash encoder's iterator shape, with no witness
+    // writes, candidate branches, or indexed cursor on its byte-hit path.
+    fn encode_chunk<const SKIP: bool>(&mut self, data: &[u8]) -> Vec<u8> {
         self.table.fill(0);
         self.successors.fill(0);
         let mut out = Bits { bytes: Vec::with_capacity(data.len().min(4096)), pending: 0, count: 0 };
@@ -51,15 +57,17 @@ impl Encoder {
                         *count = count.saturating_add(1);
                         if next < 4096 && !omitted {
                             self.table[slot] = (key << 12) | u32::from(next);
-                            let code = usize::from(next);
-                            let length = cursor - start + 1;
-                            self.starts[code] = start;
-                            self.lengths[code] = length as u16;
-                            self.parents[code] = prefix;
-                            let phase = start % 4;
-                            latest[phase] = next;
-                            if length >= usize::from(self.lengths[usize::from(longest[phase])]) {
-                                longest[phase] = next;
+                            if SKIP {
+                                let code = usize::from(next);
+                                let length = cursor - start + 1;
+                                self.starts[code] = start;
+                                self.lengths[code] = length as u16;
+                                self.parents[code] = prefix;
+                                let phase = start % 4;
+                                latest[phase] = next;
+                                if length >= usize::from(self.lengths[usize::from(longest[phase])]) {
+                                    longest[phase] = next;
+                                }
                             }
                         }
                         next += 1;
@@ -79,30 +87,32 @@ impl Encoder {
                         prefix = u16::from(symbol);
                         start = cursor;
                         cursor += 1;
-                        for candidate in [longest[start % 4], latest[start % 4]] {
-                            let code = usize::from(candidate);
-                            let length = usize::from(self.lengths[code]);
-                            if candidate == 0 || length < 12 {
-                                continue;
-                            }
-                            let limit = length.min(data.len() - start);
-                            let witness = self.starts[code];
-                            let matched = common_prefix(&data[start..start + limit], &data[witness..witness + limit]);
-                            if matched == length {
-                                prefix = candidate;
-                                cursor = start + length;
-                                break;
-                            }
-                            // Bound parent walking by bytes consumed. Otherwise the
-                            // ordinary loop follows the same stored ancestors.
-                            if matched >= 12 && length - matched <= matched {
-                                let mut ancestor = candidate;
-                                for _ in matched..length {
-                                    ancestor = self.parents[usize::from(ancestor)];
+                        if SKIP {
+                            for candidate in [longest[start % 4], latest[start % 4]] {
+                                let code = usize::from(candidate);
+                                let length = usize::from(self.lengths[code]);
+                                if candidate == 0 || length < 12 {
+                                    continue;
                                 }
-                                prefix = ancestor;
-                                cursor = start + matched;
-                                break;
+                                let limit = length.min(data.len() - start);
+                                let witness = self.starts[code];
+                                let matched = common_prefix(&data[start..start + limit], &data[witness..witness + limit]);
+                                if matched == length {
+                                    prefix = candidate;
+                                    cursor = start + length;
+                                    break;
+                                }
+                                // Bound parent walking by bytes consumed. Otherwise the
+                                // ordinary loop follows the same stored ancestors.
+                                if matched >= 12 && length - matched <= matched {
+                                    let mut ancestor = candidate;
+                                    for _ in matched..length {
+                                        ancestor = self.parents[usize::from(ancestor)];
+                                    }
+                                    prefix = ancestor;
+                                    cursor = start + matched;
+                                    break;
+                                }
                             }
                         }
                         break;
@@ -133,6 +143,87 @@ impl Encoder {
         );
         out.bytes
     }
+    fn encode_plain(&mut self, data: &[u8]) -> Vec<u8> {
+        self.table.fill(0);
+        self.successors.fill(0);
+        let mut out = Bits { bytes: Vec::with_capacity(data.len().min(4096)), pending: 0, count: 0 };
+        let mut width = 9;
+        let mut next = 258u16;
+        out.put(256, width);
+        if let Some((&first, rest)) = data.split_first() {
+            let mut prefix = u16::from(first);
+            for &symbol in rest {
+                let key = (u32::from(prefix) << 8) | u32::from(symbol);
+                let mut slot = (key.wrapping_mul(0x9e3779b1) >> 19) as usize;
+                loop {
+                    let entry = self.table[slot];
+                    if entry == 0 {
+                        // Weezl inserts entry 4096, then immediately clears; it
+                        // can never be referenced and need not be stored.
+                        // Compatibility: weezl 0.2.1 consumes a code but omits the
+                        // seventeenth successor when promoting a sparse tree node.
+                        let count = &mut self.successors[usize::from(prefix)];
+                        let omitted = *count == 16;
+                        *count = count.saturating_add(1);
+                        if next < 4096 && !omitted {
+                            self.table[slot] = (key << 12) | u32::from(next);
+                        }
+                        next += 1;
+                        out.put(prefix, width);
+                        if next >= (1 << width) && width < 12 {
+                            width += 1;
+                        }
+                        if next > 4096 {
+                            out.put(256, width);
+                            self.table.fill(0);
+                            self.successors.fill(0);
+                            next = 258;
+                            width = 9;
+                        }
+                        prefix = u16::from(symbol);
+                        break;
+                    }
+                    if entry >> 12 == key {
+                        prefix = (entry & 4095) as u16;
+                        break;
+                    }
+                    slot = (slot + 1) & 8191;
+                }
+            }
+            out.put(prefix, width);
+            // The decoder adds one final entry before it reads EOI.
+            if next >= (1 << width) - 1 && width < 12 {
+                width += 1;
+            }
+        }
+        out.put(257, width);
+        if out.count != 0 {
+            out.bytes.push((out.pending << (8 - out.count)) as u8);
+        }
+        #[cfg(test)]
+        assert_eq!(
+            out.bytes,
+            weezl::encode::Encoder::with_tiff_size_switch(weezl::BitOrder::Msb, 8).encode(data).unwrap(),
+            "writer LZW oracle"
+        );
+        out.bytes
+    }
+}
+
+// Start on with a 256-byte contiguous probe, then back off to one 32-byte
+// re-probe per 4096 bytes. Only a verified period-four run enables witnesses.
+// Missing a run costs compression speed, never changes output. Sampling costs
+// O(n/4096), with no dictionary or thread state and no raw-sized allocation.
+fn profitable_chunk(data: &[u8]) -> bool {
+    let initial = data.len().min(256);
+    if data[..initial].windows(32).step_by(4).any(periodic_probe) {
+        return true;
+    }
+    (256..data.len().saturating_sub(31)).step_by(4096).any(|at| periodic_probe(&data[at..at + 32]))
+}
+
+fn periodic_probe(bytes: &[u8]) -> bool {
+    bytes[..28] == bytes[4..32]
 }
 
 // Safe unaligned word comparisons, independent of the host byte order.
@@ -174,6 +265,35 @@ impl Bits {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn adaptive_on_backoff_and_reprobe_match_oracle() {
+        let mut encoder = Encoder::new();
+        let mut state = 37u32;
+        let noise: Vec<_> = (0..65536)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                state as u8
+            })
+            .collect();
+        assert!(!profitable_chunk(&noise)); // on -> backed off -> failed probes
+        encoder.encode(&noise);
+        let mut later = noise.clone();
+        later[4352..4384].fill(0); // backed off -> successful re-probe
+        assert!(profitable_chunk(&later));
+        encoder.encode(&later);
+        let run = vec![0; 65536];
+        assert!(profitable_chunk(&run)); // on -> immediate success
+        encoder.encode(&run);
+        for input in [&noise, &later, &run] {
+            assert_eq!(encoder.encode_chunk::<true>(input), encoder.encode_plain(input));
+        }
+        for size in 0..300 {
+            encoder.encode(&noise[..size]);
+        }
+    }
 
     #[test]
     fn mixed_runs_copies_and_adversarial_prefixes_match_oracle() {
