@@ -147,6 +147,23 @@ impl Compression {
         matches!(self, Self::Lzw | Self::Deflate | Self::Zstd)
     }
 
+    /// Each chunk remains an independent TIFF stream, with fresh owned output.
+    /// Scratch retains dictionary capacity only, never codes from a previous chunk.
+    fn compress_reusing(
+        self,
+        data: Vec<u8>,
+        c: &ChunkInfo,
+        p: &CodecParams,
+        scratch: &mut Option<weezl::encode::Encoder>,
+    ) -> Result<Vec<u8>> {
+        if !matches!(self, Self::Lzw) {
+            return self.compress(data, c, p);
+        }
+        let encoder = scratch.get_or_insert_with(|| weezl::encode::Encoder::with_tiff_size_switch(weezl::BitOrder::Msb, 8));
+        encoder.reset();
+        encoder.encode(&data).map_err(|e| Error::InvalidData(format!("LZW: {e}")))
+    }
+
     fn compress(self, data: Vec<u8>, c: &ChunkInfo, p: &CodecParams) -> Result<Vec<u8>> {
         Ok(match self {
             Self::None => data,
@@ -1448,7 +1465,7 @@ impl<'a> Level<'a> {
         let band_len = self.cols * self.rows;
         let clipped = std::sync::atomic::AtomicBool::new(false);
         let packed_bits = layout.nbits.filter(|&bits| bits != (size * 8) as u16);
-        let chunks = crate::par::map_range_coarse(planes * per_plane, |i| {
+        let chunks = crate::par::map_range_init_coarse(planes * per_plane, || None, |scratch, i| {
             let (plane, j) = (i / per_plane, i % per_plane);
             let (x0, y0) = ((j % across) * chunk_w, (j / across) * chunk_h);
             // Strips stop at the last row; tiles are padded to full size.
@@ -1470,7 +1487,7 @@ impl<'a> Level<'a> {
             } else {
                 apply_predictor(&mut buf, layout.predictor, chunk_w * chunk_spp, chunk_spp, size);
             }
-            compression.compress(buf, &ChunkInfo { w: chunk_w, h, spp: chunk_spp, t }, codec)
+            compression.compress_reusing(buf, &ChunkInfo { w: chunk_w, h, spp: chunk_spp, t }, codec, scratch)
         });
         let chunks = chunks.into_iter().collect::<Result<Vec<_>>>()?;
         let clipped_bits = packed_bits.filter(|_| clipped.load(std::sync::atomic::Ordering::Relaxed));
@@ -3222,6 +3239,45 @@ fn directories(mut images: Vec<Directory>, big: bool, cog: bool) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn lzw_reused_streams_match_fresh_tiff_size_switch() {
+        let mut scratch = None;
+        let c = ChunkInfo { w: 1, h: 1, spp: 1, t: DataType::U8 };
+        let p = CodecParams::default();
+        let mut rng = 0x12345678u32;
+        let random: Vec<u8> = (0..262144)
+            .map(|_| {
+                rng ^= rng << 13;
+                rng ^= rng >> 17;
+                rng ^= rng << 5;
+                rng as u8
+            })
+            .collect();
+        let float_bytes: Vec<u8> =
+            [0x7fc01234u32, 0x7fa00001, 0x80000000, 0, 0x7f800000, 0xff800000].into_iter().flat_map(u32::to_le_bytes).collect();
+        let cases = [vec![], vec![0], vec![255; 217724], random.clone(), float_bytes, (0..65536).map(|i| (i % 251) as u8).collect()];
+        // Alternate lengths, dictionary saturation/clears, empty and repeated data.
+        for _ in 0..3 {
+            for data in &cases {
+                let expected = Compression::Lzw.compress(data.clone(), &c, &p).unwrap();
+                let actual = Compression::Lzw.compress_reusing(data.clone(), &c, &p, &mut scratch).unwrap();
+                assert_eq!(actual, expected);
+                assert_eq!(weezl::decode::Decoder::with_tiff_size_switch(weezl::BitOrder::Msb, 8).decode(&actual).unwrap(), *data);
+            }
+        }
+        let early = Compression::Lzw.compress(random.clone(), &c, &p).unwrap();
+        let late = weezl::encode::Encoder::new(weezl::BitOrder::Msb, 8).encode(&random).unwrap();
+        assert_ne!(early, late, "fixture must exercise TIFF's early code-width switch");
+        for compression in [Compression::None, Compression::Deflate, Compression::PackBits, Compression::Zstd] {
+            let mut unused = None;
+            assert_eq!(
+                compression.compress(random.clone(), &c, &p).unwrap(),
+                compression.compress_reusing(random.clone(), &c, &p, &mut unused).unwrap()
+            );
+            assert!(unused.is_none());
+        }
+    }
+
     use super::*;
 
     #[test]
