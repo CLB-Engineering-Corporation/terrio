@@ -425,7 +425,7 @@ jobs:
       - name: Zstandard with the C library
         run: |
           cargo test -p terrio --features libzstd --lib zstandard
-          cargo test -p terrio --features libzstd --test zstd_tiff_samples --test zstd_input_limits --test parquet_zstd
+          cargo test -p terrio --features libzstd --test merged -- zstd_tiff_samples:: zstd_input_limits:: parquet_zstd::
       # HTTPS is `rustls` with `ring` in every native build (CLB fork): `rustls-graviola` 0.4 panics
       # on the first HTTPS request on x86-64 CPUs without AVX2, ADX or BMI2. No default native build
       # (the library, the command, the Python wheels and the Docker image, on each release
