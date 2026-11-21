@@ -3,8 +3,7 @@
 The Rust tests of #165 (`crates/terrio/src/drivers/gtiff_write.rs`) check COG overviews
 against the model of #165: each level reduced from the full-resolution source, with sizes
 rounded up. GDAL's COG driver computes each level from the previous one, with sizes rounded down
-(65 x 35 gives 32 x 17 and 16 x 8 with 16-pixel tiles). The explicit GDAL_3_13 policy
-writes GDAL's overviews.
+(65 x 35 gives 32 x 17 and 16 x 8 with 16-pixel tiles), and terrio writes GDAL's overviews.
 These are the same scenarios, with GDAL (rasterio) as the oracle: each input is written by GDAL as
 a GeoTIFF and converted to a COG by GDAL and by terrio as an ingestion pipeline converts uploads
 (`rasterio.shutil.copy(..., driver="COG")`), and every level is compared bit for bit, pixels and
@@ -188,8 +187,6 @@ def _convert(module, src, dst, method):
     with rasterio.open(src) as ds:
         profile = ds.profile.copy()
     profile.update(driver="COG", blocksize=16, compress="NONE")
-    if module is trio:
-        profile["COG_OVERVIEW_POLICY"] = "GDAL_3_13"
     if method is not None:
         profile["overview_resampling"] = method
     module.shutil.copy(src, str(dst), **profile)

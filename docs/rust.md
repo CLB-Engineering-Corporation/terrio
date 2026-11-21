@@ -88,13 +88,30 @@ terrio::write_raster_dataset(&ds, "dem_cog.tif", &options)?;
 # Ok::<(), terrio::Error>(())
 ```
 
-`RasterWriteOptions::overview_resampling` accepts `nearest`, `average`, `min`, `max` or
-`mode` for GeoTIFF and COG. The defaults are `nearest` for GeoTIFF and palette COGs, and `average` for continuous COGs.
+`RasterWriteOptions::overview_resampling` takes GDAL's names, `nearest`, `average`, `rms`,
+`bilinear`, `cubic`, `cubicspline`, `lanczos`, `mode` and `gauss`, plus terrio's `min` and `max`
+for GeoTIFF overviews. GeoTIFF overviews default to `nearest`. COGs follow GDAL's COG driver: the
+`OVERVIEW_RESAMPLING` and `RESAMPLING` creation options come first, and the default is `cubic`
+(`nearest` for paletted and complex rasters). COG overviews have GDAL's sizes, down to one that
+fits in a tile, and GDAL's pixels: each level is computed from the previous one, as
+`GDALRegenerateOverviewsMultiBand` computes it, with nodata, the alpha band (`ALPHA=YES`) and
+per-dataset masks weighting the samples as in GDAL, and the masks given overviews of their own.
+Row-streamed COG output computes the same pixels, whatever the input row chunk size, without
+retaining the whole source image.
+
 COGs build factors 2, 4, 8, … until the image fits in one tile, unless
 `RasterWriteOptions::overviews` gives the factors: those levels are then built as for a GeoTIFF
 (each from the previous one, `ceil(cols / f) x ceil(rows / f)`) and written as the COG's, as
 GDAL's COG driver reuses overviews built on its source by `gdaladdo` (`OVERVIEWS=AUTO` or
 `FORCE_USE_EXISTING`; `NONE` or `IGNORE_EXISTING` with factors is refused rather than ignored).
+
+The CLB fork adds the `COG_OVERVIEW_POLICY` creation option. Its default, `GDAL_3_13`, is the
+behaviour above, upstream's. `COG_OVERVIEW_POLICY=SOURCE` selects the fork's source-block
+overviews instead: levels of `ceil(cols / f) x ceil(rows / f)` pixels, `nearest`, `average`,
+`min`, `max` or `mode` (`average` by default, `nearest` for palette COGs). The area-matched
+overviews and the overview report below need it, and supplied overview arrays of ceil sizes (as
+GDAL's GTiff driver and `gdaladdo` build them) are written under it. (`SOURCE` was the fork's
+default until 2026-11-21.)
 
 Without explicit factors, the unmasked `SOURCE` policy reduces each automatic
 overview level from the original source blocks independently: `nearest` samples the block center (clamped at image edges), and
@@ -129,8 +146,9 @@ any of its pixels is, so a flood extent grows at every level (by 22% to 56% on H
 grids), and `nearest` speckles its margin. Each level keeps `round(valid / f²)` cells, the most
 covered first, solving a threshold on the coverage histogram and breaking ties by the number of
 kept neighbours then a deterministic hash, and holds the mean of their valid pixels (the mode for
-categorical rasters, the lowest value on ties). It needs a nodata value. The algorithm and its
-output are ras2cng's `build_area_matched_overviews`.
+categorical rasters, the lowest value on ties). It needs a nodata value and
+`COG_OVERVIEW_POLICY=SOURCE`. The algorithm and its output are ras2cng's
+`build_area_matched_overviews`.
 
 `write_raster_dataset_with_report` returns what was measured while building them, an
 `OverviewReport`: per band, the valid area each level keeps (kept cells × f² over the valid
@@ -151,6 +169,7 @@ level is built.
 let ds = terrio::open_raster("depth.tif")?;
 let options = terrio::RasterWriteOptions {
     driver: Some(terrio::formats::RasterDriver::Cog),
+    creation_options: vec![("COG_OVERVIEW_POLICY".into(), "SOURCE".into())],
     overview_resampling: Some("area_matched".into()),
     overview_report_metadata: Some(terrio::OverviewReportMetadata {
         area_ratios: Some("overview_area_ratios".into()),
@@ -177,7 +196,9 @@ instead of scanning the raster first.
 
 Overviews computed elsewhere are written as they are with `RasterWriteOptions::overview_data`
 (GDAL's `OVERVIEWS=FORCE_USE_EXISTING`): the levels of factors 2, 4, 8…, each of the raster's
-bands and data type and `ceil(cols / f) x ceil(rows / f)` pixels.
+bands and data type, of `ceil(cols / f) x ceil(rows / f)` pixels with `COG_OVERVIEW_POLICY=SOURCE`
+(the sizes of GDAL's GTiff overviews, as here), or halved and floored from level to level under
+the default `GDAL_3_13`. A level of another size is refused.
 
 ```rust,no_run
 use std::sync::Arc;
@@ -187,7 +208,11 @@ let ds = terrio::open_raster("depth.tif")?;
 let options = terrio::RasterWriteOptions {
     driver: Some(terrio::formats::RasterDriver::Cog),
     compression: Some("DEFLATE".into()),
-    creation_options: vec![("PREDICTOR".into(), "YES".into()), ("OVERVIEWS".into(), "FORCE_USE_EXISTING".into())],
+    creation_options: vec![
+        ("PREDICTOR".into(), "YES".into()),
+        ("OVERVIEWS".into(), "FORCE_USE_EXISTING".into()),
+        ("COG_OVERVIEW_POLICY".into(), "SOURCE".into()),
+    ],
     overview_data: vec![Arc::new(level2), Arc::new(level4)],
     metadata: vec![("overview_method".into(), "area_matched_mean".into())],
     ..Default::default()
@@ -196,11 +221,11 @@ terrio::write_raster_dataset(&ds, "depth_cog.tif", &options)?;
 # Ok::<(), terrio::Error>(())
 ```
 
-Set `COG_OVERVIEW_POLICY=GDAL_3_13` to select the upstream recursive GDAL
-overview implementation with floor-sized levels, including alpha and dataset masks. This opt-in policy
-also supports `rms`, `bilinear`, `cubic`, `cubicspline`, `lanczos` and `gauss`.
-The fork keeps its `SOURCE` default and scientific area-matched/supplied-array
-extensions described above. Neither policy implies a performance advantage.
+`COG_OVERVIEW_POLICY=GDAL_3_13`, the default, is the upstream recursive GDAL overview
+implementation with floor-sized levels, including alpha and dataset masks, and supports `rms`,
+`bilinear`, `cubic`, `cubicspline`, `lanczos` and `gauss` besides SOURCE's methods. `SOURCE` is
+opt-in and carries the scientific area-matched/supplied-array extensions described above.
+Neither policy implies a performance advantage.
 
 For `SOURCE` rasters carrying a dataset mask, nearest/average/mode use the
 upstream recursive mask-weighted kernels at SOURCE's ceil dimensions. Masked

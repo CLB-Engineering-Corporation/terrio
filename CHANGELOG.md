@@ -5,6 +5,15 @@
 Changes of the CLB fork (CLB-Engineering-Corporation/terrio) on top of upstream 0.9.0 and the nine
 commits after it (a7473c2). Upstream's own entries are below, unchanged.
 
+- Changed default (CLB fork, owner's decision of 2026-11-21): COG overviews are upstream's again,
+  `COG_OVERVIEW_POLICY=GDAL_3_13` (GDAL's recursive kernels, `cubic` by default, `nearest` for
+  palettes, levels halved and floored). The fork's `SOURCE` policy (`average` from the source
+  blocks, ceil-sized levels) is now opt-in with `COG_OVERVIEW_POLICY=SOURCE`, which area-matched
+  overviews (`overview_resampling="area_matched"`, `report_metadata`, `area_matched_nan_valid`),
+  `min` and `max` COG overviews and supplied overview arrays of ceil sizes (GDAL's GTiff
+  overviews) need: without it they are refused, and the error names the option. A COG written without the option now has
+  GDAL's overview pixels and sizes (one level fewer on some odd sizes) and records
+  `OVERVIEW_RESAMPLING=CUBIC`. GeoTIFF overviews are unchanged.
 - Pure-Rust Zstandard by default again (CLB fork, owner's decision of 2026-11-10): `libzstd-geotiff`
   is no longer a default feature of terrio, terrio-cli and the Python package, so the default
   build, the `terrio` command and the wheels write and read ZSTD and LERC_ZSTD GeoTIFF/COG chunks

@@ -2023,14 +2023,7 @@ fn large_row_calls_keep_encoded_work_bounded() {
     let mut build_writer = terrio::GeoTiffWriter::create(
         directory.path().join("build-copy.tif").to_str().unwrap(),
         &build_header,
-        &RasterWriteOptions {
-            driver: Some(RasterDriver::Cog),
-            tile_size: Some(256),
-            // The third copy is the GDAL policy's overview source buffer: the fork's default
-            // SOURCE policy builds every level from the slab it owns, with two copies.
-            creation_options: vec![("COG_OVERVIEW_POLICY".into(), "GDAL_3_13".into())],
-            ..Default::default()
-        },
+        &RasterWriteOptions { driver: Some(RasterDriver::Cog), tile_size: Some(256), ..Default::default() },
     )
     .unwrap();
     let (result, largest) = largest_during(|| build_writer.write_rows(&build_data, build_rows, None));

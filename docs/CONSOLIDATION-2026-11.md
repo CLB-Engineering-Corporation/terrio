@@ -123,6 +123,13 @@ and "CI" had last passed on d1e1484, before the upstream merge in f88347f.
   the branches suspected at first (the default-domain report, sidecar overviews, streamed blend)
   touches the overview pixels. Resolution: `SOURCE` stays the fork's default, as chosen in f88347f,
   and those three test files now name `GDAL_3_13`, as upstream's other comparisons already do.
+  **Superseded 2026-11-21 (owner's decision):** the default is now upstream's, `GDAL_3_13`, with
+  the reconciliation onto upstream 80c9e7a. `SOURCE` is opt-in: callers of area-matched overviews,
+  the overview report or ceil-sized supplied overview arrays (the ras2fim viewer's
+  `terrio_cog.py`) pass `COG_OVERVIEW_POLICY=SOURCE`, and a ceil-sized array written without it is
+  refused with a message naming the option. The three test files (and
+  `test_cog_overview_scenarios.py`) are upstream's again, comparing the default with GDAL, and the
+  tests of SOURCE's own behaviour name `SOURCE`.
 - **Metadata domains.** An early return in `gdal_metadata_xml`'s `item` (from 70ef191, kept through
   f88347f) wrote an item with a domain without its `sample`, so a band's domain was read back as the
   dataset's. Not the effective-options resolution of `plan_with`. The early return is gone; the

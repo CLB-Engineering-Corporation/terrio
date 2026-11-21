@@ -1777,15 +1777,18 @@ pub struct RasterWriteOptions {
     pub overviews: Vec<usize>,
     /// The overview resampling, as GDAL names it: `nearest`, `average`, `rms`, `bilinear`,
     /// `cubic`, `cubicspline`, `lanczos` or `mode` (and terrio's `min` and `max` for GeoTIFF
-    /// overviews). GeoTIFF overviews default to `nearest`; COGs use the scientific SOURCE
-    /// policy with `average` by default. `COG_OVERVIEW_POLICY=GDAL_3_13` selects upstream GDAL
-    /// kernels and its `cubic` default (`nearest` for palettes). COGs take `OVERVIEW_RESAMPLING` and
-    /// `RESAMPLING` creation options, which come first.
+    /// overviews). GeoTIFF overviews default to `nearest`; COGs use GDAL 3.13's kernels
+    /// (`COG_OVERVIEW_POLICY=GDAL_3_13`, the default, as upstream's) and its `cubic` default
+    /// (`nearest` for palettes). `COG_OVERVIEW_POLICY=SOURCE` selects the CLB fork's scientific
+    /// SOURCE policy instead: `nearest`, `average` (its default), `min`, `max` or `mode`, with
+    /// ceil-sized levels. COGs take `OVERVIEW_RESAMPLING` and `RESAMPLING` creation options,
+    /// which come first.
     ///
     /// `area_matched` (or `area_matched_mode` for categorical rasters) builds levels whose valid
     /// area matches the full-resolution image's, where `average` grows it at every level: each
     /// level keeps as many cells as the valid pixels fill, the most covered first, with the mean
-    /// (or the mode) of their valid pixels. It needs a nodata value. The algorithm is ras2cng's
+    /// (or the mode) of their valid pixels. It needs a nodata value, and for a COG
+    /// `COG_OVERVIEW_POLICY=SOURCE`. The algorithm is ras2cng's
     /// `build_area_matched_overviews`, with the same output.
     pub overview_resampling: Option<String>,
     /// Area-matched overviews count NaN samples under a numeric nodata as valid, as rasterio's
@@ -1810,8 +1813,10 @@ pub struct RasterWriteOptions {
     pub overview_report_metadata: Option<OverviewReportMetadata>,
     /// COG (or GeoTIFF) overviews supplied by the caller, written as they are instead of being
     /// computed: from the largest, the overviews of factors 2, 4, 8... Each has the raster's bands
-    /// and data type and the size the writer gives that level, `ceil(cols / f) x ceil(rows / f)`
-    /// (halved and floored from level to level with `COG_OVERVIEW_POLICY=GDAL_3_13`). As GDAL's
+    /// and data type and the size the writer gives that level: for a COG, halved and floored
+    /// from level to level under the default `COG_OVERVIEW_POLICY=GDAL_3_13`, and
+    /// `ceil(cols / f) x ceil(rows / f)` (the sizes of GDAL's GTiff overviews) with
+    /// `COG_OVERVIEW_POLICY=SOURCE`, which a caller supplying those passes. As GDAL's
     /// COG driver with `OVERVIEWS=FORCE_USE_EXISTING`; fewer levels than the writer would build
     /// are written as they are.
     pub overview_data: Vec<std::sync::Arc<Raster>>,

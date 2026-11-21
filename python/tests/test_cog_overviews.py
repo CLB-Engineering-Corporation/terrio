@@ -17,6 +17,9 @@ import pytest
 import terrio
 
 TRANSFORM = (500000.0, 10.0, 0.0, 4000000.0, 0.0, -10.0)
+# Area-matched COG overviews and their report are the opt-in SOURCE policy's (CLB fork; the
+# default is GDAL 3.13's, which refuses them).
+SOURCE = {"COG_OVERVIEW_POLICY": "SOURCE"}
 
 
 def river(width=1300, height=1100, nodata=-9999.0):
@@ -62,8 +65,14 @@ def test_area_matched_overviews_keep_the_wet_area(tmp_path):
     a = river()
     valid = int((a != -9999).sum())
     avg, am = tmp_path / "avg.tif", tmp_path / "am.tif"
-    raster(a).write(str(avg), driver="COG", compress="DEFLATE")
-    raster(a).write(str(am), driver="COG", compress="DEFLATE", overview_resampling="area_matched")
+    raster(a).write(str(avg), driver="COG", compress="DEFLATE", options=SOURCE)
+    raster(a).write(
+        str(am),
+        driver="COG",
+        compress="DEFLATE",
+        options=SOURCE,
+        overview_resampling="area_matched",
+    )
     for i, (ov_avg, ov_am) in enumerate(zip(overviews(avg), overviews(am), strict=True)):
         f = 2 ** (i + 1)
         assert int((ov_avg != -9999).sum()) * f * f / valid > 1.2
@@ -71,8 +80,14 @@ def test_area_matched_overviews_keep_the_wet_area(tmp_path):
     # Without nodata there is no wet area to match.
     with pytest.raises(terrio.TerrioError):
         terrio.Raster.from_array(a, TRANSFORM, "EPSG:32610").write(
-            str(tmp_path / "x.tif"), driver="COG", overview_resampling="area_matched"
+            str(tmp_path / "x.tif"),
+            driver="COG",
+            options=SOURCE,
+            overview_resampling="area_matched",
         )
+    # The default GDAL 3.13 policy refuses them and names the policy that builds them.
+    with pytest.raises(terrio.TerrioError, match="COG_OVERVIEW_POLICY=SOURCE"):
+        raster(a).write(str(tmp_path / "d.tif"), driver="COG", overview_resampling="area_matched")
 
 
 def test_supplied_overviews_round_trip(tmp_path):
@@ -124,7 +139,7 @@ def test_predictor_yes_follows_gdal_cog(tmp_path, dtype, expected):
         {"TILED": "YES"},
         {"BLOCKXSIZE": "256"},
         {"OVERVIEWS": "FORCE_USE_EXISTING"},
-        {"RESAMPLING": "CUBIC"},
+        {"COG_OVERVIEW_POLICY": "SOURCE", "RESAMPLING": "CUBIC"},
         {"COMPRESS": "DEFLATE", "OVERVIEW_COMPRESS": "LZW"},
     ],
 )
@@ -142,7 +157,7 @@ def test_gdal_reads_terrio_cogs_as_its_own(tmp_path):
         str(out),
         driver="COG",
         compress="LERC",
-        options={"MAX_Z_ERROR": "0.01", "OVERVIEW_RESAMPLING": "area_matched"},
+        options={**SOURCE, "MAX_Z_ERROR": "0.01", "OVERVIEW_RESAMPLING": "area_matched"},
         metadata={"compression_lossy": "true"},
     )
     assert cogeo.cog_validate(str(out), quiet=True)[0]
@@ -197,8 +212,8 @@ def test_area_matched_write_reports_the_area_ratios(tmp_path):
     a[100:180, 900:1000] = 7.0  # a pond away from the river
     valid = int((a != -9999).sum())
     for driver, kwargs, method in [
-        ("COG", {}, "area_matched"),
-        ("COG", {}, "area_matched_mode"),
+        ("COG", {"options": SOURCE}, "area_matched"),
+        ("COG", {"options": SOURCE}, "area_matched_mode"),
         ("GTiff", {"overviews": [2, 4]}, "area_matched"),
     ]:
         out = tmp_path / f"{driver}_{method}.tif"
@@ -221,7 +236,9 @@ def test_area_ratios_in_image_structure_metadata(tmp_path):
     rasterio = pytest.importorskip("rasterio")
     a = river()
     out = tmp_path / "am.tif"
-    report = raster(a).write(str(out), driver="COG", overview_resampling="area_matched")
+    report = raster(a).write(
+        str(out), driver="COG", options=SOURCE, overview_resampling="area_matched"
+    )
     with rasterio.open(out) as src:
         assert_overview_method(out, rasterio, src.tags(ns="IMAGE_STRUCTURE"), "AREA_MATCHED")
         tags = src.tags(ns="OVERVIEW_REPORT")

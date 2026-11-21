@@ -753,7 +753,9 @@ impl TiffOptions {
             co(key).map(|v| v.trim().parse::<u32>().map_err(|_| Error::InvalidArgument(format!("invalid {key} '{v}'")))).transpose()
         };
         let gdal_overviews = match co("COG_OVERVIEW_POLICY").map(str::to_ascii_uppercase).as_deref() {
-            None | Some("SOURCE") => false,
+            // GDAL 3.13's COG overviews are the default, as upstream's; GeoTIFFs keep theirs.
+            None => cog,
+            Some("SOURCE") => false,
             Some("GDAL_3_13") if cog => true,
             Some(value) => {
                 return Err(Error::InvalidArgument(format!("invalid COG_OVERVIEW_POLICY '{value}' (SOURCE or GDAL_3_13 for COG)")));
@@ -785,6 +787,12 @@ impl TiffOptions {
                     ));
                 }
             },
+            Some(method) if cog && matches!(method.to_ascii_lowercase().as_str(), "min" | "max") => {
+                return Err(Error::Unsupported(format!(
+                    "'{method}' overview resampling is not supported under COG_OVERVIEW_POLICY=GDAL_3_13 (the default, GDAL's \
+                     methods); COG_OVERVIEW_POLICY=SOURCE builds min and max COG overviews"
+                )));
+            }
             Some(method) => OverviewResampling::parse(method)?,
             // Palette entries are categorical: averaging their indices invents classes.
             // Retain GDAL COG's nearest default for palettes under both policies.
@@ -1711,8 +1719,15 @@ fn supplied_levels<'a>(raster: &Raster, opts: &'a TiffOptions) -> Result<Vec<Lev
                 )));
             }
             if (ov.cols, ov.rows) != (cols, rows) {
+                // Ceil-sized levels (GDAL's GTiff overviews) are SOURCE's sizes, not GDAL 3.13 COG's.
+                let hint = if opts.gdal_overviews && (ov.cols, ov.rows) == overview_size(raster.cols, raster.rows, i, false) {
+                    "; COG_OVERVIEW_POLICY=GDAL_3_13 (the default) halves and floors each level, \
+                     pass COG_OVERVIEW_POLICY=SOURCE to write ceil-sized overviews"
+                } else {
+                    ""
+                };
                 return Err(Error::InvalidArgument(format!(
-                    "overview {i} (factor {}) is {} x {} pixels, not {cols} x {rows}",
+                    "overview {i} (factor {}) is {} x {} pixels, not {cols} x {rows}{hint}",
                     1usize << (i + 1),
                     ov.cols,
                     ov.rows
@@ -5898,7 +5913,6 @@ mod tests {
             tile_size: Some(16),
             compression: Some("NONE".into()),
             overview_resampling: Some("cubic".into()),
-            creation_options: vec![("COG_OVERVIEW_POLICY".into(), "GDAL_3_13".into())],
             ..Default::default()
         };
         let mut opts = TiffOptions::from_write_options(&options, true, None).unwrap().unwrap();
@@ -5974,9 +5988,11 @@ mod tests {
         }
     }
 
+    /// The overviews the opt-in SOURCE policy stores (the default is GDAL 3.13's).
     fn stored_cog_overviews(raster: &Raster, mut options: crate::RasterWriteOptions, nodata: Option<f64>) -> Vec<(usize, RasterData)> {
         options.tile_size = Some(16);
         options.compression = Some("NONE".into());
+        options.creation_options.push(("COG_OVERVIEW_POLICY".into(), "SOURCE".into()));
         let opts = TiffOptions::from_write_options(&options, true, nodata).unwrap().unwrap();
         let mut lazy = crate::LazyRaster::from_tiff_bytes(encode(raster, &opts).unwrap()).unwrap().unwrap();
         let dimensions = lazy.overviews();
@@ -6322,7 +6338,11 @@ mod tests {
         let raster = overview_fixture(1, DataType::U64, RasterData::U64(source.clone()));
         let dir = tempfile::tempdir().unwrap();
         for method in ["nearest", "min", "max", "mode"] {
-            let options = crate::RasterWriteOptions { overview_resampling: Some(method.into()), ..Default::default() };
+            let options = crate::RasterWriteOptions {
+                overview_resampling: Some(method.into()),
+                creation_options: vec![("COG_OVERVIEW_POLICY".into(), "SOURCE".into())],
+                ..Default::default()
+            };
             for (factor, data) in stored_cog_overviews(&raster, options.clone(), Some(base as f64)) {
                 let RasterData::U64(actual) = data else { panic!() };
                 let cols = 65usize.div_ceil(factor);
@@ -6529,6 +6549,19 @@ mod cog_option_tests {
         }
     }
 
+    /// `cog_options` under the opt-in SOURCE policy, which area-matched overviews, the overview
+    /// report and ceil-sized supplied overviews need (the default is GDAL 3.13's).
+    fn source_options(co: &[(&str, &str)]) -> crate::RasterWriteOptions {
+        let mut o = cog_options(co);
+        o.creation_options.push(("COG_OVERVIEW_POLICY".into(), "SOURCE".into()));
+        o
+    }
+
+    /// COG options of an area-matched write, under SOURCE.
+    fn area_matched_cog(method: &str) -> crate::RasterWriteOptions {
+        crate::RasterWriteOptions { overview_resampling: Some(method.into()), ..source_options(&[]) }
+    }
+
     /// The TIFF images (IFDs) of a file: (width, height, predictor).
     fn images(path: &std::path::Path) -> Vec<(u32, u32, u16)> {
         let mut d = tiff::decoder::Decoder::new(std::fs::File::open(path).unwrap()).unwrap();
@@ -6647,10 +6680,17 @@ mod cog_option_tests {
         }
     }
 
-    /// GDAL 3.13's COG defaults are opt-in; scientific SOURCE remains the fork default.
+    /// GDAL 3.13's COG overviews are the default, as upstream's; SOURCE is opt-in.
     #[test]
     fn overview_policies_select_distinct_defaults_and_filter_scopes() {
-        let source = TiffOptions::from_write_options(&crate::RasterWriteOptions::default(), true, None).unwrap().unwrap();
+        let default = TiffOptions::from_write_options(&crate::RasterWriteOptions::default(), true, None).unwrap().unwrap();
+        assert!(default.gdal_overviews);
+        assert_eq!(cog_method(&default), Method::Cubic);
+        let gtiff = TiffOptions::from_write_options(&crate::RasterWriteOptions::default(), false, None).unwrap().unwrap();
+        assert!(!gtiff.gdal_overviews);
+        let options =
+            crate::RasterWriteOptions { creation_options: vec![("COG_OVERVIEW_POLICY".into(), "SOURCE".into())], ..Default::default() };
+        let source = TiffOptions::from_write_options(&options, true, None).unwrap().unwrap();
         assert!(!source.gdal_overviews);
         assert_eq!(source.overview_resampling, OverviewResampling::Average);
         for policy in ["SOURCE", "GDAL_3_13"] {
@@ -6672,7 +6712,18 @@ mod cog_option_tests {
         cubic.overview_resampling = Some("cubic".into());
         assert!(TiffOptions::from_write_options(&cubic, true, None).is_ok());
         cubic.creation_options.clear();
+        assert!(TiffOptions::from_write_options(&cubic, true, None).is_ok());
+        cubic.creation_options = vec![("COG_OVERVIEW_POLICY".into(), "SOURCE".into())];
         assert!(TiffOptions::from_write_options(&cubic, true, None).is_err());
+        // min and max are SOURCE's: the default refuses them and names the policy.
+        let min = crate::RasterWriteOptions { overview_resampling: Some("min".into()), ..Default::default() };
+        let Err(Error::Unsupported(message)) = TiffOptions::from_write_options(&min, true, None) else { panic!("min under GDAL_3_13") };
+        assert!(message.contains("COG_OVERVIEW_POLICY=SOURCE"), "{message}");
+        let source_min = crate::RasterWriteOptions { creation_options: vec![("COG_OVERVIEW_POLICY".into(), "SOURCE".into())], ..min };
+        assert!(TiffOptions::from_write_options(&source_min, true, None).is_ok());
+        assert!(
+            TiffOptions::from_write_options(&crate::RasterWriteOptions { creation_options: vec![], ..source_min }, false, None).is_ok()
+        );
         assert_eq!(source_sizes(65, 35, 16, None), [(33, 18), (17, 9), (9, 5)]);
         assert_eq!(source_sizes(2, 2, 16, Some(usize::MAX)), [(1, 1)]);
         assert_eq!(gdal_overview::cog_sizes(65, 35, 16, None), [(32, 17), (16, 8)]);
@@ -6686,8 +6737,9 @@ mod cog_option_tests {
             &[("BLOCKXSIZE", "256")],
             &[("OVERVIEWS", "FORCE_USE_EXISTING")],
             &[("OVERVIEWS", "SOMETIMES")],
-            &[("RESAMPLING", "CUBIC")],
-            &[("OVERVIEW_RESAMPLING", "BILINEAR")],
+            // GDAL's filters are the default policy's, not SOURCE's.
+            &[("COG_OVERVIEW_POLICY", "SOURCE"), ("RESAMPLING", "CUBIC")],
+            &[("COG_OVERVIEW_POLICY", "SOURCE"), ("OVERVIEW_RESAMPLING", "BILINEAR")],
             &[("COMPRESS", "DEFLATE"), ("OVERVIEW_COMPRESS", "LZW")],
             &[("COMPRESS", "DEFLATE"), ("PREDICTOR", "YES"), ("OVERVIEW_PREDICTOR", "2")],
             &[("COMPRESS", "LERC"), ("MAX_Z_ERROR", "0.01"), ("MAX_Z_ERROR_OVERVIEW", "0.1")],
@@ -6707,6 +6759,9 @@ mod cog_option_tests {
             &[("COMPRESS", "DEFLATE"), ("PREDICTOR", "YES"), ("OVERVIEW_PREDICTOR", "YES"), ("NUM_THREADS", "ALL_CPUS")],
             &[("COMPRESS", "LERC"), ("MAX_Z_ERROR", "0.01"), ("MAX_Z_ERROR_OVERVIEW", "0.01")],
             &[("BIGTIFF", "IF_SAFER"), ("TILING_SCHEME", "CUSTOM"), ("RESAMPLING", "mode")],
+            &[("RESAMPLING", "CUBIC")],
+            &[("OVERVIEW_RESAMPLING", "BILINEAR")],
+            &[("COG_OVERVIEW_POLICY", "SOURCE"), ("RESAMPLING", "mode")],
         ];
         for co in accepted {
             write_cog(&r, &cog_options(co)).unwrap_or_else(|e| panic!("{co:?}: {e}"));
@@ -6729,6 +6784,9 @@ mod cog_option_tests {
     fn overviews_none_writes_the_full_resolution_only() {
         let r = grid(1100, 600, DataType::F32, |x, _| x as f64);
         let (_d, p) = write_cog(&r, &cog_options(&[])).unwrap();
+        assert_eq!(images(&p).len(), 3);
+        assert!(gdal_metadata(&p).contains(r#"<Item name="OVERVIEW_RESAMPLING" domain="IMAGE_STRUCTURE">CUBIC</Item>"#));
+        let (_d, p) = write_cog(&r, &source_options(&[])).unwrap();
         assert_eq!(images(&p).len(), 3);
         assert!(gdal_metadata(&p).contains(r#"<Item name="OVERVIEW_RESAMPLING" domain="IMAGE_STRUCTURE">AVERAGE</Item>"#));
         let (_d, p) = write_cog(&r, &cog_options(&[("OVERVIEWS", "NONE")])).unwrap();
@@ -6771,12 +6829,27 @@ mod cog_option_tests {
             o.overview_data = vec![Arc::new(grid(550, 300, DataType::F32, |_, _| 0.0))];
             assert!(write_cog(&r, &o).is_err(), "{co:?}");
         }
-        // Odd sizes round up, as the writer's own levels.
+        // Odd sizes round up under SOURCE, as its own levels (and GDAL's GTiff overviews).
         let r = grid(1025, 513, DataType::U8, |x, _| (x % 200) as f64);
-        let mut o = cog_options(&[]);
-        o.overview_data = vec![Arc::new(grid(513, 257, DataType::U8, |_, _| 7.0)), Arc::new(grid(257, 129, DataType::U8, |_, _| 9.0))];
+        let ceil = vec![Arc::new(grid(513, 257, DataType::U8, |_, _| 7.0)), Arc::new(grid(257, 129, DataType::U8, |_, _| 9.0))];
+        let mut o = source_options(&[]);
+        o.overview_data = ceil.clone();
         let (_d, p) = write_cog(&r, &o).unwrap();
         assert_eq!(images(&p).iter().map(|i| (i.0, i.1)).collect::<Vec<_>>(), vec![(1025, 513), (513, 257), (257, 129)]);
+        // The default GDAL 3.13 policy floors them, and says how to write ceil-sized levels.
+        let mut o = cog_options(&[]);
+        o.overview_data = ceil;
+        let Err(Error::InvalidArgument(message)) = write_cog(&r, &o) else { panic!("ceil-sized levels under GDAL_3_13") };
+        assert!(message.contains("is 513 x 257 pixels, not 512 x 256") && message.contains("COG_OVERVIEW_POLICY=SOURCE"), "{message}");
+        let mut o = cog_options(&[]);
+        o.overview_data = vec![Arc::new(grid(512, 256, DataType::U8, |_, _| 7.0))];
+        let (_d, p) = write_cog(&r, &o).unwrap();
+        assert_eq!(images(&p).iter().map(|i| (i.0, i.1)).collect::<Vec<_>>(), vec![(1025, 513), (512, 256)]);
+        // A size neither policy gives gets no hint.
+        let mut o = cog_options(&[]);
+        o.overview_data = vec![Arc::new(grid(511, 256, DataType::U8, |_, _| 7.0))];
+        let Err(Error::InvalidArgument(message)) = write_cog(&r, &o) else { panic!("511 x 256") };
+        assert!(!message.contains("SOURCE"), "{message}");
     }
 
     #[test]
@@ -6795,8 +6868,11 @@ mod cog_option_tests {
                 _ => unreachable!(),
             }
         };
-        let (_d, avg) = write_cog(&r, &cog_options(&[])).unwrap();
-        let (_d2, am) = write_cog(&r, &cog_options(&[("OVERVIEW_RESAMPLING", "AREA_MATCHED")])).unwrap();
+        let (_d, avg) = write_cog(&r, &source_options(&[])).unwrap();
+        let (_d2, am) = write_cog(&r, &source_options(&[("OVERVIEW_RESAMPLING", "AREA_MATCHED")])).unwrap();
+        // Area-matched COG overviews are SOURCE's: the default GDAL 3.13 policy refuses them.
+        let e = write_cog(&r, &cog_options(&[("OVERVIEW_RESAMPLING", "AREA_MATCHED")])).err();
+        assert!(matches!(&e, Some(Error::Unsupported(m)) if m.contains("COG_OVERVIEW_POLICY=SOURCE")), "{e:?}");
         assert!(gdal_metadata(&am).contains(r#"<Item name="OVERVIEW_RESAMPLING" domain="IMAGE_STRUCTURE">AREA_MATCHED</Item>"#));
         for i in 0..2 {
             let f = (1usize << (i + 1)) as f64;
@@ -6806,9 +6882,7 @@ mod cog_option_tests {
             assert!((ratio_am - 1.0).abs() < 0.01, "area-matched level {i}: {ratio_am}");
         }
         // The same through the writer options, and through the GeoTIFF overview factors.
-        let mut o = cog_options(&[]);
-        o.overview_resampling = Some("area_matched_mode".into());
-        write_cog(&r, &o).unwrap();
+        write_cog(&r, &area_matched_cog("area_matched_mode")).unwrap();
         let o = crate::RasterWriteOptions {
             driver: Some(crate::formats::RasterDriver::GTiff),
             overviews: vec![2, 4],
@@ -6851,7 +6925,7 @@ mod cog_option_tests {
         for (factors, method) in
             [(vec![2, 4, 8], "average"), (vec![4, 2], "nearest"), (vec![3, 9], "average"), (vec![2, 4], "area_matched")]
         {
-            let mut cog = cog_options(&[]);
+            let mut cog = source_options(&[]);
             cog.overviews = factors.clone();
             cog.overview_resampling = Some(method.into());
             let (_d, c) = write_cog(&r, &cog).unwrap();
@@ -6870,7 +6944,7 @@ mod cog_option_tests {
             let name = if method == "area_matched" { "AREA_MATCHED".to_string() } else { method.to_ascii_uppercase() };
             assert!(gdal_metadata(&c).contains(&format!(r#"<Item name="OVERVIEW_RESAMPLING" domain="IMAGE_STRUCTURE">{name}</Item>"#)));
             // FORCE_USE_EXISTING uses them too.
-            let mut force = cog_options(&[("OVERVIEWS", "FORCE_USE_EXISTING")]);
+            let mut force = source_options(&[("OVERVIEWS", "FORCE_USE_EXISTING")]);
             force.overviews = factors.clone();
             force.overview_resampling = Some(method.into());
             let (_d3, f) = write_cog(&r, &force).unwrap();
@@ -6946,6 +7020,11 @@ mod cog_option_tests {
                 driver: Some(driver),
                 overviews,
                 overview_resampling: Some(method.into()),
+                creation_options: if matches!(driver, crate::formats::RasterDriver::Cog) {
+                    vec![("COG_OVERVIEW_POLICY".into(), "SOURCE".into())]
+                } else {
+                    vec![]
+                },
                 ..Default::default()
             };
             let report = crate::write_raster_dataset_with_report(&ds, p.to_str().unwrap(), &o).unwrap().unwrap();
@@ -6999,11 +7078,7 @@ mod cog_option_tests {
         let r = Raster::from_data_native(cfg, RasterData::I16(v)).unwrap();
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("two.tif");
-        let o = crate::RasterWriteOptions {
-            driver: Some(crate::formats::RasterDriver::Cog),
-            overview_resampling: Some("area_matched".into()),
-            ..Default::default()
-        };
+        let o = area_matched_cog("area_matched");
         let report =
             crate::write_raster_dataset_with_report(&crate::RasterDataset::new(r, true), p.to_str().unwrap(), &o).unwrap().unwrap();
         assert_eq!(report.base_valid_pixels, vec![3 * rows as u64, 100 * cols as u64]);
@@ -7043,11 +7118,9 @@ mod cog_option_tests {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("two.tif");
         let o = crate::RasterWriteOptions {
-            driver: Some(crate::formats::RasterDriver::Cog),
-            overview_resampling: Some("area_matched".into()),
             overview_report_metadata: Some(report_names()),
             metadata: vec![("compression".into(), "LZW".into())],
-            ..Default::default()
+            ..area_matched_cog("area_matched")
         };
         let ds = crate::RasterDataset::new(r, true);
         let report = crate::write_raster_dataset_with_report(&ds, p.to_str().unwrap(), &o).unwrap().unwrap();
@@ -7079,11 +7152,7 @@ mod cog_option_tests {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("x.tif");
         let p = p.to_str().unwrap();
-        let am = crate::RasterWriteOptions {
-            driver: Some(crate::formats::RasterDriver::Cog),
-            overview_resampling: Some("area_matched".into()),
-            ..Default::default()
-        };
+        let am = area_matched_cog("area_matched");
         let names = |a: &str, b: &str| crate::OverviewReportMetadata { area_ratios: Some(a.into()), base_valid_pixels: Some(b.into()) };
         let bad = [
             // A name of the caller's metadata.
@@ -7136,12 +7205,7 @@ mod cog_option_tests {
         let dir = tempfile::tempdir().unwrap();
         for compression in ["DEFLATE", "LERC_DEFLATE"] {
             let p = dir.path().join(format!("{compression}.tif"));
-            let mut o = crate::RasterWriteOptions {
-                driver: Some(crate::formats::RasterDriver::Cog),
-                compression: Some(compression.into()),
-                overview_resampling: Some("area_matched".into()),
-                ..Default::default()
-            };
+            let mut o = crate::RasterWriteOptions { compression: Some(compression.into()), ..area_matched_cog("area_matched") };
             let default = crate::write_raster_dataset_with_report(&ds, p.to_str().unwrap(), &o).unwrap().unwrap();
             assert_eq!(default.base_valid_pixels, vec![(wet - nans) as u64]);
             assert_eq!(default.nan_pixels, vec![nans as u64]);

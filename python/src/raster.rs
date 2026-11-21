@@ -1157,14 +1157,20 @@ impl PyRaster {
     ///         raises); or the overviews themselves (GeoTIFF or COG), written as they are instead
     ///         of computed:
     ///         `Raster`s or arrays (`(rows, cols)` or `(bands, rows, cols)`) of the raster's dtype,
-    ///         from the largest, at factors 2, 4, 8... (`ceil(width / f) x ceil(height / f)`).
-    ///     overview_resampling: `"nearest"`, `"average"`, `"min"`, `"max"` or `"mode"`; or
+    ///         from the largest, at factors 2, 4, 8...: for a COG, halved and floored from level
+    ///         to level under the default `COG_OVERVIEW_POLICY=GDAL_3_13`, or
+    ///         `ceil(width / f) x ceil(height / f)` (GDAL's GTiff overview sizes, and a GeoTIFF's)
+    ///         with `options={"COG_OVERVIEW_POLICY": "SOURCE"}`.
+    ///     overview_resampling: GDAL's names (`"nearest"`, `"average"`, `"bilinear"`, `"cubic"`,
+    ///         `"cubicspline"`, `"lanczos"`, `"rms"`, `"mode"`), `"min"` or `"max"`; or
     ///         `"area_matched"` (`"area_matched_mode"` for categorical rasters), whose levels keep
     ///         the full-resolution valid area instead of growing it, with the mean (or mode) of the
-    ///         valid pixels (needs a nodata value). Defaults to `"nearest"` for GeoTIFF and
-    ///         `"average"` for COG under its default `COG_OVERVIEW_POLICY=SOURCE`. Explicit
-    ///         `COG_OVERVIEW_POLICY=GDAL_3_13` selects GDAL cubic defaults and filter kernels
-    ///         (`bilinear`, `cubic`, `cubicspline`, `lanczos`, `rms`), as creation options.
+    ///         valid pixels (needs a nodata value, and for a COG `COG_OVERVIEW_POLICY=SOURCE`).
+    ///         Defaults to `"nearest"` for GeoTIFF and GDAL's `"cubic"` for COG under its default
+    ///         `COG_OVERVIEW_POLICY=GDAL_3_13` (`"nearest"` for palettes). The CLB fork's
+    ///         `COG_OVERVIEW_POLICY=SOURCE` (a creation option) builds ceil-sized levels from the
+    ///         source blocks with `"nearest"`, `"average"` (its default), `"min"`, `"max"` or
+    ///         `"mode"`.
     ///     metadata: Dataset metadata items (GDAL's default domain) to set over the raster's
     ///         own: a mapping or `(key, value)` pairs.
     ///     gcps: GeoTIFF ground control points, in the raster's CRS: `(pixel, line, x, y, z)`

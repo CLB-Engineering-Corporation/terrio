@@ -7,6 +7,9 @@ import pytest
 import terrio
 
 TRANSFORM = (500000.0, 10.0, 0.0, 4000000.0, 0.0, -10.0)
+# Area-matched COG overviews and their report are the opt-in SOURCE policy's (the default is
+# GDAL 3.13's, which refuses them).
+SOURCE = {"COG_OVERVIEW_POLICY": "SOURCE"}
 REPORT_NAMES = {
     "area_ratios": "overview_area_ratios",
     "base_valid_pixels": "overview_base_valid_pixels",
@@ -42,7 +45,7 @@ def test_report_metadata_in_the_default_domain(tmp_path):
             str(out),
             driver="COG",
             compress="DEFLATE",
-            options={"BLOCKSIZE": "16"},
+            options={**SOURCE, "BLOCKSIZE": "16"},
             overview_resampling="area_matched",
             report_metadata=REPORT_NAMES,
             metadata={"overview_method": "area_matched_mean"},
@@ -64,7 +67,11 @@ def test_report_metadata_of_several_bands(tmp_path):
     a[1, :400] = -9999.0
     out = tmp_path / "two.tif"
     report = terrio.Raster.from_array(a, TRANSFORM, "EPSG:32610", -9999.0).write(
-        str(out), driver="COG", overview_resampling="area_matched", report_metadata=REPORT_NAMES
+        str(out),
+        driver="COG",
+        options=SOURCE,
+        overview_resampling="area_matched",
+        report_metadata=REPORT_NAMES,
     )
     with rasterio.open(out) as src:
         tags = src.tags()
@@ -85,14 +92,22 @@ def test_report_metadata_refusals(tmp_path):
     ]
     for kwargs in bad:
         with pytest.raises(terrio.TerrioError):
-            raster(a).write(out, driver="COG", overview_resampling="area_matched", **kwargs)
+            raster(a).write(
+                out, driver="COG", options=SOURCE, overview_resampling="area_matched", **kwargs
+            )
     # Only with area-matched overviews.
     for kwargs in (dict(report_metadata=REPORT_NAMES), dict(area_matched_nan_valid=True)):
         with pytest.raises(terrio.TerrioError):
-            raster(a).write(out, driver="COG", overview_resampling="average", **kwargs)
+            raster(a).write(
+                out, driver="COG", options=SOURCE, overview_resampling="average", **kwargs
+            )
     # Nothing to store without levels.
     small = raster(river(100, 80)).write(
-        out, driver="COG", overview_resampling="area_matched", report_metadata=REPORT_NAMES
+        out,
+        driver="COG",
+        options=SOURCE,
+        overview_resampling="area_matched",
+        report_metadata=REPORT_NAMES,
     )
     assert small is None
     assert not any(k.startswith("overview_") for k, _ in terrio.open_raster(out).metadata)
@@ -189,6 +204,7 @@ def test_nan_valid_area_matched_matches_ras2cng_bit_for_bit(tmp_path):
     report = raster(a).write(
         str(out),
         driver="COG",
+        options=SOURCE,
         compress="DEFLATE",
         overview_resampling="area_matched",
         area_matched_nan_valid=True,
@@ -207,7 +223,11 @@ def test_nan_valid_area_matched_matches_ras2cng_bit_for_bit(tmp_path):
     np.testing.assert_array_equal(full.view("uint32"), a.view("uint32"))
     # By default NaN is invalid: fewer valid pixels, and no NaN reaches the levels.
     report = raster(a).write(
-        str(out), driver="COG", compress="DEFLATE", overview_resampling="area_matched"
+        str(out),
+        driver="COG",
+        options=SOURCE,
+        compress="DEFLATE",
+        overview_resampling="area_matched",
     )
     assert report["base_valid_pixels"] == [int(((a != -9999.0) & ~np.isnan(a)).sum())]
     assert report["nan_pixels"] == [int(np.isnan(a).sum())]
@@ -216,11 +236,16 @@ def test_nan_valid_area_matched_matches_ras2cng_bit_for_bit(tmp_path):
     b = np.where(a == -9999.0, np.float32(np.nan), a)
     plain, valid = tmp_path / "p.tif", tmp_path / "v.tif"
     raster(b, np.nan).write(
-        str(plain), driver="COG", compress="DEFLATE", overview_resampling="area_matched"
+        str(plain),
+        driver="COG",
+        options=SOURCE,
+        compress="DEFLATE",
+        overview_resampling="area_matched",
     )
     raster(b, np.nan).write(
         str(valid),
         driver="COG",
+        options=SOURCE,
         compress="DEFLATE",
         overview_resampling="area_matched",
         area_matched_nan_valid=True,
@@ -236,7 +261,7 @@ def test_nan_valid_with_lerc_reads_back_nan(tmp_path):
         str(out),
         driver="COG",
         compress="LERC_DEFLATE",
-        options={"MAX_Z_ERROR": "0.01"},
+        options={**SOURCE, "MAX_Z_ERROR": "0.01"},
         overview_resampling="area_matched",
         area_matched_nan_valid=True,
     )
