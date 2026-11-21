@@ -154,22 +154,19 @@ impl Compression {
         data: Vec<u8>,
         c: &ChunkInfo,
         p: &CodecParams,
-        scratch: &mut Option<weezl::encode::Encoder>,
+        scratch: &mut Option<super::tiff_lzw::Encoder>,
     ) -> Result<Vec<u8>> {
         if !matches!(self, Self::Lzw) {
             return self.compress(data, c, p);
         }
-        let encoder = scratch.get_or_insert_with(|| weezl::encode::Encoder::with_tiff_size_switch(weezl::BitOrder::Msb, 8));
-        encoder.reset();
-        encoder.encode(&data).map_err(|e| Error::InvalidData(format!("LZW: {e}")))
+        let encoder = scratch.get_or_insert_with(super::tiff_lzw::Encoder::new);
+        Ok(encoder.encode(&data))
     }
 
     fn compress(self, data: Vec<u8>, c: &ChunkInfo, p: &CodecParams) -> Result<Vec<u8>> {
         Ok(match self {
             Self::None => data,
-            Self::Lzw => weezl::encode::Encoder::with_tiff_size_switch(weezl::BitOrder::Msb, 8)
-                .encode(&data)
-                .map_err(|e| Error::InvalidData(format!("LZW: {e}")))?,
+            Self::Lzw => super::tiff_lzw::Encoder::new().encode(&data),
             // The chunk's `h` rows, each of the same length: each search also examines the position
             // one row back.
             Self::Deflate => {
@@ -3239,6 +3236,36 @@ fn directories(mut images: Vec<Directory>, big: bool, cog: bool) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn lzw_matches_for_predicted_samples_and_byte_orders() {
+        let mut enc = super::super::tiff_lzw::Encoder::new();
+        for size in [1, 2, 4] {
+            for big in [false, true] {
+                for predictor in [1, 2, 3] {
+                    if predictor == 3 && size != 4 {
+                        continue;
+                    }
+                    for rows in [1, 2, 15, 16, 17, 255, 256, 257] {
+                        let mut data: Vec<u8> = (0..37 * rows)
+                            .flat_map(|i| {
+                                let bits = [0x7fc01234u32, 0x7fa00001, 0x80000000, 0x7f800000, i as u32][i % 5];
+                                let b = if big { bits.to_be_bytes() } else { bits.to_le_bytes() };
+                                b[..size].to_vec()
+                            })
+                            .collect();
+                        // Encoder sees bytes only; both sample byte orders are
+                        // exercised. The writer's predictor itself is LE-only.
+                        apply_predictor(&mut data, predictor, 37, 1, size);
+                        let actual = enc.encode(&data);
+                        let expected = weezl::encode::Encoder::with_tiff_size_switch(weezl::BitOrder::Msb, 8).encode(&data).unwrap();
+                        assert_eq!(actual, expected);
+                        assert_eq!(weezl::decode::Decoder::with_tiff_size_switch(weezl::BitOrder::Msb, 8).decode(&actual).unwrap(), data);
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn lzw_reused_streams_match_fresh_tiff_size_switch() {
         let mut scratch = None;
