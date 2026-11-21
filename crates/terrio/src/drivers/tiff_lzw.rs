@@ -9,11 +9,15 @@ pub(super) struct Encoder {
     // Packed (20-bit prefix/symbol key, 12-bit code). Code zero marks empty.
     table: Vec<u32>,
     successors: Vec<u8>,
+    // Only stored codes have witnesses. Offsets must support chunks above 4 GiB.
+    starts: Vec<usize>,
+    lengths: Vec<u16>,
+    parents: Vec<u16>,
 }
 
 impl Encoder {
     pub(super) fn new() -> Self {
-        Self { table: vec![0; 8192], successors: vec![0; 4096] }
+        Self { table: vec![0; 8192], successors: vec![0; 4096], starts: vec![0; 4096], lengths: vec![0; 4096], parents: vec![0; 4096] }
     }
 
     /// Starts an independent strip/tile. No dictionary state crosses chunks.
@@ -24,9 +28,15 @@ impl Encoder {
         let mut width = 9;
         let mut next = 258u16;
         out.put(256, width);
-        if let Some((&first, rest)) = data.split_first() {
+        if let Some(&first) = data.first() {
             let mut prefix = u16::from(first);
-            for &symbol in rest {
+            let mut start = 0;
+            let mut cursor = 1;
+            // Four-byte phase is a hint for Float32 runs, never a format assumption.
+            let mut latest = [0u16; 4];
+            let mut longest = [0u16; 4];
+            while cursor < data.len() {
+                let symbol = data[cursor];
                 let key = (u32::from(prefix) << 8) | u32::from(symbol);
                 let mut slot = (key.wrapping_mul(0x9e3779b1) >> 19) as usize;
                 loop {
@@ -41,6 +51,16 @@ impl Encoder {
                         *count = count.saturating_add(1);
                         if next < 4096 && !omitted {
                             self.table[slot] = (key << 12) | u32::from(next);
+                            let code = usize::from(next);
+                            let length = cursor - start + 1;
+                            self.starts[code] = start;
+                            self.lengths[code] = length as u16;
+                            self.parents[code] = prefix;
+                            let phase = start % 4;
+                            latest[phase] = next;
+                            if length >= usize::from(self.lengths[usize::from(longest[phase])]) {
+                                longest[phase] = next;
+                            }
                         }
                         next += 1;
                         out.put(prefix, width);
@@ -53,12 +73,43 @@ impl Encoder {
                             self.successors.fill(0);
                             next = 258;
                             width = 9;
+                            latest = [0; 4];
+                            longest = [0; 4];
                         }
                         prefix = u16::from(symbol);
+                        start = cursor;
+                        cursor += 1;
+                        for candidate in [longest[start % 4], latest[start % 4]] {
+                            let code = usize::from(candidate);
+                            let length = usize::from(self.lengths[code]);
+                            if candidate == 0 || length < 12 {
+                                continue;
+                            }
+                            let limit = length.min(data.len() - start);
+                            let witness = self.starts[code];
+                            let matched = common_prefix(&data[start..start + limit], &data[witness..witness + limit]);
+                            if matched == length {
+                                prefix = candidate;
+                                cursor = start + length;
+                                break;
+                            }
+                            // Bound parent walking by bytes consumed. Otherwise the
+                            // ordinary loop follows the same stored ancestors.
+                            if matched >= 12 && length - matched <= matched {
+                                let mut ancestor = candidate;
+                                for _ in matched..length {
+                                    ancestor = self.parents[usize::from(ancestor)];
+                                }
+                                prefix = ancestor;
+                                cursor = start + matched;
+                                break;
+                            }
+                        }
                         break;
                     }
                     if entry >> 12 == key {
                         prefix = (entry & 4095) as u16;
+                        cursor += 1;
                         break;
                     }
                     slot = (slot + 1) & 8191;
@@ -84,6 +135,25 @@ impl Encoder {
     }
 }
 
+// Safe unaligned word comparisons, independent of the host byte order.
+fn common_prefix(a: &[u8], b: &[u8]) -> usize {
+    let limit = a.len().min(b.len());
+    let mut matched = 0;
+    while limit - matched >= 8 {
+        let left = u64::from_le_bytes(a[matched..matched + 8].try_into().unwrap());
+        let right = u64::from_le_bytes(b[matched..matched + 8].try_into().unwrap());
+        let difference = left ^ right;
+        if difference != 0 {
+            return matched + (difference.trailing_zeros() / 8) as usize;
+        }
+        matched += 8;
+    }
+    while matched < limit && a[matched] == b[matched] {
+        matched += 1;
+    }
+    matched
+}
+
 struct Bits {
     bytes: Vec<u8>,
     pending: u32,
@@ -104,6 +174,61 @@ impl Bits {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mixed_runs_copies_and_adversarial_prefixes_match_oracle() {
+        let mut encoder = Encoder::new();
+        for seed in 1..=512u32 {
+            let mut state = seed;
+            let mut random = || {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                state
+            };
+            let mut data = Vec::new();
+            for _ in 0..32 {
+                let size = 1 + random() as usize % 4096;
+                match random() % 4 {
+                    0 => {
+                        let period = 1 + random() as usize % 9;
+                        let pattern: Vec<_> = (0..period).map(|_| random() as u8).collect();
+                        data.extend((0..size).map(|i| pattern[i % period]));
+                    }
+                    1 => data.extend((0..size).map(|_| random() as u8)),
+                    2 => {
+                        let phase = random() as usize % 4;
+                        let nodata = (-9999.0f32).to_le_bytes();
+                        data.extend((0..size).map(|i| nodata[(i + phase) % 4]));
+                    }
+                    _ if !data.is_empty() => {
+                        let from = random() as usize % data.len();
+                        data.extend_from_within(from..(from + size).min(data.len()));
+                    }
+                    _ => {}
+                }
+            }
+            let encoded = encoder.encode(&data); // Every call asserts the weezl oracle.
+            assert_eq!(
+                weezl::decode::Decoder::with_tiff_size_switch(weezl::BitOrder::Msb, 8).decode(&encoded).unwrap(),
+                data,
+                "seed {seed}"
+            );
+        }
+        for period in 1..=9 {
+            for phase in 0..4 {
+                let mut data: Vec<_> = (0..phase).map(|i| i as u8).collect();
+                data.extend((0..65537).map(|i| (i % period) as u8));
+                // Long shared prefixes with different tails force failed candidates
+                // and ancestor recovery, including truncation at the end of input.
+                for tail in 0..32u8 {
+                    data.extend_from_within(phase..phase + 4096);
+                    data.push(tail);
+                }
+                encoder.encode(&data);
+            }
+        }
+    }
 
     #[test]
     fn sparse_strips_do_not_retain_raw_sized_output_buffers() {
