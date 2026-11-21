@@ -20,7 +20,7 @@ impl Encoder {
     pub(super) fn encode(&mut self, data: &[u8]) -> Vec<u8> {
         self.table.fill(0);
         self.successors.fill(0);
-        let mut out = Bits { bytes: Vec::with_capacity(data.len()), pending: 0, count: 0 };
+        let mut out = Bits { bytes: Vec::with_capacity(data.len().min(4096)), pending: 0, count: 0 };
         let mut width = 9;
         let mut next = 258u16;
         out.put(256, width);
@@ -104,6 +104,13 @@ impl Bits {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sparse_strips_do_not_retain_raw_sized_output_buffers() {
+        let raw = vec![0; 217724];
+        let out = Encoder::new().encode(&raw);
+        assert!(out.capacity() < raw.len() / 8);
+    }
 
     #[test]
     fn randomized_streams_and_sparse_node_promotion_match() {

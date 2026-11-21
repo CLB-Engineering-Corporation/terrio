@@ -7,6 +7,8 @@ counts (4 KiB) replace the general-purpose weezl encoder's tree. Linear probing
 always has space: at most 3838 dictionary entries are live. Every chunk starts
 with clear code 256, ends with EOI 257, and resets its dictionary independently.
 No unsafe code or new dependency is needed.
+Compressed outputs start with at most 4 KiB capacity and grow as needed: ordered
+collection must not retain a raw-sized buffer for every sparse strip.
 
 Exact output compatibility includes weezl 0.2.1's sparse-node promotion behavior:
 the seventeenth successor consumes a code but is not entered in the lookup table.
