@@ -26,7 +26,7 @@ use crate::{SpatialRef, def, epsg};
 
 /// The PROJ string of a CRS, or `None` when it has none.
 pub(crate) fn write(s: &SpatialRef) -> Option<String> {
-    if s.wkt.as_deref().is_some_and(is_engineering) {
+    if s.wkt.as_deref().is_some_and(is_engineering) || s.wkt.as_deref().is_some_and(unwritable_bound) {
         return None;
     }
     if let Some(mut tokens) = extension(s) {
@@ -52,7 +52,7 @@ pub(crate) fn write(s: &SpatialRef) -> Option<String> {
         };
         let to_meter = def::vertical_from_wkt(&vertical)?.to_meter;
         // A geoid model (GDAL's `PROJ4_GRIDS` extension) comes with the CRS of its heights.
-        if let Some(grids) = wkt_geoid_grids(&vertical) {
+        if let Some(grids) = def::wkt_geoid_grids(&vertical) {
             // Quoted when it has a space, as PROJ does (`+geoidgrids="egm96 15.gtx"`): by
             // `finish`, or here after an extension.
             let grids = format!("+geoidgrids={grids}");
@@ -79,7 +79,7 @@ pub(crate) fn write(s: &SpatialRef) -> Option<String> {
         if s.wkt.as_deref().is_some_and(crate::is_variant_c) {
             return None;
         }
-        return s.wkt.as_deref().and_then(|w| crate::wkt_proj(w).and_then(|p| custom(&wkt_axes(w, &p), wkt_datum(w))));
+        return s.wkt.as_deref().and_then(|w| crate::wkt_proj(w).and_then(|p| custom(&wkt_axes(w, &p)?, wkt_datum(w))));
     }
     // A WKT's shift to WGS 84 (`TOWGS84`, a WKT 2 `BOUNDCRS`) makes it a bound CRS, which PROJ
     // writes with the ellipsoid and `+towgs84` in place of the datum, even for a code.
@@ -111,6 +111,24 @@ pub(crate) fn write(s: &SpatialRef) -> Option<String> {
     s.esri.and_then(epsg::esri).map(|e| registry(&e.proj, e.datum, &e.wkt, is_web_mercator(s), shift.as_deref()))
 }
 
+/// Whether a WKT 2 `BOUNDCRS` has no PROJ string, as PROJ 9.8.1 writes none (or one that does
+/// not place points where it does):
+/// - a Helmert transformation PROJ does not write (see `wkt2::helmert_writable`);
+/// - a source CRS whose datum has a `TOWGS84` of its own (a WKT 1 source, as GDAL writes one):
+///   PROJ writes that shift, but transforms by the bound one.
+fn unwritable_bound(wkt: &str) -> bool {
+    if !crate::def::is_bound_crs(wkt) {
+        return false;
+    }
+    let Some(root) = crate::wkt1::parse(wkt).filter(|r| r.key.eq_ignore_ascii_case("BOUNDCRS")) else { return false };
+    let source = root.child("SOURCECRS").and_then(crate::wkt2::first_node);
+    let own_shift = source.is_some_and(|s| {
+        let geogcs = if s.key.eq_ignore_ascii_case("PROJCS") { s.child("GEOGCS") } else { Some(s) };
+        geogcs.and_then(|g| g.child("DATUM")).is_some_and(|d| d.child("TOWGS84").is_some())
+    });
+    own_shift || root.child("ABRIDGEDTRANSFORMATION").is_some_and(|t| !crate::wkt2::helmert_writable(t))
+}
+
 /// The shift to WGS 84 of a CRS's WKT, when it has one: `+nadgrids`, else `+towgs84`.
 fn wkt_shift(s: &SpatialRef) -> Option<String> {
     let w = s.wkt.as_deref().filter(|w| ["TOWGS84", "ABRIDGEDTRANSFORMATION", "nadgrids"].iter().any(|k| w.contains(k)))?;
@@ -126,14 +144,6 @@ fn wkt_shift(s: &SpatialRef) -> Option<String> {
 /// Whether a PROJ parameter is an angle, which may be given in degrees, minutes and seconds.
 fn is_angle(key: &str) -> bool {
     ["+lat_", "+lon_", "+o_lat_", "+o_lon_"].iter().any(|p| key.starts_with(p)) || matches!(key, "+lonc" | "+alpha" | "+gamma" | "+lat_ts")
-}
-
-/// The geoid grids of a vertical CRS's WKT (GDAL's `EXTENSION["PROJ4_GRIDS", ...]`).
-fn wkt_geoid_grids(wkt: &str) -> Option<&str> {
-    // After the key and its quotes (13 bytes): at most the end of the string.
-    let rest = &wkt[wkt.find("\"PROJ4_GRIDS\"")? + 13..];
-    let rest = &rest[rest.find('"')? + 1..];
-    Some(&rest[..rest.find('"')?])
 }
 
 /// `+towgs84` values as PROJ writes them: seven of them. `None` for other than 3 or 7 finite
@@ -152,8 +162,9 @@ fn towgs84(values: &str) -> Option<String> {
 /// A WKT's PROJ string without the axes of its coordinate system, which PROJ does not write
 /// (`AXIS["Y",WEST],AXIS["X",SOUTH]` on Transverse Mercator): only those of a method defining
 /// them (south-orientated Transverse Mercator, Krovak's south and west), as PROJ 9.8.1 writes
-/// them, and a PROJ4 extension's as given.
-fn wkt_axes(wkt: &str, proj: &str) -> String {
+/// them, and a PROJ4 extension's as given. `None` for south-orientated Transverse Mercator with
+/// a false easting or northing, which PROJ 9.8.1 writes no PROJ string for.
+fn wkt_axes(wkt: &str, proj: &str) -> Option<String> {
     /// The source CRS's conversion method, excluding a bound datum transformation.
     fn method(n: &crate::wkt1::Node) -> Option<(String, Option<u32>)> {
         if n.key.eq_ignore_ascii_case("BOUNDCRS") {
@@ -170,7 +181,7 @@ fn wkt_axes(wkt: &str, proj: &str) -> String {
         projection.name().map(|name| (crate::wkt1::norm(name), projection.epsg()))
     }
     if crate::proj4_extension(wkt).is_some() {
-        return proj.to_string();
+        return Some(proj.to_string());
     }
     // A method is recognized by its name or its EPSG code, as the WKT 2 reader does.
     let (method, code) = crate::wkt1::parse(wkt).and_then(|root| method(&root)).unwrap_or_default();
@@ -179,14 +190,21 @@ fn wkt_axes(wkt: &str, proj: &str) -> String {
     let axis = |t: &str| t.starts_with("+axis=");
     let tokens = proj.split_whitespace();
     if south_orientated {
+        // PROJ refuses a false easting or northing ("CRS cannot be converted to a PROJ string"):
+        // it would write them added, where the method subtracts them.
+        let offset =
+            |t: &str| ["+x_0=", "+y_0="].iter().any(|k| t.strip_prefix(k).and_then(|v| v.parse::<f64>().ok()).is_some_and(|v| v != 0.0));
+        if proj.split_whitespace().any(offset) {
+            return None;
+        }
         // The method's axes, west and south, whatever the coordinate system's order.
-        tokens.map(|t| if axis(t) { "+axis=wsu" } else { t }).collect::<Vec<_>>().join(" ")
+        Some(tokens.map(|t| if axis(t) { "+axis=wsu" } else { t }).collect::<Vec<_>>().join(" "))
     } else if krovak {
         // Krovak's south and west (EPSG's), which PROJ writes; not other axes.
-        tokens.filter(|t| !axis(t) || *t == "+axis=swu").collect::<Vec<_>>().join(" ")
+        Some(tokens.filter(|t| !axis(t) || *t == "+axis=swu").collect::<Vec<_>>().join(" "))
     } else {
         // PROJ 9.8.1 also omits geographic coordinate-system axes on export.
-        tokens.filter(|t| !axis(t)).collect::<Vec<_>>().join(" ")
+        Some(tokens.filter(|t| !axis(t)).collect::<Vec<_>>().join(" "))
     }
 }
 
@@ -200,15 +218,17 @@ fn kept_axis(method: &str, axis: &str) -> bool {
 /// describe), which is the CRS's PROJ string: PROJ writes it as it is, but GDAL's Web Mercator,
 /// which it writes as its own; not for a CRS given by a PROJ string, whose WKT terrio builds.
 fn extension(s: &SpatialRef) -> Option<Vec<String>> {
-    let text = s.wkt.as_deref().and_then(crate::proj4_extension).filter(|_| s.proj4.is_none())?;
+    // Not the registry's own extension of a code's WKT, written without its datum: the code's
+    // string (`+datum=NAD27` for EPSG:9311).
+    let wkt = s.wkt.as_deref().filter(|w| !s.epsg.is_some_and(|c| crate::is_registry_extension(w, c)))?;
+    let text = crate::proj4_extension(wkt).filter(|_| s.proj4.is_none())?;
     let text = gdal_web_mercator(&text).unwrap_or(text);
     Some(tokens(&text, true).into_iter().filter(|t| t != "+type=crs").collect())
 }
 
 /// Whether a WKT is of an engineering CRS, which has no PROJ string.
 fn is_engineering(wkt: &str) -> bool {
-    let root = wkt.split(['[', '(']).next().unwrap_or_default().trim();
-    ["LOCAL_CS", "ENGCRS", "ENGINEERINGCRS"].iter().any(|key| root.eq_ignore_ascii_case(key))
+    crate::keywords::is(crate::keywords::root_key(wkt), crate::keywords::ENGINEERING_CRS)
 }
 
 /// Web Mercator, which PROJ writes on its sphere with `+nadgrids=@null +wktext`, not with its
@@ -704,7 +724,7 @@ fn strip_suffix(proj: &str) -> Vec<String> {
 /// grid.gtx"`), as the reader splits them: a quote opens a value right after `=` and closes it,
 /// `""` in it is a quote, and elsewhere a quote is a character (DMS seconds, `52d30'10"N`).
 /// Quoted values are unquoted, or `keep` as they are written.
-fn tokens(proj: &str, keep: bool) -> Vec<String> {
+pub(crate) fn tokens(proj: &str, keep: bool) -> Vec<String> {
     let (mut tokens, mut token, mut quoted) = (Vec::new(), String::new(), false);
     let mut chars = proj.chars().peekable();
     while let Some(c) = chars.next() {

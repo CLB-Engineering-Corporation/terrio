@@ -102,6 +102,80 @@ work too); errors have rioxarray's names (`terrio.xarray.exceptions`: `MissingCR
 | DataArray `.terrio` only | `nodata`, `encoded_nodata`, `write_nodata` (`encoded`), `set_nodata`, `pad_xy`, `to_rasterio_dataset` |
 | `terrio.xarray` | `merge_arrays`, `merge_datasets` (`bounds`, `res`, `nodata`, `method`, `crs`), `register_rio_accessor`, `set_options` (`export_grid_mapping`, `skip_missing_spatial_dims`), `crs_to_cf`, `exceptions` |
 
+## terrio operations
+
+Beyond rioxarray's API, the accessor runs terrio's raster operations on the array in memory.
+Each takes the keyword arguments of the terrio function of the same name and gives what that
+function gives on the array written to a file: a DataArray on the same grid, or a
+`terrio.Layer` for vector results.
+
+```python
+slope = dem.terrio.dem("slope")  # hillshade, aspect, TRI, TPI, roughness...
+fields = dem.terrio.zonal_stats("fields.gpkg", stats=["mean", "max"])  # a terrio.Layer
+fields.to_geopandas()
+classes = txr.rasterize("fields.gpkg", like=dem, attribute="crop_id")
+```
+
+| | Methods |
+|---|---|
+| DataArray and Dataset `.terrio`, band by band | `dem`, `sieve`, `proximity`, `fill_nodata`, `reclassify`, `viewshed` |
+| DataArray `.terrio`, a `terrio.Layer` | `polygonize`, `contour`, `footprint`, `zonal_stats` (2-D) |
+| Dataset `.terrio`, a `terrio.Layer` | `zonal_stats` (2-D variables; columns prefixed with the variables' names) |
+| `terrio.xarray` | `rasterize(src, like)`: vectors burnt on the grid of a DataArray or Dataset |
+
+Zones and vectors to burn may be any vector input of terrio's Python API (a path, a `Layer`, a
+GeoDataFrame, Shapely geometries, GeoJSON, WKT, bounds...; see
+[Vector inputs](python.md#vector-inputs)); geometries without a CRS of their own are in the
+array's CRS, as `clip` reads them.
+
+### Zonal statistics of cubes
+
+On an array with other dimensions than its spatial ones (`time`, `band`...), `zonal_stats`
+reduces every 2-D slice and returns a cube indexed by the zones' geometries:
+
+```python
+ndvi = cube.terrio.zonal_stats(fields, stats=["mean", "median"])  # (geometry, time, statistic)
+ndvi.sel(statistic="mean")  # one time series per field
+ndvi.terrio.crs  # the zones' CRS
+```
+
+An array with one extra dimension of length 1 (such as the `band` of `open_rasterio`) is a cube
+too, so it no longer gives a `Layer` with `bands=`. Squeeze the dimension first
+(`da.squeeze("band", drop=True)`) to keep the `Layer`.
+
+- `geometry`: the zones' Shapely geometries, in their own CRS (written as the grid mapping), with
+  the zones' attributes as coordinates along it. An attribute named like one of the result's
+  coordinates or Dataset variables gets `_2`, `_3`... Duplicate zone geometries remain
+  separate rows with a non-unique geometry index; select by position to distinguish them.
+- Then the array's other dimensions, and `statistic`, one entry per statistic.
+  Input dimensions or coordinates named `geometry` or `statistic` must be renamed first.
+- float32 for float32 data unless `count` or `variety` is requested, then float64
+  for every statistic to preserve integer counts above 2**24 (exact through 2**53);
+  float64 for other input types. NaN where a zone has no valid pixel.
+- A Dataset gives one such variable per spatial variable, sharing `geometry`.
+
+Options: `stats`, `all_touched`, `fractional`, `layer` and `batch_bytes`. The cube is reduced a
+few slices at a time (whole dask chunks of its first other dimension), holding about
+`batch_bytes` (512 MiB by default): only the strips holding zone pixels are read, and each dask
+chunk is computed once. Variables of a Dataset on one grid are read in one dask computation.
+A chunk larger than `batch_bytes` warns. Sorted statistics budget the complete values of
+zones open at the same time,
+including overlapping zones, temporary bins, ranks and fractional sorting pairs.
+Input reads and retained values are estimates, excluding the result, zone index and
+allocator overhead; `batch_bytes` is not a hard process memory limit.
+The same budget applies to 2-D variables in mixed Datasets.
+
+Limits: the zones are rasterized once per grid and strip height, and their geometries held
+in memory; the result is held in memory (zones × slices × statistics); strips never cross a
+dask chunk edge, so chunks
+of very uneven heights (or a prime common height) give strips of a few rows, which reads the
+same data in more, smaller pieces. Weighted statistics are not available on cubes.
+
+The other raster operations support two or three dimensions and compute dask arrays first;
+`zonal_stats` also supports cubes with any number of dimensions. Pixels masked
+on read (`masked=True`) go back to terrio with the file's nodata value. Floating-point results
+come back masked, with the nodata value in the encoding.
+
 ## Agreement with rioxarray
 
 `scripts/compare_xarray_with_rioxarray.py` runs every check twice, with rioxarray 0.23 (rasterio
@@ -195,5 +269,8 @@ quicklook (RPCs) images, every variable, coordinate and attribute, the GCPs and 
   HTTP, terrio does not read `.aux.xml` sidecar files.
 - terrio writes north-up or south-up grids, not rotated ones. Writers other than GeoTIFF do not
   store band scales and offsets: `to_raster` warns when it would lose them.
+- `clip` also takes a GeoDataFrame or GeoSeries, a vector file path, Arrow data or a terrio
+  `Layer` (each with its own CRS), a GeoJSON Feature or FeatureCollection, a single geometry,
+  WKT, or `(xmin, ymin, xmax, ymax)` bounds; rioxarray takes an iterable of geometries.
 - `clip(from_disk=True)` of an overview clips in memory. `estimate_utm_crs` knows the WGS 84,
   NAD83 and NAD27 UTM zones. Complex data types are not supported.

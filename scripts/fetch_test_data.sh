@@ -105,11 +105,23 @@ done
 # Vector tiles in a PMTiles archive (ZIP code tabulation areas, by Protomaps, made with Tippecanoe).
 [ -e cb_2018_us_zcta510_500k.pmtiles ] || curl -sSfL -o cb_2018_us_zcta510_500k.pmtiles \
   https://r2-public.protomaps.com/protomaps-sample-datasets/cb_2018_us_zcta510_500k.pmtiles
-[ -e usgs_dem.tif ] || curl -sSfL -o usgs_dem.tif https://prd-tnm.s3.amazonaws.com/StagedProducts/Elevation/1/TIFF/current/n40w106/USGS_1_n40w106.tif
-# Adjacent USGS 3DEP 1 arc-second tiles, for mosaics.
+# USGS 3DEP 1 arc-second tiles, pinned to the edition of 2026-07-08: the tests' expected values
+# come from it, and USGS replaces the files under current/ with each new edition. Tiles of
+# another edition (an earlier download from current/) are replaced. The three GDAL references
+# made from usgs_dem.tif are removed with them, and so is wasm_refs/done, so that the next run
+# with GDAL's tools makes wasm_refs/ again; without the tools, the other references stay.
+usgs_3dep=https://prd-tnm.s3.amazonaws.com/StagedProducts/Elevation/1/TIFF/historical
+usgs_edition=20260708
+if [ "$(cat usgs_3dep_edition 2>/dev/null || true)" != "$usgs_edition" ]; then
+  rm -f usgs_dem.tif USGS_1_n40w107.tif USGS_1_n41w106.tif USGS_1_n41w107.tif
+  rm -f wasm_refs/translate_srcwin.tif wasm_refs/translate_scale.tif wasm_refs/warp_3857.tif wasm_refs/done
+fi
+[ -e usgs_dem.tif ] || curl -sSfL -o usgs_dem.tif "$usgs_3dep/n40w106/USGS_1_n40w106_$usgs_edition.tif"
+# Adjacent tiles, for mosaics.
 for t in n40w107 n41w106 n41w107; do
-  [ -e "USGS_1_$t.tif" ] || curl -sSfL -o "USGS_1_$t.tif" "https://prd-tnm.s3.amazonaws.com/StagedProducts/Elevation/1/TIFF/current/$t/USGS_1_$t.tif"
+  [ -e "USGS_1_$t.tif" ] || curl -sSfL -o "USGS_1_$t.tif" "$usgs_3dep/$t/USGS_1_${t}_$usgs_edition.tif"
 done
+printf '%s\n' "$usgs_edition" > usgs_3dep_edition
 # HDF5 and netCDF-4 products: JPSS ATMS and VIIRS sensor data records (HDF5 with a user block,
 # from NOAA's open data on AWS) and a Sentinel-5P methane product (netCDF-4 with nested groups, from
 # the Copernicus mirror on AWS).
@@ -394,6 +406,9 @@ fi
 have_tools() { for t in "$@"; do command -v "$t" >/dev/null || return 1; done; }
 if have_tools gdal_translate gdalwarp gdaldem gdal_calc.py gdal_merge.py gdal_proximity.py gdal_sieve.py \
   gdal_rasterize gdal_polygonize.py && [ ! -e wasm_refs/done ]; then
+  # Made again as a whole: gdalwarp, gdal_merge.py and gdal_polygonize.py add to an existing
+  # output instead of replacing it.
+  rm -rf wasm_refs
   mkdir -p wasm_refs
   r=wasm_refs
   gdal_translate -q -srcwin 100 200 500 400 usgs_dem.tif $r/translate_srcwin.tif
@@ -439,13 +454,17 @@ if [ ! -e grids_legacy/egm96_15.gtx ]; then
   unzip -q -o grids_legacy/proj-datumgrid.zip BETA2007.gsb ntf_r93.gsb nzgd2kgrid0005.gsb egm96_15.gtx -d grids_legacy
   rm grids_legacy/proj-datumgrid.zip
 fi
-# GDAL's transformations for every EPSG CRS, which terrio's are checked against (needs pyproj,
-# NumPy and GDAL's Python bindings): without grids, and with those of grids/. 50 points of each
-# kind per CRS: about 950,000 lines and 83 MB per file, and 10 CPU minutes each to compute.
-if [ ! -e epsg_points.tsv ] && python -c "import numpy, pyproj, osgeo" 2>/dev/null; then
-  python "$here/gen_epsg_points.py" epsg_points.tsv
+# GDAL's transformations for every EPSG CRS, which terrio's are checked against, without grids
+# and with those of grids/. They need pyproj, NumPy and GDAL's Python bindings on the PROJ of
+# terrio-crs's EPSG table: GDAL 3.13.3 and PROJ 9.9.0. TERRIO_EPSG_POINTS_PYTHON names the
+# Python to run them with, when that GDAL is in another environment (`micromamba run -n NAME
+# python`). 50 points of each kind per CRS: about 950,000 lines and 85 MB per file, and 10 CPU
+# minutes each to compute.
+points_python=${TERRIO_EPSG_POINTS_PYTHON:-python}
+if [ ! -e epsg_points.tsv ] && $points_python -c "import numpy, pyproj, osgeo" 2>/dev/null; then
+  $points_python "$here/gen_epsg_points.py" epsg_points.tsv
 fi
-if [ ! -e epsg_points_grids.tsv ] && python -c "import numpy, pyproj, osgeo" 2>/dev/null; then
-  python "$here/gen_epsg_points.py" epsg_points_grids.tsv --grids grids
+if [ ! -e epsg_points_grids.tsv ] && $points_python -c "import numpy, pyproj, osgeo" 2>/dev/null; then
+  $points_python "$here/gen_epsg_points.py" epsg_points_grids.tsv --grids grids
 fi
 echo "Test data in $(pwd)"

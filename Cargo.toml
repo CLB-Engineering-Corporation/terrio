@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/*", "python", "js", "js/fetch", "js/zarr"]
+members = ["crates/*", "python", "js", "js/fetch", "js/zarr", "js/cog"]
 
 [workspace.package]
 version = "0.9.0"
@@ -80,15 +80,17 @@ lz4_flex = { version = "0.14", default-features = false, features = ["alloc", "s
 ruzstd = { package = "zstd-rust", git = "https://github.com/gpt-cmdr/zstd-rs", rev = "e716f7375fceb321fb603db1e97721bf72be1ca2" }
 # 0.10 reads HDF5 files written in the earliest format with version 1/2 compound datatypes
 # (every HEC-RAS geometry and plan file, among others) and old fill value messages
-# (roteiro-gis/netcdf-rust#95). netcdf-reader, hdf5-reader and the HEC-RAS engine move together
-# (netcdf-reader 0.12 and ras-commander-fast-hdf 0.4 use hdf5-reader 0.12), so a build compiles
-# one HDF5 reader.
-netcdf-reader = { version = "0.12.1", default-features = false, features = ["netcdf4"] }
-hdf5-reader = { version = "0.12.1", default-features = false }
+# (roteiro-gis/netcdf-rust#95). Keep netcdf-reader and the direct hdf5-reader on compatible
+# release lines: Terrio passes their shared Storage types between them. The HEC-RAS engine
+# owns its reader and may pin an older release; allow both rather than blocking these updates
+# on an engine release. Its HDF5 types do not cross Terrio's engine API boundary.
+netcdf-reader = { version = "0.13.0", default-features = false, features = ["netcdf4"] }
+hdf5-reader = { version = "0.13.0", default-features = false }
 # HEC-RAS geometry and plan HDF files (the `hecras` feature): the read-only engine behind
 # ras-commander. It owns every HEC-RAS rule, layer name and field name (its Arrow layer catalog);
-# terrio's driver only translates its values. 0.3.0 was the first release with the Arrow layer API.
-ras-commander-fast-hdf = { version = "0.4.0", default-features = false, features = ["hdf", "mesh", "results"] }
+# terrio's driver only translates its values. 0.3.0 was the first release with the Arrow layer API;
+# 0.5.0's `arrow` feature pins Arrow `=59.0.0`, which is why the workspace is on Arrow 59 (CLB fork).
+ras-commander-fast-hdf = { version = "0.5.0", default-features = false, features = ["hdf", "mesh", "results"] }
 # The portable decoder: the same pixels on every platform, closer to libjpeg's than its SIMD paths.
 jpeg-decoder = { version = "0.3", default-features = false, features = ["platform_independent"] }
 # GeoPackage JPEG tiles; the version wbraster already uses.
@@ -96,7 +98,7 @@ jpeg-encoder = "0.7"
 # WebP tiles of PMTiles and MBTiles archives; the version tiff already uses.
 image-webp = "0.2"
 # Pure-Rust WebP encoder for GeoTIFF/COG (wbgeotiff still uses 0.2).
-webp-rust = "0.3.2"
+webp-rust = "0.5.0"
 openjp2 = { version = "0.6", default-features = false, features = ["std"] }
 # GeoTIFF compressions GDAL writes and the tiff crate does not read: LERC, JPEG XL and LZMA (XZ).
 # 0.5.2: lerc-writer's EncoderProfile (LERC_ENCODER).
@@ -116,6 +118,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 shlex = "2.0.1"
 tempfile = "3"
+# Instruction-count benchmarks (crates/terrio/benches); `gungraun-runner` must be the same version.
+gungraun = "=0.20.0"
 same-file = "1.0.6"
 tar = { version = "0.4", default-features = false }
 # POSIX file locks for in-place SQLite updates (Unix).
@@ -129,7 +133,7 @@ zip = { version = "9.1", default-features = false, features = ["deflate-flate2-z
 ureq = { version = "3", default-features = false, features = ["gzip", "rustls", "rustls-webpki-roots"] }
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }
 # Test-only original DER snapshot for constrained-anchor regressions; update with webpki-roots.
-webpki-root-certs = "=1.0.11"
+webpki-root-certs = "=1.0.12"
 webpki-roots = "1"
 hmac = "0.13"
 sha2 = "0.11"
@@ -145,7 +149,7 @@ getrandom = "0.4"
 # Silences drivers' diagnostic prints on the command line's standard output.
 gag = "1"
 # LASzip compression of point clouds (LAZ, COPC), pure Rust.
-laz = "0.13"
+laz = "0.14"
 # E57 laser scans, pure Rust.
 e57 = "0.11"
 # Delaunay triangulation, for gridding points by linear interpolation.
@@ -213,3 +217,13 @@ laz = { opt-level = 3 }
 rusty_av1d = { opt-level = 3 }
 image-webp = { opt-level = 3 }
 lz4_flex = { opt-level = 3 }
+
+# The Python wheels (release-build.yml, `maturin build --profile wheel`): without symbols, with one
+# codegen unit and whole-program LTO. The extension module installs 33% smaller on Linux x86_64
+# (114 to 76 MB), 35% on macOS arm64 (95 to 62 MB) and 7% on Windows x64 (95 to 88 MB), but builds
+# 1.6 to 3.5 times as long (Linux x86_64 12 to 19 min, Windows x64 15 to 32, macOS arm64 10 to 35). The release profile, used by local and CI builds, stays fast.
+[profile.wheel]
+inherits = "release"
+lto = "fat"
+codegen-units = 1
+strip = true

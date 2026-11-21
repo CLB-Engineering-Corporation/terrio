@@ -10,11 +10,11 @@ LICENSE-THIRD-PARTY.md`, from `about.toml`.
 
 ## Overview
 
-- Apache License 2.0 (260)
-- MIT License (68)
+- Apache License 2.0 (265)
+- MIT License (73)
 - ISC License (20)
 - BSD 3-Clause "New" or "Revised" License (15)
-- BSD 2-Clause "Simplified" License (8)
+- BSD 2-Clause "Simplified" License (9)
 - Mozilla Public License 2.0 (4)
 - Creative Commons Zero v1.0 Universal (2)
 - Independent JPEG Group License (2)
@@ -261,16 +261,17 @@ Used by:
 
 Used by:
 
-- [arrow-array 59.0.0](https://github.com/apache/arrow-rs)
-- [arrow-data 59.0.0](https://github.com/apache/arrow-rs)
-- [arrow-ipc 59.0.0](https://github.com/apache/arrow-rs)
-- [arrow-schema 59.0.0](https://github.com/apache/arrow-rs)
-- [arrow-select 59.0.0](https://github.com/apache/arrow-rs)
+- [arrow-array 58.4.1](https://github.com/apache/arrow-rs)
+- [arrow-buffer 58.4.1](https://github.com/apache/arrow-rs)
+- [arrow-data 58.4.1](https://github.com/apache/arrow-rs)
+- [arrow-ipc 58.4.1](https://github.com/apache/arrow-rs)
+- [arrow-schema 58.4.1](https://github.com/apache/arrow-rs)
+- [arrow-select 58.4.1](https://github.com/apache/arrow-rs)
 - [cmov 0.5.4](https://github.com/RustCrypto/utils)
 - [ctutils 0.4.8](https://github.com/RustCrypto/utils)
 - [encoding_rs 0.8.44](https://github.com/hsivonen/encoding_rs)
 - [multiversion_no_op 1.0.0](https://github.com/hsivonen/multiversion_no_op)
-- [parquet 59.0.0](https://github.com/apache/arrow-rs)
+- [parquet 58.4.1](https://github.com/apache/arrow-rs)
 - [siphasher 1.0.4](https://github.com/jedisct1/rust-siphash)
 - [spade 2.15.1](https://github.com/Stoeoef/spade)
 - [static_assertions 1.1.0](https://github.com/nvzqz/static-assertions-rs)
@@ -1004,7 +1005,7 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 Used by:
 
-- [arrow-buffer 59.3.2](https://github.com/apache/arrow-rs)
+- [thrift 0.23.0](https://github.com/apache/thrift/tree/master/lib/rs)
 
 ```text
 
@@ -1210,12 +1211,118 @@ Used by:
    See the License for the specific language governing permissions and
    limitations under the License.
 
---------------------------------------------------------------------------------
+--------------------------------------------------
+SOFTWARE DISTRIBUTED WITH THRIFT:
 
-arrow-array/src/delta.rs: MIT
+The Apache Thrift software includes a number of subcomponents with
+separate copyright notices and license terms. Your use of the source
+code for the these subcomponents is subject to the terms and
+conditions of the following licenses.
 
-This file is derived from the chronoutil crate. The full MIT license
-text is in arrow-array/LICENSE-MIT.
+--------------------------------------------------
+Portions of the following files are licensed under the MIT License:
+
+  lib/erl/src/Makefile.am
+
+Please see doc/otp-base-license.txt for the full terms of this license.
+
+--------------------------------------------------
+For the aclocal/ax_boost_base.m4 and contrib/fb303/aclocal/ax_boost_base.m4 components:
+
+#   Copyright (c) 2007 Thomas Porschberg <thomas@randspringer.de>
+#
+#   Copying and distribution of this file, with or without
+#   modification, are permitted in any medium without royalty provided
+#   the copyright notice and this notice are preserved.
+
+--------------------------------------------------
+For the lib/nodejs/lib/thrift/json_parse.js:
+
+/*
+    json_parse.js
+    2015-05-02
+    Public Domain.
+    NO WARRANTY EXPRESSED OR IMPLIED. USE AT YOUR OWN RISK.
+
+*/
+(By Douglas Crockford <douglas@crockford.com>)
+
+--------------------------------------------------
+For lib/cpp/src/thrift/windows/SocketPair.cpp
+
+/* socketpair.c
+ * Copyright 2007 by Nathan C. Myers <ncm@cantrip.org>; some rights reserved.
+ * This code is Free Software.  It may be copied freely, in original or
+ * modified form, subject only to the restrictions that (1) the author is
+ * relieved from all responsibilities for any use for any purpose, and (2)
+ * this copyright notice must be retained, unchanged, in its entirety.  If
+ * for any reason the author might be held responsible for any consequences
+ * of copying or use, license is withheld.
+ */
+
+
+--------------------------------------------------
+For lib/py/compat/win32/stdint.h
+
+// ISO C9x  compliant stdint.h for Microsoft Visual Studio
+// Based on ISO/IEC 9899:TC2 Committee draft (May 6, 2005) WG14/N1124
+//
+//  Copyright (c) 2006-2008 Alexander Chemeris
+//
+// Redistribution and use in source and binary forms, with or without
+// modification, are permitted provided that the following conditions are met:
+//
+//   1. Redistributions of source code must retain the above copyright notice,
+//      this list of conditions and the following disclaimer.
+//
+//   2. Redistributions in binary form must reproduce the above copyright
+//      notice, this list of conditions and the following disclaimer in the
+//      documentation and/or other materials provided with the distribution.
+//
+//   3. The name of the author may be used to endorse or promote products
+//      derived from this software without specific prior written permission.
+//
+// THIS SOFTWARE IS PROVIDED BY THE AUTHOR ``AS IS'' AND ANY EXPRESS OR IMPLIED
+// WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF
+// MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO
+// EVENT SHALL THE AUTHOR BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+// SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
+// PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS;
+// OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY,
+// WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR
+// OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF
+// ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+//
+///////////////////////////////////////////////////////////////////////////////
+
+
+--------------------------------------------------
+Codegen template in t_html_generator.h
+
+* Bootstrap v2.0.3
+*
+* Copyright 2012 Twitter, Inc
+* Licensed under the Apache License v2.0
+* http://www.apache.org/licenses/LICENSE-2.0
+*
+* Designed and built with all the love in the world @twitter by @mdo and @fat.
+
+---------------------------------------------------
+For t_cl_generator.cc
+
+ * Copyright (c) 2008- Patrick Collison <patrick@collison.ie>
+ * Copyright (c) 2006- Facebook
+
+---------------------------------------------------
+
+---------------------------------------------------
+For compiler/cpp/src/thrift/generate/sha256.h
+
+SHA-256 implementation by Brad Conte (brad AT bradconte.com).
+Source: https://github.com/B-Con/crypto-algorithms
+The author has placed this code in the public domain (no copyright claimed).
+No algorithmic changes were made; the file was adapted to a C++ header-only
+form for inclusion in the Thrift compiler.
 
 ```
 
@@ -2509,7 +2616,7 @@ Used by:
 
 Used by:
 
-- [ureq 3.5.1](https://github.com/algesten/ureq)
+- [ureq 3.5.2](https://github.com/algesten/ureq)
 - [zune-core 0.5.3](https://github.com/etemesi254/zune-image)
 - [zune-jpeg 0.5.15](https://github.com/etemesi254/zune-image/tree/dev/crates/zune-jpeg)
 - [zune-jpegxl 0.5.2](https://github.com/etemesi254/zune-image/tree/dev/crates/zune-jpegxl)
@@ -4889,7 +4996,6 @@ Used by:
 - [matrixmultiply 0.3.11](https://github.com/bluss/matrixmultiply/)
 - [ndarray 0.17.2](https://github.com/rust-ndarray/ndarray)
 - [num-bigint 0.4.8](https://github.com/rust-num/num-bigint)
-- [num-bigint 0.5.1](https://github.com/rust-num/num-bigint)
 - [num-complex 0.4.6](https://github.com/rust-num/num-complex)
 - [num-derive 0.4.2](https://github.com/rust-num/num-derive)
 - [num-integer 0.1.47](https://github.com/rust-num/num-integer)
@@ -4914,6 +5020,7 @@ Used by:
 - [stable_deref_trait 1.2.1](https://github.com/storyyeller/stable_deref_trait)
 - [tar 0.4.46](https://github.com/composefs/tar-rs)
 - [tempfile 3.27.0](https://github.com/Stebalien/tempfile)
+- [uuid 1.29.0](https://github.com/uuid-rs/uuid)
 - [wasi 0.11.1+wasi-snapshot-preview1](https://github.com/bytecodealliance/wasi)
 - [wasip2 1.0.4+wasi-0.2.12](https://github.com/bytecodealliance/wasi-rs)
 - [wasm-bindgen-futures 0.4.79](https://github.com/wasm-bindgen/wasm-bindgen/tree/master/crates/futures)
@@ -6483,9 +6590,12 @@ Used by:
 - [geo-traits 0.3.0](https://github.com/georust/geo)
 - [geo 0.33.1](https://github.com/georust/geo)
 - [geozero 0.15.1](https://github.com/georust/geozero)
+- [graviola 0.4.2](https://github.com/ctz/graviola/)
 - [half 2.7.1](https://github.com/VoidStarKat/half-rs)
 - [hdf5-core 0.12.1](https://github.com/roteiro-gis/netcdf-rust)
+- [hdf5-core 0.13.0](https://github.com/roteiro-gis/netcdf-rust)
 - [hdf5-reader 0.12.1](https://github.com/roteiro-gis/netcdf-rust)
+- [hdf5-reader 0.13.0](https://github.com/roteiro-gis/netcdf-rust)
 - [i_overlay 4.5.2](https://github.com/iShape-Rust/iOverlay)
 - [image-webp 0.2.4](https://github.com/image-rs/image-webp)
 - [itoa 1.0.18](https://github.com/dtolnay/itoa)
@@ -6502,15 +6612,15 @@ Used by:
 - [jxl-render 0.12.4](https://github.com/tirr-c/jxl-oxide.git)
 - [jxl-threadpool 1.0.0](https://github.com/tirr-c/jxl-oxide.git)
 - [jxl-vardct 0.11.1](https://github.com/tirr-c/jxl-oxide.git)
-- [laz 0.13.0](https://github.com/tmontaigu/laz-rs)
+- [laz 0.14.0](https://github.com/tmontaigu/laz-rs)
 - [lerc-core 0.5.2](https://github.com/i-norden/lerc-rust)
 - [lerc-reader 0.5.2](https://github.com/i-norden/lerc-rust)
 - [lerc-writer 0.5.2](https://github.com/i-norden/lerc-rust)
 - [libc 0.2.191](https://github.com/rust-lang/libc)
 - [miniz_oxide 0.8.9](https://github.com/Frommi/miniz_oxide/tree/master/miniz_oxide)
 - [miniz_oxide 0.9.1](https://github.com/Frommi/miniz_oxide/tree/master/miniz_oxide)
-- [netcdf-core 0.12.1](https://github.com/roteiro-gis/netcdf-rust)
-- [netcdf-reader 0.12.1](https://github.com/roteiro-gis/netcdf-rust)
+- [netcdf-core 0.13.0](https://github.com/roteiro-gis/netcdf-rust)
+- [netcdf-reader 0.13.0](https://github.com/roteiro-gis/netcdf-rust)
 - [paste 1.0.15](https://github.com/dtolnay/paste)
 - [pin-project-lite 0.2.17](https://github.com/taiki-e/pin-project-lite)
 - [portable-atomic-util 0.2.8](https://github.com/taiki-e/portable-atomic-util)
@@ -6527,6 +6637,7 @@ Used by:
 - [rstar 0.12.2](https://github.com/georust/rstar)
 - [rstar 0.14.0](https://github.com/georust/rstar)
 - [rustc-hash 2.1.3](https://github.com/rust-lang/rustc-hash)
+- [rustls-graviola 0.4.0](https://github.com/ctz/graviola/)
 - [ryu 1.0.23](https://github.com/dtolnay/ryu)
 - [seq-macro 0.3.6](https://github.com/dtolnay/seq-macro)
 - [serde 1.0.229](https://github.com/serde-rs/serde)
@@ -6887,7 +6998,7 @@ limitations under the License.
 
 Used by:
 
-- [rusty_av1d 1.2.1](https://github.com/Remade-With-Rust/rusty-av1-toolkit)
+- [rusty_av1d 1.3.0](https://github.com/Remade-With-Rust/rusty-av1-toolkit)
 
 ```text
 /*
@@ -6955,7 +7066,7 @@ Used by:
 
 Used by:
 
-- [rusty_av1d 1.2.1](https://github.com/Remade-With-Rust/rusty-av1-toolkit)
+- [rusty_av1d 1.3.0](https://github.com/Remade-With-Rust/rusty-av1-toolkit)
 
 ```text
 ; Copyright © 2018, VideoLAN and dav1d authors
@@ -7020,7 +7131,7 @@ cglobal cpu_xgetbv, 0, 0, 0, xcr
 
 Used by:
 
-- [rusty_av1d 1.2.1](https://github.com/Remade-With-Rust/rusty-av1-toolkit)
+- [rusty_av1d 1.3.0](https://github.com/Remade-With-Rust/rusty-av1-toolkit)
 
 ```text
 ; Copyright © 2019-2022, VideoLAN and dav1d authors
@@ -7111,7 +7222,7 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 Used by:
 
-- [rusty_av1d 1.2.1](https://github.com/Remade-With-Rust/rusty-av1-toolkit)
+- [rusty_av1d 1.3.0](https://github.com/Remade-With-Rust/rusty-av1-toolkit)
 
 ```text
 BSD 2-Clause License
@@ -7169,7 +7280,7 @@ THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND 
 
 Used by:
 
-- [rusty_av1d 1.2.1](https://github.com/Remade-With-Rust/rusty-av1-toolkit)
+- [rusty_av1d 1.3.0](https://github.com/Remade-With-Rust/rusty-av1-toolkit)
 
 ```text
 Copyright © 2018-2019, VideoLAN and dav1d authors
@@ -7196,6 +7307,45 @@ LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
 ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
 SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+```
+
+## BSD 2-Clause "Simplified" License
+
+Used by:
+
+- [zstd-sys 2.1.3+zstd.1.5.7](https://github.com/gyscos/zstd-rs)
+
+```text
+The decoders for legacy formats, in zstd/lib/legacy/, include code under the
+2-clause BSD license:
+
+BSD 2-Clause License
+
+Copyright (C) 2013-2016, Yann Collet.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are
+met:
+
+    * Redistributions of source code must retain the above copyright
+notice, this list of conditions and the following disclaimer.
+    * Redistributions in binary form must reproduce the above
+copyright notice, this list of conditions and the following disclaimer
+in the documentation and/or other materials provided with the
+distribution.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+"AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 ```
 
@@ -7268,10 +7418,10 @@ pub(crate) static GB18030_2022_OVERRIDE_BYTES: [[u8; 2]; 18] = [
 Used by:
 
 - [zstd-safe 7.4.0](https://github.com/gyscos/zstd-rs)
-- [zstd-safe 8.2.0](https://github.com/gyscos/zstd-rs)
-- [zstd-sys 2.1.2+zstd.1.5.7](https://github.com/gyscos/zstd-rs)
+- [zstd-safe 8.3.0](https://github.com/gyscos/zstd-rs)
+- [zstd-sys 2.1.3+zstd.1.5.7](https://github.com/gyscos/zstd-rs)
 - [zstd 0.13.4](https://github.com/gyscos/zstd-rs)
-- [zstd 0.14.3](https://github.com/gyscos/zstd-rs)
+- [zstd 0.14.4](https://github.com/gyscos/zstd-rs)
 
 ```text
 BSD 3-Clause License
@@ -7309,7 +7459,7 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 Used by:
 
-- [zstd-sys 2.1.2+zstd.1.5.7](https://github.com/gyscos/zstd-rs)
+- [zstd-sys 2.1.3+zstd.1.5.7](https://github.com/gyscos/zstd-rs)
 
 ```text
 BSD License
@@ -7506,7 +7656,7 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 Used by:
 
-- [zstd-sys 2.1.2+zstd.1.5.7](https://github.com/gyscos/zstd-rs)
+- [zstd-sys 2.1.3+zstd.1.5.7](https://github.com/gyscos/zstd-rs)
 
 ```text
 The auto-generated bindings are under the 3-clause BSD license:
@@ -7680,7 +7830,7 @@ express Statement of Purpose.
 
 Used by:
 
-- [webpki-roots 1.0.11](https://github.com/rustls/webpki-roots)
+- [webpki-roots 1.0.12](https://github.com/rustls/webpki-roots)
 
 ```text
 # Community Data License Agreement - Permissive - Version 2.0
@@ -8429,7 +8579,7 @@ THIS SOFTWARE.
 
 Used by:
 
-- [ras-commander-fast-hdf 0.4.0](https://github.com/gpt-cmdr/ras-commander-fast-hdf)
+- [ras-commander-fast-hdf 0.5.0](https://github.com/gpt-cmdr/ras-commander-fast-hdf)
 
 ```text
 Supercluster 8.0.1: ISC License
@@ -8458,7 +8608,7 @@ THIS SOFTWARE.
 
 Used by:
 
-- [ras-commander-fast-hdf 0.4.0](https://github.com/gpt-cmdr/ras-commander-fast-hdf)
+- [ras-commander-fast-hdf 0.5.0](https://github.com/gpt-cmdr/ras-commander-fast-hdf)
 
 ```text
 # MIT License
@@ -8577,6 +8727,7 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 Used by:
 
+- [ordered-float 3.9.2](https://github.com/reem/rust-ordered-float)
 - [ordered-float 5.5.1](https://github.com/reem/rust-ordered-float)
 
 ```text
@@ -8840,6 +8991,7 @@ THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR I
 Used by:
 
 - [lru 0.16.4](https://github.com/jeromefroe/lru-rs.git)
+- [lru 0.19.0](https://github.com/jeromefroe/lru-rs.git)
 
 ```text
 MIT License
@@ -8994,43 +9146,12 @@ SOFTWARE.
 Used by:
 
 - [ruzstd 0.8.3](https://github.com/KillingSpark/zstd-rs)
+- [ruzstd 0.9.1](https://github.com/KillingSpark/zstd-rs)
 
 ```text
 MIT License
 
 Copyright (c) 2019 Moritz Borcherding
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
-
-```
-
-## MIT License
-
-Used by:
-
-- [zstd-rust 0.1.0](https://github.com/gpt-cmdr/zstd-rs)
-
-```text
-MIT License
-
-Copyright (c) 2019 Moritz Borcherding
-Copyright (c) 2026 William Katzenmeyer / CLB Engineering Corporation
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -9121,7 +9242,7 @@ SOFTWARE.
 
 Used by:
 
-- [arrow-array 59.0.0](https://github.com/apache/arrow-rs)
+- [arrow-array 58.4.1](https://github.com/apache/arrow-rs)
 
 ```text
 MIT License
@@ -9145,6 +9266,43 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+```
+
+## MIT License
+
+Used by:
+
+- [bin-rs 0.1.0](https://github.com/mith-mmk/bin-rs)
+
+```text
+MIT License
+
+Copyright (c) 2023 MITH@mmk
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the "Software"), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
 
 ```
 
@@ -9184,7 +9342,7 @@ SOFTWARE.
 
 Used by:
 
-- [ras-commander-fast-hdf 0.4.0](https://github.com/gpt-cmdr/ras-commander-fast-hdf)
+- [ras-commander-fast-hdf 0.5.0](https://github.com/gpt-cmdr/ras-commander-fast-hdf)
 
 ```text
 MIT License
@@ -9246,6 +9404,42 @@ SOFTWARE.
 
 Used by:
 
+- [webp-rust 0.5.0](https://github.com/mith-mmk/webp-rust)
+
+```text
+MIT License
+
+Copyright (c) 2026 MITH@mmk
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the "Software"), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+```
+
+## MIT License
+
+Used by:
+
 - terrio (terrio's own crate)
 - terrio-cli (terrio's own crate)
 - terrio-crs (terrio's own crate)
@@ -9288,6 +9482,7 @@ licenses of the Rust crates terrio is built with.
 Used by:
 
 - terrio-js (terrio's own crate)
+- terrio-js-cog (terrio's own crate)
 - terrio-js-fetch (terrio's own crate)
 - terrio-js-zarr (terrio's own crate)
 - [gdal-sys 0.12.0](https://github.com/georust/gdal)
@@ -9420,7 +9615,7 @@ DEALINGS IN THE SOFTWARE.
 
 Used by:
 
-- [ras-commander-fast-hdf 0.4.0](https://github.com/gpt-cmdr/ras-commander-fast-hdf)
+- [ras-commander-fast-hdf 0.5.0](https://github.com/gpt-cmdr/ras-commander-fast-hdf)
 
 ```text
 MIT License
@@ -9483,7 +9678,6 @@ SOFTWARE.
 Used by:
 
 - [webp-rust 0.2.1](https://github.com/mith-mmk/webp-rust)
-- [webp-rust 0.3.2](https://github.com/mith-mmk/webp-rust)
 
 ```text
 MIT License
@@ -9554,7 +9748,7 @@ Used by:
 
 - [tracing-core 0.1.36](https://github.com/tokio-rs/tracing)
 - [zip 8.6.0](https://github.com/zip-rs/zip2)
-- [zip 9.5.0](https://github.com/zip-rs/zip2)
+- [zip 9.7.0](https://github.com/zip-rs/zip2)
 
 ```text
 The MIT License (MIT)
@@ -9774,6 +9968,39 @@ SOFTWARE.
 
 Used by:
 
+- [integer-encoding 3.0.4](https://github.com/dermesser/integer-encoding-rs)
+
+```text
+The MIT License (MIT)
+
+Copyright (c) 2016 Google Inc. (lewinb@google.com) -- though not an official
+Google product or in any way related!
+Copyright (c) 2018-2020 Lewin Bormann (lbo@spheniscida.de)
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to
+deal in the Software without restriction, including without limitation the
+rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
+sell copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
+IN THE SOFTWARE.
+
+```
+
+## MIT License
+
+Used by:
+
 - [quick-xml 0.42.0](https://github.com/tafia/quick-xml)
 
 ```text
@@ -9874,7 +10101,7 @@ Used by:
 
 - [lz4_flex 0.11.6](https://github.com/pseitz/lz4_flex)
 - [lz4_flex 0.13.1](https://github.com/pseitz/lz4_flex)
-- [lz4_flex 0.14.0](https://github.com/pseitz/lz4_flex)
+- [lz4_flex 0.14.2](https://github.com/pseitz/lz4_flex)
 
 ```text
 The MIT License (MIT)

@@ -705,6 +705,8 @@ def suite_raster_manage(ctx):
     suite = Suite("raster-manage", "Raster management", "GDAL 3.13.3",
                   "Creation types/bands, metadata escaping, nodata, internal overview add/delete and external "
                   "overview add/delete beside read-only GeoTIFFs (left unchanged), "
+                  "two-band average overviews of an odd size (non-integer ratios), internal and external "
+                  "(band-separate .ovr), "
                   "exact Landsat Byte/UInt16/Float32 mode on uneven levels, "
                   "internal mask overviews added, refreshed (whole and over an extent) and added again over "
                   "gdaladdo's, and real DEM subset updates: masks, mask blocks, type, nodata, CRS and "
@@ -1888,7 +1890,8 @@ def suite_vector_ops(ctx):
         "Vector operations",
         "`ogr2ogr`, `gdal_rasterize`, `gdal_polygonize.py`",
         "Conversions with `ogr2ogr`'s options (where, spat, select, sql, nlt...) compared feature "
-        "by feature; rasterized pixels compared exactly, including nodata backgrounds, masks, "
+        "by feature; rasterized pixels compared exactly, including edits over existing raster "
+        "pixels, nodata backgrounds, masks, "
         "types and CRSs (ENVI uses a GDAL-converted GeoTIFF reference); polygons compared by count, holes and "
         "validity, and by rasterizing them back.",
     )
@@ -1916,7 +1919,11 @@ def suite_vector_ops(ctx):
                 status = IDENTICAL if n == 0 else TOLERANCE
                 s.cases.append(Case(section, name, status, "" if n == 0 else f"{n} of {m[2]} pixels differ (reprojected input)"))
     if not s.cases:
-        s.error = tail(err or out)
+        s.error = tail(err or out) or "Vector comparison subprocess produced no cases"
+    elif "# vector comparisons complete" not in out.splitlines():
+        s.error = tail(err) or "Vector comparison subprocess did not complete"
+    elif _code and not any(case.status == DIFFERS for case in s.cases):
+        s.error = tail(err or out) or "Vector comparison subprocess failed"
     return s
 
 
@@ -2261,11 +2268,13 @@ def suite_healpix(ctx):
 def suite_isea(ctx):
     """ISEA, as PROJ strings and as GDAL's and ESRI's WKT, and its inverse refusals."""
     suite = Suite("isea", "Icosahedral Snyder Equal Area", "GDAL/PROJ",
-                  "14 configurations on the authalic sphere of WGS 84 and on WGS 84 (both orientations, "
-                  "central meridians, lat_0, azi, resolution and aperture, units and false offsets) and "
-                  "7,784 geographic samples, as PROJ strings, WKT2, WKT1 and ESRI WKT1; PROJ's inverse and "
-                  "its refusals. Projected allowance 1 mm; inverse 1e-8 degrees, longitude weighted by "
-                  "cos(latitude). Not compared with a PROJ whose isea differs from PROJ 9.8.1's.")
+                  "24 configurations on the authalic sphere of WGS 84 and on WGS 84 (both orientations, "
+                  "the projected origin by lat_0 and lon_0, azi, orient_lat and orient_lon, the "
+                  "dodecahedral dual and its nets, ignored resolution and aperture, units and false "
+                  "offsets) and 13,344 geographic samples, as PROJ strings, WKT2, WKT1 and ESRI WKT1; "
+                  "PROJ's inverse and its refusals. Projected allowance 1 mm; inverse 1e-8 degrees "
+                  "(1e-5 within 0.001 degrees of a pole), longitude weighted by cos(latitude). Not "
+                  "compared with a PROJ whose isea differs from PROJ 9.9.0's.")
     if missing_modules("osgeo"):
         suite.skipped = "needs GDAL Python bindings"
         return suite
@@ -2602,7 +2611,7 @@ def suite_crs(ctx):
     s = Suite(
         "crs",
         "Coordinate transformations",
-        "GDAL 3.12 and PROJ (`gdaltransform`)",
+        "GDAL 3.13.3 and PROJ 9.9.0 (EPSG reference points), PROJ (`gdaltransform`)",
         "50 reference points per EPSG geographic and projected CRS (the centre of its area of use "
         "and random points of it), transformed from WGS 84 (forward), 50 more back (inverse), and "
         "50 between the CRS and another whose area holds them, compared with GDAL's results, "
@@ -2622,18 +2631,23 @@ def suite_crs(ctx):
         "input poles for platform asin rounding); PROJ-refused inverse "
         "boundary points may be refused or recover the original input). "
         "Then the WKT and PROJ-string readings of opengeos/terrio#1012, against PROJ 9.8.1 "
-        "(pyproj 3.8.0, no grids) in JSON fixtures: WKT 1 `AXIS` nodes (wkt1_axes.rs), WKT 2 "
+        "(pyproj 3.8.0, no grids) in JSON fixtures: WKT 1 `AXIS` nodes (wkt1_axes.rs), WKT 1 EPSG "
+        "parameter names and two UNIT nodes (wkt1_epsg_names.rs), GeoKeys other writers write, "
+        "against GDAL 3.12.2 (geokeys_read_gdal.rs), WKT 2 "
         "`BOUNDCRS` (wkt2_bound.rs), Mercator variant A, unknown node keywords and NULs "
         "(wkt1_proj_reads.rs), grads and prime meridians (grads_and_prime_meridians.rs), datums "
         "known by ID or name (wkt_datum_shift.rs), WKTs PROJ does not resolve to their EPSG CRS "
-        "(wkt_unresolved.rs), and PROJ-string ellipsoid parameters and PROJ4 extensions "
-        "(proj_ellipsoid_shape.rs, proj_ellipsoid_registry.rs); not compared there: the known "
+        "(wkt_unresolved.rs), root codes that are not the CRS (wkt_root_code.rs), unused latitudes "
+        "of world projections (wkt2_world_latitude.rs), and PROJ-string ellipsoid parameters and PROJ4 extensions "
+        "(proj_ellipsoid_shape.rs, proj_ellipsoid_registry.rs), and deprecated EPSG codes by their own "
+        "definition (epsg_deprecated.rs); not compared there: the known "
         "differences each row names (a scale in parts per million, ESRI ATF (Paris), PROJ's datum "
-        "pivot and renamed datums, #1012). "
+        "pivot and renamed datums, south-orientated Transverse Mercator with offsets, #1012). "
         "Identical: within 1 mm. Within tolerance: within 1 cm (forward, inverse) or 1 m (CRS to "
         "CRS, where the datum transformations GDAL picks can differ by area of use). Known "
-        "differences: deprecated CRSs whose own datum PROJ uses, where terrio uses their "
-        "replacement's (#153).",
+        "differences: RRAF 1991 (EPSG:4640 and 2989), deprecated CRSs whose own datum PROJ chains "
+        "through its RRAFG transformation, where terrio uses its ballpark (#153). Deprecated "
+        "codes have their own definition, as in PROJ (GDAL with OSR_USE_NON_DEPRECATED=NO).",
     )
     if not shutil.which("cargo"):
         s.skipped = "needs cargo"
@@ -2760,6 +2774,18 @@ PROJ_CASES = {
         "longlat_longitudes_are_relative_to_lon_0": "Geographic PROJ strings with `+lon_0` (`longlat`, `latlong`, `+pm`, `+towgs84`): seven GDAL 3.13.3 points",
     },
     # The WKT and PROJ-string readings of opengeos/terrio#1012, against PROJ 9.8.1 (pyproj 3.8.0, no grids).
+    "wkt1_epsg_names": {
+        "epsg_parameter_names_in_wkt1_are_read_as_proj_reads_them": (
+            "WKT 1 with EPSG parameter names, and two UNIT nodes (12 cases)", IDENTICAL,
+            "PROJ 9.8.1 (pyproj 3.8.0): within 1 mm, or refused as PROJ refuses",
+        ),
+    },
+    "geokeys_read_gdal": {
+        "user_defined_geokeys_are_read_as_gdal_reads_them": (
+            "GeoKeys of user-defined projected CRSs as other writers write them (10 cases)", IDENTICAL,
+            "GDAL 3.12.2 (libgeotiff GTIFFetchProjParms): within 1 mm",
+        ),
+    },
     "wkt1_axes": {
         "projected_axes_are_read_and_written_as_proj_does": (
             "WKT 1 projected CRSs with `AXIS` nodes in every direction and order (54 cases)", IDENTICAL,
@@ -2771,15 +2797,98 @@ PROJ_CASES = {
             "PROJ 9.8.1: a point on a west-counted Mars CRS within 1e-10 degrees",
         ),
     },
+    "proj_string_strict": {
+        "angles_are_read_as_proj_reads_them": (
+            "PROJ-string angles: D, °, implied minutes and seconds, radians with a hemisphere, trailing text (29 cases)", TOLERANCE,
+            "PROJ 9.8.1 (pyproj 3.8.0): within 1 mm, or refused as PROJ refuses",
+        ),
+        "names_proj_does_not_know_are_refused": (
+            "Unknown ellipsoid, datum, units and vunits names, and vto_meter values, false origins of nan or inf (28 cases)", TOLERANCE,
+            "PROJ 9.8.1 (pyproj 3.8.0): within 1 mm, or refused as PROJ refuses",
+        ),
+        "a_wkt_proj4_extension_is_read_as_a_pipeline_step": (
+            "WKT PROJ4 extensions with unreadable values, angle prefixes, fractions and unknown names (11 cases)", TOLERANCE,
+            "PROJ 9.8.1 (pyproj 3.8.0): within 1 mm",
+        ),
+        "an_overflowing_angle_is_refused_and_a_fraction_reads_beside_a_geoid": (
+            "An angle of 1e400, and a PROJ4 extension's vto_meter fraction or negative value with geoidgrids, an overflow in an extension, and empty values (8 cases)", TOLERANCE,
+            "PROJ 9.8.1 (pyproj 3.8.0): 1e400, -1 and empty mapped values refused; the fraction and robin read, within 1 mm",
+        ),
+        "an_unknown_ellipsoid_is_ignored_beside_a_sphere_radius_only": (
+            "+ellps beside +R, refused beside +a (3 cases)", TOLERANCE,
+            "PROJ 9.8.1 (pyproj 3.8.0): within 1 mm, or refused as PROJ refuses",
+        ),
+    },
+    "esri_datum_altered_ellipsoid": {
+        "an_esri_datum_on_an_altered_ellipsoid_keeps_its_transformation": (
+            "Esri D_Monte_Mario on an International 1924 of another axis (3 points)", TOLERANCE,
+            "PROJ 9.8.1 (pyproj 3.8.0, no grids): Monte Mario to WGS 84 (4) on the file's ellipsoid, within 1e-9°",
+        ),
+        "esri_datums_on_altered_ellipsoids_keep_their_transformations": (
+            "Esri OSGB 1936, ED50 and Tokyo on an ellipsoid 88 m shorter", TOLERANCE,
+            "PROJ 9.8.1 (pyproj 3.8.0, no grids): the datum's transformation on the file's ellipsoid, within 1e-9°",
+        ),
+        "a_datum_found_by_its_name_keeps_its_missing_grids_for_only_best": (
+            "Esri OSGB 1936 on an altered Airy, no grids: refused under ONLY_BEST (OSTN15 missing)", EXPECTED_REJECTION,
+            "PROJ 9.8.1 (pyproj 3.8.0, no grids): refused under only_best; the Helmert otherwise, within 1e-9°",
+        ),
+        "a_datum_on_an_altered_ellipsoid_is_found_by_its_name_only_as_proj_finds_it": (
+            "Datum names PROJ finds (underscores, D_) or not (spaces, EPSG alias) on an altered ellipsoid (9 cases)", IDENTICAL,
+            "PROJ 9.8.1 (pyproj 3.8.0, no grids): shifted or ballpark as PROJ",
+        ),
+        "a_null_transformation_on_another_ellipsoid_is_applied_geocentrically": (
+            "Esri TWD97, RDN2008, IGM95 and MAGNA-SIRGAS on other ellipsoids, and TWD97 on its own: name, flag, point and height", TOLERANCE,
+            "PROJ 9.8.1 (pyproj 3.8.0, no grids): within 1e-9°",
+        ),
+        "null_transformations_on_another_ellipsoid_stop_where_proj_stops": (
+            "ETRF89 and D_GR96 (geocentric), NAD83(CSRS)v6 and Greenland_1996 with GR96's ID (kept) on GRS 1980 88 m shorter", TOLERANCE,
+            (
+                "PROJ 9.8.1 (pyproj 3.8.0, no grids): within 1e-9°; known difference: PROJ reports NAD83(CSRS)v6 as a ballpark "
+                "before its registered operation, terrio by the operation alone (opengeos/terrio#1012 item 56)"
+            ),
+        ),
+    },
+    "wkt_root_code": {
+        "a_wkt_is_read_by_its_nodes_not_its_root_code": (
+            "WKT root code not the CRS of its nodes, and an ESRI name on another datum, with controls (34 cases)", IDENTICAL,
+            "PROJ 9.8.1 (pyproj 3.8.0, no grids): within 1 mm, or refused as PROJ refuses; a declared code that is not the CRS not kept",
+        ),
+        "an_unread_method_under_another_code_is_refused": (
+            "WKT 2 of a method terrio does not read (Belgian Lambert 72) declaring another code", EXPECTED_REJECTION,
+            "refused, not read as the code; PROJ 9.8.1 reads its content (#1012 item 43)",
+        ),
+    },
+    "wkt2_world_latitude": {
+        "an_unused_latitude_of_a_world_projection_is_ignored": (
+            "WKT 2 world projections with an unused latitude of natural origin (10 cases)", IDENTICAL,
+            "PROJ 9.8.1 (pyproj 3.8.0): PROJ string and point within 1 mm",
+        ),
+    },
+    "south_orientated_offsets": {
+        "south_orientated_transverse_mercator_subtracts_its_offsets": (
+            "South-orientated Transverse Mercator with a false easting and northing", NOT_COMPARED,
+            (
+                "PROJ 9.8.1 refuses it; checked against EPSG method 9808 (W = FE - x, S = FN - y) from "
+                "the placement without offsets, which matches PROJ"
+            ),
+        ),
+    },
     "wkt2_bound": {
         "bound_crss_place_points_as_proj_does": (
-            "WKT 2 BOUNDCRS to WGS 84 and to another CRS (ED50, OSGB36)", IDENTICAL, "PROJ 9.8.1 (pyproj 3.8.0, no grids): within 1 mm",
+            "WKT 2 BOUNDCRS to WGS 84 and to another CRS (ED50, OSGB36), over WKT 2 and WKT 1 source CRSs", IDENTICAL, "PROJ 9.8.1 (pyproj 3.8.0, no grids): within 1 mm",
         ),
         "the_bound_transformation_is_undone_the_other_way": (
             "WKT 2 BOUNDCRS: the shift undone from a CRS on the target's datum", IDENTICAL, "PROJ 9.8.1 (pyproj 3.8.0, no grids): within 1 mm",
         ),
         "only_best_transforms_a_bound_crs_as_proj_does": (
             "WKT 2 BOUNDCRS under ONLY_BEST", IDENTICAL, "PROJ 9.8.1 (pyproj 3.8.0, no grids): within 1 mm",
+        ),
+        "a_time_specific_helmert_transformation_is_refused_and_rates_are_left_out": (
+            "WKT 2 BOUNDCRS: time-specific Helmert refused, time-dependent rates left out", IDENTICAL,
+            "PROJ 9.8.1 (pyproj 3.8.0): refused; within 1 mm",
+        ),
+        "a_bound_crs_without_its_transformation_is_refused": (
+            "WKT 2 BOUNDCRS without its transformation refused", IDENTICAL, "PROJ 9.8.1 (pyproj 3.8.0): refused",
         ),
         "a_wgs84_target_is_known_by_any_datum_keyword": (
             "WKT 2 BOUNDCRS: WGS 84 target by `DATUM`, `GEODETICDATUM` or `TRF`", IDENTICAL, "PROJ 9.8.1 (pyproj 3.8.0, no grids): within 1 mm",
@@ -2790,6 +2899,14 @@ PROJ_CASES = {
                 "known difference: PROJ 9.8.1 reads an abridged transformation's scale as a ratio whatever its unit; "
                 "terrio reads it in its unit"
             ),
+        ),
+        "an_exact_or_evaluation_point_shift_to_an_unread_target_is_left_out": (
+            "WKT 2 BOUNDCRS: a full-matrix or evaluation-point shift to a target terrio cannot convert", NOT_COMPARED,
+            "left out with its target, as a `+towgs84` one is: placed as the source CRS alone (PROJ 9.8.1 reads a WKT 1 target)",
+        ),
+        "an_unapplied_transformation_method_is_refused": (
+            "WKT 2 BOUNDCRS: a transformation method terrio does not apply", EXPECTED_REJECTION,
+            "PROJ 9.8.1 (pyproj 3.8.0): unknown names refused; Molodensky applied, refused rather than left out",
         ),
         "an_unreadable_shift_to_another_crs_is_refused": (
             "WKT 2 BOUNDCRS: a Helmert transformation terrio cannot read", EXPECTED_REJECTION,
@@ -2852,9 +2969,9 @@ PROJ_CASES = {
         "wkts_proj_does_not_resolve_are_placed_through_other_datums_as_proj_does": (
             "WKTs PROJ places through other datums than their code's", IDENTICAL, "PROJ 9.8.1 (pyproj 3.8.0, no grids): within 1 mm",
         ),
-        "a_wkt_proj_places_by_its_datum_pivot_is_placed_by_its_code": (
-            "EPSG:7373's ESRI WKT 1 (ONGD14), which PROJ places by its datum pivot", NOT_COMPARED,
-            "known difference, placed by the code until terrio follows that step (opengeos/terrio#1012, item 7 step 2)",
+        "a_wkt_proj_places_by_its_datum_pivot_is_placed_as_proj_does": (
+            "EPSG:7373's ESRI WKT 1 (ONGD14), which PROJ places by its datum pivot", IDENTICAL,
+            "PROJ 9.8.1 (pyproj 3.8.0, no grids): within 1 mm, through the datum's geocentric CRSs' transformation",
         ),
     },
     "wkt_unresolved": {
@@ -2862,9 +2979,23 @@ PROJ_CASES = {
             "WKTs PROJ does not resolve to their EPSG CRS: ESRI, renamed, WKT 2 without IDs (1,100 cases)", IDENTICAL,
             "PROJ 9.8.1 (pyproj 3.8.0, no grids): within 1 mm",
         ),
-        "datum_pivot_and_renamed_datums_are_placed_by_the_code": (
-            "WKTs PROJ places by its datum pivot or a renamed datum", NOT_COMPARED,
+        "renamed_datums_and_the_datum_pivot_into_them_are_placed_by_the_code": (
+            "WKTs PROJ places through a renamed datum, or by its datum pivot into a CRS it cannot find by name", NOT_COMPARED,
             "known difference, placed by the code until terrio follows those steps (opengeos/terrio#1012, item 7 step 2)",
+        ),
+    },
+    "null_transformations": {
+        "null_transformations_are_named_not_ballparks": (
+            "EPSG null transformations (SWEREF99, ETRS89, NZGD2000, REGVEN to WGS 84) and their concatenations: name, accuracy, ballpark flag",
+            IDENTICAL, "PROJ 9.8.1 (pyproj 3.8.0): proj_trans_get_last_used_operation's name and accuracy",
+        ),
+        "a_wkt2_projected_crs_on_a_null_transformation_datum_is_not_a_ballpark": (
+            "SWEREF99 TM as WKT 2 without its ID, to WGS 84: the null transformation, not a ballpark",
+            IDENTICAL,
+            (
+                "PROJ 9.8.1 (pyproj 3.8.0): proj_trans_get_last_used_operation's name to WGS 84; known difference from WGS 84: "
+                "PROJ adds \"+ SWEREF99 TM\", terrio leaves the projection unnamed"
+            ),
         ),
     },
     "proj_ellipsoid_shape": {
@@ -2890,6 +3021,31 @@ PROJ_CASES = {
     "proj_ellipsoid_registry": {
         "registry_proj_strings_keep_their_ellipsoids": (
             "EPSG and ESRI registry PROJ strings keep their WKT's ellipsoid", IDENTICAL, "within 1e-6 m",
+        ),
+    },
+    "epsg_deprecated": {
+        "deprecated_codes_are_placed_by_their_own_definition_as_proj_does": (
+            "Deprecated EPSG CRSs by their own definition (486 cases)", IDENTICAL,
+            "PROJ 9.8.1 (pyproj 3.8.0, no grids): within 1 mm (1e-8 degrees geographic); 4 geographic 3D and geocentric CRSs pending "
+            "(opengeos/terrio#1012, item 8)",
+        ),
+        "replacements_are_those_proj_lists": "Deprecated EPSG CRSs: their replacements are PROJ 9.8.1's, GDAL's substitution of a single one",
+        "codes_proj_cannot_transform": (
+            "Deprecated EPSG CRSs PROJ cannot transform (8 cases)", NOT_COMPARED,
+            "PROJ 9.8.1 refuses them; terrio refuses the 6 it cannot write as PROJ strings and transforms the RRAF 1991 "
+            "geocentric CRSs (EPSG:4384, 4972) by their datum's ballpark",
+        ),
+        "geokeys_of_deprecated_codes_read_as_their_own_definition": (
+            "Deprecated EPSG CRSs GDAL substitutes are written to GeoKeys by an identical replacement or as WKT", IDENTICAL,
+            "PROJ 9.8.1 (pyproj 3.8.0, no grids): EPSG:4855's keys read back within 1 mm; GDAL 3.12 reads a code with a single "
+            "replacement as the replacement; EPSG:6986's WKT is read 0.3 m from PROJ (opengeos/terrio#1012, item 19)",
+        ),
+        "geokeys_of_deprecated_codes_read_as_gdal_reads_them": (
+            "GeoKeys giving a deprecated projected code read as GDAL reads them", IDENTICAL,
+            "GDAL 3.12.2: a single replacement's CRS (EPSG:4855 as 5105, 2036 as 2953, 3752 as 3994), another code its own (2191)",
+        ),
+        "ntm_zone_5_keeps_its_own_false_origin": (
+            "EPSG:4855 (deprecated ETRS89 / NTM zone 5) keeps its own false origin", IDENTICAL, "PROJ 9.8.1 (pyproj 3.8.0, no grids): within 1 mm",
         ),
     },
 }
@@ -2925,7 +3081,7 @@ def suite_crs_grids(ctx):
     s = Suite(
         "crs-grids",
         "Datum shift grids, geoid models and coordinate epochs",
-        "GDAL 3.12 and PROJ, with the same grids",
+        "GDAL 3.13.3 and PROJ 9.9.0 (EPSG reference points), GDAL 3.12 and PROJ, with the same grids",
         "The EPSG reference points again, GDAL and terrio both using the grids of "
         "`scripts/proj_grids.txt` (crates/terrio-crs/tests/epsg_accuracy_grids.rs); then random "
         "points through every horizontal shift grid (NTv2 and GeoTIFF, forward and inverse), "
@@ -2933,8 +3089,9 @@ def suite_crs_grids(ctx):
         "and time-dependent transformations with coordinate epochs "
         "(scripts/compare_crs_grids_with_gdal.py), with the largest difference of each case. "
         "Identical: within 1 mm. Within tolerance: within 1 cm, or 1 m from CRS to CRS. Known "
-        "differences: deprecated CRSs whose own datum PROJ uses, where terrio uses their "
-        "replacement's (#153).",
+        "differences: RRAF 1991 (EPSG:4640 and 2989), deprecated CRSs whose own datum PROJ chains "
+        "through its RRAFG transformation, where terrio uses its ballpark (#153). Deprecated "
+        "codes have their own definition, as in PROJ (GDAL with OSR_USE_NON_DEPRECATED=NO).",
     )
     if not shutil.which("cargo"):
         s.skipped = "needs cargo"
@@ -3685,6 +3842,7 @@ def suite_vector_dataset(ctx):
         "GDAL vector concat, partition, set-field-type, make-point, create, export-schema, rename-layer, edit and update",
         "Natural Earth countries and places, US and Tennessee counties, Las Vegas roads and "
         "a GPS trace: OGR_SCHEMA members, created schemas, field type conversions, "
+        "GeoJSON list properties (types, and values converted and read back by GDAL), "
         "concatenated, partitioned and point layers read back by GDAL. Values exact; "
         "coordinates of layers reprojected to a common CRS within 1e-9 (degrees) or 1e-6 "
         "(metres). Int16, Float32 and JSON subtypes stored without the subtype are within "

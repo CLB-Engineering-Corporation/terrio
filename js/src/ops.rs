@@ -85,8 +85,8 @@ pub(crate) fn input_rasters(v: &JsValue) -> Result<Vec<RasterDataset>, JsError> 
     Ok(out)
 }
 
-/// Vector layers given to an operation: a `Dataset`, a file's bytes, or GeoJSON (an object or a
-/// string).
+/// Vector layers given to an operation: a `Dataset`, a file's bytes, or geometries as
+/// [`crate::from_geojson`] takes them (GeoJSON, an array of geometries, bounds or WKT).
 pub(crate) fn input_layers(v: &JsValue) -> Result<Vec<Layer>, JsError> {
     if let Some(inner) = Dataset::lookup(v) {
         return match &*inner.borrow() {
@@ -107,7 +107,7 @@ pub(crate) fn input_layers(v: &JsValue) -> Result<Vec<Layer>, JsError> {
             return Ok(layers.clone());
         }
     }
-    Err(invalid("expected vector data: a Dataset, a Uint8Array, { bytes, filename } or GeoJSON"))
+    Err(invalid("expected vector data: a Dataset, a Uint8Array, { bytes, filename }, GeoJSON, WKT or bounds"))
 }
 
 /// Select file layers while their source name and complete inventory are still available.
@@ -255,6 +255,7 @@ struct WarpArgs {
     only_best: bool,
     kernel_version: Option<String>,
     grid_invariant: Option<bool>,
+    periodic_longitude: Option<bool>,
     geoloc: bool,
     s_srs: Option<String>,
     t_srs: Option<String>,
@@ -301,6 +302,7 @@ pub fn warp(src: JsValue, options: JsValue) -> Result<Dataset, JsError> {
         transform_options: terrio::crs::TransformOptions { allow_ballpark: a.allow_ballpark, only_best: a.only_best, ..Default::default() },
         kernel_version: terrio::ops::warp::KernelVersion::parse_or_configured(a.kernel_version.as_deref()).map_err(js_err)?,
         grid_invariant: a.grid_invariant.unwrap_or_else(|| WarpOptions::default().grid_invariant),
+        periodic_longitude: a.periodic_longitude.unwrap_or_else(|| WarpOptions::default().periodic_longitude),
         geoloc: a.geoloc,
         src_srs: srs(a.s_srs.as_deref())?,
         dst_srs: srs(a.t_srs.as_deref())?,
@@ -533,10 +535,17 @@ struct RasterizeArgs {
 /// `src`: vector data (a `Dataset`, bytes or GeoJSON). Options: `burn` (a value, or one per
 /// band) or `attribute`, `layers`, `sql`, `where`, `tr`, `ts`, `te`, `tap`, `like` (a raster
 /// whose grid to use), `ot`, `init`, `nodata`, `allTouched`, `add`, `aSrs`.
+/// `background` copies a raster's pixels and metadata, then edits all bands. Separate validity
+/// masks are not copied; nodata masks follow the edited values.
+/// With `add`, covered nodata samples also receive offsets: -9999 plus -2.5 becomes -10001.5
+/// and is marked valid. NaN remains NaN. Check voids before adding offsets.
+/// Burn and add values use stored sample units. Band scale/offset are retained, not applied.
+/// With `add`, signed values raise or lower elevations. Cannot be combined with grid, size,
+/// resolution, extent, alignment, type, initialization, nodata or CRS overrides.
 /// Without `init`, uncovered pixels start at `nodata` when set, otherwise 0, for every format.
 #[wasm_bindgen]
 pub fn rasterize(src: JsValue, options: JsValue) -> Result<Dataset, JsError> {
-    let (rest, taken) = split_options(&options, &["like"])?;
+    let (rest, taken) = split_options(&options, &["like", "background"])?;
     let a: RasterizeArgs = parse_options(&rest)?;
     let burn_values = numbers(a.burn)?;
     if burn_values.is_empty() && a.attribute.is_none() {
@@ -575,7 +584,11 @@ pub fn rasterize(src: JsValue, options: JsValue) -> Result<Dataset, JsError> {
         merge: if a.add { MergeAlg::Add } else { MergeAlg::Replace },
         assign_srs: srs(a.a_srs.as_deref())?,
     };
-    Ok(Dataset::from_raster(terrio::ops::rasterize::rasterize(&to_burn, &o).map_err(js_err)?))
+    let out = match &taken[1] {
+        Some(raster) => terrio::ops::rasterize::rasterize_on(&input_raster(raster)?, &to_burn, &o),
+        None => terrio::ops::rasterize::rasterize(&to_burn, &o),
+    };
+    Ok(Dataset::from_raster(out.map_err(js_err)?))
 }
 
 /// Options of [`polygonize`].

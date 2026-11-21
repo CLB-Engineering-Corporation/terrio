@@ -714,12 +714,12 @@ fn convert(
 
 /// Opens the layers given to an operation: a path, or layers in memory.
 pub(crate) fn input_layers(py: Python<'_>, src: &Bound<'_, PyAny>, layers: Option<Vec<String>>) -> PyResult<Vec<terrio::Layer>> {
-    match src.extract::<String>() {
-        Ok(path) => {
+    match crate::vector::vector_path(src)? {
+        Some(path) => {
             let options = VectorOpenOptions { layers: layers.unwrap_or_default(), ..Default::default() };
             Ok(py.detach_result(|| terrio::open_vector(&path, &options)).py()?.into_resolved_layers())
         }
-        Err(_) => {
+        None => {
             let all = layers_from_object(src, None, None)?;
             Ok(match layers {
                 Some(names) => terrio::ops::vector_filter::select_layers(all, &names).py()?,
@@ -732,7 +732,8 @@ pub(crate) fn input_layers(py: Python<'_>, src: &Bound<'_, PyAny>, layers: Optio
 /// Runs a read-only OGR SQL subset query on vector layers.
 ///
 /// Args:
-///     src: A vector path, VectorDataset, Layer, list of layers or GeoJSON.
+///     src: Vector data: a path, a `Layer`, a GeoDataFrame, GeoJSON, WKT, Shapely geometries...
+///         (see "Vector inputs" in the Python guide).
 ///     query: SELECT statement, including computed columns, DISTINCT, grouped summaries,
 ///         LEFT JOIN or the documented spatial functions.
 ///     layers: Restrict the available input layers.
@@ -792,7 +793,8 @@ pub(crate) fn input_raster(py: Python<'_>, src: &Bound<'_, PyAny>) -> PyResult<A
 /// Burns vector geometries into a raster, like `terrio rasterize` (GDAL's `gdal_rasterize`).
 ///
 /// Args:
-///     src: The vector data: a path, a `Layer`, a `VectorDataset`, a list of layers, or GeoJSON.
+///     src: The vector data: a path, a `Layer`, a GeoDataFrame, GeoJSON, WKT, Shapely
+///         geometries... (see "Vector inputs" in the Python guide).
 ///     dst: Also write the raster to this path.
 ///     layers: The layers to burn, by name. Needed when the dataset has several.
 ///     sql: Burn the result of `SELECT fields FROM layer [WHERE ...]` instead of whole layers.
@@ -804,6 +806,13 @@ pub(crate) fn input_raster(py: Python<'_>, src: &Bound<'_, PyAny>) -> PyResult<A
 ///     te: The extent `(min_x, min_y, max_x, max_y)`. By default, that of the layers.
 ///     tap: Align the extent on multiples of the pixel size.
 ///     like: Use the grid of this raster (a path or a `Raster`).
+///     background: Copy this raster's pixels and metadata before burning (a path or a `Raster`).
+///         Use add=True with signed attributes to raise or lower elevations. Cannot be combined
+///         with like, tr, ts, te, tap, ot, init, nodata or a_srs. Edits all bands. Separate
+///         validity masks are not copied; nodata masks follow the edited values.
+///         With add=True, covered nodata samples also receive offsets: -9999 plus -2.5
+///         becomes -10001.5 and is marked valid. NaN remains NaN. Check voids before adding offsets.
+///         Burn and add values use stored sample units. Band scale/offset are retained, not applied.
 ///     ot: The output data type: `"Byte"`, `"Int16"`, `"UInt16"`, `"Int32"`, `"Float32"`,
 ///         `"Float64"` (the default)...
 ///     init: The initial pixel values (a number, or one per band). Defaults to nodata when set,
@@ -825,7 +834,7 @@ pub(crate) fn input_raster(py: Python<'_>, src: &Bound<'_, PyAny>) -> PyResult<A
 #[pyo3(signature = (
     src, dst=None, *, layers=None, sql=None, burn=None, attribute=None, r#where=None, tr=None, ts=None, te=None,
     tap=false, like=None, ot=None, init=None, nodata=None, all_touched=false, add=false, a_srs=None, format=None,
-    compress=None, tile_size=None, bigtiff=false, options=None
+    compress=None, tile_size=None, bigtiff=false, options=None, background=None
 ))]
 #[allow(clippy::too_many_arguments)]
 fn rasterize(
@@ -853,6 +862,7 @@ fn rasterize(
     tile_size: Option<u32>,
     bigtiff: bool,
     options: Option<std::collections::BTreeMap<String, String>>,
+    background: Option<&Bound<'_, PyAny>>,
 ) -> PyResult<PyRaster> {
     let creation_options = options;
     let numbers = |v: Option<&Bound<'_, PyAny>>| -> PyResult<Vec<f64>> {
@@ -882,6 +892,7 @@ fn rasterize(
         None => all,
     };
     let grid = like.map(|l| input_raster(py, l)).transpose()?.map(|r| Grid::like(&r));
+    let background = background.map(|r| input_raster(py, r)).transpose()?;
     let options = RasterizeOptions {
         burn_values,
         attribute,
@@ -902,7 +913,10 @@ fn rasterize(
         dst.map(|_| crate::raster::write_options_with_creation(format, compress, tile_size, bigtiff, creation_options)).transpose()?;
     let out = py
         .detach_result(|| -> terrio::Result<RasterDataset> {
-            let out = terrio::ops::rasterize::rasterize(&to_burn, &options)?;
+            let out = match &background {
+                Some(raster) => terrio::ops::rasterize::rasterize_on(raster, &to_burn, &options)?,
+                None => terrio::ops::rasterize::rasterize(&to_burn, &options)?,
+            };
             if let (Some(path), Some(o)) = (dst, &write) {
                 terrio::write_raster_dataset(&out, path, o)?;
             }
@@ -1160,7 +1174,7 @@ fn set_network_enabled(enabled: Option<bool>) {
 
 /// Lists the CRSs of the registries terrio carries (EPSG, ESRI and IAU_2015), for searchable CRS
 /// pickers, without network or PROJ installation. They are described as GDAL's
-/// ``osr.GetCRSInfoListFromDatabase`` describes them, from PROJ 9.8.1's database (EPSG v12.029).
+/// ``osr.GetCRSInfoListFromDatabase`` describes them, from PROJ 9.9.0's database (EPSG v13.102).
 ///
 /// Every listed CRS resolves: ``f"{authority}:{code}"`` is a CRS terrio's functions take. ESRI
 /// CRSs on projections terrio does not compute are left out.
@@ -1178,9 +1192,12 @@ fn set_network_enabled(enabled: Option<bool>) {
 ///
 /// Returns:
 ///     list[dict]: One entry per CRS, in order of authority and code: ``authority``, ``code``
-///     (int), ``name``, ``kind``, ``deprecated``, ``area_name`` (str or None), ``bounds``
-///     (``[west, south, east, north]`` in degrees, or None), ``projection_method`` (str or None)
-///     and ``celestial_body`` (str or None).
+///     (int), ``name``, ``kind``, ``deprecated``, ``replaced_by`` (the codes of the CRSs that
+///     replace a deprecated EPSG CRS, ``[5105]`` for EPSG:4855), ``area_name`` (str or None),
+///     ``bounds`` (``[west, south, east, north]`` in degrees, or None), ``projection_method``
+///     (str or None) and ``celestial_body`` (str or None). A deprecated code gives its own CRS,
+///     as PROJ does; for GDAL's default (``OSR_USE_NON_DEPRECATED=YES``), pass the code of a
+///     single replacement instead.
 ///
 /// Raises:
 ///     InvalidArgumentError: If an authority or a kind is unknown.
@@ -1450,8 +1467,8 @@ fn translate(
 ///     srcnodata: The sources' nodata: a number, one per band, or `"none"` to ignore theirs.
 ///     dstnodata: The output nodata, or `"none"`. By default, the sources'.
 ///     ot: The output data type.
-///     cutline: Polygons masking the sources: a vector path, a `Layer`, a `VectorDataset` or
-///         GeoJSON.
+///     cutline: Polygons masking the sources, as vector data (a path, a `Layer`, a GeoDataFrame,
+///         GeoJSON, WKT, Shapely geometries...; see "Vector inputs" in the Python guide).
 ///     crop_to_cutline: Set the output extent to the cutline's.
 ///     et: The maximum error of the approximate transformer, in pixels (0 for exact).
 ///         A `sum` transforms its output pixels' corners exactly, whatever the threshold.
@@ -1483,6 +1500,9 @@ fn translate(
 ///     max_memory_mib: The memory of a chunk of the warp, in MiB, as `gdalwarp -wm` (default
 ///         64): the output is warped in chunks of about this many bytes of source and output
 ///         pixels. The values do not depend on it.
+///     periodic_longitude: Wrap interpolation across the stored edge of a geographic source
+///         covering one turn of longitude (default). False keeps it inside the stored columns,
+///         for fields that are not continuous across that edge.
 ///     init: A `Raster` holding the values the output starts from (all its bands, on the output
 ///         grid, in any type), as GDAL warps without `INIT_DEST`: pixels no valid source pixel
 ///         reaches keep them. By default the output starts at its nodata value, else 0.
@@ -1499,7 +1519,7 @@ fn translate(
     resampling="near", overview=None, srcnodata=None, dstnodata=None, ot=None, cutline=None, crop_to_cutline=false, et=0.125,
     format=None, compress=None, tile_size=None, bigtiff=false, options=None, gcps=None, order=0, gcp_method="auto",
     rpc=None, to=None, wo=None, geoloc=false, geolocation=None, kernel_version=None, grid_invariant=None, max_memory_mib=None,
-    init=None, _sum_scale=1.0
+    init=None, _sum_scale=1.0, periodic_longitude=None
 ))]
 #[allow(clippy::too_many_arguments)]
 fn warp(
@@ -1540,6 +1560,7 @@ fn warp(
     max_memory_mib: Option<f64>,
     init: Option<&Bound<'_, PyAny>>,
     _sum_scale: f64,
+    periodic_longitude: Option<bool>,
 ) -> PyResult<PyRaster> {
     if max_memory_mib.is_some_and(|m| m.is_nan() || m <= 0.0) {
         return Err(invalid("max_memory_mib must be positive"));
@@ -1558,11 +1579,19 @@ fn warp(
     let cutline = match cutline {
         None => None,
         Some(c) => {
-            let layers = input_layers(py, c, None)?;
+            // Geometries as text are read as the CLI's --cutline reads them: WKT has no CRS, so
+            // it is in the sources' CRS; GeoJSON is in WGS 84.
+            let layers = match c.extract::<String>() {
+                Ok(text) if terrio::memory::is_geometry_text(&text) => vec![terrio::memory::parse_geometry_text(&text, "cutline").py()?],
+                _ => input_layers(py, c, None)?,
+            };
             let ds = terrio::VectorDataset::new(layers, VectorDriver::GeoJSON);
             Some(Cutline::from_vector(&ds).py()?)
         }
     };
+    // Default options warn about an unknown TERRIO_WARP_GRID or TERRIO_GDAL_COMPAT. Drop warnings
+    // left by earlier calls, then issue those now: the `with_warnings` calls below would drop them.
+    let _ = terrio::warnings::take();
     let mut o = WarpOptions {
         src_srs: srs(s_srs)?,
         dst_srs: srs(t_srs)?,
@@ -1593,8 +1622,12 @@ fn warp(
         sum_scale: _sum_scale,
         ..Default::default()
     };
+    crate::issue_warnings(py, terrio::warnings::take())?;
     if let Some(value) = grid_invariant {
         o.grid_invariant = value;
+    }
+    if let Some(value) = periodic_longitude {
+        o.periodic_longitude = value;
     }
     for (k, v) in wo.unwrap_or_default() {
         match k.to_ascii_uppercase().as_str() {
@@ -1614,12 +1647,10 @@ fn warp(
         }
         let initial = input_raster(py, init)?;
         let sources = input_rasters(py, src)?;
-        let out = py
-            .detach_result(|| {
-                let refs: Vec<&RasterDataset> = sources.iter().map(|(_, ds)| &**ds).collect();
-                terrio::ops::warp::warp_onto(&refs, &o, &initial.raster.data)
-            })
-            .py()?;
+        let out = crate::with_warnings(py, || {
+            let refs: Vec<&RasterDataset> = sources.iter().map(|(_, ds)| &**ds).collect();
+            terrio::ops::warp::warp_onto(&refs, &o, &initial.raster.data)
+        })?;
         return finish_raster(py, out, dst, format, compress, tile_size, bigtiff, creation_options);
     }
     enum Input {
@@ -1713,7 +1744,7 @@ fn warp(
             _ => return Err(invalid("serialized warped VRT output needs a single source path")),
         };
         let options = crate::raster::write_options_with_creation(format, compress, tile_size, bigtiff, creation_options)?;
-        py.detach_result(|| terrio::ops::warp::warp_to_path(&[source], &o, path, &options)).py()?;
+        crate::with_warnings(py, || terrio::ops::warp::warp_to_path(&[source], &o, path, &options))?;
         return Ok(PyRaster { inner: py.detach_result(|| terrio::open_raster_lazy(path)).py()? });
     }
     // Source paths to a path: read by window and written a chunk of rows at a time.
@@ -1725,7 +1756,7 @@ fn warp(
         })
         .collect();
     if let (Some(path), Some(sources), None) = (dst, paths, geolocation) {
-        let options = write_options(format, compress, tile_size, bigtiff)?;
+        let options = crate::raster::write_options_with_creation(format, compress, tile_size, bigtiff, creation_options)?;
         let out = crate::with_warnings(py, || {
             terrio::ops::warp::warp_to_path(&sources, &o, path, &options)?;
             terrio::open_raster_lazy(path)
@@ -1961,6 +1992,9 @@ fn _window_converts(src: &str, work: &str) -> bool {
 ///         "3.13". By default the `TERRIO_GDAL_COMPAT` option's, else "3.12".
 ///     grid_invariant: Keep values independent of tiles/windows (default). False selects
 ///         GDAL's chunk-dependent sampling. None follows TERRIO_WARP_GRID.
+///     periodic_longitude: Wrap interpolation across the stored edge of a geographic source
+///         covering one turn of longitude (default). False keeps it inside the stored columns,
+///         for fields that are not continuous across that edge.
 ///     sum_scale: With `sum`, the full-resolution pixels each pixel of the source level stands
 ///         for, `(W / w) * (H / h)` for a `w` x `h` overview of a `W` x `H` raster: each source
 ///         value counts that many times. 1 by default; a positive number.
@@ -1973,7 +2007,7 @@ pub struct PyRegionWarp {
 #[pymethods]
 impl PyRegionWarp {
     #[new]
-    #[pyo3(signature = (src_size, src_transform, src_crs, dst_crs, dst_transform, resampling, error_threshold, dtype, src_nodata, dst_nodata=None, gcps=None, gcp_order=0, gcp_method="auto", rpc=None, rpc_options=None, kernel_version=None, sum_scale=1.0, grid_invariant=None))]
+    #[pyo3(signature = (src_size, src_transform, src_crs, dst_crs, dst_transform, resampling, error_threshold, dtype, src_nodata, dst_nodata=None, gcps=None, gcp_order=0, gcp_method="auto", rpc=None, rpc_options=None, kernel_version=None, sum_scale=1.0, grid_invariant=None, periodic_longitude=None))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         py: Python<'_>,
@@ -1995,6 +2029,7 @@ impl PyRegionWarp {
         kernel_version: Option<&str>,
         sum_scale: f64,
         grid_invariant: Option<bool>,
+        periodic_longitude: Option<bool>,
     ) -> PyResult<Self> {
         if !(sum_scale.is_finite() && sum_scale > 0.0) {
             return Err(invalid(format!("sum_scale must be a positive number, not {sum_scale}")));
@@ -2002,6 +2037,7 @@ impl PyRegionWarp {
         let bands = src_nodata.len();
         let kernel_version = terrio::ops::warp::KernelVersion::parse_or_configured(kernel_version).py()?;
         let grid_invariant = grid_invariant.unwrap_or_else(|| WarpOptions::default().grid_invariant);
+        let periodic_longitude = periodic_longitude.unwrap_or_else(|| WarpOptions::default().periodic_longitude);
         let (src_srs, dst_srs) = (SpatialRef::parse_literal(src_crs).py()?, SpatialRef::parse_literal(dst_crs).py()?);
         let (resampling, dtype) = (Resampling::parse(resampling).py()?, terrio::ops::parse_data_type(dtype).py()?);
         if let (None, Some(rpc)) = (&gcps, rpc) {
@@ -2024,7 +2060,11 @@ impl PyRegionWarp {
             .py()?;
             return Ok(Self {
                 bands,
-                inner: inner.with_kernel_version(kernel_version).with_grid_invariance(grid_invariant).with_sum_scale(sum_scale),
+                inner: inner
+                    .with_kernel_version(kernel_version)
+                    .with_grid_invariance(grid_invariant)
+                    .with_periodic_longitude(periodic_longitude)
+                    .with_sum_scale(sum_scale),
             });
         }
         let inner = match gcps {
@@ -2060,7 +2100,14 @@ impl PyRegionWarp {
             ),
         }
         .py()?;
-        Ok(Self { bands, inner: inner.with_kernel_version(kernel_version).with_grid_invariance(grid_invariant).with_sum_scale(sum_scale) })
+        Ok(Self {
+            bands,
+            inner: inner
+                .with_kernel_version(kernel_version)
+                .with_grid_invariance(grid_invariant)
+                .with_periodic_longitude(periodic_longitude)
+                .with_sum_scale(sum_scale),
+        })
     }
 
     /// The source window `(x, y, width, height)` a region `(x, y, width, height)` of the grid

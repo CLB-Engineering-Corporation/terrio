@@ -40,6 +40,7 @@ from terrio.rio.crs import CRS
 from terrio.rio.enums import Resampling
 from terrio.rio.errors import WindowError
 from terrio.rio.io import MemoryFile, driver_from_extension
+from terrio.xarray import _ops, _zonal
 from terrio.xarray._crs import crs_from_cf, crs_from_user_input, crs_to_cf
 from terrio.xarray._options import EXPORT_GRID_MAPPING, SKIP_MISSING_SPATIAL_DIMS, get_option
 from terrio.xarray._spatial import (
@@ -1052,6 +1053,21 @@ class XRasterBase:
         except (KeyError, AttributeError):
             return None
 
+    def _zonal_cube(
+        self, arrays: list[xarray.DataArray], zones: Any, **kwargs: Any
+    ) -> list[xarray.DataArray]:
+        """`_zonal.zonal_cube` of `zones` (one layer, plain geometries in this CRS)."""
+        unsupported = set(kwargs) - {"stats", "all_touched", "fractional", "layer", "batch_bytes"}
+        if unsupported:
+            raise TypeError(
+                f"{', '.join(sorted(unsupported))}: not available on arrays with dimensions "
+                "besides y and x, which take stats, all_touched, fractional, layer and "
+                "batch_bytes; reduce each 2-D slice for the others (for a single band, use "
+                'da.squeeze("band", drop=True) to retain the Layer output)'
+            )
+        layer = _zonal.zones_layer(zones, self.crs, kwargs.pop("layer", None))
+        return _zonal.zonal_cube(arrays, layer, **kwargs)
+
 
 def _gcps_to_geojson(gcps: Iterable[Any]) -> dict[str, Any]:
     """Ground control points as rioxarray stores them: a GeoJSON FeatureCollection.
@@ -1584,7 +1600,7 @@ class TerrioArray(XRasterBase):
 
     def clip(
         self,
-        geometries: Iterable[Any],
+        geometries: Any,
         crs: Any = None,
         *,
         all_touched: bool = False,
@@ -1595,10 +1611,14 @@ class TerrioArray(XRasterBase):
         """Clips the array to geometries: pixels outside them become nodata.
 
         Args:
-            geometries: GeoJSON-like geometries (dicts, or objects with `__geo_interface__`), or
-                a terrio `Layer`, burnt without a round trip through GeoJSON on north-up grids in
-                memory.
-            crs: Their CRS (default: the Layer's own, else the array's).
+            geometries: GeoJSON-like geometries (dicts, or objects with `__geo_interface__`), a
+                single one, a GeoJSON Feature or FeatureCollection, WKT, `(xmin, ymin, xmax,
+                ymax)` bounds, a GeoDataFrame or GeoSeries, Arrow data, a vector file path, or a
+                terrio `Layer`. Layers, GeoPandas objects, Arrow data and files
+                carry their own CRS and are burnt without a round trip through GeoJSON on
+                north-up grids in memory.
+            crs: Their CRS (default: the Layer's, GeoPandas object's or file's own, else the
+                array's).
             all_touched: Keep every pixel a geometry touches (else those whose centre is inside).
             drop: Crop to the geometries' extent.
             invert: Keep the pixels outside the geometries instead.
@@ -1619,6 +1639,7 @@ class TerrioArray(XRasterBase):
                 f"{get_data_var_message(self._obj)}"
             )
         crs = crs_from_user_input(crs) if crs is not None else None
+        geometries = _ops.geometry_input(geometries, (crs or self.crs).to_wkt())
         geoms: Any
         if isinstance(geometries, _terrio.Layer):
             own = crs_from_user_input(geometries.crs) if geometries.crs else None
@@ -1774,6 +1795,148 @@ class TerrioArray(XRasterBase):
         out.encoding = self._obj.encoding
         add_attrs_proj(new_data_array=out, src_data_array=self._obj)
         return out
+
+    # terrio's raster operations: the array goes to terrio in memory, band by band (dask arrays
+    # are computed). Keyword arguments are those of the terrio function of the same name.
+
+    def dem(self, processing: str, **kwargs: Any) -> xarray.DataArray:
+        """Terrain analysis with `terrio.dem` (`gdaldem`): slope, aspect, hillshade...
+
+        Args:
+            processing: `hillshade`, `slope`, `aspect`, `color-relief`, `TRI`, `TPI` or
+                `roughness`.
+            **kwargs: Options of `terrio.dem` (`z`, `scale`, `azimuth`, `alg`, ...).
+
+        Returns:
+            xarray.DataArray: The result, on the array's grid (`color-relief` along a `band`
+            dimension).
+        """
+        return _ops.raster_op(self._obj, _terrio.dem, processing, **kwargs)
+
+    def sieve(self, **kwargs: Any) -> xarray.DataArray:
+        """Removes regions smaller than `threshold` pixels with `terrio.sieve`.
+
+        Args:
+            **kwargs: Options of `terrio.sieve` (`threshold`, `connectedness`, `mask`).
+
+        Returns:
+            xarray.DataArray: The sieved array.
+        """
+        return _ops.raster_op(self._obj, _terrio.sieve, **kwargs)
+
+    def proximity(self, **kwargs: Any) -> xarray.DataArray:
+        """The distance to the nearest target pixel with `terrio.proximity`.
+
+        Args:
+            **kwargs: Options of `terrio.proximity` (`values`, `distunits`, `maxdist`, ...).
+
+        Returns:
+            xarray.DataArray: The distances.
+        """
+        return _ops.raster_op(self._obj, _terrio.proximity, **kwargs)
+
+    def fill_nodata(self, **kwargs: Any) -> xarray.DataArray:
+        """Fills nodata pixels from their neighbours with `terrio.fill_nodata`.
+
+        Args:
+            **kwargs: Options of `terrio.fill_nodata` (`max_distance`, `interpolation`,
+                `smoothing_iterations`, `mask`).
+
+        Returns:
+            xarray.DataArray: The filled array.
+        """
+        return _ops.raster_op(self._obj, _terrio.fill_nodata, **kwargs)
+
+    def reclassify(self, mapping: str, **kwargs: Any) -> xarray.DataArray:
+        """Maps values or ranges to new values with `terrio.reclassify`.
+
+        Args:
+            mapping: The mapping, as `terrio.reclassify` reads it (`"[1,10]=1; 11=2; NO_DATA=0"`).
+            **kwargs: Options of `terrio.reclassify` (`ot`).
+
+        Returns:
+            xarray.DataArray: The reclassified array.
+        """
+        return _ops.raster_op(self._obj, _terrio.reclassify, mapping, **kwargs)
+
+    def viewshed(self, ox: float, oy: float, **kwargs: Any) -> xarray.DataArray:
+        """The area visible from an observer with `terrio.viewshed`.
+
+        Args:
+            ox: The observer's x, in the array's CRS.
+            oy: The observer's y.
+            **kwargs: Options of `terrio.viewshed` (`oz`, `tz`, `md`, `cc`, `om`, ...).
+
+        Returns:
+            xarray.DataArray: The viewshed.
+        """
+        return _ops.raster_op(self._obj, _terrio.viewshed, ox, oy, **kwargs)
+
+    def polygonize(self, **kwargs: Any) -> _terrio.Layer:
+        """The array's regions of equal value as polygons, with `terrio.polygonize`.
+
+        Args:
+            **kwargs: Options of `terrio.polygonize` (`band`, `field`, `connectedness`, ...).
+
+        Returns:
+            terrio.Layer: The polygons.
+        """
+        return _terrio.polygonize(_ops.to_raster(self._obj), **kwargs)
+
+    def contour(self, **kwargs: Any) -> _terrio.Layer:
+        """Contour lines with `terrio.contour`.
+
+        Args:
+            **kwargs: Options of `terrio.contour` (`interval`, `levels`, `offset`, ...).
+
+        Returns:
+            terrio.Layer: The contour lines.
+        """
+        return _terrio.contour(_ops.to_raster(self._obj), **kwargs)
+
+    def footprint(self, **kwargs: Any) -> _terrio.Layer:
+        """The outline of the valid pixels with `terrio.footprint`.
+
+        Args:
+            **kwargs: Options of `terrio.footprint` (`bands`, `intersection`, ...).
+
+        Returns:
+            terrio.Layer: The footprint.
+        """
+        return _terrio.footprint(_ops.to_raster(self._obj), **kwargs)
+
+    def zonal_stats(self, zones: Any, **kwargs: Any) -> _terrio.Layer | xarray.DataArray:
+        """Statistics of the pixels in each zone, for a 2-D array or every 2-D slice of a cube.
+
+        A 2-D array gives `terrio.zonal_stats`'s `Layer`. An array with other dimensions
+        (`band`, `time`...) gives a DataArray of dims `(geometry, ..., statistic)`: one
+        row per zone, indexed by its Shapely geometry in the zones' CRS (written as the grid
+        mapping, `.terrio.crs`), the array's other dimensions, and one column per statistic.
+        The zones' attributes are coordinates along `geometry`. The values are float32 for
+        float32 data unless count or variety is requested; those results use float64
+        to preserve counts above 2**24 (exact through 2**53). Other data uses float64.
+
+        A cube is reduced a few slices at a time (whole dask chunks of its first other
+        dimension), holding about `batch_bytes`: the pixels read, the batch read ahead, and
+        the values a median or quantile keeps. Only the strips holding zone pixels are read,
+        and each dask chunk is computed once. A chunk larger than `batch_bytes` warns.
+
+        Args:
+            zones: The zones, as `terrio.zonal_stats` takes them (a path, a `Layer`,
+                a GeoDataFrame, Shapely geometries, GeoJSON, WKT, bounds...). Geometries
+                without a CRS of their own are in the array's.
+            **kwargs: Options of `terrio.zonal_stats` (`stats`, `all_touched`, `fractional`,
+                `weights`, `bands`, ...). A cube takes `stats`, `all_touched`, `fractional`,
+                `layer` and `batch_bytes` (default 512 MiB).
+
+        Returns:
+            terrio.Layer | xarray.DataArray: The zones with a column per band and statistic,
+            or the cube of statistics.
+        """
+        if self._obj.ndim > 2:
+            return self._zonal_cube([self._obj], zones, **kwargs)[0]
+        prefixes = kwargs.pop("prefixes", None)
+        return _ops.zonal_stats([self._obj], _ops.in_crs(zones, self.crs), prefixes, **kwargs)
 
     # Writing.
 
@@ -2071,7 +2234,7 @@ class TerrioDataset(XRasterBase):
 
     def clip(
         self,
-        geometries: Iterable[Any],
+        geometries: Any,
         crs: Any = None,
         *,
         all_touched: bool = False,
@@ -2082,7 +2245,7 @@ class TerrioDataset(XRasterBase):
         """Clips every variable to geometries.
 
         Args:
-            geometries: GeoJSON-like geometries, or a terrio `Layer`.
+            geometries: The geometries, as `TerrioArray.clip` takes them.
             crs: Their CRS.
             all_touched: Keep every pixel a geometry touches.
             drop: Crop to the geometries' extent.
@@ -2092,6 +2255,8 @@ class TerrioDataset(XRasterBase):
         Returns:
             xarray.Dataset: The clipped Dataset.
         """
+        own = crs_from_user_input(crs) if crs is not None else self.crs
+        geometries = _ops.geometry_input(geometries, own.to_wkt() if own is not None else None)
         if not isinstance(geometries, _terrio.Layer):
             geometries = list(geometries)
         out = self._per_var(
@@ -2119,6 +2284,68 @@ class TerrioDataset(XRasterBase):
         """
         out = self._per_var(lambda da: da.terrio.interpolate_na(method=method))
         return out.terrio.set_spatial_dims(x_dim=self.x_dim, y_dim=self.y_dim, inplace=True)  # type: ignore[no-any-return]
+
+    # terrio's raster operations, on each spatial variable (see `TerrioArray`).
+
+    def dem(self, processing: str, **kwargs: Any) -> xarray.Dataset:
+        """`TerrioArray.dem` on each spatial variable."""
+        return self._per_var(lambda da: da.terrio.dem(processing, **kwargs))
+
+    def sieve(self, **kwargs: Any) -> xarray.Dataset:
+        """`TerrioArray.sieve` on each spatial variable."""
+        return self._per_var(lambda da: da.terrio.sieve(**kwargs))
+
+    def proximity(self, **kwargs: Any) -> xarray.Dataset:
+        """`TerrioArray.proximity` on each spatial variable."""
+        return self._per_var(lambda da: da.terrio.proximity(**kwargs))
+
+    def fill_nodata(self, **kwargs: Any) -> xarray.Dataset:
+        """`TerrioArray.fill_nodata` on each spatial variable."""
+        return self._per_var(lambda da: da.terrio.fill_nodata(**kwargs))
+
+    def reclassify(self, mapping: str, **kwargs: Any) -> xarray.Dataset:
+        """`TerrioArray.reclassify` on each spatial variable."""
+        return self._per_var(lambda da: da.terrio.reclassify(mapping, **kwargs))
+
+    def viewshed(self, ox: float, oy: float, **kwargs: Any) -> xarray.Dataset:
+        """`TerrioArray.viewshed` on each spatial variable."""
+        return self._per_var(lambda da: da.terrio.viewshed(ox, oy, **kwargs))
+
+    def zonal_stats(self, zones: Any, **kwargs: Any) -> _terrio.Layer | xarray.Dataset:
+        """Statistics of each spatial variable in each zone.
+
+        When every spatial variable is 2-D, `terrio.zonal_stats`'s `Layer`. Otherwise a
+        Dataset of `TerrioArray.zonal_stats`'s cubes, sharing the `geometry` dimension;
+        variables on one grid are read together, within `batch_bytes` for all of them, so
+        what they share (a mask...) is computed once.
+
+        Args:
+            zones: The zones, as `terrio.zonal_stats` takes them (a path, a `Layer`,
+                a GeoDataFrame, Shapely geometries, GeoJSON, WKT, bounds...). Geometries
+                without a CRS of their own are in the array's.
+            **kwargs: Options of `terrio.zonal_stats`; `prefixes` defaults to the variables'
+                names. Cubes take those of `TerrioArray.zonal_stats`.
+
+        Returns:
+            terrio.Layer | xarray.Dataset: The zones with a column per variable, band and
+            statistic, or the cubes of statistics.
+        """
+        names = [v for v in self.vars if has_spatial_dims(self._obj, var=v)]
+        if not names:
+            raise MissingSpatialDimensionError(
+                "No variable has spatial dimensions: there are no zonal statistics to compute."
+            )
+        arrays = []
+        for name in names:
+            x_dim, y_dim = get_spatial_dims(self._obj, var=name)
+            da = self._obj[name]
+            da.terrio.set_spatial_dims(x_dim=x_dim, y_dim=y_dim, inplace=True)
+            arrays.append(da)
+        if any(da.ndim > 2 for da in arrays):
+            cubes = self._zonal_cube(arrays, zones, **kwargs)
+            return xarray.Dataset(dict(zip(names, cubes, strict=True)))
+        prefixes = kwargs.pop("prefixes", None) or [str(n) for n in names]
+        return _ops.zonal_stats(arrays, _ops.in_crs(zones, self.crs), prefixes, **kwargs)
 
     def to_raster(
         self,

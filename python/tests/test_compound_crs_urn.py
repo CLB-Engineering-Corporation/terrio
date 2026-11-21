@@ -12,6 +12,9 @@ CASES = [
     (4269, 5713, (52, 4), (4, 52)),
     (4326, 5773, (52, 4), (4, 52)),
 ]
+# The compound CRS of the pair, as PROJ 9.9.0 identifies it (100%, as GDAL 3.13.3's FindMatches):
+# EPSG:4269 + 5713 is none.
+COMPOUND = {(2154, 5720): "EPSG:5698", (4326, 5773): "EPSG:9707"}
 
 
 def document(name, position, city=False):
@@ -53,7 +56,10 @@ def test_compound_crs_and_layer_argument_keep_components(horizontal, vertical, p
     name = f"urn:ogc:def:crs,crs:EPSG::{horizontal},crs:EPSG::{vertical}"
     expected = CRS.from_user_input(f"EPSG:{horizontal}+{vertical}")
     actual = CRS.from_user_input(name)
-    assert actual.to_epsg() is None
+    compound = COMPOUND.get((horizontal, vertical))
+    assert actual.to_epsg() == (int(compound.split(":")[1]) if compound else None)
+    if compound:
+        assert actual == CRS.from_user_input(compound)
     assert actual.to_wkt() == expected.to_wkt()
     assert actual.to_dict(projjson=True)["type"] == "CompoundCRS"
     layer = terrio.Layer.from_geojson(
@@ -69,7 +75,8 @@ def test_compound_crs_and_layer_argument_keep_components(horizontal, vertical, p
         },
         crs=name,
     )
-    assert CRS.from_user_input(layer.crs).to_wkt() == expected.to_wkt()
+    assert layer.crs_wkt == expected.to_wkt()
+    assert layer.crs == COMPOUND.get((horizontal, vertical), layer.crs_wkt)
     assert layer.to_geojson()["features"][0]["geometry"]["coordinates"] == [*xy, 35]
 
 
@@ -92,10 +99,8 @@ def test_gml_path_and_bytes_keep_compound_axes(tmp_path, horizontal, vertical, p
     path.write_bytes(data)
     for dataset in [terrio.open_vector(str(path)), terrio.open_bytes(data, filename="point.gml")]:
         layer = dataset[0]
-        assert (
-            CRS.from_user_input(layer.crs).to_wkt()
-            == CRS.from_user_input(f"EPSG:{horizontal}+{vertical}").to_wkt()
-        )
+        assert layer.crs_wkt == CRS.from_user_input(f"EPSG:{horizontal}+{vertical}").to_wkt()
+        assert layer.crs == COMPOUND.get((horizontal, vertical), layer.crs_wkt)
         assert layer.to_geojson()["features"][0]["geometry"]["coordinates"] == [*xy, 35]
 
 

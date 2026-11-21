@@ -7,9 +7,10 @@
 //     lerc-reader/src/lerc1.rs, lerc2.rs (header parsing)
 
 //! TIFF compressions the `tiff` crate does not decode, read as GDAL (libtiff) reads them: LERC
-//! (alone, or wrapped in Deflate or Zstandard), JPEG XL and LZMA, and Zstandard in every build
-//! (the crate is built without its Zstandard, zstd 0.13), Float16 samples (read as Float32, as GDAL's
-//! Float16) and WhiteIsZero ones (as stored) included. And JPEG, decoded as
+//! (alone, or wrapped in Deflate or Zstandard), JPEG XL (with the `jxl` feature, on by default),
+//! LZMA (with `lzma`), and Zstandard in every build (the crate is built without its Zstandard,
+//! zstd 0.13), Float16 samples (read as Float32, as GDAL's Float16) and WhiteIsZero ones (as
+//! stored) included. And JPEG, decoded as
 //! libjpeg decodes it for GDAL ([`crate::jpeg`]), YCbCr converted to RGB. And unsigned samples
 //! packed in 9 to 31 bits (GDAL's `NBITS`, as written for Sentinel-2's 15-bit bands), in any of the
 //! lossless compressions, read as UInt16 or UInt32 as GDAL reads them; and samples of 1 to 7 bits
@@ -74,9 +75,9 @@ enum Codec {
     /// compression `.0`, which the `tiff` crate inverts (unsigned and floating-point ones, one
     /// sample per pixel) or refuses (the others): read as stored, as libtiff gives them to GDAL.
     WhiteIsZero(u16),
-    /// Deflate of little-endian integer samples (or floating-point ones without a predictor),
-    /// inflated straight into the result with `fdeflate` (pure Rust), then its predictor undone:
-    /// faster than the `tiff` crate's streaming reader and its predictor.
+    /// Deflate of little-endian integer and floating-point samples, inflated straight into the
+    /// result with `fdeflate` (pure Rust), then its predictor undone: faster than the `tiff`
+    /// crate's streaming reader and its predictor.
     Deflate,
 }
 
@@ -147,6 +148,11 @@ impl Sample {
 /// bytes: a stream that would expand further is cut there (it cannot be a valid chunk), and one
 /// that ends short is an error rather than missing pixels.
 fn decompress(compression: u16, raw: Vec<u8>, limit: usize) -> TiffResult<Vec<u8>> {
+    if compression == 5
+        && let Some(out) = lzw_bytes(&raw, limit)
+    {
+        return Ok(out);
+    }
     let mut out = Vec::new();
     // Reads at most `limit` bytes of a decompressing reader.
     let bounded = |r: &mut dyn Read, out: &mut Vec<u8>| r.take(limit as u64).read_to_end(out).map(|_| ());
@@ -209,15 +215,126 @@ fn decompress(compression: u16, raw: Vec<u8>, limit: usize) -> TiffResult<Vec<u8
     Ok(out)
 }
 
+/// The first `limit` bytes of a TIFF LZW stream (codes of 9 to 12 bits, most significant bit
+/// first, widened one code early as libtiff writes them), or `None` when the stream gives fewer or
+/// does anything unusual (a code past the table, a table filled without a clear): `weezl` then
+/// decodes it, and reports what is wrong. Every string is a copy of earlier output, so the table
+/// holds where each one starts in the output and its length, and a short one is copied as 16
+/// bytes: about 1.3x faster than `weezl` on Float32 elevation tiles.
+fn lzw_bytes(raw: &[u8], limit: usize) -> Option<Vec<u8>> {
+    const CLEAR: usize = 256;
+    const EOI: usize = 257;
+    // Room past the string being written: the longest string (under 4096 bytes) and a 16-byte copy.
+    const ROOM: usize = 4096 + 16;
+    // The table's offsets are 32-bit: larger chunks are left to `weezl`.
+    if limit > u32::MAX as usize - ROOM {
+        return None;
+    }
+    let mut out: Vec<u8> = Vec::new();
+    // Codes 258 and up: (start, length) in `out`.
+    let mut table = vec![(0u32, 0u32); 4096];
+    let (mut bits, mut nbits, mut i) = (0u64, 0u32, 0usize);
+    let (mut width, mut next) = (9u32, 258usize);
+    // The previous string: (start, length) in `out`. None after a clear.
+    let mut prev: Option<(usize, usize)> = None;
+    let mut pos = 0;
+    while pos < limit {
+        if nbits < width {
+            if let Some(word) = raw.get(i..i + 8) {
+                // Eight bytes at once, the whole ones counted: the bits past them are the next
+                // bytes' own, ORed again unchanged by the next refill.
+                bits |= u64::from_be_bytes(word.try_into().unwrap()) >> nbits;
+                let whole = (63 - nbits) / 8;
+                (i, nbits) = (i + whole as usize, nbits + whole * 8);
+            } else {
+                while nbits <= 56 && i < raw.len() {
+                    bits |= u64::from(raw[i]) << (56 - nbits);
+                    nbits += 8;
+                    i += 1;
+                }
+                if nbits < width {
+                    return None;
+                }
+            }
+        }
+        let code = (bits >> (64 - width)) as usize;
+        (bits, nbits) = (bits << width, nbits - width);
+        if code == CLEAR {
+            (width, next, prev) = (9, 258, None);
+            continue;
+        }
+        if code == EOI {
+            break;
+        }
+        // The output grows as the stream backs it, from eight times the stream (LZW rarely packs
+        // more): a chunk size from the header is not allocated up front.
+        if out.len() < pos + ROOM {
+            let len = (limit + ROOM).min(out.len().saturating_mul(2).max(pos + ROOM).max(raw.len().saturating_mul(8)));
+            let extra = len - out.len();
+            crate::dataset::fallible::reserve(&mut out, extra, "a TIFF chunk").ok()?;
+            out.resize(len, 0);
+        }
+        let len = if code < 256 {
+            out[pos] = code as u8;
+            1
+        } else if code < next {
+            let (start, len) = table[code];
+            copy_earlier(&mut out, start as usize, len as usize, pos);
+            len as usize
+        } else if code == next {
+            // The previous string and its own first byte.
+            let (start, len) = prev?;
+            copy_earlier(&mut out, start, len, pos);
+            out[pos + len] = out[start];
+            len + 1
+        } else {
+            return None;
+        };
+        if let Some((start, len)) = prev {
+            // The previous string and the first byte of this one, which follows it in `out`.
+            *table.get_mut(next)? = (start as u32, len as u32 + 1);
+            next += 1;
+            if next + 1 >= 1 << width && width < 12 {
+                width += 1;
+            }
+        }
+        prev = Some((pos, len));
+        pos += len;
+    }
+    (pos >= limit).then(|| {
+        out.truncate(limit);
+        out
+    })
+}
+
+/// Copies `len` bytes of `out` from `src` to `dst`, past the end of the copied ones (`src + len <=
+/// dst`). Up to 16 bytes are copied as 16, the bytes past `len` to be overwritten.
+#[inline(always)]
+fn copy_earlier(out: &mut [u8], src: usize, len: usize, dst: usize) {
+    debug_assert!(src + len <= dst && dst + len.max(16) <= out.len());
+    if len <= 16 {
+        let b: [u8; 16] = out[src..src + 16].try_into().unwrap();
+        out[dst..dst + 16].copy_from_slice(&b);
+    } else {
+        out.copy_within(src..src + len, dst);
+    }
+}
+
 /// Whether Deflate chunks of an image are inflated here ([`Codec::Deflate`]) rather than by the
 /// `tiff` crate: a little-endian file on a little-endian host, not YCbCr, samples of a type read
-/// here (8- to 64-bit integers, Float32, Float64; not Float16), and no predictor, or the
-/// horizontal one on integers. Images matched by an earlier codec arm never reach this choice.
+/// here (8- to 64-bit integers, Float32, Float64; not Float16), and no predictor, the
+/// horizontal one on integers or the floating-point one on floats. Images matched by an earlier
+/// codec arm never reach this choice.
 fn inflated_here(little_endian: bool, photometric: Option<u16>, format: u16, bits: u16, predictor: u16) -> bool {
     cfg!(target_endian = "little")
         && little_endian
         && photometric != Some(6) // YCbCr may be subsampled: left to the crate
-        && Sample::new(format, bits).is_some_and(|s| predictor == 1 || (predictor == 2 && !s.is_float()))
+        && Sample::new(format, bits).is_some_and(|s| match predictor {
+            1 => true,
+            2 => !s.is_float(),
+            3 => s.is_float(),
+            _ => false,
+        })
 }
 
 /// Whether the `tiff` crate reads the pixel-interleaved chunks of an image of `samples` samples
@@ -249,7 +366,7 @@ fn invalid(msg: impl Into<String>) -> TiffError {
 }
 
 /// The error of a compression this build leaves out: terrio was built without `feature`.
-#[cfg(not(all(feature = "lerc", feature = "lzma")))]
+#[cfg(not(all(feature = "lerc", feature = "lzma", feature = "jxl")))]
 fn disabled(feature: &str) -> TiffError {
     TiffError::IoError(std::io::Error::new(std::io::ErrorKind::Unsupported, format!("built without the `{feature}` feature")))
 }
@@ -576,6 +693,8 @@ impl ChunkCodec {
                 };
             }
             acc!(U8, I8, U16, I16, U32, I32, U64, I64);
+        } else if self.predictor == 3 {
+            self.unpredict(res.as_buffer(0).as_bytes_mut(), w);
         }
         if (dw, dh) == (w, h) {
             return Ok(res);
@@ -947,6 +1066,7 @@ impl ChunkCodec {
 
     /// Decodes a JPEG XL codestream into native-endian samples: the colour channels, then the extra
     /// channels, interleaved by pixel, as libtiff's JPEG XL codec does.
+    #[cfg(feature = "jxl")]
     fn jxl(&self, raw: &[u8], w: usize, h: usize) -> TiffResult<Vec<u8>> {
         use jxl_oxide::image::BitDepth;
         // On terrio's thread pool: `jxl-oxide` decodes with rayon (see `par`).
@@ -993,6 +1113,11 @@ impl ChunkCodec {
             }
         }
         self.to_bytes(&samples)
+    }
+
+    #[cfg(not(feature = "jxl"))]
+    fn jxl(&self, _raw: &[u8], _w: usize, _h: usize) -> TiffResult<Vec<u8>> {
+        Err(disabled("jxl"))
     }
 
     /// Decodes a JPEG chunk, its stream completed with the shared tables.
@@ -1198,6 +1323,32 @@ mod tests {
         }
     }
 
+    /// Deflate chunks of three samples a pixel with the floating-point predictor, coded as libtiff
+    /// codes them: each row's samples split into byte planes, then differenced byte by byte with
+    /// a stride of the samples a pixel.
+    #[test]
+    fn deflate_with_the_floating_point_predictor_over_several_samples() {
+        let (w, h, spp) = (5, 4, 3);
+        let wc = w * spp;
+        let values: Vec<f32> = (0..wc * h).map(|i| (i as f32 * 0.73).cos() * 500.0).collect();
+        let mut coded = Vec::new();
+        for row in values.chunks(wc) {
+            let mut planes = vec![0u8; wc * 4];
+            for (i, v) in row.iter().enumerate() {
+                for (b, byte) in v.to_be_bytes().iter().enumerate() {
+                    planes[b * wc + i] = *byte;
+                }
+            }
+            for i in (spp..planes.len()).rev() {
+                planes[i] = planes[i].wrapping_sub(planes[i - spp]);
+            }
+            coded.extend(planes);
+        }
+        let c = ChunkCodec { codec: Codec::Deflate, sample: Sample::F32, spp, predictor: 3, big_endian: false, ..packed(8, spp) };
+        let DecodingResult::F32(out) = c.deflate(&zlib(&coded), w, h, w, h).unwrap() else { panic!("Float32 expected") };
+        assert_eq!(out, values);
+    }
+
     /// Zstandard chunks decode (with the zstd C library natively with the `libzstd-geotiff`
     /// feature, with `ruzstd` otherwise), whichever encoder wrote them.
     #[test]
@@ -1216,6 +1367,72 @@ mod tests {
         assert!(c.lossless(crate::zstandard::geotiff::compress(&rows[..8], 9).unwrap(), 4, 4).is_err());
     }
 
+    /// LZW streams decoded here give the bytes `weezl` gives; a stream that does not give all the
+    /// bytes asked for is left to `weezl`.
+    #[test]
+    fn lzw_decodes_as_weezl_decodes() {
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut rand = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        // The first `limit` bytes `weezl` decodes, as `decompress` read them before.
+        let weezl_first = |raw: &[u8], limit: usize| {
+            let mut dec = weezl::decode::Decoder::with_tiff_size_switch(weezl::BitOrder::Msb, 8);
+            let (mut out, mut consumed, mut written) = (vec![0; limit], 0, 0);
+            while written < limit {
+                let r = dec.decode_bytes(&raw[consumed..], &mut out[written..]);
+                (consumed, written) = (consumed + r.consumed_in, written + r.consumed_out);
+                match r.status.ok()? {
+                    weezl::LzwStatus::Done => break,
+                    weezl::LzwStatus::NoProgress if r.consumed_in == 0 && r.consumed_out == 0 => break,
+                    _ => {}
+                }
+            }
+            (written == limit).then_some(out)
+        };
+        // Random bytes (the table fills and clears), runs (codes read before they are in the
+        // table), a smooth Float32 surface and a short image of each.
+        let surface: Vec<u8> = (0..200_000).flat_map(|i| ((i as f32 * 0.01).sin() * 900.0).to_le_bytes()).collect();
+        let inputs = [
+            (0..300_000).map(|_| rand() as u8).collect::<Vec<u8>>(),
+            (0..300_000).map(|i| (i / 997) as u8).collect(),
+            vec![7; 100_000],
+            surface,
+            (0..300_000).map(|_| (rand() % 3) as u8).collect(),
+            vec![1, 2, 3],
+            vec![],
+        ];
+        // Chunks past the table's 32-bit offsets are left to `weezl`.
+        assert_eq!(lzw_bytes(&lzw_encode(&[1, 2]), u32::MAX as usize), None);
+        for data in &inputs {
+            let raw = lzw_encode(data);
+            assert_eq!(lzw_bytes(&raw, data.len()).as_deref(), Some(&data[..]));
+            // The first bytes only, and more than the stream holds.
+            assert_eq!(lzw_bytes(&raw, data.len() / 2).as_deref(), Some(&data[..data.len() / 2]));
+            assert_eq!(lzw_bytes(&raw, data.len() + 1), None);
+            // A cut stream gives no result, or the bytes it holds.
+            let cut = &raw[..raw.len() * 2 / 3];
+            if let Some(out) = lzw_bytes(cut, data.len() / 3) {
+                assert_eq!(out, data[..data.len() / 3]);
+            }
+        }
+        // Random streams: where both give the bytes asked for, they agree. `weezl` reads a code
+        // ahead and refuses a bad one past those bytes; libtiff, as here, stops at them.
+        let mut agreed = 0;
+        for _ in 0..20_000 {
+            let raw: Vec<u8> = (0..rand() % 64).map(|_| rand() as u8).collect();
+            let limit = (rand() % 64) as usize;
+            if let (Some(ours), Some(theirs)) = (lzw_bytes(&raw, limit), weezl_first(&raw, limit)) {
+                assert_eq!(ours, theirs, "{raw:?}, {limit} bytes");
+                agreed += usize::from(limit > 0);
+            }
+        }
+        assert!(agreed > 100, "{agreed} random streams compared with a nonzero length");
+    }
+
     /// A truncated LZW chunk is an error, and a header's chunk size overflowing is refused.
     #[test]
     fn short_and_oversized_lzw_chunks_are_errors() {
@@ -1226,8 +1443,8 @@ mod tests {
     }
 
     /// Deflate is inflated here for little-endian, non-YCbCr images of integer samples (with or
-    /// without the horizontal predictor) or Float32/Float64 samples without a predictor; every
-    /// other image is left to the `tiff` crate.
+    /// without the horizontal predictor) or Float32/Float64 samples (with or without the
+    /// floating-point predictor); every other image is left to the `tiff` crate.
     #[test]
     fn deflate_is_inflated_here_only_for_the_images_it_reads_as_the_crate() {
         let gray = Some(1);
@@ -1247,7 +1464,10 @@ mod tests {
             (true, gray, 3, 32, 2, false),
             (true, gray, 3, 64, 2, false),
             (true, gray, 1, 16, 3, false),
-            (true, gray, 3, 32, 3, false),
+            (true, gray, 3, 32, 3, true),
+            (true, gray, 3, 64, 3, true),
+            (true, gray, 3, 16, 3, false),
+            (true, gray, 3, 32, 4, false),
             (true, gray, 5, 32, 1, false),
             (true, gray, 1, 12, 1, false),
         ];
@@ -1373,8 +1593,8 @@ mod tests {
     }
 
     /// Deflate tiles inflated here give what the `tiff` crate gives, the edge tiles of a 37 x 23
-    /// image in 16 x 16 tiles included: the horizontal predictor is undone over the stored tile
-    /// width, padding included, before the tile is cut to its image data.
+    /// image in 16 x 16 tiles included: the horizontal and floating-point predictors are undone
+    /// over the stored tile width, padding included, before the tile is cut to its image data.
     #[test]
     fn deflate_tiles_decode_as_the_tiff_crate_decodes_them() {
         // Every byte of every sample set: a 64-bit multiplicative hash of the tile and position.
@@ -1423,6 +1643,10 @@ mod tests {
         case!(i32, 32, 2, 2, differenced!(i32));
         case!(u64, 64, 1, 2, differenced!(u64));
         case!(f32, 32, 3, 1, |_: &mut Vec<f32>| {});
+        // Any bytes are a valid floating-point predictor's planes: the predictor is undone as the
+        // crate undoes it, over the stored tile width.
+        case!(f32, 32, 3, 3, |_: &mut Vec<f32>| {});
+        case!(f64, 64, 3, 3, |_: &mut Vec<f64>| {});
     }
 
     /// Deflate chunks inflated here give what the `tiff` crate gives, for every sample type

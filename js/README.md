@@ -124,7 +124,7 @@ not a guarantee for other Rust/wasm-opt versions:
 import init, { open, features } from "terrio-js/core";
 
 await init();
-features(); // { build: "terrio-js/core", features: ["flatgeobuf", "lerc", "lzma", "sqlite", "tiles"] }
+features(); // { build: "terrio-js/core", features: ["flatgeobuf", "jxl", "lerc", "lzma", "sqlite", "tiles"] }
 ```
 
 A format the module leaves out fails with a message that says so (``built without the `jp2`
@@ -167,6 +167,40 @@ snapshot:
 | Module | `.wasm` | gzip | Brotli |
 |---|---|---|---|
 | `terrio-js/zarr` | 0.53 MB | 0.23 MB | 0.19 MB |
+
+## GeoTIFF alone: `terrio-js/cog`
+
+`terrio-js/cog` is a fourth module, of its own API, that reads GeoTIFFs and COGs over HTTP and
+nothing else: terrio's GeoTIFF reader (tiles and strips, overviews, LZW, Deflate, PackBits, ZSTD,
+JPEG and WebP; not JPEG XL, LZMA or LERC, which the full module reads), the range requests of
+`openUrl` (64 KiB blocks, 12 in flight, blocks kept between reads), and no CRS engine. It suits
+pages that only show COGs.
+
+```js
+import init, { openCog } from "terrio-js/cog";
+
+await init();
+const r = await openCog("https://example.com/dem.tif");
+r.width, r.height, r.count, r.dtype, r.nodata, r.transform, r.epsg;
+r.overviews;                                      // [[width, height], ...], largest first
+const [red, nir] = await r.read({ window: [0, 0, 512, 512], bands: [3, 4] }); // typed arrays
+const [preview] = await r.read({ overview: 2, bands: [1] }); // an overview, whole
+r.stats();                                        // { requests, bytes }
+```
+
+Its options are those of `openUrl` for GeoTIFFs: `blockSize`, `cacheSize`, `fetch` and `headers`;
+a read fetches the bytes `openUrl` fetches for it. Without the CRS engine, `epsg` is the code of
+ProjectedCSTypeGeoKey, or of GeographicTypeGeoKey in a geographic model (GTModelTypeGeoKey 2):
+a user-defined or vertical CRS is not read (`epsg` is then `undefined`, or the horizontal CRS's
+code). Reads return the samples `openUrl` reads (CMYK as RGBA) without applying masks; `nodata` is
+the first band's.
+
+Measured from a local `wasm-release` build (wasm-opt `-Oz`; gzip 9, Brotli 11), not a recorded CI
+snapshot:
+
+| Module | `.wasm` | gzip | Brotli |
+|---|---|---|---|
+| `terrio-js/cog` | 1.00 MB | 0.38 MB | 0.30 MB |
 
 ## Threads: `terrio-js/load` and `terrio-js/threads`
 
@@ -301,7 +335,9 @@ with `takeWarnings()` after an operation. `warp` also accepts `kernelVersion: "3
 for GDAL 3.13 kernel arithmetic; `"3.12"` remains the default. Sampling uses
 grid-invariant coordinates and local footprints by default, so aligned output tiles
 retain whole-grid values. Set `gridInvariant: false` to reproduce GDAL's
-chunk-dependent sampling instead. GeoTIFF/COG outputs preserve
+chunk-dependent sampling instead. A geographic source covering one turn of longitude
+is periodic: interpolation wraps across its stored edge. Set `periodicLongitude: false`
+for a field that is not continuous there. GeoTIFF/COG outputs preserve
 PixelIsPoint metadata and corner georeferencing.
 
 `blend(color, overlay, {operator: "multiply", opacity: 75})` composes same-sized

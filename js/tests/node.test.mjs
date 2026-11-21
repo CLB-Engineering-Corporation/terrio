@@ -52,6 +52,22 @@ const SQUARES = {
   ],
 };
 
+test("periodicLongitude: false keeps bilinear inside a full-turn source's stored columns", () => {
+  // Each pixel holds its centre longitude: -179.5 and 179.5 meet at the stored edge.
+  const values = Float64Array.from({length: 360 * 180}, (_, i) => (i % 360) - 179.5);
+  const source = terrio.rasterFromArray(values, 360, 180, [-180, 1, 0, 90, 0, -1], "EPSG:4326");
+  const options = {tSrs: "+proj=longlat +datum=WGS84 +lon_0=180", te: [-10.5, 58, 10.5, 60], ts: [21, 2], ot: "Float64"};
+  const turn = (d) => Math.abs((((d + 180) % 360) + 360) % 360 - 180);
+  const nearest = terrio.warp(source, {...options, resampling: "near"}).readBand(1);
+  const worst = (extra, difference) => {
+    const out = terrio.warp(source, {...options, resampling: "bilinear", ...extra}).readBand(1);
+    return Math.max(...Array.from(out, (v, i) => difference(v - nearest[i])));
+  };
+  assert.ok(worst({}, turn) > 90, "the periodic default blends the two edge columns");
+  // The plain difference: a value from the other stored edge would be 359 away.
+  assert.ok(worst({periodicLongitude: false}, Math.abs) <= 1);
+});
+
 test("wider-source area footprints use two nonduplicated placements", () => {
   const values = Float64Array.from({length: 3610}, (_, i) => ({0: 2, 1: 4, 359: 8, 360: 1000})[i % 361] ?? 1);
   const source = terrio.rasterFromArray(values, 361, 10, [-180.5, 1, 0, 10, 0, -1], "EPSG:4326");
@@ -95,7 +111,7 @@ test("version", () => {
 });
 
 test("the module's build and its formats", () => {
-  assert.ok(["flatgeobuf", "sqlite", "tiles", "lzma", "lerc"].every((f) => BUILT.includes(f)), BUILT.join());
+  assert.ok(["flatgeobuf", "sqlite", "tiles", "lzma", "lerc", "jxl"].every((f) => BUILT.includes(f)), BUILT.join());
   if (BUILD === "terrio-js/threads") assert.ok(terrio.features().threads > 1, "the thread pool is started");
   assert.ok(terrio.features().memory > 0);
   if (BUILD !== "terrio-js/core") {
@@ -222,6 +238,20 @@ test("JPEG 2000 to bytes and back", { skip: needs("jp2") }, () => {
   assert.throws(() => terrio.rasterFromArray(new Float32Array(4), 2, 2, [0, 1, 0, 2, 0, -1]).toBytes("f.jp2"), /8- and 16-bit integers/);
 });
 
+test("geometries as WKT, bounds or arrays read as GeoJSON does", () => {
+  const square = { type: "Polygon", coordinates: [[[0, 0], [2, 0], [2, 2], [0, 2], [0, 0]]] };
+  const geometries = (v) => terrio.fromGeoJSON(v).toGeoJSON().features.map((f) => f.geometry);
+  const expected = geometries(square);
+  assert.deepEqual(geometries("POLYGON ((0 0, 2 0, 2 2, 0 2, 0 0))"), expected);
+  assert.deepEqual(geometries([0, 0, 2, 2]), expected);
+  assert.deepEqual(geometries([square, { type: "Feature", properties: {}, geometry: square }]), [...expected, ...expected]);
+  terrio.takeWarnings();
+  const across = terrio.fromGeoJSON([170, 0, -170, 2]).toGeoJSON().features[0].geometry;
+  assert.equal(across.type, "MultiPolygon");
+  assert.ok(terrio.takeWarnings().some((w) => w.includes("antimeridian")));
+  assert.throws(() => terrio.fromGeoJSON("POLYGON ((0 0, 1 0"), /neither an existing file nor valid geometries/);
+});
+
 test("vector layers as Arrow IPC streams, and back", { skip: needs("parquet") }, () => {
   const ds = terrio.fromGeoJSON(SQUARES, "squares");
   for (const options of [undefined, { geometryEncoding: "geoarrow" }, { geometryEncoding: "geoarrow", coordinates: "interleaved" }]) {
@@ -254,6 +284,32 @@ test("CityJSON late root type retains vertical XYZ and unknown CRS", () => {
   assert.equal(fc.features[0].properties.city_id, "house");
   assert.deepEqual(fc.features[0].geometry.coordinates[0].slice(0, 3), doc.vertices);
   ds.free();
+});
+
+test("toGeoJSON returns every geometry type, heights, holes and null geometries", () => {
+  const geometries = [
+    { type: "Point", coordinates: [1, 2] },
+    { type: "Point", coordinates: [1, 2, 3] },
+    { type: "LineString", coordinates: [[0, 0], [1, 1, 5]] },
+    { type: "Polygon", coordinates: [[[0, 0], [4, 0], [4, 4], [0, 0]], [[1, 1], [2, 1], [2, 2], [1, 1]]] },
+    { type: "MultiPoint", coordinates: [[0, 0], [1, 1]] },
+    { type: "MultiLineString", coordinates: [[[0, 0], [1, 1]], [[2, 2], [3, 3]]] },
+    { type: "MultiPolygon", coordinates: [[[[0, 0], [1, 0], [1, 1], [0, 0]]], [[[5, 5], [6, 5], [6, 6], [5, 5]]]] },
+    { type: "GeometryCollection", geometries: [{ type: "Point", coordinates: [9, 9] }, { type: "LineString", coordinates: [[0, 0], [1, 1]] }] },
+    null,
+  ];
+  const ds = terrio.fromGeoJSON({ type: "FeatureCollection", features: geometries.map((geometry, i) => ({ type: "Feature", properties: { i }, geometry })) });
+  const fc = ds.toGeoJSON();
+  // In a list where only some positions have a height, the others get NaN.
+  geometries[2] = { type: "LineString", coordinates: [[0, 0, NaN], [1, 1, 5]] };
+  assert.deepStrictEqual(fc.features.map((f) => f.geometry), geometries);
+  assert.deepStrictEqual(fc.features.map((f) => f.properties.i), geometries.map((_, i) => i));
+  ds.free();
+  // Coordinates also end a chunk, at 8 MB of numbers: 3 lines of 300,000 positions cross one.
+  const lines = [0, 1, 2].map((i) => ({ type: "LineString", coordinates: Array.from({ length: 300000 }, (_, k) => [i, k]) }));
+  const long = terrio.fromGeoJSON({ type: "FeatureCollection", features: lines.map((geometry, i) => ({ type: "Feature", properties: { i }, geometry })) });
+  assert.deepStrictEqual(long.toGeoJSON().features.map((f) => f.geometry), lines);
+  long.free();
 });
 
 test("toGeoJSON escapes control characters and keeps feature order across parse chunks", () => {
@@ -522,13 +578,16 @@ test("listCrs lists the registry CRSs", () => {
   assert.equal(albers.name, "GDA94 / Australian Albers");
   assert.equal(albers.kind, "projected");
   assert.equal(albers.deprecated, false);
+  assert.deepEqual(albers.replaced_by, []);
   assert.deepEqual(albers.bounds, [112.85, -43.7, 153.69, -9.86]);
   assert.equal(albers.projection_method, "Albers Equal Area");
   assert.match(albers.area_name, /^Australia - Australian Capital Territory/);
   const geographic = terrio.listCrs(undefined, { authority: "EPSG", kind: ["geographic_2d"] });
   assert.ok(geographic.length > 600 && geographic.every((e) => e.kind === "geographic_2d" && !e.deprecated));
   assert.deepEqual(terrio.listCrs("EPSG:3785"), []);
-  assert.equal(terrio.listCrs("EPSG:3785", { includeDeprecated: true })[0].deprecated, true);
+  const [pseudo] = terrio.listCrs("EPSG:3785", { includeDeprecated: true });
+  assert.equal(pseudo.deprecated, true);
+  assert.deepEqual(pseudo.replaced_by, [3857]);
   const both = terrio.listCrs("albers", { authority: ["epsg", "ESRI"] });
   assert.deepEqual([...new Set(both.map((e) => e.authority))].sort(), ["EPSG", "ESRI"]);
   assert.ok(terrio.listCrs(undefined, { authority: "IAU_2015" }).every((e) => e.authority === "IAU_2015"));
@@ -609,16 +668,27 @@ test("CRS transforms", () => {
   assert.equal(crs.epsg, 32633);
   assert.equal(JSON.parse(terrio.crsToProjjson("EPSG:32633")).conversion.name, "UTM zone 33N");
   assert.throws(() => terrio.crsToProjjson("+proj=longlat +lon_0=10 +datum=WGS84"), /lon_0/);
-  // PROJ 9.8.1's projinfo -o PROJ.
+  // PROJ 9.9.0's projinfo -o PROJ.
   assert.equal(terrio.crsToProj4("EPSG:32633"), "+proj=utm +zone=33 +datum=WGS84 +units=m +no_defs +type=crs");
-  // PROJ 9.8.1's WKT1_GDAL with GDAL's axes; none where it needs the PROJ4 extension, or PROJ
+  // GDAL 3.13.3's ExportToProj4 (PROJ 9.9.0, network off): GDAL's +towgs84, none with several
+  // transformations to WGS 84 (EPSG:27700), none for an engineering CRS.
+  assert.equal(
+    terrio.crsToProj4Gdal("EPSG:31467"),
+    "+proj=tmerc +lat_0=0 +lon_0=9 +k=1 +x_0=3500000 +y_0=0 +ellps=bessel +towgs84=598.1,73.7,418.2,0.202,0.045,-2.455,6.7 +units=m +no_defs",
+  );
+  assert.equal(
+    terrio.crsToProj4Gdal("EPSG:27700"),
+    "+proj=tmerc +lat_0=49 +lon_0=-2 +k=0.9996012717 +x_0=400000 +y_0=-100000 +ellps=airy +units=m +no_defs",
+  );
+  assert.equal(terrio.crsToProj4Gdal('LOCAL_CS["Engineering",LOCAL_DATUM["site",0],UNIT["metre",1],AXIS["X",EAST],AXIS["Y",NORTH]]'), undefined);
+  // PROJ 9.9.0's WKT1_GDAL with GDAL's axes; none where it needs the PROJ4 extension, or PROJ
   // writes no WKT 1 (geographic 3D).
   assert.match(terrio.crsToWkt1Strict("EPSG:32633"), /^PROJCS\["WGS 84 \/ UTM zone 33N",.*AUTHORITY\["EPSG","32633"\]\]$/);
   assert.equal(terrio.crsToWkt1Strict("+proj=longlat +ellps=clrk66 +nadgrids=conus +no_defs"), undefined);
   assert.equal(terrio.crsToWkt1Strict("EPSG:4979"), undefined);
   assert.match(crs.name, /UTM zone 33N/);
   assert.equal(crs.geographic, false);
-  // PROJ 9.8.1 resolves the authority version separately from the EPSG code.
+  // PROJ 9.9.0 resolves the authority version separately from the EPSG code.
   for (const reference of [
     "urn:ogc:def:crs:EPSG:6.6:4326",
     "urn:ogc:def:crs:EPSG:9.9:4326",
@@ -1257,6 +1327,26 @@ test("operations on in-memory rasters and layers", () => {
   }
   const like = terrio.rasterize(SQUARES, { burn: [5], like: terrio.rasterize(SQUARES, { burn: 1, ts: [60, 20] }) });
   assert.deepEqual([like.width, like.height], [60, 20]);
+  const background = terrio.rasterize(SQUARES, { burn: 100, init: 100, tr: [1, 1], te: [0, 0, 30, 10], ot: "Float32" });
+  for (const input of [background, background.toBytes("dem.tif")]) {
+    const edited = terrio.rasterize(SQUARES, { attribute: "value", background: input });
+    assert.equal(edited.dtype, "float32");
+    assert.equal(edited.readBand(1)[0], 3);
+    assert.equal(edited.readBand(1)[15], 100);
+    assert.equal(edited.readBand(1)[29], 7);
+    const lowered = terrio.rasterize(SQUARES, { burn: -2.5, add: true, background: input });
+    assert.equal(lowered.readBand(1)[0], 97.5);
+    assert.equal(lowered.readBand(1)[15], 100);
+    assert.equal(background.readBand(1)[0], 100);
+  }
+  assert.throws(() => terrio.rasterize(SQUARES, { burn: 1, background, init: 0 }), /background cannot/);
+  assert.throws(() => terrio.rasterize(SQUARES, { burn: 1, background, like }), /background cannot/);
+  const packed = terrio.rasterize(SQUARES, { burn: 1, init: 1, like: background, ot: "Byte" })
+    .toBytes("packed.tif", { creationOptions: { NBITS: "1" } });
+  const unpacked = terrio.rasterize(SQUARES, { burn: 2, background: packed });
+  const writtenEdit = terrio.open(unpacked.toBytes("edited.tif"), "edited.tif");
+  assert.equal(writtenEdit.readBand(1)[0], 2);
+  assert.equal(writtenEdit.readBand(1)[15], 1);
   const cut = terrio.warp(terrio.rasterize(SQUARES, { burn: 1, tr: [1, 1], te: [0, 0, 30, 10], ot: "Byte", init: 9 }), {
     cutline: { type: "Polygon", coordinates: [[[0, 0], [5, 0], [5, 5], [0, 5], [0, 0]]] },
     cropToCutline: true,
@@ -1816,7 +1906,27 @@ test("remote files read with range requests", async () => {
     assert.ok(fgb.stats().bytes - before < fgb.size / 4);
 
     const pq = parquet && (await terrio.openUrl(server.url + "cells.parquet"));
+    let small, misnamed;
     if (pq) {
+      // Opened from its end, where the footer is: one request, not the first block and then the end.
+      const requests = server.stats.requests;
+      small = await terrio.openUrl(server.url + "cells.parquet", { blockSize: 4096 });
+      assert.equal(server.stats.requests - requests, 1);
+      assert.deepEqual(small.info().rowGroups, pq.info().rowGroups);
+      // The end asked for, answered with other bytes whose header hides the total: refused, not
+      // stored as the end.
+      const whole = readFileSync(join(dir, "cells.parquet"));
+      const misplaced = async (url, init) => {
+        if (init?.headers?.Range === "bytes=-8192") {
+          return new Response(whole.subarray(0, 8192), { status: 206, headers: { "Content-Range": "bytes 0-8191/*" } });
+        }
+        return fetch(url, init);
+      };
+      await assert.rejects(terrio.openUrl(server.url + "cells.parquet", { blockSize: 4096, fetch: misplaced }), /Content-Range/);
+      // Another format under a GeoParquet name: found by its first bytes, as before.
+      writeFileSync(join(dir, "dem.parquet"), readFileSync(join(dir, "dem.tif")));
+      misnamed = await terrio.openUrl(server.url + "dem.parquet");
+      assert.deepEqual([misnamed.kind, misnamed.width], ["raster", 1500]);
       const groups = pq.info().rowGroups;
       assert.equal(groups.reduce((s, g) => s + g.rows, 0), 1500);
       const last = await pq.read({ rowGroups: [groups.length - 1] });
@@ -1852,7 +1962,7 @@ test("remote files read with range requests", async () => {
 
     await assert.rejects(terrio.openUrl(server.url + "missing.tif"), /404/);
     // The requests the server saw are those terrio counted.
-    const counted = [cog, busy, fgb, pq, tiles, copc].filter(Boolean).reduce((s, d) => s + d.stats().bytes, 0);
+    const counted = [cog, busy, fgb, pq, small, misnamed, tiles, copc].filter(Boolean).reduce((s, d) => s + d.stats().bytes, 0);
     assert.equal(counted, server.stats.bytes);
   } finally {
     server.close();
@@ -3310,7 +3420,7 @@ test("HEALPix and rHEALPix match PROJ", () => {
       }
     }
     // On the edge of the image the last bit moves the point in or out of it (the platform's
-    // libm, and PROJ 9.8.1's US survey foot in these methods' own +units, 0.304800609601219,
+    // libm, and PROJ 9.9.0's US survey foot in these methods' own +units, 0.304800609601219,
     // where terrio has 1200/3937): there either is right, and a point terrio unprojects must be
     // the projected one. As in crates/terrio-crs/tests/healpix.rs.
     const edge = new Set(c.edge_samples);
@@ -3338,7 +3448,12 @@ test("HEALPix and rHEALPix match PROJ", () => {
 
 test("ISEA matches PROJ", () => {
   const reference = JSON.parse(readFileSync(new URL("../../crates/terrio-crs/tests/data/isea_reference.json", import.meta.url), "utf8"));
-  const near = (actual, [lon, lat]) => Math.abs(((actual[0] - lon + 540) % 360 - 180) * Math.cos(lat * Math.PI / 180)) <= 1e-8 && Math.abs(actual[1] - lat) <= 1e-8;
+  // 1e-5 within 0.001 degrees of a pole, where the latitude is the arcsine of a number near 1
+  // (crates/terrio-crs/tests/isea.rs).
+  const near = (actual, [lon, lat]) => {
+    const tolerance = Math.abs(lat) > 89.999 ? 1e-5 : 1e-8;
+    return Math.abs(((actual[0] - lon + 540) % 360 - 180) * Math.cos(lat * Math.PI / 180)) <= tolerance && Math.abs(actual[1] - lat) <= tolerance;
+  };
   for (const c of reference.cases) {
     const samples = c.samples;
     for (const target of [c.target, c.wkt2, c.wkt1, c.wkt1_esri]) {
@@ -3347,8 +3462,7 @@ test("ISEA matches PROJ", () => {
         assert.ok(Math.abs(result[j][i] - samples[i][2][j]) * c.metres_per_unit <= 0.001, `${c.name} forward ${i}/${j}`);
       }
     }
-    // PROJ's inverse, which is not the forward's on an ellipsoid and is refused outside its
-    // default grid. As in crates/terrio-crs/tests/isea.rs.
+    // PROJ's inverse, refused outside the unfolded net. As in crates/terrio-crs/tests/isea.rs.
     const pairs = samples.map(s => [s[2], s[3]]).concat(c.inverse_samples);
     const reversible = pairs.filter(([, e]) => e !== null);
     if (reversible.length > 0) {
@@ -5596,17 +5710,19 @@ test("packed cubic translations and memory reads retain the GDAL sample domain",
 });
 
 test("engineering and long vertical WKT roots keep their CRS identity", () => {
-  // Independent metadata reference: GDAL 3.13.3.
+  // Independent metadata reference: GDAL 3.13.3; the code PROJ 9.9.0 identifies (`proj_epsg`)
+  // where GDAL's root authority has none.
   const reference = JSON.parse(readFileSync(new URL("../../crates/terrio-crs/tests/data/wkt_keywords_reference.json", import.meta.url)));
   for (const c of reference.cases) {
+    const epsg = c.proj_epsg ?? c.epsg;
     const actual = terrio.describeCrs(c.wkt);
-    assert.equal(actual.epsg, c.epsg, c.name);
+    assert.equal(actual.epsg, epsg, c.name);
     assert.equal(actual.geocentric, false, c.name);
     assert.equal(actual.wkt, c.wkt, c.name);
     const values = new Uint8Array([1, 2, 3, 4]);
     const raster = terrio.rasterFromArray(values, 2, 2, [0, 1, 0, 2, 0, -1], c.wkt);
     assert.deepEqual(Array.from(raster.readBand(1)), Array.from(values), c.name);
-    assert.equal(terrio.describeCrs(raster.crs).epsg, c.epsg, c.name);
+    assert.equal(terrio.describeCrs(raster.crs).epsg, epsg, c.name);
     raster.free();
   }
 });

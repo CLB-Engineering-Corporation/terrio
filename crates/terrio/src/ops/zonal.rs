@@ -210,9 +210,9 @@ pub fn time_text(iso: &str) -> String {
 /// The bands of one labelled input (a CLI `--inputs` row, a Python dict, a JavaScript object):
 /// each of `bands`, its fields named by [`label_prefix`] when the input has a time or a label,
 /// else `unlabelled(band)`. A label given to several bands is suffixed with each band's number
-/// (`B04_b1`, `B04_b2`), so that their fields say which band they hold. Every band gets a
-/// `label`, `bN` when the input gives none, so that outputs with a band dimension can name it.
-/// Blank times and labels are absent, as an empty `--inputs` cell is.
+/// (`B04_b1`, `B04_b2`), so that their fields say which band they hold. A band's `label` is
+/// set only when the input gives one. Blank times and labels are absent, as an empty `--inputs`
+/// cell is.
 pub fn labelled_bands(bands: &[usize], time: Option<&str>, label: Option<&str>, unlabelled: impl Fn(usize) -> String) -> Vec<ZonalBand> {
     let (time, label) = (time.filter(|t| !t.trim().is_empty()), label.filter(|l| !l.trim().is_empty()));
     bands
@@ -224,7 +224,7 @@ pub fn labelled_bands(bands: &[usize], time: Option<&str>, label: Option<&str>, 
                 None => format!("b{band}"),
             };
             let prefix = if time.is_some() || label.is_some() { label_prefix(time, &name) } else { unlabelled(band) };
-            ZonalBand { band, prefix, time: time.map(String::from), label: Some(name) }
+            ZonalBand { band, prefix, time: time.map(String::from), label: label.map(|_| name) }
         })
         .collect()
 }
@@ -802,6 +802,7 @@ struct Reducer {
     fractional: bool,
     fids: Vec<u64>,
     windows: Vec<Window>,
+    strip_rows: usize,
 }
 
 impl Reducer {
@@ -847,12 +848,30 @@ impl ZonalReducer {
         let fids = zones.features.iter().map(|f| f.fid).collect();
         let strip_rows = strip_rows.unwrap_or_else(|| super::strips::small_strip_rows(cols, 1, std::mem::size_of::<f64>(), None));
         let windows = reduce::strip_windows(&index, strip_rows);
-        Ok(Self { inner: Arc::new(Reducer { index, stats: options.stats.clone(), fractional: options.fractional, fids, windows }) })
+        Ok(Self {
+            inner: Arc::new(Reducer { index, stats: options.stats.clone(), fractional: options.fractional, fids, windows, strip_rows }),
+        })
     }
 
     /// The windows to supply, in order.
     pub fn windows(&self) -> &[Window] {
         &self.inner.windows
+    }
+
+    /// Estimated peak bytes of retained zone values per stream, including overlapping zones.
+    ///
+    /// Zero for statistics that do not retain values. Uses f64 lists as a conservative bound
+    /// for integer histograms, and includes temporary bins, ranks and fractional sorting pairs.
+    /// Excludes input pixels, result columns, zone indexes and allocator overhead.
+    pub fn retained_bytes(&self) -> usize {
+        if !self.inner.stats.iter().any(|s| s.needs_values()) {
+            return 0;
+        }
+        let pixels = reduce::open_pixels_peak(&self.inner.index, self.inner.strip_rows, usize::MAX);
+        // Binary: value (1 f64), bins (2), ranks (1). Fractional: value and coverage
+        // (2 f64s), plus sorting pairs (2). This conservatively includes temporary buffers.
+        const BYTES_PER_OPEN_PIXEL: usize = 4 * std::mem::size_of::<f64>();
+        pixels.saturating_mul(BYTES_PER_OPEN_PIXEL)
     }
 
     /// The number of features of the zone layer.

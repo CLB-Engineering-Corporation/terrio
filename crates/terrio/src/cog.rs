@@ -357,6 +357,13 @@ pub(crate) trait WindowSource: Send + Sync {
     /// Reads a window of some bands (numbered from 1) of a level (0 for full resolution, `i + 1`
     /// for overview `i`), band after band.
     fn read(&mut self, level: usize, window: Window, bands: &[usize]) -> Result<RasterData>;
+    /// Reads a window of some bands resampled to another size (from overviews `RasterIO`
+    /// chooses), as GDAL reads a virtual dataset of several sources: each source read for its
+    /// part of the output, from the overview it chooses itself. `None` for a source without such
+    /// a read, whose levels [`LazyRaster::read_resampled`] resamples. Reference: GDAL 3.13.3.
+    fn read_resampled(&mut self, _options: &crate::ResampledReadOptions) -> Result<Option<RasterData>> {
+        Ok(None)
+    }
     /// Reads the pixels at columns `cols` of rows `rows` of a level (see
     /// [`LazyRaster::read_sampled`]), when the source reads them from the blocks that hold them
     /// alone; `None` for a source that would read the window spanning them.
@@ -411,6 +418,9 @@ impl WindowSource for SharedRaster {
     }
     fn shared_clone(&self) -> Option<Box<dyn WindowSource>> {
         Some(Box::new(self.clone()))
+    }
+    fn read_resampled(&mut self, options: &crate::ResampledReadOptions) -> Result<Option<RasterData>> {
+        self.lock()?.source_read_resampled(options)
     }
     fn alpha_band(&self) -> Option<usize> {
         self.alpha
@@ -720,7 +730,7 @@ impl LazyRaster {
             let local = vfs::resolve(path)?;
             let file = local.path().to_path_buf();
             Ok::<_, Error>((
-                Source::File(BufReader::new(crate::geotiff::FileCursor::new(std::fs::File::open(&file)?))),
+                Source::File(crate::vfs::NearSeek::new(crate::geotiff::FileCursor::new(std::fs::File::open(&file)?))),
                 Some(local),
                 Some(file),
             ))
@@ -733,7 +743,7 @@ impl LazyRaster {
             }
             Location::Local(p) if !p.is_file() => return Ok(None),
             Location::Local(p) => {
-                (Source::File(BufReader::new(crate::geotiff::FileCursor::new(std::fs::File::open(p)?))), None, Some(p.clone()))
+                (Source::File(crate::vfs::NearSeek::new(crate::geotiff::FileCursor::new(std::fs::File::open(p)?))), None, Some(p.clone()))
             }
             // A member of a zip archive, stored or seek-optimized: read in place, without
             // extracting the archive (remote archives by range requests).
@@ -755,7 +765,7 @@ impl LazyRaster {
         // allowed. `LazyRaster::open` judges a local file's content before; a remote one's, and a
         // TIFF opened here directly, are judged here, after the first request.
         crate::formats::check_driver_allowed("GTiff", path, crate::formats::Kind::Raster)?;
-        let mut t = TiffRaster::new(source, local, limits)?;
+        let mut t = TiffRaster::new::<true>(source, local, limits)?;
         t.files.push(path.to_string());
         if let Location::Local(p) = &loc
             && t.tags.apply_sidecar_crs(p)
@@ -815,7 +825,7 @@ impl LazyRaster {
         let limits = limits()?;
         // Opened as a GeoTIFF by its caller: only if the GTiff driver is allowed.
         crate::formats::check_driver_allowed("GTiff", "a GeoTIFF in memory", crate::formats::Kind::Raster)?;
-        let t = TiffRaster::new(source, None, limits)?;
+        let t = TiffRaster::new::<true>(source, None, limits)?;
         t.tags.warn_unreadable("a GeoTIFF in memory");
         Ok(Some(Self { inner: Inner::Tiff(Box::new(t)), sidecar_mask: None, asset_policy: crate::stac::AssetReadPolicy::current() }))
     }
@@ -825,7 +835,31 @@ impl LazyRaster {
     /// again. Returns `None` when the file is not a TIFF. Refused when it declares more than
     /// `TERRIO_MAX_DECLARED_BYTES` or `TERRIO_MAX_BANDS` allow, as [`LazyRaster::open`] refuses it.
     pub fn from_sparse(file: crate::sparse::SparseFile) -> Result<Option<Self>> {
-        declared_allowed(Self::from_sparse_using(file, TiffReadLimits::from_config))
+        declared_allowed(Self::from_sparse_using::<true>(file, TiffReadLimits::from_config))
+    }
+
+    /// [`LazyRaster::from_sparse`] with the CRS reduced to the EPSG code the GeoKeys name: opening
+    /// does not run the CRS engine. [`LazyRaster::crs`] still builds a spatial reference from that
+    /// code through the engine, so only a build that opens GeoTIFFs this way, reads them with
+    /// [`LazyRaster::read_geotiff_samples`] and asks for the CRS with [`LazyRaster::geotiff_epsg`]
+    /// alone leaves the engine out (terrio-js/cog). A user-defined or vertical CRS is not read;
+    /// [`LazyRaster::crs`] then has no CRS, or only the horizontal one.
+    ///
+    /// ```no_run
+    /// use terrio::sparse::{SparseFile, read_with};
+    /// use terrio::{LazyRaster, Window, WindowOptions};
+    ///
+    /// let bytes = std::fs::read("dem.tif")?; // the remote file, fetched by range in practice
+    /// let file = SparseFile::new(bytes.len() as u64);
+    /// let fetch = |offset: u64, len: u64| Ok(bytes[offset as usize..(offset + len) as usize].to_vec());
+    /// let mut dem = read_with(&file, 64, fetch, || LazyRaster::from_sparse_epsg_only(file.clone()))?.expect("a TIFF");
+    /// let epsg = dem.geotiff_epsg();
+    /// let options = WindowOptions { bands: vec![1], overview: None };
+    /// let pixels = read_with(&file, 64, fetch, || dem.read_geotiff_samples(Window::new(0, 0, 256, 256), &options))?;
+    /// # Ok::<(), terrio::Error>(())
+    /// ```
+    pub fn from_sparse_epsg_only(file: crate::sparse::SparseFile) -> Result<Option<Self>> {
+        declared_allowed(Self::from_sparse_using::<false>(file, TiffReadLimits::from_config))
     }
 
     /// Opens the array at `key` (`""` for the store's root: a group's single array) of a Zarr
@@ -844,10 +878,13 @@ impl LazyRaster {
 
     /// [`LazyRaster::from_sparse`] with other decoding limits than the defaults.
     pub fn from_sparse_with_limits(file: crate::sparse::SparseFile, limits: TiffReadLimits) -> Result<Option<Self>> {
-        declared_allowed(Self::from_sparse_using(file, || Ok(limits)))
+        declared_allowed(Self::from_sparse_using::<true>(file, || Ok(limits)))
     }
 
-    fn from_sparse_using(file: crate::sparse::SparseFile, limits: impl FnOnce() -> Result<TiffReadLimits>) -> Result<Option<Self>> {
+    fn from_sparse_using<const ENGINE: bool>(
+        file: crate::sparse::SparseFile,
+        limits: impl FnOnce() -> Result<TiffReadLimits>,
+    ) -> Result<Option<Self>> {
         let mut source = Source::sparse(file);
         source.seek(SeekFrom::Start(0))?;
         let mut magic = [0u8; 4];
@@ -859,7 +896,7 @@ impl LazyRaster {
         // Opened as a GeoTIFF by its caller: only if the GTiff driver is allowed.
         crate::formats::check_driver_allowed("GTiff", "a remote GeoTIFF", crate::formats::Kind::Raster)?;
         source.seek(SeekFrom::Start(0))?;
-        let t = TiffRaster::new(source, None, limits)?;
+        let t = TiffRaster::new::<ENGINE>(source, None, limits)?;
         t.tags.warn_unreadable("a remote GeoTIFF");
         Ok(Some(Self { inner: Inner::Tiff(Box::new(t)), sidecar_mask: None, asset_policy: crate::stac::AssetReadPolicy::current() }))
     }
@@ -1101,6 +1138,18 @@ impl LazyRaster {
     pub fn geotiff_has_geo_transform(&self) -> Option<bool> {
         match &self.inner {
             Inner::Tiff(t) => Some(t.tags.corner_geo_transform().is_some()),
+            Inner::Memory(_) | Inner::Source(..) => None,
+        }
+    }
+
+    /// The EPSG code a GeoTIFF's CRS has, without resolving the CRS: after
+    /// [`LazyRaster::from_sparse_epsg_only`], the code of ProjectedCSTypeGeoKey, or of
+    /// GeographicTypeGeoKey in a geographic model; after other opens, the code the CRS was
+    /// identified with, which a compound CRS does not have. `None` without one, and for other
+    /// formats.
+    pub fn geotiff_epsg(&self) -> Option<u32> {
+        match &self.inner {
+            Inner::Tiff(t) => t.tags.epsg,
             Inner::Memory(_) | Inner::Source(..) => None,
         }
     }
@@ -1573,6 +1622,27 @@ impl LazyRaster {
         Ok(dataset)
     }
 
+    /// The samples of a window of some bands of a GeoTIFF, band after band, as
+    /// [`LazyRaster::read_window`] reads them, without the dataset it builds around them: no mask
+    /// is applied and no CRS resolved, so a build that reads only this way and with
+    /// [`LazyRaster::geotiff_epsg`] leaves the CRS engine out (terrio-js/cog).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidArgument`] for a raster that is not a GeoTIFF, a window outside the image or
+    /// overview, or a band that does not exist; the read's own errors otherwise.
+    pub fn read_geotiff_samples(&mut self, window: Window, options: &WindowOptions) -> Result<RasterData> {
+        let _scope = self.enter_asset_read()?;
+        let (lw, lh) = self.level_size(options.overview)?;
+        window.check(lw, lh)?;
+        let bands = read_bands(&options.bands, self.band_count())?;
+        crate::dataset::fallible::check_raster_buffer("a window", window.width, window.height, bands.len(), self.data_type())?;
+        match &mut self.inner {
+            Inner::Tiff(t) => t.read(options.overview.map_or(0, |i| i + 1), window, &bands),
+            Inner::Memory(_) | Inner::Source(..) => Err(Error::InvalidArgument("not a GeoTIFF".into())),
+        }
+    }
+
     /// The nodata values of some bands (numbered from 1) at full resolution or of an overview,
     /// whose own tags a GeoTIFF's overview may carry.
     pub fn level_band_nodata(&self, bands: &[usize], overview: Option<usize>) -> Vec<Option<f64>> {
@@ -1974,6 +2044,14 @@ impl LazyRaster {
         value
     }
 
+    /// [`WindowSource::read_resampled`] of a raster another driver reads; `None` for others.
+    pub(crate) fn source_read_resampled(&mut self, options: &crate::ResampledReadOptions) -> Result<Option<RasterData>> {
+        match &mut self.inner {
+            Inner::Source(_, source) => source.read_resampled(options),
+            _ => Ok(None),
+        }
+    }
+
     /// A raster read by window by `source`, described by `header` (a dataset without pixels).
     pub(crate) fn from_source(header: RasterDataset, source: Box<dyn WindowSource>) -> Self {
         Self { inner: Inner::Source(Arc::new(header), source), sidecar_mask: None, asset_policy: crate::stac::AssetReadPolicy::current() }
@@ -2205,7 +2283,7 @@ impl AsRef<[u8]> for SharedBytes {
 
 /// Where a TIFF's bytes come from.
 enum Source {
-    File(BufReader<crate::geotiff::FileCursor>),
+    File(crate::vfs::NearSeek<crate::geotiff::FileCursor>),
     Memory(std::io::Cursor<SharedBytes>),
     #[cfg(remote)]
     Http(crate::http::RangeReader),
@@ -2431,13 +2509,15 @@ fn tiff_err(e: tiff::TiffError) -> Error {
 }
 
 impl TiffRaster {
-    fn new(mut source: Source, local: Option<vfs::LocalPath>, limits: TiffReadLimits) -> Result<Self> {
+    /// Opens a TIFF; without the CRS engine (`ENGINE` false), its CRS is only the EPSG code its
+    /// GeoKeys name.
+    fn new<const ENGINE: bool>(mut source: Source, local: Option<vfs::LocalPath>, limits: TiffReadLimits) -> Result<Self> {
         let zip = match &source {
             Source::Zip(member) => member.reopen(),
             _ => None,
         };
         let uploaded = matches!(&source, Source::Memory(_));
-        let tags = try_read_geo_tags_from(&mut source)
+        let tags = if ENGINE { try_read_geo_tags_from(&mut source) } else { crate::geotiff::try_read_geo_tags_epsg_only(&mut source) }
             .map_err(|error| {
                 // Invalid metadata is malformed input regardless of its source. An immutable
                 // buffer's EOF is malformed too; live EOF errors retain their I/O causes.
@@ -2560,7 +2640,11 @@ impl TiffRaster {
             return Ok(());
         }
         let Ok(file) = std::fs::File::open(path) else { return Ok(()) };
-        let mut ovr = match TiffRaster::new(Source::File(BufReader::new(crate::geotiff::FileCursor::new(file))), None, self.limits) {
+        let mut ovr = match TiffRaster::new::<true>(
+            Source::File(crate::vfs::NearSeek::new(crate::geotiff::FileCursor::new(file))),
+            None,
+            self.limits,
+        ) {
             Ok(ovr) => ovr,
             Err(error) if error.is_resource_refusal() => return Err(error),
             Err(_) => return Ok(()),
@@ -2912,6 +2996,63 @@ impl TiffRaster {
         if misses.is_empty() {
             return Ok(out);
         }
+        // An uncompressed strip that takes more than the chunk limit (an image stored as one
+        // strip, as TIFF 6.0 allows) is read by the rows the window needs, at their offsets in the
+        // file, a few at a time, when those rows fit the limit: the limit then bounds what the
+        // read holds, not what the strip declares. Only for a strip the file holds whole; one cut
+        // short or declared past the end of the file is decoded, and refused, as any chunk.
+        if compression == 1 && !self.complex && dec.get_chunk_type() == tiff::decoder::ChunkType::Strip {
+            let limit = self.limits.chunk_bytes as u64;
+            let row_bytes = cw.checked_mul(spp).and_then(|n| n.checked_mul(self.data_type.size_bytes())).filter(|n| *n > 0);
+            // (first row, rows) of the strip to read by rows, when it is.
+            let by_rows = |idx: u32, row_bytes: usize| -> Option<(usize, usize)> {
+                let rows = ch.min(lh - (idx as usize % per_plane) * ch);
+                let strip = (rows as u64).checked_mul(row_bytes as u64)?;
+                let (offset, count) = tables.get(idx as usize)?;
+                let y0 = targets[&idx][0].1;
+                let (first, end) = (w.y.max(y0) - y0, (w.y + w.height).min(y0 + rows) - y0);
+                let held = count >= strip && offset.checked_add(count).is_some_and(|stop| stop <= self.file_len);
+                (strip > limit && held && (end - first) as u64 * row_bytes as u64 <= limit).then_some((first, end - first))
+            };
+            if let Some(row_bytes) = row_bytes
+                && misses.iter().any(|idx| by_rows(*idx, row_bytes).is_some())
+                && stored_as_decoded(dec, self.data_type)?
+            {
+                let batch = (STRIP_ROWS_BYTES / row_bytes).max(1);
+                let mut whole: Vec<u32> = Vec::new();
+                crate::dataset::fallible::reserve(&mut whole, misses.len(), what)?;
+                for &idx in &misses {
+                    let Some((first, rows)) = by_rows(idx, row_bytes) else {
+                        whole.push(idx);
+                        continue;
+                    };
+                    let offset = tables.offsets[idx as usize];
+                    let mut row = first;
+                    while row < first + rows {
+                        let n = batch.min(first + rows - row);
+                        let at = offset + row as u64 * row_bytes as u64;
+                        // One row larger than the batch is held whole: refused, as a whole strip
+                        // is, when the process cannot hold it.
+                        crate::dataset::fallible::check_usable(n.checked_mul(row_bytes), || "a TIFF strip row".into())
+                            .map_err(Error::ResourceLimit)?;
+                        dec.inner().get_ref().prefetch(&[(at, (n * row_bytes) as u64)])?;
+                        let mut bytes = Vec::new();
+                        crate::dataset::fallible::reserve(&mut bytes, n * row_bytes, "TIFF strip rows")?;
+                        bytes.resize(n * row_bytes, 0u8);
+                        dec.inner().seek(SeekFrom::Start(at))?;
+                        dec.inner().read_exact(&mut bytes)?;
+                        let samples = stored_samples(bytes, self.data_type, self.tags.little_endian)?;
+                        let placed: Vec<ChunkTarget> = targets[&idx].iter().map(|&(x0, y0, map)| (x0, y0 + row, map)).collect();
+                        place_decoded(&mut out, &samples, (cw, n), &placed, w, spp)?;
+                        row += n;
+                    }
+                }
+                misses = whole;
+                if misses.is_empty() {
+                    return Ok(out);
+                }
+            }
+        }
         let mut ranges: Vec<(u64, u64)> = Vec::new();
         crate::dataset::fallible::reserve(&mut ranges, misses.len(), what)?;
         ranges.extend(misses.iter().filter_map(|i| tables.get(*i as usize)));
@@ -2937,7 +3078,7 @@ impl TiffRaster {
                         let mut file = file.clone();
                         file.seek(SeekFrom::Start(0))?;
                         let len = file.len()?;
-                        (Source::File(BufReader::new(file)), len)
+                        (Source::File(crate::vfs::NearSeek::new(file)), len)
                     }
                     Reopened::Memory(bytes) => (Source::Memory(std::io::Cursor::new(bytes.clone())), bytes.as_ref().len() as u64),
                     Reopened::Zip(member) => {
@@ -2973,6 +3114,58 @@ impl TiffRaster {
         })?;
         Ok(out)
     }
+}
+
+/// The bytes read at a time from an uncompressed strip larger than the chunk limit.
+const STRIP_ROWS_BYTES: usize = 8 << 20;
+
+/// Whether the bytes of the decoder's uncompressed image are its samples as the `tiff` crate
+/// returns them, in the file's byte order: whole-byte samples of `data_type`, most significant
+/// bit first, without a predictor, and of a photometric interpretation the crate leaves as
+/// stored (it inverts WhiteIsZero).
+fn stored_as_decoded<R: Read + Seek>(dec: &mut Decoder<R>, data_type: DataType) -> Result<bool> {
+    let tag = |dec: &mut Decoder<R>, tag| dec.find_tag_unsigned::<u16>(tag).map_err(tiff_err);
+    let list = |dec: &mut Decoder<R>, tag| dec.find_tag_unsigned_vec::<u16>(tag).map_err(tiff_err);
+    let format = match data_type {
+        DataType::U8 | DataType::U16 | DataType::U32 | DataType::U64 => 1,
+        DataType::I8 | DataType::I16 | DataType::I32 | DataType::I64 => 2,
+        DataType::F32 | DataType::F64 => 3,
+    };
+    let bits = (data_type.size_bytes() * 8) as u16;
+    Ok(tag(dec, Tag::Predictor)?.unwrap_or(1) == 1
+        && tag(dec, Tag::FillOrder)?.unwrap_or(1) == 1
+        && matches!(tag(dec, Tag::PhotometricInterpretation)?, Some(1..=3))
+        && list(dec, Tag::BitsPerSample)?.is_some_and(|v| !v.is_empty() && v.iter().all(|b| *b == bits))
+        && list(dec, Tag::SampleFormat)?.unwrap_or_default().iter().all(|f| *f == format))
+}
+
+/// The samples of `data_type` stored in `bytes`, in the file's byte order.
+fn stored_samples(bytes: Vec<u8>, data_type: DataType, little_endian: bool) -> Result<DecodingResult> {
+    macro_rules! samples {
+        ($variant:ident, $t:ty) => {{
+            const N: usize = std::mem::size_of::<$t>();
+            let value = |b: &[u8]| {
+                let b: [u8; N] = b.try_into().expect("chunks_exact gives N bytes");
+                if little_endian { <$t>::from_le_bytes(b) } else { <$t>::from_be_bytes(b) }
+            };
+            let mut samples: Vec<$t> = Vec::new();
+            crate::dataset::fallible::reserve(&mut samples, bytes.len() / N, "TIFF strip samples")?;
+            samples.extend(bytes.chunks_exact(N).map(value));
+            DecodingResult::$variant(samples)
+        }};
+    }
+    Ok(match data_type {
+        DataType::U8 => DecodingResult::U8(bytes),
+        DataType::I8 => samples!(I8, i8),
+        DataType::U16 => samples!(U16, u16),
+        DataType::I16 => samples!(I16, i16),
+        DataType::U32 => samples!(U32, u32),
+        DataType::I32 => samples!(I32, i32),
+        DataType::U64 => samples!(U64, u64),
+        DataType::I64 => samples!(I64, i64),
+        DataType::F32 => samples!(F32, f32),
+        DataType::F64 => samples!(F64, f64),
+    })
 }
 
 /// Places a decoded chunk, whose image data is `dims` (width, height) pixels, into the window `w`
@@ -4197,8 +4390,8 @@ mod tests {
         let path = dir.path().join("tiled.tif");
         write_tiled_tiff(&path, (64, 64, 1), sequence(DataType::U8, 64 * 64, 1), &[]);
         let file = std::fs::File::open(&path).unwrap();
-        let source = Source::File(BufReader::new(crate::geotiff::FileCursor::new(file)));
-        let mut r = TiffRaster::new(source, None, TiffReadLimits::default()).unwrap();
+        let source = Source::File(crate::vfs::NearSeek::new(crate::geotiff::FileCursor::new(file)));
+        let mut r = TiffRaster::new::<true>(source, None, TiffReadLimits::default()).unwrap();
         r.read_samples(0, Window::full(64, 64), &[1]).unwrap();
         let handle = r.cache_handle;
         assert!(crate::block_cache::get(handle, 0, 0).is_some());

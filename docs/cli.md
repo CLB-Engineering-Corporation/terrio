@@ -295,7 +295,7 @@ terrio formats [--json]
 ## crs
 
 ```sh
-terrio crs CRS [--wkt] [--projjson | --proj4 | --wkt1-strict]
+terrio crs CRS [--wkt | --projjson | --proj4 | --proj4-gdal | --wkt1-strict]
 terrio crs SRC --to DST [--s_coord_epoch YEAR] [--t_coord_epoch YEAR] X Y [X Y ...]
 echo "X Y [Z [T]]" | terrio crs SRC --to DST [--s_coord_epoch YEAR] [--t_coord_epoch YEAR]
 ```
@@ -308,6 +308,10 @@ year) use it for time-dependent transformations, and a point that cannot be tran
 [Writing PROJJSON](crs.md#writing-projjson)); it cannot be combined with `--to` or `--wkt`.
 `--proj4` prints only the PROJ string, as `projinfo -o PROJ` writes it, which leaves out the
 datum transformation of an EPSG CRS (see [Writing PROJ strings](crs.md#writing-proj-strings)).
+`--proj4-gdal` prints the PROJ string GDAL 3.13.3 writes. For an EPSG or ESRI code, or a WKT whose
+root names one, it adds GDAL's `+towgs84` where PROJ finds a single transformation to WGS 84 for the
+CRS's area of use (EPSG:31467 gets one; EPSG:27700 has several, so it gets none), and a compound
+CRS's geoid model.
 `--wkt1-strict` prints only the WKT 1 without GDAL's PROJ4 extension, for a `.prj` file whose
 readers ignore it, and fails where WKT 1 needs the extension or PROJ writes none (see
 [Writing strict WKT 1](crs.md#writing-strict-wkt-1)).
@@ -1135,6 +1139,17 @@ every periodic image inside its support; it does not clip the filter at the stor
 This source-extension rule applies under both grid policies and can differ from GDAL's
 finite-edge clipping for coarse global filters.
 
+That is right for a field that is continuous across the stored edge. For one that is not, such
+as longitudes, class codes or a product made per hemisphere or per tile, pass
+`--periodic-longitude false`: interpolation neighbors then stay inside the stored columns, as
+for a regional source, and the edge columns are not blended. A point a whole turn away is still
+found on the source, so nearest-neighbour results do not change, and area methods and `sum`
+still count both stored edges under a footprint that crosses the cut: they measure what the
+footprint covers, and `sum` would otherwise lose it.
+Python's `warp`, `terrio.rio`'s `reproject` and `WarpedVRT` accept
+`periodic_longitude=False`; JavaScript's `warp` accepts `periodicLongitude: false`. A
+serialized warped VRT cannot record it: write a materialized output.
+
 Regional geographic sources also accept a longitude a whole turn away when it falls inside
 their stored columns. A source from 160° E to 200° E therefore covers 180° to 160° W.
 The shift uses the CRS's angular period, rather than the regional raster's width. A source
@@ -1314,6 +1329,12 @@ Terrio's chunk-dependent source windows of kernels other than `sum` also reach a
 source's CRS inside or beside their chunk, which the points sampled along the chunk's edges do not
 bound, so that a grid holding a pole is written up to it. Values in such a chunk can therefore
 differ from those of a window bounded by those points alone.
+With the 3.12 kernel scales, a chunk of a periodic source covering one longitude turn whose
+sampled points cross the 180° meridian takes its scale from the arc of longitudes those points
+span across the meridian, when it is shorter than half a turn, rather than from their least and
+greatest longitudes, which lie the long way round: chunks mirrored across the meridian get
+mirrored kernels. With `--periodic-longitude false`, the stored edges are a regional source's,
+and such a chunk keeps the scale of the stored columns between those longitudes.
 Both kernel-version selectors apply Terrio's periodic global-source boundaries and the
 pole-window extension described above; these policies can differ from GDAL's finite-edge
 or edge-only window planning even with chunk-dependent sampling selected.
@@ -2772,6 +2793,24 @@ s3://bucket/S2A_20240701/B08.tif,2024-07-01,B08
 s3://bucket/S2B_20240711/B04.tif,2024-07-11,B04
 ```
 
+An output ending in `.zarr` (or `-f Zarr`) gets the statistics as a cube instead of a layer:
+a Zarr v3 store with one variable, named after the store (`ndvi.zarr` holds `ndvi`), of dims
+`(geometry, time, band, statistic)`:
+
+```sh
+terrio zonal-stats fields.gpkg ndvi.zarr --inputs s2.csv --stats mean,median
+```
+
+- `time` is present when the `--inputs` rows have times (then every row needs one), as CF times
+  when they are ISO 8601 dates; `band` when rows have labels or there are several bands. A date
+  without one of the bands holds NaN for it; two rows on the same time and label are an error.
+- The zones are stored as CF-1.8 polygon geometries with a CF grid mapping of their CRS, their
+  fields and FIDs (`feature_id`) as coordinates along `geometry`: xarray opens the store, and
+  cf_xarray and xvec decode the geometries. A zone without a polygon geometry is an error, as
+  CF cannot store it.
+- `--t-srs`, `--decimal-places`, `--nln`, `--append` and `--overwrite` do not apply, and the zones
+  input must have one layer.
+
 `zonal-stats` (alias `zonal`) adds statistics independently for each polygon or multipolygon.
 Repeat `--raster` for multiple rasters (or give `--raster @FILE`, a list of paths one per line)
 and use `--band` for comma-separated bands from each. `--inputs FILE` reads a CSV table with a
@@ -3611,13 +3650,53 @@ separately supports preserving its input declaration.
 ## rasterize
 
 ```sh
-terrio rasterize INPUT OUTPUT (--burn VALUE | -a FIELD) (--tr X Y | --ts W H | --like RASTER) [options]
+terrio rasterize INPUT OUTPUT (--burn VALUE | -a FIELD) (--tr X Y | --ts W H | --like RASTER | --background RASTER) [options]
 ```
 
 `-l`, `--sql`, `--where`, `--te`, `--tap`, `--ot`, `--init`, `--a-nodata`, `--at` (all touched),
 `--add`, `--a-srs`. Points, lines and polygons are burned with GDAL's algorithms, pixel for pixel.
 
-Without `--init`, the background starts at `--a-nodata` when given, otherwise at 0.
+To edit a DEM with elevation attributes from a polyline or polygon shapefile, copy the DEM
+as the background. Uncovered pixels retain their original elevations over its full extent:
+
+```sh
+terrio rasterize edits.shp edited_dem.tif --background dem.tif --attribute Elevation
+# Raise or lower existing elevations by a signed attribute, rather than setting absolute heights:
+terrio rasterize edits.shp adjusted_dem.tif --background dem.tif --attribute Offset --add
+```
+
+`--like` copies only a raster's grid; `--background` copies its pixels, grid, type, metadata
+and nodata declarations. The input remains unchanged; the output is written
+as a whole new raster, not updated tile by tile. Background rasters are read into memory.
+Cached statistics are removed because the edits can change them.
+All bands are edited: a single burn or attribute value applies to each, or give one burn
+per band. Vectors are reprojected when both CRSs are known and different. If either CRS is
+unknown, coordinates are used as given; the caller must ensure they use the same CRS.
+North-up, real-valued affine rasters
+are supported. `--background` refuses `--like`, `--tr`, `--ts`, `--te`, `--tap`, `--ot`,
+`--init`, `--a-nodata` and `--a-srs`, which would redefine the background.
+> **Nodata and elevation offsets:** `--add` also adds to covered nodata samples, as GDAL does.
+> A void of -9999 plus -2.5 becomes -10001.5 and is then marked valid because it no longer
+> equals the nodata sentinel. NaN remains NaN. Check voids before using additive DEM edits.
+
+Separate internal or sidecar validity masks are not copied by this in-memory operation;
+output nodata masks follow the edited values. Overlapping features replace in input order or
+add once per line or polygon feature with `--add`; points add per coordinate, so multiple
+points within one pixel accumulate even in a single MultiPoint, as GDAL does.
+`--where` can select the edits. A packed background retains its `NBITS` width only when the
+edited values still fit; otherwise packing is dropped for the whole raster and output uses
+the full width of the sample type. The TIFF writer uses one stored width for all bands.
+
+Burn and add values use **stored sample units**; band scale and offset are retained but
+are not applied to the edits. Convert physical heights or height offsets to stored units
+first. For example, with scale 0.1 and offset 0, burning 100 stores 100 and represents a
+physical height of 10; burn 1000 to represent a physical height of 100.
+
+The same operation is `terrio.rasterize("edits.shp", background="dem.tif", attribute="Elevation")`
+in Python, `rasterize(edits, { background: dem, attribute: "Elevation" })` in JavaScript
+(datasets or bytes), and `ops::rasterize::rasterize_on` in Rust.
+
+For new rasters without `--background` or `--init`, pixels start at `--a-nodata` when given, otherwise at 0.
 Explicit `--init` values take precedence, including 0. This matches GDAL's new GeoTIFF
 background. Terrio uses this policy for all output formats and in-memory rasters; GDAL's
 initialization is driver-dependent (for example, its ENVI output defaults to 0).
@@ -4244,7 +4323,7 @@ for one command and its descendants. Required dataset arguments may be omitted;
 metadata requests open no datasets or output files. The Python package supports
 identical requests with `python -m terrio`.
 
-The payload has `schema_version: "0.1.6"`, `unstable: true`, the program/version,
+The payload has `schema_version: "0.1.12"`, `unstable: true`, the program/version,
 and a recursive `command` object. Each command records its canonical name/path,
 aliases, description, arguments and subcommands. Arguments include flags and
 aliases, positional index, type, raw default tokens, choices, required status,

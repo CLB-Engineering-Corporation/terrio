@@ -191,71 +191,80 @@ pub async fn open_url(url: String, options: JsValue) -> Result<RemoteDataset, Js
         #[cfg(feature = "zarr")]
         return open_zarr(path.to_string(), fetcher, o).await;
     }
-    // Blocks of 512 bytes to 16 MiB: the first request is one block.
-    let block = o.block_size.clamp(512, 16 << 20);
-    // The first block: the file's length, and its first bytes.
-    let first = fetcher.response(fetcher.request(Some((0, block - 1)), false)?).await?;
-    // A server that ignores `Range` sends the whole file: every block is then held, and nothing
-    // more is requested.
-    let len = match (first.status, first.total) {
-        (206, Some(total)) => total,
-        (206, None) => match fetcher.head_len().await? {
-            Some(len) => len,
-            None => {
-                return Err(JsError::new(&format!(
-                    "{url}: the server's response has no Content-Range (cross-origin servers must expose it) and no Content-Length"
-                )));
-            }
-        },
-        _ => first.data.len() as u64,
-    };
-    let file = SparseFile::with_block_size(len, block);
-    if first.status == 206 {
-        let expected = block.min(len);
-        first.validate_content_range(terrio::sparse::ObjectRange::At(0, expected), Some(len))?;
-        if first.data.len() as u64 != expected {
-            return Err(JsError::new("initial range response has an unexpected length"));
-        }
-    }
-    file.insert(0, &first.data);
-    let path = url.split(['?', '#']).next().unwrap_or(&url);
     let name = path.rsplit('/').next().filter(|n| !n.is_empty()).unwrap_or("remote").to_string();
-    let format = detect(&name, &first.data, o.format.as_deref())?;
+    // GeoParquet, as the URL or the options tell it: opened from the end, where its footer is.
+    // The first bytes, when held: read quietly, as bytes not held aren't to be fetched for this.
+    let head = |f: &SparseFile| f.quiet().read_exact_at(0, f.len().min(8) as usize).ok();
+    // A file whose end isn't Parquet's (`PAR1`) is opened from its start, as other formats are,
+    // from the bytes already fetched when they hold it (a whole file, or a first block).
+    let tail = if detect(&name, &[], o.format.as_deref()).is_ok_and(|f| f == "Parquet") {
+        let file = fetcher.open_file_tail(o.block_size).await?;
+        let parquet = file.len() >= 4 && file.quiet().read_exact_at(file.len() - 4, 4).is_ok_and(|end| end == b"PAR1");
+        (parquet || head(&file).is_some()).then_some(file)
+    } else {
+        None
+    };
+    let (file, early) = if let Some(file) = tail {
+        (file, None)
+    } else {
+        // Other formats from the start of the first block, as it arrives: the header of a GeoTIFF,
+        // PMTiles archive, COPC or FlatGeobuf file is its first bytes. A GeoParquet file the URL
+        // doesn't tell opens from the whole block.
+        fetcher
+            .open_file_arriving(o.block_size, |file| {
+                let head = file.read_exact_at(0, file.len().min(8) as usize)?;
+                match detect(&name, &head, o.format.as_deref()) {
+                    Ok(format) if format != "Parquet" && check_built(format).is_ok() => open_reader(format, file, &name),
+                    _ => Err(terrio::Error::InvalidData("opened from the whole first block".into())),
+                }
+            })
+            .await?
+    };
+    // Its magic number, or, for a GeoParquet file opened from its end alone, its name.
+    let head = head(&file).unwrap_or_default();
+    let format = detect(&name, &head, o.format.as_deref())?;
     check_built(format)?;
     let state = Rc::new(State { remote: Remote::new(file, None, fetcher, o.cache_size), name, format, reader: RefCell::new(None) });
+    if let Some((reader, arriving)) = early {
+        state.remote.wait_for_arriving(arriving);
+        *state.reader.borrow_mut() = Some(reader);
+        return Ok(RemoteDataset { state });
+    }
     let (file, name) = (state.remote.file.clone(), state.name.clone());
     state
         .run(|r| {
-            *r = Some(match format {
-                "GTiff" => Reader::Raster(
-                    LazyRaster::from_sparse(file.clone())?.ok_or_else(|| terrio::Error::InvalidData(format!("'{name}' is not a TIFF")))?,
-                ),
-                #[cfg(feature = "tiles")]
-                "PMTiles" => {
-                    let archive = TileArchive::from_sparse(file.clone())?;
-                    let raster = if archive.is_vector() {
-                        None
-                    } else {
-                        Some(LazyRaster::from_tile_archive(TileArchive::from_sparse(file.clone())?)?)
-                    };
-                    Reader::Tiles(archive, raster)
-                }
-                #[cfg(feature = "pointcloud")]
-                "COPC" => Reader::Points(Box::new(terrio::pointcloud::open_points_sparse(file.clone(), &name)?)),
-                #[cfg(feature = "flatgeobuf")]
-                "FlatGeobuf" => {
-                    let (info, _) = terrio::vector::read_flatgeobuf_header_sparse(&file, &name)?;
-                    Reader::FlatGeobuf(info)
-                }
-                #[cfg(feature = "parquet")]
-                "Parquet" => Reader::Parquet(terrio::vector::geoparquet_row_groups_sparse(&file)?),
-                // Checked before: see `check_built`.
-                other => return Err(crate::not_built(feature_of(other).unwrap_or(other))),
-            });
+            *r = Some(open_reader(format, &file, &name)?);
             Ok(())
         })
         .await?;
     Ok(RemoteDataset { state })
+}
+
+/// Reads the header of a remote file of `format` (detected, and built).
+fn open_reader(format: &'static str, file: &SparseFile, name: &str) -> terrio::Result<Reader> {
+    Ok(match format {
+        "GTiff" => Reader::Raster(
+            LazyRaster::from_sparse(file.clone())?.ok_or_else(|| terrio::Error::InvalidData(format!("'{name}' is not a TIFF")))?,
+        ),
+        #[cfg(feature = "tiles")]
+        "PMTiles" => {
+            let archive = TileArchive::from_sparse(file.clone())?;
+            let raster =
+                if archive.is_vector() { None } else { Some(LazyRaster::from_tile_archive(TileArchive::from_sparse(file.clone())?)?) };
+            Reader::Tiles(archive, raster)
+        }
+        #[cfg(feature = "pointcloud")]
+        "COPC" => Reader::Points(Box::new(terrio::pointcloud::open_points_sparse(file.clone(), name)?)),
+        #[cfg(feature = "flatgeobuf")]
+        "FlatGeobuf" => {
+            let (info, _) = terrio::vector::read_flatgeobuf_header_sparse(file, name)?;
+            Reader::FlatGeobuf(info)
+        }
+        #[cfg(feature = "parquet")]
+        "Parquet" => Reader::Parquet(terrio::vector::geoparquet_row_groups_sparse(file)?),
+        // Checked before: see `check_built`.
+        other => return Err(crate::not_built(feature_of(other).unwrap_or(other))),
+    })
 }
 
 /// Opens the array `o.array` of the Zarr store (or group) at `url`, its objects fetched as reads

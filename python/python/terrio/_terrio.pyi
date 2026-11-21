@@ -136,6 +136,7 @@ __all__ = [
     "proj_boolean_parameters",
     "crs_to_projjson",
     "crs_to_proj4",
+    "crs_to_proj4_gdal",
     "crs_to_wkt1_strict",
     "suggested_grid",
     "warped_vrt_type",
@@ -799,7 +800,7 @@ class PointCloud:
     ) -> PointCloud: ...
     def overlay(
         self,
-        datasource: str | Layer | VectorDataset,
+        datasource: _VectorSource,
         dimension: str,
         *,
         column: str | None = None,
@@ -911,14 +912,17 @@ class PointCloudFile:
         max_points: int | None = None,
     ) -> PointCloud: ...
 
-# Inputs taken by the operations. Paths are `str` only: `os.PathLike` is not accepted.
+# Inputs taken by the operations. Raster paths are `str` only; vector paths may be `os.PathLike`.
 _RasterSource: TypeAlias = str | Raster
 _Layers: TypeAlias = Layer | VectorDataset | list[Layer] | tuple[Layer, ...]
 _GeoJSON: TypeAlias = dict[str, Any] | _SupportsGeoInterface
-# A path to a vector dataset, or vector data in memory.
-_VectorSource: TypeAlias = str | _Layers | _GeoJSON
+# Geometries as data: GeoJSON (or WKT text, as `str`), a sequence of geometries or Features, or
+# `(xmin, ymin, xmax, ymax)` bounds.
+_Geometries: TypeAlias = _GeoJSON | Sequence[_GeoJSON] | tuple[float, float, float, float]
+# A path to a vector dataset (a `str` that is GeoJSON or WKT is data), or vector data in memory.
+_VectorSource: TypeAlias = str | os.PathLike[str] | _Layers | _Geometries | _ArrowData
 # Vector data in memory; a `str` is GeoJSON text, not a path.
-_VectorData: TypeAlias = _Layers | str | _GeoJSON | _ArrowData
+_VectorData: TypeAlias = _Layers | str | _Geometries | _ArrowData
 
 # Opening and writing.
 
@@ -1121,6 +1125,7 @@ def rasterize(
     te: _Bounds | None = None,
     tap: bool = False,
     like: _RasterSource | None = None,
+    background: _RasterSource | None = None,
     ot: str | None = None,
     init: float | Sequence[float] | None = None,
     nodata: float | None = None,
@@ -1246,6 +1251,7 @@ class _CrsEntry(TypedDict):
         "geographic_2d", "geographic_3d", "geocentric", "projected", "vertical", "compound", "other"
     ]
     deprecated: bool
+    replaced_by: list[int]
     area_name: str | None
     bounds: list[float] | None
     projection_method: str | None
@@ -1320,6 +1326,7 @@ def warp(
     max_memory_mib: float | None = None,
     init: Raster | None = None,
     _sum_scale: float = 1.0,
+    periodic_longitude: bool | None = None,
 ) -> Raster: ...
 def mosaic(
     srcs: _RasterSource | Sequence[_RasterSource],
@@ -1525,7 +1532,7 @@ def pixel_info(
     positions: Sequence[tuple[float, float] | tuple[float, float, str]] | None = None,
     *,
     position_crs: str | None = None,
-    position_dataset: str | Layer | VectorDataset | _GeoJSON | None = None,
+    position_dataset: _VectorSource | None = None,
     layer: str | None = None,
     include_fields: Sequence[str] | None = None,
     bands: Sequence[int] | None = None,
@@ -1845,6 +1852,7 @@ def proj_boolean_parameters(definition: str) -> list[tuple[str, bool]]:
 
 def crs_to_projjson(crs: str) -> str: ...
 def crs_to_proj4(crs: str) -> str | None: ...
+def crs_to_proj4_gdal(crs: str) -> str | None: ...
 def crs_to_wkt1_strict(crs: str) -> str | None: ...
 def crs_projjson(crs: str, database: bool) -> str: ...
 def gcp_transform(
@@ -1897,6 +1905,7 @@ class RegionWarp:
         kernel_version: str | None = None,
         sum_scale: float = 1.0,
         grid_invariant: bool | None = None,
+        periodic_longitude: bool | None = None,
     ) -> RegionWarp: ...
     def source_window(self, region: _Window) -> _Window | None: ...
     def warp(
@@ -2319,7 +2328,7 @@ def update_raster(
     dst: str,
     *,
     resampling: str = "nearest",
-    geometry: str | None = None,
+    geometry: str | _GeoJSON | None = None,
     geometry_crs: str | None = None,
     no_update_overviews: bool = False,
     error_threshold: float | None = None,
@@ -2584,7 +2593,7 @@ def clip_vector(
     src: Any,
     *,
     bbox: Sequence[float] | None = None,
-    geometry: str | None = None,
+    geometry: str | _GeoJSON | None = None,
     like: Any = None,
     crs: str | None = None,
     layer: str | None = None,
@@ -2743,7 +2752,7 @@ def make_valid(src: Any, *, layer: str | None = None) -> Layer:
     ...
 
 def zonal_stats(
-    zones: Any,
+    zones: _VectorSource,
     rasters: str
     | os.PathLike[str]
     | Raster
@@ -2787,7 +2796,7 @@ class ZonalReducer:
 
     def __new__(
         cls,
-        zones: Any,
+        zones: _VectorSource,
         width: int,
         height: int,
         transform: Sequence[float],
@@ -2806,6 +2815,14 @@ class ZonalReducer:
         pixels.
         ``strip_rows`` defaults to terrio's strip size for one float64 band of this width; give a
         tiled source's block height to read each block once.
+        """
+        ...
+    @property
+    def retained_bytes(self) -> int:
+        """Estimate peak retained bytes per stream, including overlaps and fractional sorting.
+
+        Returns:
+            int: Retained value storage, excluding pixels, results, indexes and allocator overhead.
         """
         ...
     @property

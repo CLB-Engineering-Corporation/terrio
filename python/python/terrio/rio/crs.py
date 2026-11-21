@@ -542,9 +542,13 @@ class CRS(Mapping[str, Any]):
             int | None: The code.
         """
         code = self._info.get("epsg")
-        if code is None and self._info.get("proj4") and self.wkt:
+        # A compound reference (`urn:ogc:def:crs,crs:EPSG::2154,crs:EPSG::5720`) keeps its
+        # components' WKT; its code is the compound's, as PROJ identifies it and a layer reports.
+        wkt = self.wkt
+        compound = wkt.lstrip().upper().startswith(("COMPD_CS", "COMPOUNDCRS"))
+        if code is None and (self._info.get("proj4") or compound) and wkt:
             try:
-                code = _terrio.crs_info(self.wkt).get("epsg")
+                code = _terrio.crs_info(wkt).get("epsg")
             except Exception:
                 code = None
         return int(code) if code is not None else None
@@ -627,7 +631,7 @@ class CRS(Mapping[str, Any]):
         area-dependent operations cannot be represented by an ellipsoid alone;
         use WKT, PROJJSON or an authority code to preserve them. Unsupported projections
         return an empty string. This is rasterio's parameter string;
-        ``terrio._terrio.crs_to_proj4`` writes the string PROJ 9.8.1 writes
+        ``terrio._terrio.crs_to_proj4`` writes the string PROJ 9.9.0 writes
         (``pyproj.CRS.to_proj4()``), ``None`` when PROJ has none.
 
         Returns:
@@ -667,7 +671,7 @@ class CRS(Mapping[str, Any]):
     def to_wkt1_strict(self) -> str | None:
         """The CRS in WKT 1 without GDAL's ``EXTENSION["PROJ4", ...]``.
 
-        As PROJ 9.8.1 exports ``WKT1_GDAL``, for formats whose readers ignore the extension
+        As PROJ 9.9.0 exports ``WKT1_GDAL``, for formats whose readers ignore the extension
         (a ``.prj`` file).
 
         Returns:

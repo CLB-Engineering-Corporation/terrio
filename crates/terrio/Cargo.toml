@@ -75,7 +75,7 @@ lerc-core = { workspace = true, optional = true }
 lerc-writer = { workspace = true, optional = true }
 zune-jpegxl.workspace = true
 zune-core.workspace = true
-jxl-oxide.workspace = true
+jxl-oxide = { workspace = true, optional = true }
 # Data parallelism: natively, and in WebAssembly built with threads (`atomics`), where the host
 # starts the pool; WebAssembly without threads runs the same loops in sequence (see `par`).
 rayon.workspace = true
@@ -107,7 +107,7 @@ ndarray = { workspace = true, optional = true }
 default = ["drivers", "remote"]
 ## Every format driver: the default features but `remote`, so pure Rust (no C compiler needed)
 ## natively as in WebAssembly.
-drivers = ["cad", "geotiff", "parquet", "avif", "netcdf-hdf5", "osm", "lzma", "flatgeobuf", "jp2", "lerc", "pointcloud", "tiles", "zarr", "sqlite", "grib", "hecras", "xlsx", "filegdb"]
+drivers = ["cad", "geotiff", "parquet", "avif", "netcdf-hdf5", "osm", "lzma", "flatgeobuf", "jp2", "lerc", "jxl", "pointcloud", "tiles", "zarr", "sqlite", "grib", "hecras", "xlsx", "filegdb"]
 ## GeoTIFF and COG reading and writing. Always built (it is the core): the feature exists so that
 ## `features = ["geotiff"]` states what a build needs.
 geotiff = []
@@ -153,6 +153,8 @@ jp2 = ["dep:openjp2"]
 grib = ["dep:rust-aec"]
 ## LERC-compressed GeoTIFFs (read and written).
 lerc = ["dep:lerc-reader", "dep:lerc-core", "dep:lerc-writer"]
+## JPEG XL-compressed GeoTIFFs, read with jxl-oxide (writing them needs no feature).
+jxl = ["dep:jxl-oxide"]
 ## Point clouds: LAS, LAZ, COPC, EPT, E57, PLY (the `pointcloud` module).
 pointcloud = ["dep:laz", "dep:e57", "dep:delaunator"]
 ## Raster and vector tiles: MBTiles, PMTiles and MVT (the `tiles` module).
@@ -228,6 +230,12 @@ webpki-root-certs.workspace = true
 # The bounded-memory test of compressed XLSX workbooks maps its input.
 [target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
 memmap2.workspace = true
+gungraun.workspace = true
+
+# CPU instructions under Valgrind, compared on pull requests (.github/workflows/bench.yml).
+[[bench]]
+name = "instructions"
+harness = false
 
 [[example]]
 name = "xlsx_workbook"
@@ -368,6 +376,11 @@ path = "tests/geotiff_band_metadata.rs"
 [[test]]
 name = "geotiff_nodata"
 path = "tests/geotiff_nodata.rs"
+
+[[test]]
+name = "hdf_readers"
+path = "tests/hdf_readers.rs"
+required-features = ["netcdf-hdf5"]
 
 [[test]]
 name = "hecras_corpus"

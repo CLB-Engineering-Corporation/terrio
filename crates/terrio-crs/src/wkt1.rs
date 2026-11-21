@@ -46,10 +46,101 @@ impl Node {
         })
     }
 
+    /// The first child node with a keyword, to change.
+    pub fn child_mut(&mut self, key: &str) -> Option<&mut Node> {
+        self.args.iter_mut().find_map(|a| match a {
+            Arg::Node(n) if n.key.eq_ignore_ascii_case(key) => Some(n),
+            _ => None,
+        })
+    }
+
     /// The child nodes with a keyword.
     pub fn children<'a>(&'a self, key: &'a str) -> impl Iterator<Item = &'a Node> + 'a {
         self.args.iter().filter_map(move |a| match a {
             Arg::Node(n) if n.key.eq_ignore_ascii_case(key) => Some(n),
+            _ => None,
+        })
+    }
+
+    /// Whether the node's keyword is one of `keys` (see [`crate::keywords`]).
+    pub fn is(&self, keys: &[&str]) -> bool {
+        crate::keywords::is(&self.key, keys)
+    }
+
+    /// The first child node with the first of `keys` the node has one with.
+    pub fn child_in(&self, keys: &[&str]) -> Option<&Node> {
+        keys.iter().find_map(|k| self.child(k))
+    }
+
+    /// The first child node, in the node's order, whose keyword is one of `keys`: PROJ 9.9.0 reads
+    /// the first of a CRS's datum nodes (`DATUM`, `TRF` or `GEODETICDATUM`), of a datum's
+    /// ellipsoid nodes and of a projected CRS's base CRS nodes, whatever their keyword.
+    pub fn first_in(&self, keys: &[&str]) -> Option<&Node> {
+        self.args.iter().find_map(|a| match a {
+            Arg::Node(n) if n.is(keys) => Some(n),
+            _ => None,
+        })
+    }
+
+    /// The geodetic datum or datum ensemble of a geodetic CRS node, the first in its order (see
+    /// [`Self::first_in`]; PROJ refuses a CRS with both a datum and an ensemble, which terrio
+    /// reads by the first).
+    pub fn datum(&self) -> Option<&Node> {
+        self.first_in(crate::keywords::GEODETIC_DATUM)
+    }
+
+    /// The base geodetic CRS of a projected (or derived) CRS node: WKT 1's `GEOGCS`, WKT 2's
+    /// `BASEGEOGCRS` or `BASEGEODCRS` (terrio's two included), the first in its order.
+    pub fn geodetic_base(&self) -> Option<&Node> {
+        self.first_in(crate::keywords::GEODETIC_BASE)
+    }
+
+    /// The geodetic CRS of a horizontal CRS node, where PROJ 9.9.0 reads it: the node itself (a
+    /// geographic or geocentric CRS with its datum), a projected or derived CRS's base CRS's (a
+    /// rotated pole's `BASEGEOGCRS`), a compound CRS's horizontal CRS's, or a bound CRS's source
+    /// CRS's. `None` for another node (a vertical CRS's).
+    pub fn horizontal_geodetic(&self) -> Option<&Node> {
+        use crate::keywords as kw;
+        let geodetic = [kw::WKT1_GEOGRAPHIC, kw::WKT1_GEOCENTRIC, kw::GEOGRAPHIC_OR_GEODETIC_CRS, kw::BASE_GEODETIC_CRS];
+        if geodetic.iter().any(|k| self.is(k)) && self.datum().is_some() {
+            return Some(self);
+        }
+        if self.is(kw::COMPOUND_CRS) {
+            return self.first_in(kw::HORIZONTAL_CRS)?.horizontal_geodetic();
+        }
+        if self.is(kw::BOUND) {
+            return crate::wkt2::first_node(self.child("SOURCECRS")?)?.horizontal_geodetic();
+        }
+        self.geodetic_base()?.horizontal_geodetic()
+    }
+
+    /// The geodetic datum (or datum ensemble) of a horizontal CRS node, at its place (see
+    /// [`Self::horizontal_geodetic`] and [`Self::datum`]).
+    pub fn horizontal_datum(&self) -> Option<&Node> {
+        self.horizontal_geodetic()?.datum()
+    }
+
+    /// The semi-major axis in metres and the inverse flattening (0 for a sphere) of a horizontal
+    /// CRS node's ellipsoid, at its place (see [`Self::horizontal_datum`]), as the model reads it.
+    pub fn horizontal_ellipsoid(&self) -> Option<(f64, f64)> {
+        self.horizontal_datum()?.first_in(crate::keywords::ELLIPSOID)?.ellipsoid()
+    }
+
+    /// The node itself or the first node below it, depth first, whose keyword is one of `keys`.
+    pub fn find(&self, keys: &[&str]) -> Option<&Node> {
+        if self.is(keys) {
+            return Some(self);
+        }
+        self.args.iter().find_map(|a| match a {
+            Arg::Node(c) => c.find(keys),
+            _ => None,
+        })
+    }
+
+    /// The node's identifiers (its `AUTHORITY` and `ID` children), in the order the node has them.
+    pub fn ids(&self) -> impl Iterator<Item = &Node> {
+        self.args.iter().filter_map(|a| match a {
+            Arg::Node(n) if n.is(crate::keywords::ID) => Some(n),
             _ => None,
         })
     }
@@ -71,17 +162,35 @@ impl Node {
         }
     }
 
-    /// The EPSG code of the node's `AUTHORITY` or `ID`.
-    pub fn epsg(&self) -> Option<u32> {
-        let n = self.child("AUTHORITY").or_else(|| self.child("ID"))?;
-        if !n.name()?.eq_ignore_ascii_case("EPSG") {
-            return None;
-        }
-        match n.args.get(1)? {
-            Arg::Num(v) => Some(*v as u32),
+    /// The code of an `ID` or `AUTHORITY` node: its second argument, a whole number or the text of
+    /// one.
+    pub fn code(&self) -> Option<u32> {
+        match self.args.get(1)? {
+            Arg::Num(v) if v.fract() == 0.0 && *v >= 0.0 && *v <= f64::from(u32::MAX) => Some(*v as u32),
             Arg::Str(s) => s.trim().parse().ok(),
             _ => None,
         }
+    }
+
+    /// The semi-major axis in metres and the inverse flattening (0 for a sphere) of an ellipsoid
+    /// node (`SPHEROID` or `ELLIPSOID`): its axis in its `LENGTHUNIT` (WKT 2, as PROJ reads
+    /// `LENGTHUNIT["Clarke's foot",0.3047972654]`), else in metres.
+    pub fn ellipsoid(&self) -> Option<(f64, f64)> {
+        let unit = match self.child_in(&["LENGTHUNIT", "UNIT"]) {
+            Some(u) => u.num(1).filter(|v| v.is_finite() && *v > 0.0)?,
+            None => 1.0,
+        };
+        let (a, rf) = (self.num(1)? * unit, self.num(2)?);
+        (a.is_finite() && a > 0.0 && rf.is_finite() && rf >= 0.0).then_some((a, rf))
+    }
+
+    /// The EPSG code of the node's `AUTHORITY` or `ID`.
+    pub fn epsg(&self) -> Option<u32> {
+        let n = self.child_in(crate::keywords::ID)?;
+        if !n.name()?.eq_ignore_ascii_case("EPSG") {
+            return None;
+        }
+        n.code()
     }
 }
 
@@ -106,6 +215,29 @@ pub(crate) fn parse(s: &str) -> Option<Node> {
     let b = s.as_bytes();
     let mut i = 0;
     node(b, &mut i, 0)
+}
+
+/// The horizontal and vertical CRS of ESRI's compound CRS, a WKT 1 `GEOGCS` or `PROJCS` followed
+/// by a `VERTCS` (`GEOGCS[...],VERTCS[...]`, as ESRI writes EPSG:9707), which PROJ 9.9.0 reads as
+/// a compound CRS; anything after the `VERTCS` is ignored, as by PROJ. `None` for another text.
+pub(crate) fn esri_compound(s: &str) -> Option<(Node, Node)> {
+    if s.len() > MAX_LEN {
+        return None;
+    }
+    let b = s.as_bytes();
+    let mut i = 0;
+    let horizontal = node(b, &mut i, 0)?;
+    if !["GEOGCS", "PROJCS"].iter().any(|k| horizontal.key.eq_ignore_ascii_case(k)) {
+        return None;
+    }
+    skip_ws(b, &mut i);
+    if b.get(i) != Some(&b',') {
+        return None;
+    }
+    i += 1;
+    skip_ws(b, &mut i);
+    let vertical = node(b, &mut i, 0)?;
+    vertical.key.eq_ignore_ascii_case("VERTCS").then_some((horizontal, vertical))
 }
 
 /// Whether `c` is a space as C's `isspace` reads it, which PROJ 9.8.1's parser skips: ASCII
@@ -232,6 +364,22 @@ fn node(b: &[u8], i: &mut usize, level: usize) -> Option<Node> {
     Some(Node { key, args })
 }
 
+/// Whether a WKT 1 is on a polar stereographic method the reader refuses for its latitude: GDAL's
+/// `Polar_Stereographic` without a finite `latitude_of_origin` (the first, as the reader takes
+/// it), which PROJ 9.8.1 refuses rather than read at the north pole, or EPSG's variant B with a
+/// standard parallel given that is not a finite number.
+pub(crate) fn polar_latitude_refused(root: &Node) -> bool {
+    // The first parameter of a name, as the reader takes it: `None` when absent, `Some(None)`
+    // when not a number.
+    let first = |name: &str| root.children("PARAMETER").find(|p| p.name().is_some_and(|n| norm(n) == name)).map(|p| p.num(1));
+    match root.child("PROJECTION").and_then(Node::name).map(norm).as_deref() {
+        Some("polarstereographic") => !first("latitudeoforigin").flatten().is_some_and(f64::is_finite),
+        // Given but not a finite number (PROJ 9.8.1 refuses "abc" too).
+        Some("polarstereographicvariantb") => first("latitudeofstandardparallel").is_some_and(|v| !v.is_some_and(f64::is_finite)),
+        _ => false,
+    }
+}
+
 pub(crate) fn norm(s: &str) -> String {
     s.chars().filter(|c| c.is_ascii_alphanumeric()).collect::<String>().to_ascii_lowercase()
 }
@@ -289,6 +437,22 @@ pub(crate) struct Converted {
     pub geogcs_wkt1: Option<String>,
     /// A WKT 2 `BOUNDCRS` to another CRS than WGS 84: that CRS and the shift to it.
     pub bound: Option<Box<BoundTo>>,
+    /// A `BOUNDCRS`'s Helmert transformation that `+towgs84` cannot stand for: a full rotation
+    /// matrix, or a Molodensky-Badekas evaluation point.
+    pub helmert: Option<Helmert>,
+}
+
+/// A Helmert transformation as PROJ's `helmert` and `molobadekas` steps take it: translations in
+/// metres, rotations in arc-seconds and the scale difference in parts per million, in the
+/// method's own convention, the rotation matrix exact or approximate, about a pivot point.
+#[derive(Clone, Debug)]
+pub(crate) struct Helmert {
+    pub t: [f64; 3],
+    pub r: [f64; 3],
+    pub s: f64,
+    pub position_vector: bool,
+    pub exact: bool,
+    pub pivot: [f64; 3],
 }
 
 /// The target CRS of a WKT 2 `BOUNDCRS` to a CRS other than WGS 84, and its Helmert
@@ -300,26 +464,176 @@ pub(crate) struct BoundTo {
     pub shift: Vec<f64>,
 }
 
+/// What a WKT 1 `GEOGCS`, `GEOCCS` or `PROJCS` gives its PROJ string: read from its tree
+/// ([`Wkt1Input::read`]) or from its model (`model::wkt1_input`), which must agree (#1058 step 6).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Wkt1Input {
+    pub kind: Wkt1Kind,
+    /// The ellipsoid's semi-major axis and inverse flattening, as written.
+    pub a: f64,
+    pub rf: f64,
+    /// The angular unit in degrees (1 for a `GEOCCS`), WKT's rounded degree and grad made exact.
+    pub ang: f64,
+    /// The prime meridian in degrees, with PROJ's corrections.
+    pub pm: f64,
+    /// The datum's `TOWGS84` values that are numbers.
+    pub towgs84: Option<Vec<f64>>,
+    /// A `GEOCCS`'s length unit or a `PROJCS`'s first, in metres (1 for a `GEOGCS`).
+    pub unit: f64,
+    /// The datum's EPSG code.
+    pub datum_epsg: Option<u32>,
+    /// A `PROJCS`'s parameters with a name and a number, their names normalized, in order.
+    pub params: Vec<(String, f64)>,
+    /// A `PROJCS`'s `PROJECTION` name as written, and its EPSG code.
+    pub method: Option<String>,
+    pub method_epsg: Option<u32>,
+    /// Whether the `GEOGCS` is named `GCS_…` or its `DATUM` `D_…` (ESRI's dialect, as PROJ guesses it).
+    pub esri_names: bool,
+    /// A `PROJCS`'s two `AXIS` directions as `+axis` letters, when along east-west and north-south.
+    pub axes: Option<[u8; 2]>,
+    /// Whether a `PROJCS` has an `AXIS` node.
+    pub has_axis: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Wkt1Kind {
+    Geographic,
+    Geocentric,
+    Projected,
+}
+
+/// The `PARAMETER`s of a Hotine Oblique Mercator (two point) that refuse a value that is not a
+/// finite number rather than drop it for a zero default.
+pub(crate) const HOTINE_TWO_POINT_CHECKED: [&str; 23] = [
+    "latitudeofpoint1",
+    "latitudeof1stpoint",
+    "longitudeofpoint1",
+    "longitudeof1stpoint",
+    "latitudeofpoint2",
+    "latitudeof2ndpoint",
+    "longitudeofpoint2",
+    "longitudeof2ndpoint",
+    "latitudeofcenter",
+    "latitudeoforigin",
+    "latitudeofnaturalorigin",
+    "latitudeofcentre",
+    "latitudeoffalseorigin",
+    "latitudeofprojectioncentre",
+    "scalefactor",
+    "scalefactoratnaturalorigin",
+    "scalefactoroninitialline",
+    "falseeasting",
+    "eastingatfalseorigin",
+    "eastingatprojectioncentre",
+    "falsenorthing",
+    "northingatfalseorigin",
+    "northingatprojectioncentre",
+];
+
+/// Whether a Hotine Oblique Mercator (two point) `PROJCS` is refused for its parameters: one
+/// without a name, or one of [`HOTINE_TWO_POINT_CHECKED`] whose value is not a finite number (a
+/// present but malformed value must not be dropped and replaced by a zero default).
+pub(crate) fn hotine_two_point_refused(root: &Node) -> bool {
+    root.children("PARAMETER").any(|p| match p.name() {
+        None => true,
+        Some(s) => HOTINE_TWO_POINT_CHECKED.contains(&norm(s).as_str()) && !p.num(1).is_some_and(f64::is_finite),
+    })
+}
+
+/// The normalized method of a WKT 1 projection: EPSG's Polar Stereographic (variant C) by its code,
+/// else its name.
+pub(crate) fn wkt1_method(name: Option<&str>, epsg: Option<u32>) -> Option<String> {
+    if epsg == Some(9830) { Some("polarstereographicvariantc".to_string()) } else { Some(norm(name?)) }
+}
+
+impl Wkt1Input {
+    /// The input of a WKT 1 root, read from its tree; `None` for another root, a CRS without
+    /// what it needs, or one the reader refuses (a malformed Hotine two-point parameter, a polar
+    /// stereographic latitude).
+    pub(crate) fn read(root: &Node) -> Option<Self> {
+        let kind = match root.key.to_ascii_uppercase().as_str() {
+            "GEOGCS" => Wkt1Kind::Geographic,
+            "GEOCCS" => Wkt1Kind::Geocentric,
+            "PROJCS" => Wkt1Kind::Projected,
+            _ => return None,
+        };
+        let geogcs = if kind == Wkt1Kind::Projected { root.child("GEOGCS")? } else { root };
+        let datum = geogcs.child("DATUM")?;
+        let sph = datum.child_in(crate::keywords::ELLIPSOID)?;
+        let a = sph.num(1)?;
+        let rf = sph.num(2)?;
+        // Angular unit of the geographic CRS, in degrees.
+        let ang = if kind == Wkt1Kind::Geocentric {
+            1.0
+        } else {
+            geogcs.child("UNIT").and_then(|u| u.num(1)).map(|r| r.to_degrees()).unwrap_or(1.0)
+        };
+        // WKT rounds the size of a degree (0.0174532925199433) and of a grad.
+        let ang = [1.0, 0.9].into_iter().find(|u| (ang - u).abs() < 1e-9).unwrap_or(ang);
+        let primem = geogcs.child("PRIMEM");
+        let pm = primem.and_then(|p| p.num(1)).unwrap_or(0.0);
+        let pm = prime_meridian_degrees(primem.and_then(Node::name).unwrap_or(""), pm, ang);
+        let towgs84 = datum.child("TOWGS84").map(|t| (0..t.args.len()).filter_map(|i| t.num(i)).collect());
+        let unit = match kind {
+            Wkt1Kind::Geographic => 1.0,
+            // The first `UNIT`, as PROJ 9.8.1 and GDAL take it when a `PROJCS` has two.
+            _ => root.children("UNIT").next().and_then(|u| u.num(1)).unwrap_or(1.0),
+        };
+        let esri_names = geogcs.name().is_some_and(|n| n.get(..4).is_some_and(|p| p.eq_ignore_ascii_case("gcs_")))
+            || datum.name().is_some_and(|n| n.get(..2).is_some_and(|p| p.eq_ignore_ascii_case("d_")));
+        let mut input = Self {
+            kind,
+            a,
+            rf,
+            ang,
+            pm,
+            towgs84,
+            unit,
+            datum_epsg: datum.epsg(),
+            params: Vec::new(),
+            method: None,
+            method_epsg: None,
+            esri_names,
+            axes: None,
+            has_axis: false,
+        };
+        if kind != Wkt1Kind::Projected {
+            return Some(input);
+        }
+        input.params =
+            root.children("PARAMETER").filter_map(|p| Some((norm(p.name()?), p.num(1)?))).filter(|(k, _)| !k.is_empty()).collect();
+        let projection = root.child("PROJECTION")?;
+        input.method = projection.name().filter(|n| !n.is_empty()).map(str::to_string);
+        input.method_epsg = projection.epsg();
+        let method = wkt1_method(input.method.as_deref(), input.method_epsg)?;
+        if method == "hotineobliquemercatortwopointnaturalorigin" && hotine_two_point_refused(root) {
+            return None;
+        }
+        // GDAL's name gives its latitude only as `latitude_of_origin`; PROJ 9.8.1 refuses it
+        // without, rather than read it at the north pole.
+        if matches!(method.as_str(), "polarstereographic" | "polarstereographicvarianta" | "polarstereographicvariantb")
+            && polar_latitude_refused(root)
+        {
+            return None;
+        }
+        input.axes = projected_axes(root);
+        input.has_axis = root.child("AXIS").is_some();
+        Some(input)
+    }
+}
+
 /// Converts a WKT 1 `GEOGCS` or `PROJCS` (ESRI or OGC flavour) into a PROJ string. `None` for
 /// other kinds of CRS and projections terrio does not know.
 pub(crate) fn to_proj(root: &Node) -> Option<Converted> {
-    let key = root.key.to_ascii_uppercase();
-    let geogcs = match key.as_str() {
-        "GEOGCS" | "GEOCCS" => root,
-        "PROJCS" => root.child("GEOGCS")?,
-        _ => return None,
-    };
-    let datum = geogcs.child("DATUM")?;
-    let sph = datum.child("SPHEROID").or_else(|| datum.child("ELLIPSOID"))?;
-    let a = sph.num(1)?;
-    let rf = sph.num(2)?;
-    // Angular unit of the geographic CRS, in degrees.
-    let ang = if key == "GEOCCS" { 1.0 } else { geogcs.child("UNIT").and_then(|u| u.num(1)).map(|r| r.to_degrees()).unwrap_or(1.0) };
-    // WKT rounds the size of a degree (0.0174532925199433) and of a grad.
-    let ang = [1.0, 0.9].into_iter().find(|u| (ang - u).abs() < 1e-9).unwrap_or(ang);
-    let primem = geogcs.child("PRIMEM");
-    let pm = primem.and_then(|p| p.num(1)).unwrap_or(0.0);
-    let pm = prime_meridian_degrees(primem.and_then(Node::name).unwrap_or(""), pm, ang);
+    let input = Wkt1Input::read(root)?;
+    let geogcs = if input.kind == Wkt1Kind::Projected { root.child("GEOGCS")? } else { root };
+    convert(&input, geogcs)
+}
+
+/// The PROJ string of a WKT 1 CRS's input, with the CRS's `GEOGCS` node for identifying the
+/// datum: the root of a `GEOGCS` or `GEOCCS`, a `PROJCS`'s child.
+pub(crate) fn convert(input: &Wkt1Input, geogcs: &Node) -> Option<Converted> {
+    let Wkt1Input { a, rf, ang, pm, unit: to_meter, .. } = *input;
     let mut out = Vec::new();
     let mut tail = vec![format!("+a={a}"), format!("+rf={rf}")];
     if rf == 0.0 {
@@ -328,72 +642,53 @@ pub(crate) fn to_proj(root: &Node) -> Option<Converted> {
     if pm != 0.0 {
         tail.push(format!("+pm={pm}"));
     }
-    if let Some(t) = datum.child("TOWGS84") {
-        let v: Vec<String> = (0..t.args.len()).filter_map(|i| t.num(i)).map(|v| v.to_string()).collect();
+    if let Some(t) = &input.towgs84 {
+        let v: Vec<String> = t.iter().map(|v| v.to_string()).collect();
         if !v.is_empty() {
             tail.push(format!("+towgs84={}", v.join(",")));
         }
     }
-    if key == "GEOCCS" {
-        let unit = root.child("UNIT").and_then(|u| u.num(1)).unwrap_or(1.0);
-        out.push(format!("+proj=geocent +to_meter={unit}"));
+    if input.kind == Wkt1Kind::Geocentric {
+        out.push(format!("+proj=geocent +to_meter={to_meter}"));
         out.extend(tail);
-        let geog = datum.epsg().and_then(|d| super::epsg::geographic_on(d).first().copied());
-        return Some(Converted { proj: out.join(" "), geogcs: root.clone(), geog, geogcs_wkt1: None, bound: None });
+        let geog = input.datum_epsg.and_then(|d| super::epsg::geographic_on(d).iter().copied().find(|c| !super::epsg::is_deprecated(*c)));
+        return Some(Converted { proj: out.join(" "), geogcs: geogcs.clone(), geog, geogcs_wkt1: None, bound: None, helmert: None });
     }
-    if key == "GEOGCS" {
+    if input.kind == Wkt1Kind::Geographic {
         out.push("+proj=longlat".to_string());
         if (ang - 1.0).abs() > 1e-12 {
             tail.push(format!("+to_deg={ang}"));
         }
         out.extend(tail);
-        return Some(Converted { proj: out.join(" "), geogcs: geogcs.clone(), geog: None, geogcs_wkt1: None, bound: None });
+        return Some(Converted { proj: out.join(" "), geogcs: geogcs.clone(), geog: None, geogcs_wkt1: None, bound: None, helmert: None });
     }
 
-    let to_meter = root.children("UNIT").last().and_then(|u| u.num(1)).unwrap_or(1.0);
-    let params: Vec<(String, f64)> = root.children("PARAMETER").filter_map(|p| Some((norm(p.name()?), p.num(1)?))).collect();
+    let params = &input.params;
     let get = |names: &[&str]| names.iter().find_map(|n| params.iter().find(|(k, _)| k == n).map(|(_, v)| *v));
     let angle = |names: &[&str]| get(names).map(|v| v * ang);
-    let lon_0 = angle(&["centralmeridian", "longitudeofcenter", "longitudeoforigin", "longitudeofnaturalorigin", "longitudeofcentre"]);
-    let lat_0 = angle(&["latitudeoforigin", "latitudeofcenter", "latitudeofnaturalorigin", "latitudeofcentre"]);
+    // GDAL's WKT 1 names, else EPSG's (`Latitude of false origin`, `Longitude of projection
+    // centre`), which PROJ 9.8.1 also reads in WKT 1.
+    let lon_0 = angle(&[
+        "centralmeridian",
+        "longitudeofcenter",
+        "longitudeoforigin",
+        "longitudeofnaturalorigin",
+        "longitudeofcentre",
+        "longitudeoffalseorigin",
+        "longitudeofprojectioncentre",
+    ]);
+    let lat_0 = angle(&[
+        "latitudeoforigin",
+        "latitudeofcenter",
+        "latitudeofnaturalorigin",
+        "latitudeofcentre",
+        "latitudeoffalseorigin",
+        "latitudeofprojectioncentre",
+    ]);
     let k = get(&["scalefactor", "scalefactoratnaturalorigin", "scalefactoroninitialline"]);
     let sp1 = angle(&["standardparallel1", "standardparallel", "latitudeof1ststandardparallel"]);
     let sp2 = angle(&["standardparallel2", "latitudeof2ndstandardparallel"]);
-    let projection = root.child("PROJECTION")?;
-    let method = if projection.epsg() == Some(9830) { "polarstereographicvariantc".to_string() } else { norm(projection.name()?) };
-    if method == "hotineobliquemercatortwopointnaturalorigin" {
-        // A present but malformed value must not be dropped and replaced by a zero default.
-        for parameter in root.children("PARAMETER") {
-            let name = norm(parameter.name()?);
-            if matches!(
-                name.as_str(),
-                "latitudeofpoint1"
-                    | "latitudeof1stpoint"
-                    | "longitudeofpoint1"
-                    | "longitudeof1stpoint"
-                    | "latitudeofpoint2"
-                    | "latitudeof2ndpoint"
-                    | "longitudeofpoint2"
-                    | "longitudeof2ndpoint"
-                    | "latitudeofcenter"
-                    | "latitudeoforigin"
-                    | "latitudeofnaturalorigin"
-                    | "latitudeofcentre"
-                    | "scalefactor"
-                    | "scalefactoratnaturalorigin"
-                    | "scalefactoroninitialline"
-                    | "falseeasting"
-                    | "eastingatfalseorigin"
-                    | "eastingatprojectioncentre"
-                    | "falsenorthing"
-                    | "northingatfalseorigin"
-                    | "northingatprojectioncentre"
-            ) && !parameter.num(1)?.is_finite()
-            {
-                return None;
-            }
-        }
-    }
+    let method = wkt1_method(input.method.as_deref(), input.method_epsg)?;
 
     // `x_0` and `y_0` are ESRI's names for them in `PROJ_healpix`, `PROJ_rhealpix` and `PROJ_isea`.
     let proj_method = matches!(method.as_str(), "projhealpix" | "projrhealpix") || method.starts_with("projisea");
@@ -404,7 +699,7 @@ pub(crate) fn to_proj(root: &Node) -> Option<Converted> {
     let fe = easting.unwrap_or(0.0) * to_meter;
     let mut fn_ = northing.unwrap_or(0.0) * to_meter;
     let azimuth = angle(&["azimuth", "azimuthofinitialline"]);
-    let gamma = angle(&["rectifiedgridangle", "angleofrectifiedtoskewedgrid"]);
+    let gamma = angle(&["rectifiedgridangle", "angleofrectifiedtoskewedgrid", "anglefromrectifiedtoskewgrid"]);
     let push = |out: &mut Vec<String>, k: &str, v: Option<f64>| {
         if let Some(v) = v {
             out.push(format!("+{k}={v}"));
@@ -419,7 +714,7 @@ pub(crate) fn to_proj(root: &Node) -> Option<Converted> {
         }
         "transversemercatorsouthorientated" => {
             // West and south, but for a north-east CS, which PROJ reads south then west.
-            let north_east = projected_axes(root) == Some(*b"ne");
+            let north_east = input.axes == Some(*b"ne");
             out.push(if north_east { "+proj=tmerc +axis=swu" } else { "+proj=tmerc +axis=wsu" }.into());
             push(&mut out, "lat_0", lat_0.or(Some(0.0)));
             push(&mut out, "lon_0", lon_0);
@@ -439,8 +734,10 @@ pub(crate) fn to_proj(root: &Node) -> Option<Converted> {
                     push(&mut out, "lat_1", Some(s1));
                     push(&mut out, "lat_2", Some(s2));
                 }
-                // ESRI's single-parallel form.
-                (Some(s1), None) if method == "lambertconformalconic" => push(&mut out, "lat_1", Some(s1)),
+                // ESRI's single-parallel form: 1SP at the latitude of origin, as PROJ 9.9.0 reads it,
+                // which leaves `Standard_Parallel_1` out (opengeos/terrio#1012 item 30). Without a
+                // latitude of origin, which PROJ cannot transform, the parallel is read, as before.
+                (Some(s1), None) if method == "lambertconformalconic" => push(&mut out, "lat_1", lat_0.or(Some(s1))),
                 // A 2SP method without its second parallel: 0, as GDAL reads it.
                 (Some(s1), None) => {
                     push(&mut out, "lat_1", Some(s1));
@@ -450,7 +747,10 @@ pub(crate) fn to_proj(root: &Node) -> Option<Converted> {
             }
             push(&mut out, "lat_0", lat_0);
             push(&mut out, "lon_0", lon_0);
-            push(&mut out, "k_0", k);
+            // GDAL's 2SP methods have no scale: PROJ 9.9.0 ignores a `scale_factor` given with them
+            // (`parammappings.cpp`, opengeos/terrio#1012 item 29). ESRI's `Lambert_Conformal_Conic`
+            // applies its `Scale_Factor` (2SP Michigan).
+            push(&mut out, "k_0", k.filter(|_| method == "lambertconformalconic"));
         }
         "albersconicequalarea" | "albers" | "albersequalarea" => {
             out.push("+proj=aea".into());
@@ -461,16 +761,29 @@ pub(crate) fn to_proj(root: &Node) -> Option<Converted> {
         }
         // ESRI's `Mercator_Variant_A` and EPSG's `Mercator (variant A)` are Mercator (1SP), as
         // PROJ 9.8.1 reads them. PROJ leaves a latitude of origin out of ESRI's, and refuses EPSG's
-        // with one other than 0, which `+proj=merc` has no parameter for.
+        // with one other than 0, which `+proj=merc` has no parameter for. GDAL's `Mercator_1SP`
+        // with one other than 0 and a scale of 1 is Mercator (variant B) with that latitude as its
+        // standard parallel, as PROJ 9.9.0 reads it (GDAL #3026, opengeos/terrio#1012 item 24);
+        // with another scale too, which PROJ cannot transform, the scale is read, as before.
         "mercator1sp" | "mercatorvarianta" => {
             let origin = get(&["latitudeoforigin", "latitudeofnaturalorigin"]);
-            let esri = projection.name().is_some_and(|n| n.eq_ignore_ascii_case("Mercator_Variant_A"));
+            let esri = input.method.as_deref().is_some_and(|n| n.eq_ignore_ascii_case("Mercator_Variant_A"));
             if method == "mercatorvarianta" && !esri && origin.is_some_and(|v| v != 0.0) {
                 return None;
             }
             out.push("+proj=merc".into());
-            push(&mut out, "lon_0", lon_0);
-            push(&mut out, "k", k.or(Some(1.0)));
+            // The latitude of origin as the other methods read it (in degrees, whatever the unit).
+            let parallel = lat_0.filter(|v| method == "mercator1sp" && *v != 0.0 && k.is_none_or(|k| k == 1.0));
+            match parallel {
+                Some(parallel) => {
+                    push(&mut out, "lat_ts", Some(parallel));
+                    push(&mut out, "lon_0", lon_0);
+                }
+                None => {
+                    push(&mut out, "lon_0", lon_0);
+                    push(&mut out, "k", k.or(Some(1.0)));
+                }
+            }
         }
         "mercator2sp" | "mercator" => {
             out.push("+proj=merc".into());
@@ -489,7 +802,13 @@ pub(crate) fn to_proj(root: &Node) -> Option<Converted> {
         }
         "polarstereographic" | "polarstereographicvarianta" | "polarstereographicvariantb" => {
             out.push("+proj=stere".into());
-            let lat = lat_0.or(sp1).unwrap_or(90.0);
+            // EPSG's variant B gives its standard parallel as `Latitude of standard parallel`.
+            let parallel = if method == "polarstereographicvariantb" { angle(&["latitudeofstandardparallel"]) } else { None };
+            // Not a latitude of NaN, read at the north pole.
+            let lat = lat_0.or(sp1).or(parallel).unwrap_or(90.0);
+            if !lat.is_finite() {
+                return None;
+            }
             push(&mut out, "lat_0", Some(if lat < 0.0 { -90.0 } else { 90.0 }));
             if (lat.abs() - 90.0).abs() > 1e-9 {
                 push(&mut out, "lat_ts", Some(lat));
@@ -543,6 +862,21 @@ pub(crate) fn to_proj(root: &Node) -> Option<Converted> {
             push(&mut out, "lon_2", angle(&["longitudeofpoint2", "longitudeof2ndpoint"]));
             push(&mut out, "k", k.or(Some(1.0)));
         }
+        // With an azimuth (and a rectified grid angle, a missing one being the azimuth) of 90°, the
+        // Swiss oblique Mercator, as PROJ 9.9.0 reads variant A as well as B (`conversion.cpp`,
+        // opengeos/terrio#1012 item 28).
+        "hotineobliquemercator"
+        | "hotineobliquemercatorazimuthnaturalorigin"
+        | "hotineobliquemercatorvarianta"
+        | "hotineobliquemercatorazimuthcenter"
+        | "hotineobliquemercatorvariantb"
+            if azimuth.is_some_and(|a| (a - 90.0).abs() < 1e-9) && gamma.is_none_or(|g| (g - 90.0).abs() < 1e-9) =>
+        {
+            out.push("+proj=somerc".into());
+            push(&mut out, "lat_0", lat_0);
+            push(&mut out, "lon_0", lon_0);
+            push(&mut out, "k_0", k.or(Some(1.0)));
+        }
         "hotineobliquemercator" | "hotineobliquemercatorazimuthnaturalorigin" | "hotineobliquemercatorvarianta" => {
             out.push("+proj=omerc +no_uoff".into());
             push(&mut out, "lat_0", lat_0);
@@ -550,16 +884,6 @@ pub(crate) fn to_proj(root: &Node) -> Option<Converted> {
             push(&mut out, "alpha", azimuth);
             push(&mut out, "gamma", gamma.or(azimuth));
             push(&mut out, "k", k.or(Some(1.0)));
-        }
-        // With an azimuth (and a rectified grid angle, ESRI's being the azimuth) of 90°, the Swiss
-        // oblique Mercator, as PROJ reads it (and writes it, from `+proj=somerc`).
-        "hotineobliquemercatorazimuthcenter" | "hotineobliquemercatorvariantb"
-            if azimuth.is_some_and(|a| (a - 90.0).abs() < 1e-9) && gamma.is_none_or(|g| (g - 90.0).abs() < 1e-9) =>
-        {
-            out.push("+proj=somerc".into());
-            push(&mut out, "lat_0", lat_0);
-            push(&mut out, "lon_0", lon_0);
-            push(&mut out, "k_0", k.or(Some(1.0)));
         }
         "hotineobliquemercatorazimuthcenter" | "obliquemercator" | "hotineobliquemercatorvariantb" => {
             out.push("+proj=omerc".into());
@@ -576,19 +900,28 @@ pub(crate) fn to_proj(root: &Node) -> Option<Converted> {
             push(&mut out, "k_0", k.or(Some(1.0)));
         }
         "krovak" => {
-            // Its axes: ESRI's scale and rotation of the plane (-1 and 90° for east-north, else
-            // south-west; the rotation in the CRS's angular unit, 100 grads for 90°), else the
-            // WKT's, south-west without them, as GDAL 3.10 and PROJ 9.8.1 read them (northing then
-            // easting read as easting then northing).
-            let axes = match (get(&["xscale"]), angle(&["xyplanerotation"])) {
-                (Some(sx), Some(rot)) => {
-                    if sx < 0.0 && (rot - 90.0).abs() < 1e-10 {
-                        *b"en"
+            // Its axes, as PROJ 9.9.0 reads them (northing then easting read as easting then
+            // northing). ESRI's scale and rotation of the plane, -1 and 90° (the rotation in the
+            // CRS's angular unit, 100 grads for 90°), make it east-north. In ESRI's dialect without
+            // them (a `GEOGCS` named `GCS_…` or a `DATUM` named `D_…`, as PROJ guesses it), it is
+            // south-west whatever its `AXIS` nodes, but north-east and west-south are west-south.
+            // Otherwise its `AXIS` nodes decide, east-north when they are not along east-west and
+            // north-south; without them, it is south-west.
+            let east_north =
+                get(&["xscale"]).is_some_and(|sx| sx < 0.0) && angle(&["xyplanerotation"]).is_some_and(|rot| (rot - 90.0).abs() < 1e-10);
+            let esri = input.esri_names;
+            let axes = match input.axes {
+                Some(ax) if esri && !east_north => {
+                    if ax == *b"ne" || ax == *b"ws" {
+                        *b"ws"
                     } else {
                         *b"sw"
                     }
                 }
-                _ => projected_axes(root).unwrap_or(*b"sw"),
+                _ if esri && !east_north => *b"sw",
+                Some(ax) => ax,
+                None if input.has_axis || east_north => *b"en",
+                None => *b"sw",
             };
             out.push(match axes {
                 [b'e', b'n'] | [b'n', b'e'] => "+proj=krovak".into(),
@@ -753,17 +1086,23 @@ pub(crate) fn to_proj(root: &Node) -> Option<Converted> {
         }
         // ISEA, with its string-valued parameters in the method's name: `PROJ_isea_orient=pole`.
         m if m.starts_with("projisea") => {
-            let raw = root.child("PROJECTION")?.name()?;
+            let raw = input.method.as_deref()?;
             let flags = raw.get(..9)?.eq_ignore_ascii_case("PROJ_isea").then(|| &raw[9..])?;
             out.push("+proj=isea".into());
             let mut keys: Vec<&str> = Vec::new();
             for flag in flags.split('_').skip(1) {
+                // ISEA's flag (`PROJ_isea_dual`), once.
+                if flag == "dual" && !keys.contains(&flag) {
+                    keys.push(flag);
+                    out.push("+dual".into());
+                    continue;
+                }
                 let (k, v) = flag.split_once('=')?;
                 if k.is_empty() || v.is_empty() || !k.bytes().chain(v.bytes()).all(|c| c.is_ascii_alphanumeric()) {
                     return None;
                 }
                 // ISEA's string-valued parameters, each once; the others are PARAMETERs.
-                if !matches!(k, "orient" | "mode") || keys.contains(&k) {
+                if !matches!(k, "orient" | "mode" | "net") || keys.contains(&k) {
                     return None;
                 }
                 keys.push(k);
@@ -775,12 +1114,14 @@ pub(crate) fn to_proj(root: &Node) -> Option<Converted> {
             push(&mut out, "lon_0", angle(&["lon0"]));
             push(&mut out, "lat_0", angle(&["lat0"]));
             push(&mut out, "azi", angle(&["azi"]));
+            push(&mut out, "orient_lat", angle(&["orientlat"]));
+            push(&mut out, "orient_lon", angle(&["orientlon"]));
             push(&mut out, "resolution", get(&["resolution"]));
             push(&mut out, "aperture", get(&["aperture"]));
         }
         // World projections of a central meridian, as terrio writes them.
         m => {
-            let (proj, _) = super::wkt1_write::WORLD.iter().find(|(_, w)| norm(w) == m)?;
+            let proj = crate::methods::WORLD.iter().find(|w| w.wkt1.is_some_and(|n| norm(n) == m))?.proj;
             out.push(format!("+proj={proj}"));
             push(&mut out, "lon_0", lon_0);
         }
@@ -788,16 +1129,19 @@ pub(crate) fn to_proj(root: &Node) -> Option<Converted> {
     // The CRS's axes, as GDAL 3.10 and PROJ 9.8.1 (`always_xy`) read them: the directions of its
     // `AXIS` nodes, in their order but for northing then easting, which is read as easting then
     // northing. South-orientated Transverse Mercator and Krovak have their own axes.
-    match (method.as_str(), projected_axes(root)) {
+    match (method.as_str(), input.axes) {
         ("transversemercatorsouthorientated" | "krovak", _) => {}
         (_, Some([a, b])) if [a, b] != *b"ne" && [a, b] != *b"en" => out.push(format!("+axis={}{}u", a as char, b as char)),
         _ => {}
     }
+    // South-orientated Transverse Mercator's false easting and northing are subtracted (EPSG
+    // method 9808: W = FE - x, S = FN - y), where `+axis=wsu` negates `+x_0`/`+y_0` with x and y.
+    let (fe, fn_) = if method == "transversemercatorsouthorientated" { (negated(fe), negated(fn_)) } else { (fe, fn_) };
     out.push(format!("+x_0={fe}"));
     out.push(format!("+y_0={fn_}"));
     out.push(format!("+to_meter={to_meter}"));
     out.extend(tail);
-    Some(Converted { proj: out.join(" "), geogcs: geogcs.clone(), geog: None, geogcs_wkt1: None, bound: None })
+    Some(Converted { proj: out.join(" "), geogcs: geogcs.clone(), geog: None, geogcs_wkt1: None, bound: None, helmert: None })
 }
 
 /// The directions of a projected CRS's two `AXIS` nodes as PROJ's `+axis` letters (`e`, `w`,
@@ -835,11 +1179,60 @@ pub(crate) fn variant_c_pole_northing(a: f64, rf: f64, lat_ts: f64, northing: f6
     if lat_ts < 0.0 { northing - rho_f } else { northing + rho_f }
 }
 
+/// `-v`, without a negative zero.
+pub(crate) fn negated(v: f64) -> f64 {
+    if v == 0.0 { 0.0 } else { -v }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{SpatialRef, Transformer};
+
     use std::time::Duration;
+
+    /// A horizontal CRS's geodetic CRS, datum and ellipsoid are read where PROJ reads them: a
+    /// projected CRS's base, a compound CRS's horizontal CRS, a bound CRS's source (not its
+    /// target, though either may come first); a vertical CRS has none, its datum ensemble too.
+    #[test]
+    fn horizontal_datums_are_read_at_their_place() {
+        let g = |datum: &str, a: f64| {
+            format!(
+                r#"GEOGCRS["g",DATUM["{datum}",ELLIPSOID["e",{a},300,LENGTHUNIT["metre",1]]],CS[ellipsoidal,2],AXIS["lat",north],AXIS["lon",east],ANGLEUNIT["degree",0.0174532925199433]]"#
+            )
+        };
+        let name = |w: &str| parse(w).unwrap().horizontal_datum().and_then(|d| d.name().map(str::to_string));
+        let src = g("source", 6378000.0);
+        let projected = r#"PROJCRS["p",BASEGEOGCRS["b",DATUM["base",ELLIPSOID["e",6378100,300,LENGTHUNIT["metre",1]]]],CONVERSION["c",METHOD["Mercator (variant A)"]]]"#;
+        assert_eq!(name(&src).as_deref(), Some("source"));
+        assert_eq!(name(projected).as_deref(), Some("base"));
+        assert_eq!(parse(projected).unwrap().horizontal_ellipsoid(), Some((6378100.0, 300.0)));
+        let vertical = r#"VERTCRS["v",VDATUM["vd"],CS[vertical,1],AXIS["h",up,LENGTHUNIT["metre",1]]]"#;
+        assert_eq!(name(&format!(r#"COMPOUNDCRS["c",{projected},{vertical}]"#)).as_deref(), Some("base"));
+        let bound = format!(r#"BOUNDCRS[TARGETCRS[{}],SOURCECRS[{src}],ABRIDGEDTRANSFORMATION["t",METHOD["m"]]]"#, g("target", 6378137.0));
+        assert_eq!(name(&bound).as_deref(), Some("source"));
+        assert_eq!(parse(&bound).unwrap().horizontal_ellipsoid(), Some((6378000.0, 300.0)));
+        let ensemble = r#"VERTCRS["DVR90",ENSEMBLE["Dansk Vertikal Reference 1990 ensemble",MEMBER["a"],ENSEMBLEACCURACY[0.1]],CS[vertical,1],AXIS["h",up,LENGTHUNIT["metre",1]]]"#;
+        assert_eq!(name(vertical), None);
+        assert_eq!(name(ensemble), None);
+        // PROJ 9.9.0 (pyproj 3.8.0) reads a bound CRS's source whichever comes first: NAD27's
+        // ellipsoid (6378206.4 m), not the WGS 84 target's that the first one found was.
+        let geog = |n: &str, a: &str, rf: &str| {
+            format!(
+                r#"GEOGCRS["{n}",DATUM["{n} datum",ELLIPSOID["e",{a},{rf},LENGTHUNIT["metre",1]]],CS[ellipsoidal,2],AXIS["lat",north,ANGLEUNIT["degree",0.0174532925199433]],AXIS["lon",east,ANGLEUNIT["degree",0.0174532925199433]]]"#
+            )
+        };
+        let target_first = format!(
+            r#"BOUNDCRS[TARGETCRS[{}],SOURCECRS[{}],ABRIDGEDTRANSFORMATION["t",METHOD["Geocentric translations (geog2D domain)",ID["EPSG",9603]],PARAMETER["X-axis translation",-8,ID["EPSG",8605]],PARAMETER["Y-axis translation",160,ID["EPSG",8606]],PARAMETER["Z-axis translation",176,ID["EPSG",8607]]]]"#,
+            geog("WGS 84", "6378137", "298.257223563"),
+            geog("NAD27", "6378206.4", "294.978698213898")
+        );
+        assert_eq!(crate::semi_major_axis(&target_first), Some(6378206.4));
+        assert_eq!(name(&target_first).as_deref(), Some("NAD27 datum"));
+        // A derived geographic CRS's datum is its base CRS's (a rotated pole).
+        let rotated = r#"GEOGCRS["r",BASEGEOGCRS["WGS 84",DATUM["World Geodetic System 1984",ELLIPSOID["WGS 84",6378137,298.257223563]]],DERIVINGCONVERSION["p",METHOD["PROJ ob_tran o_proj=longlat"],PARAMETER["o_lon_p",0]],CS[ellipsoidal,2],AXIS["lon",east],AXIS["lat",north],ANGLEUNIT["degree",0.0174532925199433]]"#;
+        assert_eq!(name(rotated).as_deref(), Some("World Geodetic System 1984"));
+    }
 
     /// PROJ's two tables of named meridians agree on every name they share but Madrid, which
     /// `primeMeridiansDMS` has at 3°41'14.55"W and `proj_list_prime_meridians` at 16.58". Paris
@@ -976,6 +1369,23 @@ mod tests {
             assert!(within(30, move || SpatialRef::parse(&b)).is_err());
         }
         assert_eq!(within(5, || SpatialRef::parse(WGS84_PAREN).unwrap().epsg), Some(4326));
+    }
+
+    #[test]
+    fn user_wkt_keyword_without_definition_is_an_error() {
+        // #1032: a CRS keyword with only its name was a CRS that no transformation could use.
+        // GDAL 3.10.3 (PROJ 9.6.0) refuses them too: `gdalsrsinfo 'GEOGCS["x"]'` reports "Missing
+        // DATUM or ENSEMBLE node", `PROJCS["x"]` "missing CONVERSION node".
+        let keywords = "GEOGCS PROJCS GEOCCS COMPD_CS VERT_CS LOCAL_CS GEOGCRS GEOGRAPHICCRS GEODCRS GEODETICCRS \
+                        PROJCRS PROJECTEDCRS COMPOUNDCRS BOUNDCRS VERTCRS VERTICALCRS ENGCRS ENGINEERINGCRS";
+        for keyword in keywords.split_whitespace() {
+            for text in [format!("{keyword}[x]"), format!("{keyword}[\"WGS 84\"]")] {
+                let err = SpatialRef::parse_literal(&text).unwrap_err().to_string();
+                assert!(err.contains("has no definition after its name"), "{text}: {err}");
+            }
+        }
+        // A member node is enough: such minimal definitions stay readable.
+        assert!(SpatialRef::parse_literal(r#"LOCAL_CS["site grid",UNIT["metre",1]]"#).is_ok());
     }
 
     #[test]

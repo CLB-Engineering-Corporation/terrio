@@ -101,6 +101,7 @@ pub mod warp;
 pub(crate) mod window;
 pub mod xyz;
 pub mod zonal;
+pub mod zonal_cube;
 
 use crate::crs::SpatialRef;
 use crate::{Error, RasterDataset, Result};
@@ -202,6 +203,7 @@ impl Resampling {
 
     /// The interpolation kernel's weight at distance `x` (in pixels), as GDAL computes it. Weights
     /// are normalized by their sum, so the B-spline's constant factor is left out.
+    #[inline]
     pub(crate) fn weight(self, x: f64) -> f64 {
         match self {
             Self::Bilinear => {
@@ -348,6 +350,7 @@ pub(crate) fn common_type(types: impl IntoIterator<Item = DataType>) -> DataType
 
 /// Converts a value to a data type as GDAL's `GDALCopyWords` does: integers are rounded half away
 /// from zero and clamped to the type's range, NaN becomes 0, and `Float32` keeps single precision.
+#[inline]
 pub(crate) fn convert_value(v: f64, dt: DataType) -> f64 {
     match dt {
         DataType::F64 => v,
@@ -364,6 +367,7 @@ pub(crate) fn convert_value(v: f64, dt: DataType) -> f64 {
 
 /// Converts a value as GDAL's warp kernel does: integers are rounded half up (`floor(v + 0.5)`) and
 /// clamped.
+#[inline]
 pub(crate) fn warp_round(v: f64, dt: DataType) -> f64 {
     match dt {
         DataType::F64 => v,

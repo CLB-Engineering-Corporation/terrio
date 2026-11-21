@@ -231,6 +231,7 @@
         feature = "flatgeobuf",
         feature = "jp2",
         feature = "lerc",
+        feature = "jxl",
         feature = "pointcloud",
         feature = "tiles",
         feature = "zarr",
@@ -374,6 +375,18 @@ pub use pixel::{complex_components_from_iter, raster_from_data};
 /// The vector types: layers of features with geometries and attributes.
 pub use wbvector::{Feature, FieldDef, FieldType, FieldValue, Geometry, GeometryType, Layer};
 
+/// A feature's ID as the signed 64-bit integer of its source.
+///
+/// [`Feature::fid`] is unsigned, and a SQLite rowid is signed: a GeoPackage read keeps the
+/// rowid's bits, so a row of ID `-1` has a `fid` of `u64::MAX` and `signed_fid` gives `-1` back.
+/// SQL's `FID`, the Arrow export and GeoPackage edits read the ID this way.
+///
+/// A format whose IDs are unsigned keeps them in `fid`: an ID above `i64::MAX` reads back
+/// negative here, so use `fid` itself for such a source.
+pub fn signed_fid(feature: &Feature) -> i64 {
+    feature.fid as i64
+}
+
 /// The system allocator, ignoring the release of null pointers.
 ///
 /// OpenJPEG's Rust port, terrio's JPEG 2000 codec (the `jp2` feature), releases code-block
@@ -392,16 +405,22 @@ pub use wbvector::{Feature, FieldDef, FieldType, FieldValue, Geometry, GeometryT
 pub struct NullSafeAllocator;
 
 // SAFETY: every call goes to the system allocator, except releases of null pointers, which
-// allocate nothing.
+// allocate nothing; `grow_heap_ahead` releases its block as it allocated it.
 unsafe impl std::alloc::GlobalAlloc for NullSafeAllocator {
     unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+        let pages = heap_pages();
         // SAFETY: as the caller guarantees.
-        unsafe { std::alloc::System.alloc(layout) }
+        let ptr = unsafe { std::alloc::System.alloc(layout) };
+        grow_heap_ahead(pages);
+        ptr
     }
 
     unsafe fn alloc_zeroed(&self, layout: std::alloc::Layout) -> *mut u8 {
+        let pages = heap_pages();
         // SAFETY: as the caller guarantees.
-        unsafe { std::alloc::System.alloc_zeroed(layout) }
+        let ptr = unsafe { std::alloc::System.alloc_zeroed(layout) };
+        grow_heap_ahead(pages);
+        ptr
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
@@ -412,8 +431,52 @@ unsafe impl std::alloc::GlobalAlloc for NullSafeAllocator {
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: std::alloc::Layout, new_size: usize) -> *mut u8 {
+        let pages = heap_pages();
         // SAFETY: as the caller guarantees.
-        unsafe { std::alloc::System.realloc(ptr, layout, new_size) }
+        let ptr = unsafe { std::alloc::System.realloc(ptr, layout, new_size) };
+        grow_heap_ahead(pages);
+        ptr
+    }
+}
+
+/// The pages of 64 KiB of WebAssembly memory 0; 0 elsewhere.
+fn heap_pages() -> usize {
+    #[cfg(target_arch = "wasm32")]
+    {
+        core::arch::wasm32::memory_size::<0>()
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        0
+    }
+}
+
+/// After an allocation grew the WebAssembly memory, grows it by a quarter more at once.
+///
+/// The system allocator of `wasm32-unknown-unknown` (dlmalloc) grows the memory by what each
+/// allocation lacks, in steps of 64 KiB, and each `memory.grow` takes about 0.1 ms in V8 whatever
+/// its size: decoding a FlatGeobuf file of 90,000 polygons grew it about 3,700 times, 0.36 s. A
+/// block allocated and released here joins the free space at the heap's end, where the next
+/// allocations find room: the memory then grows a number of times logarithmic in its size.
+fn grow_heap_ahead(pages_before: usize) {
+    use std::alloc::GlobalAlloc;
+    let pages = heap_pages();
+    // At most 1 GiB: 65,536 pages of 64 KiB fill wasm32's 4 GiB.
+    let size = pages / 4 * 65536;
+    if pages <= pages_before || size == 0 {
+        return;
+    }
+    // No `expect`: a panic in the allocator would allocate. The size is at most 1 GiB anyway.
+    let Ok(layout) = std::alloc::Layout::from_size_align(size, 1) else {
+        return;
+    };
+    // SAFETY: a nonzero size, and the block is released with the layout it was allocated
+    // with. A null block (the memory can't grow that far) is not released.
+    unsafe {
+        let block = std::alloc::System.alloc(layout);
+        if !block.is_null() {
+            std::alloc::System.dealloc(block, layout);
+        }
     }
 }
 

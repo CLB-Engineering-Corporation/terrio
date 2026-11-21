@@ -31,6 +31,7 @@ from terrio.rio.dtypes import _gdal_typename
 from terrio.rio.enums import Resampling
 from terrio.rio.errors import CRSError, RasterioDeprecationWarning, RPCError, TransformError
 from terrio.rio.transform import array_bounds, from_bounds
+from terrio.rio.windows import Window
 
 SUPPORTED_RESAMPLING = [
     Resampling.nearest,
@@ -454,7 +455,8 @@ def calculate_default_transform(
     """The output grid GDAL suggests for reprojecting a raster.
 
     Args:
-        src_crs: The source CRS.
+        src_crs: The source CRS. `None` with georeferenced bounds: the bounds are in the target
+            CRS, and the source is not reprojected.
         dst_crs: The target CRS.
         width: The source width.
         height: The source height.
@@ -503,6 +505,10 @@ def calculate_default_transform(
         raise ValueError("Resolution cannot be used with dst_width and dst_height.")
     t = from_bounds(left, bottom, right, top, width, height)
     gcp_kw = _gcp_args(gcps, kwargs) if gcps is not None else {}
+    if src_crs is None and gcps is None and rpcs is None and not t.almost_equals(Affine.identity()):
+        # GDAL does not reproject a source with no CRS: its geotransform is in the target CRS.
+        # Bounds of pixels and lines (no geotransform) place nothing, and a CRS stays required.
+        src_crs = dst_crs
     if rpcs is not None:
         rpc_kw = _rpc_args(rpcs, kwargs)
         gt, w, h = _terrio.suggested_grid(
@@ -667,6 +673,73 @@ def _sentinel(src3: np.ndarray, valid: np.ndarray) -> Any:
     raise ValueError("no value is free to mark transparent source pixels")
 
 
+def _band_source_window(
+    band: Any,
+    destination: Any,
+    src_crs: Any,
+    dst_crs: Any,
+    dst_transform: Any,
+    rs: Resampling,
+    tolerance: float,
+    src_nodata: Any,
+    gcps: Any,
+    rpcs: Any,
+    kwargs: Mapping[str, Any],
+    grid_invariant: bool | None,
+    periodic_longitude: bool | None,
+) -> tuple[int, int, int, int] | None:
+    """The window of a band that a warp into a known grid reads, or None to read the whole band.
+
+    Only for an affine source with a CRS warped into a given destination grid, without `sum`
+    and the warp options that widen the source (`SOURCE_EXTRA`, `SAMPLE_STEPS`).
+
+    Returns:
+        tuple: `(col_off, row_off, width, height)`, at least 1x1, or None.
+    """
+    from terrio.rio import Band
+
+    ds = band.ds
+    if dst_crs is None and isinstance(destination, Band):
+        # The warp's destination CRS: the destination dataset's.
+        dst_crs = destination.ds.crs
+    if (
+        not src_crs
+        or dst_transform is None
+        or destination is None
+        or rs == Resampling.sum
+        or gcps is not None
+        or rpcs
+        or kwargs
+        or not ds._georeferenced
+        or ds.gcps[0]
+    ):
+        return None
+    dst_h, dst_w = destination.shape if isinstance(destination, Band) else destination.shape[-2:]
+    count = len(band.bidx) if isinstance(band.bidx, (list, tuple)) else 1
+    nodata = ds.nodata if src_nodata is None else src_nodata
+    rw = _terrio.RegionWarp(
+        (ds.width, ds.height),
+        ds.transform.to_gdal(),
+        _crs_text(src_crs),
+        _crs_text(dst_crs if dst_crs is not None else src_crs),
+        Affine(*dst_transform[:6]).to_gdal(),
+        _WARP_NAMES[rs],
+        float(np.float32(tolerance)),
+        _gdal_typename(np.dtype(band.dtype).name),
+        [None if nodata is None else float(nodata)] * count,
+        grid_invariant=grid_invariant,
+        periodic_longitude=periodic_longitude,
+    )
+    win = rw.source_window((0, 0, int(dst_w), int(dst_h)))
+    if win is None:
+        return None
+    x, y, w, h = win
+    if w <= 0 or h <= 0:
+        # Outside the source: one pixel, which the warp leaves unused.
+        return (0, 0, 1, 1)
+    return (x, y, w, h)
+
+
 def reproject(
     source: Any,
     destination: Any = None,
@@ -689,6 +762,7 @@ def reproject(
     warp_mem_limit: int = 0,
     src_geoloc_array: Any = None,
     grid_invariant: bool | None = None,
+    periodic_longitude: bool | None = None,
     **kwargs: Any,
 ) -> tuple[Any, Affine]:
     """Reprojects a raster array (or band) into another grid.
@@ -707,7 +781,8 @@ def reproject(
         rpcs: Rational polynomial coefficients georeferencing the source (an `RPC` or GDAL's RPC
             items; a dataset source is warped by its own RPCs), warped with GDAL's RPC
             transformer, in WGS 84 (see `**kwargs`).
-        src_crs: The source CRS (arrays only; datasets give theirs).
+        src_crs: The source CRS (arrays only; datasets give theirs). A dataset with a geotransform
+            and no CRS is not reprojected: its geotransform is in the destination CRS.
         src_nodata: The source nodata value (by default, the dataset's).
         dst_transform: The destination's transform; computed when None.
         dst_crs: The destination CRS (by default, the source's).
@@ -728,6 +803,9 @@ def reproject(
         src_geoloc_array: Unsupported.
         grid_invariant: Keep values independent of tiles (default); False selects GDAL's
             chunk-dependent sampling. None follows TERRIO_WARP_GRID.
+        periodic_longitude: Wrap interpolation across the stored edge of a geographic source
+            covering one turn of longitude (default); False keeps it inside the stored columns,
+            for fields that are not continuous across that edge.
         **kwargs: GDAL transformer options: `MAX_GCP_ORDER` and `SRC_METHOD` (`GCP_POLYNOMIAL`,
             `GCP_TPS` or `GCP_HOMOGRAPHY`) with GCPs; `RPC_HEIGHT`, `RPC_HEIGHT_SCALE`, `RPC_DEM`
             (warped with exact transformations, as rasterio), `RPC_DEMINTERPOLATION`,
@@ -769,6 +847,10 @@ def reproject(
     sum_scale = 1.0
     if isinstance(source, DatasetBase):
         source = Band(source, list(source.indexes), source.dtypes[0], source.shape)
+    # A dataset with a geotransform, which stands in for a missing CRS below.
+    georeferenced = isinstance(source, Band) and not source.ds.transform.almost_equals(
+        Affine.identity()
+    )
     if isinstance(source, Band):
         ds, bidx = source.ds, source.bidx
         if rs == Resampling.sum:
@@ -776,9 +858,29 @@ def reproject(
             count = len(bidx) if isinstance(bidx, (list, tuple)) else 1
             _terrio._check_sum_window(ds.width * ds.height, np.dtype(source.dtype).itemsize * count)
             sum_scale = _sum_scale(ds, ds.width, ds.height)
-        arr = ds.read(bidx)
         src_transform = ds.transform
         src_crs = src_crs or ds.crs
+        win = _band_source_window(
+            source,
+            destination,
+            src_crs,
+            dst_crs,
+            dst_transform,
+            rs,
+            tolerance,
+            src_nodata,
+            gcps,
+            rpcs,
+            kwargs,
+            grid_invariant,
+            periodic_longitude,
+        )
+        if win is None:
+            arr = ds.read(bidx)
+        else:
+            # Only the pixels the destination needs, as GDAL's warper reads its source window.
+            arr = ds.read(bidx, window=Window(*win))
+            src_transform = src_transform @ Affine.translation(win[0], win[1])
         if rpcs:
             # The dataset's own RPCs, as GDAL warps a dataset with SRC_METHOD=RPC.
             rpcs = ds.rpcs or rpcs
@@ -818,8 +920,17 @@ def reproject(
     src_count, src_h, src_w = src3.shape
     if src_crs is None and rpcs is not None:
         src_crs = "EPSG:4326"
+    if src_crs is None and georeferenced:
+        # A dataset with no CRS is not reprojected: its geotransform is in the destination CRS
+        # (the destination dataset's when none is given).
+        src_crs = dst_crs
+        if src_crs is None and isinstance(destination, Band):
+            src_crs = destination.ds.crs
     if src_crs is None:
         raise CRSError("A source CRS is required")
+    if dst_crs is None and isinstance(destination, Band):
+        # As rasterio: a dataset's band is warped into that dataset's CRS.
+        dst_crs = destination.ds.crs or None
     if dst_crs is None:
         dst_crs = src_crs
 
@@ -936,6 +1047,7 @@ def reproject(
         et=0.0 if "to" in rpc_kw and "RPC_DEM" in rpc_kw["to"] else tolerance,
         wo=_warp_extras(kwargs),
         grid_invariant=grid_invariant,
+        periodic_longitude=periodic_longitude,
         **gcp_kw,
         **rpc_kw,
     )

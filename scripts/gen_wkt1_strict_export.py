@@ -1,6 +1,6 @@
 """Freeze PROJ's WKT 1 of CRSs for ``SpatialRef::to_wkt1_strict`` (``tests/wkt1_strict_export.rs``).
 
-PROJ 9.8.1 (pyproj 3.8.0) writes each CRS with ``CRS.to_wkt("WKT1_GDAL", output_axis_rule=True)``
+PROJ 9.9.0 (pyproj 3.8.0) writes each CRS with ``CRS.to_wkt("WKT1_GDAL", output_axis_rule=True)``
 (``proj_as_wkt`` with ``WKT1_GDAL`` and ``OUTPUT_AXIS=YES``, the AXIS nodes GDAL's
 ``exportToWkt`` writes, as ``projinfo -o WKT1_GDAL``), with the network off. The rows are every
 20th EPSG and ESRI code, every registry code PROJ writes no WKT 1 for, the codes behind each
@@ -49,7 +49,7 @@ RULES = [("EPSG", c) for c in (3857, 4979, 4978, 8857, 2046, 5514, 7405, 9707)] 
 ]
 
 # Polar Stereographic (variant C): terrio's table WKT is GDAL's, without the AXIS nodes PROJ
-# 9.8.1 writes for it.
+# 9.9.0 writes for it.
 LEFT_OUT = {("EPSG", 2985), ("EPSG", 2986)}
 
 STRICT_PROJ_STRINGS = [
@@ -70,6 +70,14 @@ STRICT_PROJ_STRINGS = [
     "+proj=eqearth +lon_0=150 +ellps=WGS84 +units=m",
     "+proj=eqearth +lon_0=150 +x_0=0 +y_0=0 +units=m +a=6378137.0 +rf=298.257223563",
     "+proj=lcc +lat_1=40 +lat_2=50 +k=0.99 +ellps=WGS84 +units=m",
+    # LCC with its parallel given twice is 2SP, with one at the origin 1SP (#1012 item 61).
+    "+proj=lcc +lat_0=45 +lat_1=45 +lat_2=45 +lon_0=3 +x_0=700000 +y_0=6600000 +ellps=GRS80 +units=m",
+    "+proj=lcc +lat_0=45 +lat_1=45 +lon_0=3 +x_0=700000 +y_0=6600000 +ellps=GRS80 +units=m",
+    # Krovak's pseudo standard parallel is fixed: PROJ ignores `lat_ts` and writes 78.5 (#1012
+    # item 31).
+    "+proj=krovak +axis=swu +lat_ts=78 +ellps=bessel +units=m",
+    # South-orientated axes with a height down: PROJ's WKT 1 has west and south axes.
+    "+proj=tmerc +lon_0=25 +x_0=1000 +ellps=WGS84 +axis=wsd +units=m",
     (
         "+proj=col_urban +lat_0=7.88893673611111 +lon_0=-72.50287095 +x_0=842805.406 +y_0=1364404.57 "
         "+h_0=308 +ellps=GRS80 +units=m"
@@ -224,7 +232,7 @@ def main():
     args = parser.parse_args()
     warnings.simplefilter("ignore")
     pyproj.network.set_network_enabled(False)
-    assert pyproj.proj_version_str == "9.8.1", pyproj.proj_version_str
+    assert pyproj.proj_version_str == "9.9.0", pyproj.proj_version_str
     if args.all:
         write_all(args.all)
         return

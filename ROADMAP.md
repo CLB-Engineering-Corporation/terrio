@@ -564,6 +564,15 @@ Python:
       synthetic and real files (257 checks, none differing); subdatasets (`group=`,
       `variable=`), GCPs and RPCs as rioxarray opens, stores, writes and (GCPs) reprojects them,
       identical to rioxarray on an ESA CCI soil moisture netCDF and ICEYE GCP and RPC images.
+- [x] terrio's raster operations on the `.terrio` accessor: `dem`, `sieve`, `proximity`,
+      `fill_nodata`, `reclassify`, `viewshed` (DataArrays and Datasets, band by band),
+      `polygonize`, `contour`, `footprint` and `zonal_stats` (a `terrio.Layer`), and
+      `terrio.xarray.rasterize` on an array's grid; the same pixels as the terrio functions on
+      the array written to a file.
+- [ ] Move xarray zonal cube strip planning, batching, read-ahead and chunk accounting
+      onto the shared Rust zonal cube engine from [#1071](https://github.com/opengeos/terrio/pull/1071),
+      preserving the xarray dimensions, coordinates, lazy reads and byte-budget behavior
+      introduced in [#1068](https://github.com/opengeos/terrio/pull/1068).
 - [x] Wheels with the GDAL backend as an optional extra, for the formats terrio doesn't read itself.
       Done: the Python package's `gdal` feature, built from source against an installed GDAL
       (`maturin build --features gdal`).
@@ -621,7 +630,9 @@ WebAssembly (the `terrio-js` npm package):
       whole-program LTO, the codecs optimized for speed and the rest for size, and wasm-opt -Oz:
       both decode GeoTIFFs and write COGs as fast in Node.js, and the full module decodes JPEG 2000.
       The separate `terrio-js/zarr` module reads Zarr arrays over HTTP by window and band,
-      retaining declared EPSG codes without including the CRS engine (#900).
+      retaining declared EPSG codes without including the CRS engine (#900). The separate
+      `terrio-js/cog` module reads GeoTIFFs and COGs over HTTP by window, band and overview the
+      same way, with the EPSG code of their GeoKeys.
 - [x] Datasets larger than 4 GB, with the 64-bit memory proposal (memory64) where runtimes support
       it. Done: a memory64 module, `terrio-js/memory64` (every format, up to 16 GB), which
       `load({ memory64: true })` picks where the runtime has 64-bit memories (Node.js 24+, Chrome
@@ -664,7 +675,9 @@ WebAssembly (the `terrio-js` npm package):
 - [ ] HEC-RAS files read in place over HTTP and S3 by range requests: needs an engine byte-source
       interface (plan the ranges from the HDF5 metadata, fetch them, then decode, as
       `sparse::SparseFile` reads).
-- [x] One HDF5 reader for terrio and the HEC-RAS engine: both on crates.io `hdf5-reader` 0.10.1.
+- [x] Pure-Rust HDF5 reading through crates.io `hdf5-reader`. Terrio and NetCDF share compatible
+      reader types; the HEC-RAS engine owns its reader and may pin a different release, so reader
+      updates do not have to wait for an engine release.
 - [x] CRS: datum shift grids (NTv2, GeoTIFF grids), vertical datums, time-dependent transformations
       between dynamic datums (coordinate epochs). Done: PROJ's GeoTIFF grids (PROJ-data), NTv2 and GTX
       read in pure Rust and interpolated as PROJ does (`hgridshift`, `vgridshift`, NADCON5's
@@ -684,6 +697,10 @@ WebAssembly (the `terrio-js` npm package):
       727 of 732 points over 604 pairs (`scripts/compare_vertical_with_proj.py`); point motion
       operations between two epochs of a datum (the Canada velocity grids of NAD83(CSRS),
       NKG_RF17vel), PROJ's coordinates to 4 nm.
+- [ ] The grids a point's transformation needs, with where to get them, in the bindings: Rust has
+      `Transformer::best_operation_grids_at`, `GridUse` and `default_grid_search_paths` (#1075),
+      for applications that download grids themselves; Python and JavaScript (with
+      `registerGrid`) do not expose them yet, nor `Transformer::operation_at`.
     - [x] PROJ's chains through several intermediate datums. Done: between CRSs whose datums
           no transformation links directly, the transformations PROJ's database registers
           (concatenations of several among them included, NKG's too) chained through

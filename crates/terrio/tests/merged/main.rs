@@ -40,6 +40,8 @@ mod flatgeobuf_hostile;
 mod gdal_redirect_policy;
 #[path = "../geocentric.rs"]
 mod geocentric;
+#[path = "../geojson_lists.rs"]
+mod geojson_lists;
 #[path = "../geolocation_warp.rs"]
 mod geolocation_warp;
 #[path = "../geopackage.rs"]
@@ -158,6 +160,8 @@ mod wkt2;
 mod wkt_file_nul;
 #[path = "../zip_duplicate_names.rs"]
 mod zip_duplicate_names;
+#[path = "../zonal_cube.rs"]
+mod zonal_cube;
 #[path = "../zonal_remote.rs"]
 mod zonal_remote;
 #[path = "../zstd_input_limits.rs"]
