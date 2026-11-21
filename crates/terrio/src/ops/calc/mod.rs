@@ -395,7 +395,7 @@ const DEFAULT_MEMORY_MIB: f64 = 256.0;
 /// [`calc`] over raster files, written to `path` a strip of rows at a time in about
 /// `max_memory_mib` of memory, instead of reading every input whole. The output is the one
 /// [`calc`] gives, value for value: inputs of different extents (`union`, `intersect`, a
-/// `projwin`) are aligned as [`mosaic`] aligns them for [`calc`], with its rounding, and every
+/// `projwin`) are aligned as [`mosaic`](crate::ops::mosaic::mosaic) aligns them for [`calc`], with its rounding, and every
 /// strip holds whole chunks of the rows [`calc`] evaluates at once.
 ///
 /// An output that is also an input is computed whole first. Formats written whole (not GeoTIFF)
