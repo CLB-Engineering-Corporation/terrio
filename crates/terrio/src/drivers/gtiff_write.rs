@@ -1462,30 +1462,34 @@ impl<'a> Level<'a> {
         let band_len = self.cols * self.rows;
         let clipped = std::sync::atomic::AtomicBool::new(false);
         let packed_bits = layout.nbits.filter(|&bits| bits != (size * 8) as u16);
-        let chunks = crate::par::map_range_init_coarse(planes * per_plane, || None, |scratch, i| {
-            let (plane, j) = (i / per_plane, i % per_plane);
-            let (x0, y0) = ((j % across) * chunk_w, (j / across) * chunk_h);
-            // Strips stop at the last row; tiles are padded to full size.
-            let h = if tiled { chunk_h } else { chunk_h.min(self.rows - y0) };
-            // A complex sample's parts are interleaved like the bands of a pixel.
-            let mut buf = if layout.planar {
-                let plane_len = parts * band_len;
-                with_data!(self.data.as_ref(), v => chunk_bytes(&v[plane * plane_len..(plane + 1) * plane_len], self.cols, self.rows, parts, x0, y0, chunk_w, h))
-            } else {
-                with_data!(self.data.as_ref(), v => chunk_bytes(v, self.cols, self.rows, spp * parts, x0, y0, chunk_w, h))
-            };
-            if let Some(bits) = packed_bits {
-                let (packed, did_clip) = pack_unsigned_rows(&buf, chunk_w * chunk_spp, size, bits);
-                buf = packed;
-                // GDAL 3.13.3 silently clamps bilevel samples; wider packed domains warn.
-                if did_clip && bits > 1 {
-                    clipped.store(true, std::sync::atomic::Ordering::Relaxed);
+        let chunks = crate::par::map_range_init_coarse(
+            planes * per_plane,
+            || None,
+            |scratch, i| {
+                let (plane, j) = (i / per_plane, i % per_plane);
+                let (x0, y0) = ((j % across) * chunk_w, (j / across) * chunk_h);
+                // Strips stop at the last row; tiles are padded to full size.
+                let h = if tiled { chunk_h } else { chunk_h.min(self.rows - y0) };
+                // A complex sample's parts are interleaved like the bands of a pixel.
+                let mut buf = if layout.planar {
+                    let plane_len = parts * band_len;
+                    with_data!(self.data.as_ref(), v => chunk_bytes(&v[plane * plane_len..(plane + 1) * plane_len], self.cols, self.rows, parts, x0, y0, chunk_w, h))
+                } else {
+                    with_data!(self.data.as_ref(), v => chunk_bytes(v, self.cols, self.rows, spp * parts, x0, y0, chunk_w, h))
+                };
+                if let Some(bits) = packed_bits {
+                    let (packed, did_clip) = pack_unsigned_rows(&buf, chunk_w * chunk_spp, size, bits);
+                    buf = packed;
+                    // GDAL 3.13.3 silently clamps bilevel samples; wider packed domains warn.
+                    if did_clip && bits > 1 {
+                        clipped.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                } else {
+                    apply_predictor(&mut buf, layout.predictor, chunk_w * chunk_spp, chunk_spp, size);
                 }
-            } else {
-                apply_predictor(&mut buf, layout.predictor, chunk_w * chunk_spp, chunk_spp, size);
-            }
-            compression.compress_reusing(buf, &ChunkInfo { w: chunk_w, h, spp: chunk_spp, t }, codec, scratch)
-        });
+                compression.compress_reusing(buf, &ChunkInfo { w: chunk_w, h, spp: chunk_spp, t }, codec, scratch)
+            },
+        );
         let chunks = chunks.into_iter().collect::<Result<Vec<_>>>()?;
         let clipped_bits = packed_bits.filter(|_| clipped.load(std::sync::atomic::Ordering::Relaxed));
         let (bits, format) = sample_format(t);

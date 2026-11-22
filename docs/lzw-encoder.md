@@ -43,3 +43,27 @@ is a diagnostic, not a measurement of compose's clipped source windows or CPU
 shares. Synthetic in-memory writer workloads perform no source I/O or decode.
 Performance evidence belongs with workload identities and raw paired measurements;
 no cross-platform performance guarantee follows from the encoder design.
+
+
+## Upstream 0.9.0 integration
+
+The 0.9.0 port retains the release's direct `weezl` 0.2.1 oracle (the lockfile
+also contains transitive 0.1.12). The writer still encodes MSB-first eight-bit
+symbols with TIFF early size switching. No compression level applies to LZW.
+Deflate's row-aware search and level, LERC secondary levels and Zstandard levels
+remain on the release's original paths. Their option validation is unchanged.
+
+Packed `NBITS` serialization and clipping warnings run before compression;
+unpacked chunks retain the existing predictor transform. Strip/tile sizing,
+padding, planar ordering, masks and overview assembly are unchanged by this port.
+The new coarse scratch helper is separate from 0.9.0's waiting-thread scheduler;
+remote decoding, cancellation, scoped read policies and read-budget checks remain
+unchanged. State belongs to a Rayon work piece or one serial call, not a worker
+thread or a source raster, and each chunk resets the dictionary.
+
+The performance numbers above describe the earlier 0.8.0 experiments. Fresh 0.9.0
+qualification is retained separately; historical timings are not 0.9.0 evidence.
+
+The release disables automatic integration-test discovery. The LZW writer golden
+suite is an explicit `[[test]]` target, retaining its fresh-process one/three-thread
+checks rather than becoming a silently unbuilt test file.
