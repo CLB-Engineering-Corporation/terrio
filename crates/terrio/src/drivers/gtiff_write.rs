@@ -486,6 +486,8 @@ pub(crate) struct TiffOptions {
     pub rpc: Vec<f64>,
     /// The parameters of LERC and JPEG.
     pub codec: CodecParams,
+    /// `MAX_Z_ERROR` as given, which GDAL records in the IMAGE_STRUCTURE metadata of a LERC file.
+    pub max_z_error_text: Option<String>,
     /// The raster's bands are pairs of real and imaginary parts (a complex dataset): written as
     /// complex samples (`SampleFormat` 5 or 6, GDAL's `CInt16`... `CFloat64`).
     pub complex: bool,
@@ -591,6 +593,7 @@ impl Default for TiffOptions {
             mask_without_dataset: false,
             rpc: Vec::new(),
             codec: CodecParams::default(),
+            max_z_error_text: None,
             complex: false,
             nbits: None,
             domains: Vec::new(),
@@ -792,6 +795,7 @@ impl TiffOptions {
                 .ok()
                 .filter(|e| *e >= 0.0)
                 .ok_or_else(|| Error::InvalidArgument(format!("invalid MAX_Z_ERROR '{v}'")))?;
+            o.max_z_error_text = Some(v.to_string());
         }
         if let Some(v) = co("LERC_ENCODER") {
             o.codec.lerc_compact = match v.trim().to_ascii_uppercase().as_str() {
@@ -1066,7 +1070,7 @@ fn plan(raster: &Raster, opts: &TiffOptions) -> Result<Plan> {
     // GDAL's COG driver records the resampling of the overviews it makes (`@OVERVIEW_RESAMPLING`,
     // an IMAGE_STRUCTURE item): the option as given, else `GetResampling`'s; for overviews it
     // copies, the source's `RESAMPLING` item.
-    let image_structure: Vec<(String, String)> = match (tile, &opts.source_overviews) {
+    let mut image_structure: Vec<(String, String)> = match (tile, &opts.source_overviews) {
         (Some(_), Some(path)) if opts.cog => crate::LazyRaster::open_tiff(path)
             .ok()
             .flatten()
@@ -1081,6 +1085,15 @@ fn plan(raster: &Raster, opts: &TiffOptions) -> Result<Plan> {
         }
         _ => Vec::new(),
     };
+    // GDAL's GTiff and COG drivers record LERC's error bound, as the option was given, or that
+    // LERC is lossless (GDAL 3.13.3).
+    if matches!(opts.compression, Compression::Lerc | Compression::LercDeflate | Compression::LercZstd) {
+        image_structure.push(if opts.codec.max_z_error > 0.0 {
+            ("MAX_Z_ERROR".into(), opts.max_z_error_text.clone().unwrap_or_else(|| opts.codec.max_z_error.to_string()))
+        } else {
+            ("COMPRESSION_REVERSIBILITY".into(), "LOSSLESS".into())
+        });
+    }
     let mut geo = geo_tags(raster, opts, &image_structure, &implied)?;
     if !opts.georeferenced || !opts.gcps.is_empty() || opts.geo_transform.is_some_and(|gt| !crate::is_north_up(&gt)) {
         geo.retain(|(tag, _)| !matches!(tag, 33550 | 33922));
@@ -6321,6 +6334,27 @@ mod lerc_encoder_tests {
         }
         let refused = write(&ds, false, &[("LERC_ENCODER", "FAST")]);
         assert!(matches!(refused, Err(Error::InvalidArgument(m)) if m.contains("LERC_ENCODER")));
+    }
+
+    /// GDAL (3.13.3) records LERC's `MAX_Z_ERROR` as the option was given, or that LERC is
+    /// lossless, in the IMAGE_STRUCTURE items of `GDAL_METADATA`, in GeoTIFFs and COGs alike.
+    #[test]
+    fn lerc_tags_match_gdal() {
+        let ds = surface();
+        let metadata = |p: &str| {
+            let mut d = tiff::decoder::Decoder::new(std::fs::File::open(p).unwrap()).unwrap();
+            d.get_tag_ascii_string(tiff::tags::Tag::Unknown(42112)).unwrap_or_default()
+        };
+        for cog in [false, true] {
+            let (_d, p) = write(&ds, cog, &[("MAX_Z_ERROR", "1e-3")]).unwrap();
+            let md = metadata(&p);
+            assert!(md.contains(r#"<Item name="MAX_Z_ERROR" domain="IMAGE_STRUCTURE">1e-3</Item>"#), "cog={cog}: {md}");
+            assert!(!md.contains("COMPRESSION_REVERSIBILITY"), "cog={cog}: {md}");
+            let (_d, p) = write(&ds, cog, &[("MAX_Z_ERROR", "0")]).unwrap();
+            let md = metadata(&p);
+            assert!(md.contains(r#"<Item name="COMPRESSION_REVERSIBILITY" domain="IMAGE_STRUCTURE">LOSSLESS</Item>"#), "cog={cog}: {md}");
+            assert!(!md.contains("MAX_Z_ERROR"), "cog={cog}: {md}");
+        }
     }
 
     /// Each chunk is the blob `lerc-writer` encodes with its GDAL profile.
