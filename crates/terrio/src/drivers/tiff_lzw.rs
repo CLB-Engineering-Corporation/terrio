@@ -15,17 +15,19 @@ pub(super) struct Encoder {
 
 impl Encoder {
     pub(super) fn new() -> Self {
-        Self { hash: HashEncoder::new(), starts: vec![0; 4096], lengths: vec![0; 4096], parents: vec![0; 4096] }
+        Self { hash: HashEncoder::new(), starts: Vec::new(), lengths: Vec::new(), parents: Vec::new() }
     }
 
     /// Starts an independent strip/tile. No dictionary state crosses chunks.
     pub(super) fn encode(&mut self, data: &[u8]) -> Vec<u8> {
-        if profitable_chunk(data) { self.encode_chunk::<true>(data) } else { self.hash.encode(data) }
+        if profitable_chunk(data) { self.encode_chunk(data) } else { self.hash.encode(data) }
     }
 
-    // The plain loop retains the hash encoder's iterator shape, with no witness
-    // writes, candidate branches, or indexed cursor on its byte-hit path.
-    fn encode_chunk<const SKIP: bool>(&mut self, data: &[u8]) -> Vec<u8> {
+    fn encode_chunk(&mut self, data: &[u8]) -> Vec<u8> {
+        // Retain witnesses after first use; plain chunks never allocate them.
+        self.starts.resize(4096, 0);
+        self.lengths.resize(4096, 0);
+        self.parents.resize(4096, 0);
         self.hash.table.fill(0);
         self.hash.successors.fill(0);
         let mut out = Bits { bytes: Vec::with_capacity(data.len().min(4096)), pending: 0, count: 0 };
@@ -55,7 +57,7 @@ impl Encoder {
                         *count = count.saturating_add(1);
                         if next < 4096 && !omitted {
                             self.hash.table[slot] = (key << 12) | u32::from(next);
-                            if SKIP {
+                            {
                                 let code = usize::from(next);
                                 let length = cursor - start + 1;
                                 self.starts[code] = start;
@@ -85,7 +87,7 @@ impl Encoder {
                         prefix = u16::from(symbol);
                         start = cursor;
                         cursor += 1;
-                        if SKIP {
+                        {
                             for candidate in [longest[start % 4], latest[start % 4]] {
                                 let code = usize::from(candidate);
                                 let length = usize::from(self.lengths[code]);
@@ -156,6 +158,7 @@ impl HashEncoder {
         Self { table: vec![0; 8192], successors: vec![0; 4096] }
     }
 
+    // The plain loop retains iterator traversal without witness bookkeeping.
     // Keep LLVM from combining this hot loop with the much larger skip path.
     #[inline(never)]
     fn encode(&mut self, data: &[u8]) -> Vec<u8> {
@@ -225,16 +228,24 @@ impl HashEncoder {
     }
 }
 
-// Start on with a 256-byte contiguous probe, then back off to one 32-byte
-// re-probe per 4096 bytes. Only a verified period-four run enables witnesses.
-// Missing a run costs compression speed, never changes output. Sampling costs
-// O(n/4096), with no dictionary or thread state and no raw-sized allocation.
+// Require two period-four probes separated by up to 4096 bytes. A lone
+// small NoData margin must not select witnesses for a dense chunk. The
+// decision depends only on bytes, never timing, dictionary or thread state.
 fn profitable_chunk(data: &[u8]) -> bool {
+    let separation = (data.len() / 4).clamp(32, 4096);
+    let mut first = None;
     let initial = data.len().min(256);
-    if data[..initial].windows(32).step_by(4).any(periodic_probe) {
-        return true;
+    let offsets = (0..initial.saturating_sub(31)).step_by(4).chain((256..data.len().saturating_sub(31)).step_by(4096));
+    for at in offsets {
+        if periodic_probe(&data[at..at + 32]) {
+            match first {
+                None => first = Some(at),
+                Some(start) if at - start >= separation => return true,
+                _ => {}
+            }
+        }
     }
-    (256..data.len().saturating_sub(31)).step_by(4096).any(|at| periodic_probe(&data[at..at + 32]))
+    false
 }
 
 fn periodic_probe(bytes: &[u8]) -> bool {
@@ -294,20 +305,41 @@ mod tests {
             })
             .collect();
         assert!(!profitable_chunk(&noise)); // on -> backed off -> failed probes
+        assert!(encoder.starts.is_empty());
         encoder.encode(&noise);
+        assert!(encoder.starts.is_empty());
         let mut later = noise.clone();
         later[4352..4384].fill(0); // backed off -> successful re-probe
+        assert!(!profitable_chunk(&later)); // one isolated run is insufficient
+        later[8448..8480].fill(0);
         assert!(profitable_chunk(&later));
         encoder.encode(&later);
         let run = vec![0; 65536];
         assert!(profitable_chunk(&run)); // on -> immediate success
         encoder.encode(&run);
+        assert_eq!(encoder.starts.len(), 4096);
         for input in [&noise, &later, &run] {
-            assert_eq!(encoder.encode_chunk::<true>(input), encoder.hash.encode(input));
+            assert_eq!(encoder.encode_chunk(input), encoder.hash.encode(input));
         }
         for size in 0..300 {
             encoder.encode(&noise[..size]);
         }
+    }
+
+    #[test]
+    fn dense_with_small_nodata_margin_keeps_plain_loop() {
+        let mut state = 0x12345678u32;
+        let mut data = (-9999.0f32).to_le_bytes().repeat(8);
+        while data.len() < 8 << 20 {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            data.extend(((state % 10000) as f32 / 100.0).to_le_bytes());
+        }
+        assert!(!profitable_chunk(&data));
+        let mut encoder = Encoder::new();
+        encoder.encode(&data); // cfg(test) checks against weezl.
+        assert!(encoder.starts.is_empty());
     }
 
     #[test]
