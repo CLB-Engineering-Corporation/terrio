@@ -912,8 +912,8 @@ and the padding bytes of uncompressed tiles must be GDAL's, at every level, and 
 back must be GDAL's exactly (reference: GDAL 3.12.2, rasterio 1.5.2). `test_lerc_encoder.py` compares
 every tile's Lerc2 blob (inflated for `LERC_DEFLATE`) byte for byte under the default
 `LERC_ENCODER=GDAL`, for Float32, Float64, Int16 and UInt16 data, lossless and lossy, with NaN or
-a nodata value, and checks that `LERC_ENCODER=COMPACT` blobs are no larger and within
-`MAX_Z_ERROR`.
+a nodata value, checks that `LERC_ENCODER=COMPACT` blobs are no larger and within
+`MAX_Z_ERROR`, and that the `GDAL_METADATA` tag and the IMAGE_STRUCTURE items GDAL reads are GDAL's.
 
 Standalone WebP creation options are checked with
 `python scripts/conformance.py DATA --only webp-writer --strict`, using the

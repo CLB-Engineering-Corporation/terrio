@@ -5,6 +5,7 @@ GDAL (rasterio) is the oracle: the same raster is written by both, and every til
 other, no larger blobs within the same ``MAX_Z_ERROR``.
 """
 
+import struct
 import zlib
 
 import numpy as np
@@ -122,3 +123,31 @@ def test_compact_lerc_blobs_are_no_larger_within_the_error(tmp_path):
         terrio.Raster.from_array(a, GT, nodata=float("nan")).write(
             str(tmp_path / "x.tif"), compress="LERC", options={"LERC_ENCODER": "FAST"}
         )
+
+
+def _gdal_metadata(path):
+    """The GDAL_METADATA tag (42112) of a little-endian classic TIFF's first image."""
+    b = path.read_bytes()
+    assert b[:4] == b"II*\x00"
+    ifd = struct.unpack_from("<I", b, 4)[0]
+    for i in range(struct.unpack_from("<H", b, ifd)[0]):
+        tag, _, count, value = struct.unpack_from("<HHII", b, ifd + 2 + 12 * i)
+        if tag == 42112:
+            start = value if count > 4 else ifd + 10 + 12 * i
+            return b[start : start + count].rstrip(b"\x00").decode()
+    return None
+
+
+@pytest.mark.parametrize("driver", ["GTiff", "COG"])
+@pytest.mark.parametrize(
+    ("compress", "mze"), [("LERC", 0.01), ("LERC", 0.0), ("LERC_DEFLATE", 0.001)]
+)
+def test_lerc_metadata_is_gdal_s(tmp_path, driver, compress, mze):
+    # GDAL records MAX_Z_ERROR as given, or COMPRESSION_REVERSIBILITY=LOSSLESS.
+    a = _array("float32", float("nan"))
+    gdal_path, terrio_path = _write(tmp_path, a, float("nan"), driver, compress, mze)
+    # GDAL's serialization ends with a newline, terrio's GDAL_METADATA does not, whatever the
+    # compression (a separate, known difference).
+    assert _gdal_metadata(terrio_path) == _gdal_metadata(gdal_path).rstrip("\n")
+    with rasterio.open(gdal_path) as g, rasterio.open(terrio_path) as t:
+        assert t.tags(ns="IMAGE_STRUCTURE") == g.tags(ns="IMAGE_STRUCTURE")

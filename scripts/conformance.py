@@ -4569,11 +4569,11 @@ def suite_lerc_writer(ctx):
     complete, detail = _pytest_module_conformance(ctx, "test_gtiff_padding.py", expected_count=36)
     s.cases.append(Case("Edge-tile padding", "float, integer, band- and pixel-interleaved; GTiff and COG",
                         IDENTICAL if complete else DIFFERS, detail))
-    complete, detail = _pytest_module_conformance(ctx, "test_lerc_encoder.py", expected_count=29)
+    complete, detail = _pytest_module_conformance(ctx, "test_lerc_encoder.py", expected_count=35)
     s.cases.append(Case("LERC blobs", "LERC and LERC_DEFLATE, lossless and lossy, NaN and nodata; GTiff and COG",
                         IDENTICAL if complete else DIFFERS,
                         "Every tile's Lerc2 blob byte for byte (default LERC_ENCODER=GDAL); "
-                        "COMPACT blobs no larger within MAX_Z_ERROR. " + detail))
+                        "COMPACT blobs no larger within MAX_Z_ERROR; GDAL_METADATA and IMAGE_STRUCTURE items exact. " + detail))
     return s
 
 
