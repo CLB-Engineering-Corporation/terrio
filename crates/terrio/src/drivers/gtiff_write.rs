@@ -52,6 +52,9 @@ pub(crate) enum Compression {
 pub(crate) struct CodecParams {
     /// LERC: the largest error allowed (0 for lossless).
     pub max_z_error: f64,
+    /// LERC: write `lerc-writer`'s compact blobs (`LERC_ENCODER=COMPACT`) rather than the blobs
+    /// GDAL writes (`GDAL`, the default).
+    pub lerc_compact: bool,
     /// JPEG: the quality, 1 to 100.
     pub jpeg_quality: u8,
     /// JPEG: three bands in YCbCr (`PHOTOMETRIC=YCBCR`), subsampled.
@@ -69,6 +72,7 @@ impl Default for CodecParams {
     fn default() -> Self {
         Self {
             max_z_error: 0.0,
+            lerc_compact: false,
             jpeg_quality: 75,
             jpeg_ycbcr: false,
             webp_quality: 75,
@@ -164,9 +168,9 @@ impl Compression {
             }
             Self::PackBits => packbits(&data),
             Self::Zstd => zstd_compress(&data, p.zstd_level)?,
-            Self::Lerc => lerc_encode(&data, c, p.max_z_error)?,
-            Self::LercDeflate => deflate(&lerc_encode(&data, c, p.max_z_error)?, p.deflate_level)?,
-            Self::LercZstd => zstd_compress(&lerc_encode(&data, c, p.max_z_error)?, p.zstd_level)?,
+            Self::Lerc => lerc_encode(&data, c, p)?,
+            Self::LercDeflate => deflate(&lerc_encode(&data, c, p)?, p.deflate_level)?,
+            Self::LercZstd => zstd_compress(&lerc_encode(&data, c, p)?, p.zstd_level)?,
             Self::Jxl => jxl_encode(data, c)?,
             Self::Jpeg => jpeg_encode(&data, c, p.jpeg_quality, p.jpeg_ycbcr)?,
             Self::WebP => webp_encode(data, c, p)?,
@@ -175,7 +179,7 @@ impl Compression {
 }
 
 #[cfg(not(feature = "lerc"))]
-fn lerc_encode(_data: &[u8], _c: &ChunkInfo, _max_z_error: f64) -> Result<Vec<u8>> {
+fn lerc_encode(_data: &[u8], _c: &ChunkInfo, _p: &CodecParams) -> Result<Vec<u8>> {
     Err(Error::disabled("lerc"))
 }
 
@@ -193,9 +197,11 @@ fn deflate(data: &[u8], level: crate::deflate_compress::Level) -> Result<Vec<u8>
 /// also masks the padding of a partial edge tile, so the padding costs no LERC blocks; integer
 /// and pixel-interleaved chunks keep it as zeros.
 #[cfg(feature = "lerc")]
-fn lerc_encode(data: &[u8], c: &ChunkInfo, max_z_error: f64) -> Result<Vec<u8>> {
+fn lerc_encode(data: &[u8], c: &ChunkInfo, p: &CodecParams) -> Result<Vec<u8>> {
     let lerc = |e: lerc_core::Error| Error::InvalidData(format!("LERC: {e}"));
-    let options = lerc_writer::EncodeOptions::new().with_max_z_error(max_z_error);
+    // GDAL's blobs by default: the block choices of libLerc's codec v4, which GDAL calls.
+    let profile = if p.lerc_compact { lerc_writer::EncoderProfile::Compact } else { lerc_writer::EncoderProfile::Gdal };
+    let options = lerc_writer::EncodeOptions::new().with_max_z_error(p.max_z_error).with_profile(profile);
     let (w, h, d) = (c.w as u32, c.h as u32, c.spp as u32);
     macro_rules! encode {
         ($t:ty, $n:expr) => {{
@@ -786,6 +792,13 @@ impl TiffOptions {
                 .ok()
                 .filter(|e| *e >= 0.0)
                 .ok_or_else(|| Error::InvalidArgument(format!("invalid MAX_Z_ERROR '{v}'")))?;
+        }
+        if let Some(v) = co("LERC_ENCODER") {
+            o.codec.lerc_compact = match v.trim().to_ascii_uppercase().as_str() {
+                "GDAL" => false,
+                "COMPACT" => true,
+                other => return Err(Error::InvalidArgument(format!("invalid LERC_ENCODER '{other}' (GDAL, COMPACT)"))),
+            };
         }
         if let Some((key, v)) = co("JPEG_QUALITY")
             .map(|v| ("JPEG_QUALITY", v))
@@ -6241,5 +6254,95 @@ mod tests {
         let mut f: Vec<u8> = [1.0f32, 2.0].iter().flat_map(|v| v.to_le_bytes()).collect();
         apply_predictor(&mut f, 3, 2, 1, 4);
         assert_eq!(f, vec![0x3f, 0x01, 0x40, 0x80, 0x00, 0x00, 0x00, 0x00]);
+    }
+}
+
+#[cfg(all(test, feature = "lerc"))]
+mod lerc_encoder_tests {
+    use crate::{Error, RasterWriteOptions};
+    use wbraster::raster::RasterData;
+
+    /// A smooth 300 x 200 Float32 surface on a centimetre grid, with a NaN hole and NaN along the
+    /// bottom edge, so that tiles of 128 are partial at the right and bottom.
+    fn surface() -> crate::RasterDataset {
+        let (w, h) = (300usize, 200usize);
+        let v: Vec<f32> = (0..w * h)
+            .map(|i| {
+                let (x, y) = ((i % w) as f32, (i / w) as f32);
+                if ((40..60).contains(&(i / w)) && (50..90).contains(&(i % w))) || i / w >= h - 10 {
+                    f32::NAN
+                } else {
+                    ((100.0 + 0.013 * x + 0.007 * y + 2.0 * (x / 17.0).sin() * (y / 23.0).cos()) * 100.0).round() / 100.0
+                }
+            })
+            .collect();
+        let grid = crate::ops::Grid { width: w, height: h, geo_transform: [500000., 10., 0., 4000000., 0., -10.] };
+        crate::ops::build_raster_data(grid, RasterData::F32(v), 1, Some(f64::NAN), &Default::default()).unwrap()
+    }
+
+    fn write(ds: &crate::RasterDataset, cog: bool, options: &[(&str, &str)]) -> crate::Result<(tempfile::TempDir, String)> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lerc.tif").to_str().unwrap().to_string();
+        let mut creation_options = vec![("MAX_Z_ERROR".to_string(), "0.001".to_string())];
+        creation_options.extend(options.iter().map(|(k, v)| (k.to_string(), v.to_string())));
+        let o = RasterWriteOptions {
+            driver: Some(if cog { crate::formats::RasterDriver::Cog } else { crate::formats::RasterDriver::GTiff }),
+            compression: Some("LERC".into()),
+            tile_size: Some(128),
+            creation_options,
+            ..Default::default()
+        };
+        crate::write_raster_dataset(ds, &path, &o)?;
+        Ok((dir, path))
+    }
+
+    /// `LERC_ENCODER` selects `lerc-writer`'s profile: GDAL's by default, and `COMPACT` blobs no
+    /// larger, within the same `MAX_Z_ERROR`; other values are refused.
+    #[test]
+    fn lerc_encoder_selects_the_lerc_writer_profile() {
+        let ds = surface();
+        for cog in [false, true] {
+            let (_d, default) = write(&ds, cog, &[]).unwrap();
+            let (_g, gdal) = write(&ds, cog, &[("LERC_ENCODER", "gdal")]).unwrap();
+            let (_c, compact) = write(&ds, cog, &[("LERC_ENCODER", "COMPACT")]).unwrap();
+            let read = |p: &str| std::fs::read(p).unwrap();
+            // GDAL's blobs are the default.
+            assert!(read(&default) == read(&gdal), "cog={cog}");
+            // Both profiles hold MAX_Z_ERROR; the compact one is no larger.
+            assert!(read(&compact).len() <= read(&gdal).len(), "cog={cog}");
+            let (a, b) = (crate::open_raster(&gdal).unwrap(), crate::open_raster(&compact).unwrap());
+            for ((x, y), z) in a.raster.data.to_f64_vec().iter().zip(b.raster.data.to_f64_vec()).zip(ds.raster.data.to_f64_vec()) {
+                assert_eq!(x.is_nan(), z.is_nan());
+                assert_eq!(y.is_nan(), z.is_nan());
+                if !z.is_nan() {
+                    assert!((x - z).abs() <= 0.001 + 1e-9 && (y - z).abs() <= 0.001 + 1e-9);
+                }
+            }
+        }
+        let refused = write(&ds, false, &[("LERC_ENCODER", "FAST")]);
+        assert!(matches!(refused, Err(Error::InvalidArgument(m)) if m.contains("LERC_ENCODER")));
+    }
+
+    /// Each chunk is the blob `lerc-writer` encodes with its GDAL profile.
+    #[test]
+    fn gdal_profile_blobs_are_lerc_writer_s() {
+        let ds = surface();
+        let (_d, path) = write(&ds, false, &[]).unwrap();
+        let mut lazy = crate::open_raster_lazy(&path).unwrap();
+        let window = lazy.read_window(crate::Window::new(0, 0, 128, 128), &Default::default()).unwrap();
+        let v: Vec<f32> = window.raster.data.to_f64_vec().iter().map(|x| *x as f32).collect();
+        let valid: Vec<u8> = v.iter().map(|x| u8::from(!x.is_nan())).collect();
+        let filled: Vec<f32> = v.iter().map(|x| if x.is_nan() { 0.0 } else { *x }).collect();
+        let options = lerc_writer::EncodeOptions::new().with_max_z_error(0.001).with_profile(lerc_writer::EncoderProfile::Gdal);
+        let expected = lerc_writer::encode(
+            lerc_writer::RasterView::new(128, 128, 1, &filled).unwrap(),
+            Some(lerc_writer::MaskView::new(128, 128, &valid).unwrap()),
+            options,
+        )
+        .unwrap();
+        let p = super::CodecParams { max_z_error: 0.001, ..Default::default() };
+        let c = super::ChunkInfo { w: 128, h: 128, spp: 1, t: wbraster::DataType::F32, valid: (128, 128) };
+        let bytes: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
+        assert_eq!(super::lerc_encode(&bytes, &c, &p).unwrap(), expected);
     }
 }

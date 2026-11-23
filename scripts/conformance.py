@@ -4336,7 +4336,8 @@ def suite_lerc_writer(ctx):
               "Synthetic 300 x 200 rasters in 128 x 128 tiles, so the right and bottom tiles are "
               "partial: the valid-pixel mask of every stored LERC blob, padding included, and the "
               "padding bytes of uncompressed tiles, at every COG level; the pixels read back are "
-              "GDAL's exactly.")
+              "GDAL's exactly. The Lerc2 blobs of LERC_ENCODER=GDAL, the default, are GDAL's byte "
+              "for byte.")
     missing = missing_modules("rasterio", "pytest", "terrio", "numpy")
     if missing:
         s.skipped = "needs the Python modules " + ", ".join(missing)
@@ -4344,6 +4345,11 @@ def suite_lerc_writer(ctx):
     complete, detail = _pytest_module_conformance(ctx, "test_gtiff_padding.py", expected_count=36)
     s.cases.append(Case("Edge-tile padding", "float, integer, band- and pixel-interleaved; GTiff and COG",
                         IDENTICAL if complete else DIFFERS, detail))
+    complete, detail = _pytest_module_conformance(ctx, "test_lerc_encoder.py", expected_count=29)
+    s.cases.append(Case("LERC blobs", "LERC and LERC_DEFLATE, lossless and lossy, NaN and nodata; GTiff and COG",
+                        IDENTICAL if complete else DIFFERS,
+                        "Every tile's Lerc2 blob byte for byte (default LERC_ENCODER=GDAL); "
+                        "COMPACT blobs no larger within MAX_Z_ERROR. " + detail))
     return s
 
 

@@ -873,7 +873,11 @@ using current Python bindings, pytest and rasterio (no test data). `test_gtiff_p
 synthetic rasters whose right and bottom tiles are partial with GDAL and with Terrio, as GTiff and
 COG, and reads each stored edge tile: the valid-pixel mask of every LERC blob, padding included,
 and the padding bytes of uncompressed tiles must be GDAL's, at every level, and the pixels read
-back must be GDAL's exactly (reference: GDAL 3.12.2, rasterio 1.5.2).
+back must be GDAL's exactly (reference: GDAL 3.12.2, rasterio 1.5.2). `test_lerc_encoder.py` compares
+every tile's Lerc2 blob (inflated for `LERC_DEFLATE`) byte for byte under the default
+`LERC_ENCODER=GDAL`, for Float32, Float64, Int16 and UInt16 data, lossless and lossy, with NaN or
+a nodata value, and checks that `LERC_ENCODER=COMPACT` blobs are no larger and within
+`MAX_Z_ERROR`.
 
 Standalone WebP creation options are checked with
 `python scripts/conformance.py DATA --only webp-writer --strict`, using the

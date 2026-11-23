@@ -230,7 +230,11 @@ JPEG XL, with horizontal and floating-point predictors, tiled or striped, chunky
 libjpeg decodes it: the same integer IDCT, chroma upsampling and YCbCr conversion, so the pixels are
 GDAL's. Lossy JPEG XL can differ from libjxl's by 1 in a few pixels. LERC (`--compress LERC`,
 `LERC_DEFLATE`, `LERC_ZSTD`) and lossless JPEG XL (`JXL`, for Byte and UInt16) are written too;
-LZMA is read, not written. Unsigned samples packed in 9 to 15 or 17 to 31 bits (GDAL's
+LZMA is read, not written. LERC blobs are GDAL's by default (`LERC_ENCODER=GDAL`): `lerc-writer`'s
+GDAL profile makes the block choices of libLerc's codec v4, which GDAL calls, so the tiles are
+GDAL's byte for byte (compared for Float32, Float64, Int16 and UInt16 data). `LERC_ENCODER=COMPACT`
+selects `lerc-writer`'s compact profile, whose blobs (which may be Lerc2 v5) are no larger, within
+the same `MAX_Z_ERROR`. Unsigned samples packed in 9 to 15 or 17 to 31 bits (GDAL's
 `NBITS`, as GDAL writes Sentinel-2's 15-bit bands) are read as UInt16 or UInt32, as GDAL reads them,
 in either bit order (`FillOrder`); packed signed samples and packed samples with a predictor are
 not supported (GDAL writes neither). WhiteIsZero samples are read as stored, as GDAL reads them,
