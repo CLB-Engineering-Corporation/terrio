@@ -28,7 +28,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```
 
-Under unit tests every specialized encode call asserts exact compressed bytes
+Under library unit tests (`cfg(test)`) every specialized encode call asserts exact compressed bytes
 against weezl, including existing writer tests. Independent differential tests cover
 all prefix lengths 0 through 4095, selected larger strip boundaries, 64 randomized
 streams, dictionary clears, sparse-node promotion, constant and periodic inputs,
@@ -67,3 +67,32 @@ qualification is retained separately; historical timings are not 0.9.0 evidence.
 The release disables automatic integration-test discovery. The LZW writer golden
 suite is an explicit `[[test]]` target, retaining its fresh-process one/three-thread
 checks rather than becoming a silently unbuilt test file.
+
+## Adaptive selection and memory
+
+Two sampled period-four hits, separated by min(chunk length / 4, 4096)
+bytes (at least 32), enable the verified long-match path. A single 32-byte
+NoData border or isolated periodic island no longer enables it. False negatives
+only affect speed; sampling and all dictionary decisions depend only on bytes.
+
+Witness arrays allocate on the first selected chunk and remain reusable. Heap
+state excluding output and Vec headers is initially 36 KiB on both targets,
+previously 84 KiB on 64-bit or 68 KiB on 32-bit/wasm32. First skip use adds
+48 KiB (64-bit) or 32 KiB (32-bit). Rayon `map_init` initializes per split
+leaf, not strictly once per thread, so savings apply to each unused leaf.
+
+## Deterministic hash worst case
+
+The fixed multiplicative hash and linear probing are not collision-resistant.
+At most 3838 occupied entries exist before a dictionary clear; a lookup can
+inspect up to 3839 slots including its terminating empty slot. Thus lookup work
+is bounded O(n) with a large constant, not an expected-time guarantee for
+untrusted input. The review's repeating 4386-byte hash-cluster epoch measured
+roughly 1620 probes per byte and 60–80 times slower encoding than weezl.
+This change documents that exposure without adding a hot-loop probe counter,
+salted layout, or fallback. No adversarial-throughput mitigation is claimed.
+
+`lzw_reused_streams_match_fresh_tiff_size_switch` compares two specialized paths;
+its independent weezl oracle comes from the library's `cfg(test)` checks.
+Integration tests compile the library without that oracle; `lzw_write_reuse`
+uses the 48 retained complete baseline TIFF fixtures instead.
