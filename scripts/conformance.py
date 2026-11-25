@@ -4569,7 +4569,7 @@ def suite_lerc_writer(ctx):
     complete, detail = _pytest_module_conformance(ctx, "test_gtiff_padding.py", expected_count=36)
     s.cases.append(Case("Edge-tile padding", "float, integer, band- and pixel-interleaved; GTiff and COG",
                         IDENTICAL if complete else DIFFERS, detail))
-    complete, detail = _pytest_module_conformance(ctx, "test_lerc_encoder.py", selection="not lossless_8bit",
+    complete, detail = _pytest_module_conformance(ctx, "test_lerc_encoder.py", selection="not lossless_8bit and not float64-x1-nodata-9999",
                                                   expected_count=300)
     s.cases.append(Case("LERC blobs", "LERC, LERC_DEFLATE and LERC_ZSTD; Int8 to Float64, lossless and lossy; "
                         "one band, pixel and band interleaved; NaN, nodata and masks; GTiff and COG with overviews",
@@ -4584,6 +4584,13 @@ def suite_lerc_writer(ctx):
                         "Known difference: lerc-writer 0.5.2's Huffman code table and codes are not libLerc's, "
                         "so those tiles differ; the other tiles' blobs and the pixels and masks GDAL reads are "
                         "the same. " + detail))
+    complete, detail = _pytest_module_conformance(ctx, "test_lerc_encoder.py", selection="lossy_float64_sentinel",
+                                                  expected_count=12)
+    s.cases.append(Case("LERC blobs, lossy Float64 near nodata", "Float64 on a decimal grid with -9999 nodata, lossy",
+                        NOT_COMPARED if complete else DIFFERS,
+                        "Known difference: libLerc's reconstruction misses MAX_Z_ERROR by about 1e-12 in blocks "
+                        "holding both, which lerc-writer 0.5.2 stores raw; the other tiles' blobs are the same and "
+                        "the pixels are within MAX_Z_ERROR. " + detail))
     return s
 
 

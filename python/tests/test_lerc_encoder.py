@@ -16,6 +16,12 @@ Known differences:
   and its own codes there, where libLerc writes version 4, so those blobs differ; the other tiles'
   blobs and every pixel are GDAL's (``test_lossless_8bit_lerc_reads_as_gdal_s``), and
   ``test_lossless_8bit_lerc_blobs_are_gdal_s`` fails until lerc-writer matches libLerc.
+- Lossy Float64 data on a decimal grid with a finite nodata value far from it (-9999): in a block
+  holding both, libLerc's reconstruction misses ``MAX_Z_ERROR`` by about 1e-12 through ``f64``
+  rounding, and lerc-writer 0.5.2's GDAL profile, which checks for that, stores the block raw
+  instead. Those tiles differ (``FLOAT64_SENTINEL_CASES``, strict expected failures); the others
+  are GDAL's and the pixels are within ``MAX_Z_ERROR``
+  (``test_lossy_float64_sentinel_reads_within_the_error``).
 - The module asserts GDAL 3.12's blobs. GDAL 3.13 also masks the padding of partial edge tiles of
   pixel-interleaved floating-point bands, which terrio (as GDAL 3.12) does not, so those rows are
   strict expected failures with GDAL 3.13 and later (``GDAL_313_PADDING``).
@@ -159,6 +165,18 @@ CASES += [
     ("float32", 3, "pixel", None, "same", True, 0.01),
     ("float32", 1, "band", NAN, "same", True, 0.01),
 ]
+# Lossy Float64 on a decimal grid with a finite nodata value: lerc-writer stores raw the blocks
+# where libLerc's reconstruction exceeds MAX_Z_ERROR by f64 rounding (see the docstring).
+FLOAT64_SENTINEL_CASES = [
+    ("float64", 1, "band", -9999.0, "same", False, 0.01),
+    ("float64", 1, "band", -9999.0, "same", False, 0.1),
+]
+FLOAT64_SENTINEL = pytest.mark.xfail(
+    strict=True,
+    raises=AssertionError,
+    reason="known difference: lerc-writer 0.5.2 stores raw the blocks where libLerc's "
+    "reconstruction misses MAX_Z_ERROR by f64 rounding (Float64 near a far-off nodata value)",
+)
 # Lossless Int8 and Byte data, which libLerc codes with Huffman codes where they are smaller.
 HUFFMAN_CASES = [
     ("int8", 1, "band", None, "same", False, 0.0),
@@ -184,9 +202,16 @@ def _id(case):
 
 
 def _params(cases):
-    """The cases as pytest parameters, GDAL 3.13's padding rows marked."""
+    """The cases as pytest parameters, GDAL 3.13's padding rows and the Float64 sentinel rows
+    marked."""
     return [
         pytest.param(
+            c,
+            id=_id(c),
+            marks=FLOAT64_SENTINEL,
+        )
+        if c in FLOAT64_SENTINEL_CASES
+        else pytest.param(
             c,
             id=_id(c),
             marks=GDAL_313_PADDING
@@ -326,7 +351,7 @@ def _assert_blobs_are_gdal_s(gdal_path, terrio_path, compress):
 
 @pytest.mark.parametrize("driver", ["GTiff", "COG"])
 @pytest.mark.parametrize("compress", ["LERC", "LERC_DEFLATE", "LERC_ZSTD"])
-@pytest.mark.parametrize("case", _params(CASES))
+@pytest.mark.parametrize("case", _params(CASES + FLOAT64_SENTINEL_CASES))
 def test_default_lerc_blobs_are_gdal_s(tmp_path, driver, compress, case):
     dt, bands, interleave, nodata, holes, mask, mze = case
     a = _array(dt, bands, nodata, holes)
@@ -371,6 +396,29 @@ def test_lossless_8bit_lerc_reads_as_gdal_s(tmp_path, driver, compress, case):
     for (key, g), (_, t), mode in zip(gdal, ours, modes, strict=True):
         if mode != "huffman":
             assert _blob(t, compress) == _blob(g, compress), f"{mode} tile {key}"
+
+
+@pytest.mark.parametrize("driver", ["GTiff", "COG"])
+@pytest.mark.parametrize("compress", ["LERC", "LERC_DEFLATE", "LERC_ZSTD"])
+@pytest.mark.parametrize("case", FLOAT64_SENTINEL_CASES, ids=_id)
+def test_lossy_float64_sentinel_reads_within_the_error(tmp_path, driver, compress, case):
+    """Float64 near a far-off nodata value: the tiles without it are GDAL's, the pixels are
+    within MAX_Z_ERROR and nodata is kept (the other tiles differ, above)."""
+    dt, bands, interleave, nodata, holes, mask, mze = case
+    a = _array(dt, bands, nodata, holes)
+    paths = _write(tmp_path, a, nodata, driver, compress, mze)
+    gdal, ours = _chunks(paths[0]), _chunks(paths[1])
+    assert [k for k, _ in gdal] == [k for k, _ in ours]
+    for ((_level, band, tx, ty), g), (_, t) in zip(gdal, ours, strict=True):
+        tile = a[band - 1, ty * TILE : (ty + 1) * TILE, tx * TILE : (tx + 1) * TILE]
+        if not (tile == nodata).any():
+            assert _blob(t, compress) == _blob(g, compress), (tx, ty)
+    with rasterio.open(paths[1]) as t, rasterio.open(paths[0]) as g:
+        back, theirs = t.read().astype("float64"), g.read().astype("float64")
+    holes = a == nodata
+    np.testing.assert_array_equal(back == nodata, holes)
+    assert np.abs(back - a)[~holes].max() <= mze + 1e-9
+    assert np.abs(theirs - a)[~holes].max() <= mze + 1e-9
 
 
 def _lerc_mode(blob):

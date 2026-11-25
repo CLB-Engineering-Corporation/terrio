@@ -944,8 +944,9 @@ impl TiffOptions {
             o.max_z_error_text = Some(v.to_string());
         }
         // GDAL reads MAX_Z_ERROR_OVERVIEW as a number whatever it is (`CPLAtof`); terrio refuses
-        // what MAX_Z_ERROR refuses.
-        if let Some(v) = co("MAX_Z_ERROR_OVERVIEW") {
+        // what MAX_Z_ERROR refuses, with LERC only: other compressions ignore it, as GDAL's do.
+        let lerc = matches!(o.compression, Compression::Lerc | Compression::LercDeflate | Compression::LercZstd);
+        if let Some(v) = co("MAX_Z_ERROR_OVERVIEW").filter(|_| lerc) {
             o.codec.max_z_error_overview = Some(
                 v.trim()
                     .parse::<f64>()
@@ -7971,6 +7972,14 @@ mod lerc_encoder_tests {
             for bad in ["-1", "bogus", ""] {
                 let Err(Error::InvalidArgument(m)) = write(&ds, cog, &[("MAX_Z_ERROR_OVERVIEW", bad)]) else { panic!("{bad:?}") };
                 assert_eq!(m, format!("invalid MAX_Z_ERROR_OVERVIEW '{bad}'"));
+                // Other compressions ignore it, as GDAL's do.
+                let deflate = RasterWriteOptions {
+                    driver: options.driver,
+                    compression: Some("DEFLATE".into()),
+                    creation_options: vec![("MAX_Z_ERROR_OVERVIEW".into(), bad.into())],
+                    ..Default::default()
+                };
+                crate::write_raster_dataset(&ds, &path, &deflate).unwrap();
             }
         }
         // The full-resolution image is the same as without it; the overviews of a COG are not.

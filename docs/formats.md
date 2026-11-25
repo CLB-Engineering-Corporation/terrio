@@ -254,13 +254,13 @@ LERC tiles (`LERC`, `LERC_DEFLATE`, `LERC_ZSTD`) take these creation options:
 | `MAX_Z_ERROR` | 0 or more, 0 by default | the same | The largest error allowed; 0 is lossless. Recorded in `GDAL_METADATA` as GDAL records it: `MAX_Z_ERROR` as given, or `COMPRESSION_REVERSIBILITY=LOSSLESS`. |
 | `LERC_ENCODER` | `GDAL` (default), `COMPACT` | terrio's own | `GDAL` writes the Lerc2 v4 blobs GDAL writes, byte for byte; `COMPACT` writes `lerc-writer`'s smallest blobs (which may be Lerc2 v5), no larger and within the same `MAX_Z_ERROR`. Other values are refused, whatever the compression. |
 | `LERC_VERSION` | any | not an option | Ignored with GDAL's warning, `driver GTiff (COG) does not support creation option LERC_VERSION`: GDAL's GTiff and COG drivers have no such option and always write Lerc2 v4. `LERC_VERSION=2.4` is the IMAGE_STRUCTURE item GDAL reads back from the `LercParameters` tag. |
-| `MAX_Z_ERROR_OVERVIEW` | 0 or more, `MAX_Z_ERROR` by default | the same | The largest error allowed in the overviews terrio writes with the file (a COG's, or a GeoTIFF's `overviews`). When it differs from `MAX_Z_ERROR`, both are recorded as given (`MAX_Z_ERROR` empty when it was not), as GDAL records them, whether or not there are overviews. Negative or unreadable values are refused, where GDAL reads them as numbers. Overviews added to an existing file are lossless, as before. |
+| `MAX_Z_ERROR_OVERVIEW` | 0 or more, `MAX_Z_ERROR` by default | the same | The largest error allowed in the overviews terrio writes with the file (a COG's, or a GeoTIFF's `overviews`). When it differs from `MAX_Z_ERROR`, both are recorded as given (`MAX_Z_ERROR` empty when it was not), as GDAL records them, whether or not there are overviews. With a LERC compression, negative or unreadable values are refused, where GDAL reads them as numbers; other compressions ignore the option, as GDAL's do. Overviews added to an existing file are lossless, as before. |
 
 `LERC_ENCODER=GDAL` uses `lerc-writer`'s GDAL profile, which makes the choices of libLerc's codec
 v4 that GDAL calls. With it, every tile's Lerc2 blob is GDAL 3.12.2's (rasterio 1.5.2) byte for
 byte for Int8, Byte, Int16, UInt16, Int32, UInt32, Float32 and Float64 data, lossless and lossy,
 one band or three pixel- or band-interleaved, with NaN, a nodata value or a per-dataset mask, as
-GTiff or COG, overviews and partial edge tiles included; for `LERC_DEFLATE` and `LERC_ZSTD`, the
+GTiff or COG, overviews and partial edge tiles included, except as listed below; for `LERC_DEFLATE` and `LERC_ZSTD`, the
 blob inflated from the chunk (the outer Deflate and Zstandard streams are terrio's encoders', not
 zlib's or libzstd's, so the stored chunks can differ), and the checksum of a blob is the
 checksum of GDAL's. Known differences:
@@ -271,6 +271,13 @@ checksum of GDAL's. Known differences:
   codes there. Those tiles differ from GDAL's, the others are GDAL's, and the pixels read back are
   the same. Such a file is then neither GDAL's bytes nor the smallest output: in the tests' Byte
   raster it is 0.8% larger than GDAL's and 0.5% larger than `COMPACT`'s.
+- Lossy Float64 data near a nodata value far from it, such as values on a 0.01 or 0.001 grid with
+  -9999: in an 8 x 8 block holding both, libLerc's reconstruction `offset + q * 2 * MAX_Z_ERROR`
+  misses the bound by about 1e-12 through `f64` rounding (GDAL's file is off by up to 1.1e-12 at
+  `MAX_Z_ERROR` 0.01), and `lerc-writer` 0.5.2's GDAL profile, which checks for that, stores the
+  block raw instead. The tiles holding such blocks differ and are larger (in a raster on a 0.01 grid,
+  4 of 6 tiles and 25% more bytes); the pixels are within `MAX_Z_ERROR`. NaN nodata, lossless
+  Float64 and Float32 match.
 - GDAL 3.13.3 also masks the padding of partial edge tiles of pixel-interleaved floating-point
   bands, as GDAL 3.12.2 masks it for one band. terrio masks it as GDAL 3.12.2, the reference, so
   those edge tiles differ from GDAL 3.13.3's; lossy values near the image's right and bottom edges
