@@ -339,7 +339,7 @@ pub use dataset::{
     VectorWriteOptions, geo_transform, is_north_up, list_layers, open, open_raster, open_raster_with_tiff_limits, open_vector, read_gcps,
     write_netcdf_groups, write_raster, write_raster_dataset, write_vector,
 };
-pub use drivers::gtiff_write::GeoTiffWriter;
+pub use drivers::gtiff_write::{CompressedTile, GeoTiffWriter, TileEncoder, TileGrid};
 pub use drivers::vector::citygml_write::{CityGmlLod0Surface, CityGmlVersion};
 pub use drivers::vector::cityjson_write::CityJsonVersion;
 pub use drivers::vector::csv::{CsvGeometry, CsvOptions};
@@ -361,12 +361,12 @@ pub use resampled_read::{ResampledReadOptions, WindowSampling};
 // Raster pixels as `ndarray` arrays, without copying them.
 #[cfg(feature = "ndarray")]
 #[cfg_attr(docsrs, doc(cfg(feature = "ndarray")))]
-pub use ndarray_ext::{ArrayError, BandLayout, FloatElement, RasterArrayExt, RasterElement};
+pub use ndarray_ext::{ArrayError, BandLayout, FloatElement, RasterArrayExt};
 
 /// The raster type: pixels, georeferencing and CRS, in memory.
 pub use wbraster::{DataType, Raster, RasterConfig};
 // Building a `Raster` from its pixels without a nodata fill.
-pub use pixel::{complex_components_from_iter, raster_from_data};
+pub use pixel::{RasterElement, complex_components_from_iter, raster_from_data};
 /// The vector types: layers of features with geometries and attributes.
 pub use wbvector::{Feature, FieldDef, FieldType, FieldValue, Geometry, GeometryType, Layer};
 

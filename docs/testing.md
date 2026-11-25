@@ -382,6 +382,24 @@ scale and offset metadata remain separate from the samples. Sparse blocks are
 also checked. Rust tests compare concurrent reads with the owned TIFF read and
 verify zero additional worker decoder opens after the file is renamed.
 
+## GeoTIFF tiles in any order
+
+`python scripts/conformance.py DATA --only tiled-writes --strict` runs
+`scripts/compare_tiled_writes_with_gdal.py` (osgeo, GDAL 3.13.3), which needs no test data. It
+writes the tiles of a 300 x 217 raster of 64-pixel tiles, whose right and bottom tiles are cut by
+its edges, in a shuffled order with `terrio.GeoTiffWriter.write_tile`, and GDAL writes the same
+tiles in the same order to a file of the same creation options (`Create`, then one `WriteRaster`
+per tile). For Byte, Int16, Int32, Float32 and Float64 rasters, LZW, DEFLATE and ZSTD, predictors
+1, 2 and 3 (floating point only) and pixel and band interleaving, GDAL reads both files: samples
+bit for bit, data type, block size, compression, predictor, interleaving, nodata, geotransform and
+CRS must be the same. Tiles never given are filled with nodata by both, or, with `SPARSE_OK=YES`,
+left out by both, with the tiles given whose samples are all nodata: the same blocks have an
+offset of 0 (`BLOCK_OFFSET_x_y` of the `TIFF` metadata domain). `terrio translate --co
+SPARSE_OK=YES` and `gdal_translate -co SPARSE_OK=TRUE` of the same source leave out the same
+blocks and read the same; uncompressed, the blocks kept hold the same bytes. File sizes are
+reported; compressed bytes are not compared. The Rust tests of `drivers::gtiff_write` hold the
+tiles' compressed chunks byte for byte to those of the same raster written in rows.
+
 ## TIFF block metadata
 
 `python scripts/conformance.py DATA --only tiff-block-tags --strict` requires

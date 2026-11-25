@@ -28,6 +28,8 @@ Suites:
     bigtiff           BIGTIFF=YES/NO/IF_NEEDED/IF_SAFER at GDAL's thresholds (compare_bigtiff_with_gdal.py)
     supplied-overviews  COG overviews supplied as arrays vs GDAL's OVERVIEWS=FORCE_USE_EXISTING copy
                       (compare_supplied_overviews_with_gdal.py)
+    tiled-writes      GeoTIFF tiles written in any order, and SPARSE_OK, vs GDAL's GTiff driver
+                      (compare_tiled_writes_with_gdal.py)
     warp-grid         aligned warp tiles and windows on real terrain
     sum-overviews     extensive sum estimates and exact NONE controls vs GDAL
     cog-area-matched  area-matched COG overviews read and validated by GDAL, beside GDAL's
@@ -667,6 +669,34 @@ def suite_supplied_overviews(ctx):
         suite.cases.append(Case("Supplied overviews", row["name"], statuses.get(row["status"], DIFFERS), row["detail"]))
     if len(rows) < 4 or code and not any(case.status == DIFFERS for case in suite.cases):
         suite.error = tail(err or out) or "incomplete supplied-overview comparisons"
+    return suite
+
+
+def suite_tiled_writes(ctx):
+    """GeoTIFF tiles written in any order, and SPARSE_OK, against GDAL's GTiff driver."""
+    suite = Suite("tiled-writes", "GeoTIFF tiles in any order and SPARSE_OK", "GDAL GTiff driver (Create, gdal_translate)",
+                  "Tiles written in a shuffled order, edge tiles included, of Byte, Int16, Int32, Float32 and Float64 rasters, "
+                  "LZW, DEFLATE and ZSTD, predictors 1 to 3, pixel and band interleaving, read by GDAL beside GDAL's own file of "
+                  "the same tiles: samples bit for bit, data type, block size, compression, predictor, interleaving, nodata, "
+                  "geotransform and CRS. Tiles not given are filled as GDAL fills them, or with SPARSE_OK left out as GDAL leaves "
+                  "them out (the same blocks have an offset of 0). terrio translate --co SPARSE_OK=YES leaves out the blocks "
+                  "gdal_translate -co SPARSE_OK=TRUE leaves out; uncompressed, the blocks kept hold the same bytes. Compressed "
+                  "bytes and file sizes are reported, not compared.")
+    missing = missing_modules("terrio", "numpy", "osgeo")
+    if missing:
+        suite.skipped = "needs " + ", ".join(missing)
+        return suite
+    code, out, err = run([sys.executable, str(SCRIPTS / "compare_tiled_writes_with_gdal.py"), "--terrio", ctx.terrio, "--json"])
+    try:
+        rows = json.loads(out)
+    except json.JSONDecodeError:
+        suite.error = tail(err or out)
+        return suite
+    for row in rows:
+        group = "SPARSE_OK" if "SPARSE_OK" in row["name"] else "Tile order"
+        suite.cases.append(Case(group, row["name"], IDENTICAL if row["status"] == "identical" else DIFFERS, row["detail"]))
+    if len(rows) < 49 or code and not any(case.status == DIFFERS for case in suite.cases):
+        suite.error = tail(err or out) or "incomplete tiled-write comparisons"
     return suite
 
 
@@ -4623,6 +4653,7 @@ SUITES = OrderedDict(
         ("deflate", suite_deflate),
         ("bigtiff", suite_bigtiff),
         ("supplied-overviews", suite_supplied_overviews),
+        ("tiled-writes", suite_tiled_writes),
         ("windows", suite_windows),
         ("ops", suite_ops),
         ("raster-masks", suite_raster_masks),

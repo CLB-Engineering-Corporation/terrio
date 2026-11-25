@@ -22,7 +22,7 @@
 use super::area_matched::{self, AreaMatched, IntoRasterData};
 use super::common::{Rewrite, create_replacing};
 use super::gdal_overview::{self, Method};
-use crate::pixel::{Pixel, map_data, with_data};
+use crate::pixel::{Pixel, RasterElement, map_data, with_data};
 use crate::{BigTiffPolicy, Error, Result};
 use std::io::Write;
 use wbraster::raster::RasterData;
@@ -1897,10 +1897,9 @@ impl<'a> Level<'a> {
         empty: Option<f64>,
     ) -> Result<Image> {
         let parts = layout.parts;
-        // The size of a sample's part, and the TIFF samples per pixel.
         let size = t.size_bytes();
+        // The TIFF samples per pixel.
         let spp = self.bands / parts;
-        // Samples per chunk (each of `parts` values).
         let chunk_spp = if layout.planar { 1 } else { spp };
         let planes = if layout.planar { spp } else { 1 };
         let (chunk_w, chunk_h, across, down, tiled) = match layout.tile {
@@ -1914,91 +1913,203 @@ impl<'a> Level<'a> {
             }
         };
         let per_plane = across * down;
-        let band_len = self.cols * self.rows;
-        let clipped = std::sync::atomic::AtomicBool::new(false);
-        let packed_bits = layout.nbits.filter(|&bits| bits != (size * 8) as u16);
-        let empty = empty.filter(|&v| representable(t, v));
+        let encoder = ChunkEncoder::new(t, compression, codec, layout, (chunk_w, chunk_h), empty);
         let chunks = crate::par::map_range_init_coarse(
             planes * per_plane,
             || None,
             |scratch, i| {
                 let (plane, j) = (i / per_plane, i % per_plane);
                 let (x0, y0) = ((j % across) * chunk_w, (j / across) * chunk_h);
-                // Strips stop at the last row; tiles are padded to full size.
-                let h = if tiled { chunk_h } else { chunk_h.min(self.rows - y0) };
-                if let Some(v) = empty {
-                    let (first, samples) = if layout.planar { (plane * parts * band_len, parts) } else { (0, spp * parts) };
-                    let data = self.data.as_ref();
-                    if with_data!(data, d => all_samples_equal(&d[first..][..samples * band_len], self.cols, self.rows, x0, y0, chunk_w, h, v))
-                    {
-                        return Ok(Vec::new());
-                    }
-                }
-                // A complex sample's parts are interleaved like the bands of a pixel.
-                let mut buf = if layout.planar {
-                    let plane_len = parts * band_len;
-                    with_data!(self.data.as_ref(), v => chunk_bytes(&v[plane * plane_len..(plane + 1) * plane_len], self.cols, self.rows, parts, x0, y0, chunk_w, h))
-                } else {
-                    with_data!(self.data.as_ref(), v => chunk_bytes(v, self.cols, self.rows, spp * parts, x0, y0, chunk_w, h))
-                };
-                if let Some(bits) = packed_bits {
-                    let (packed, did_clip) = pack_unsigned_rows(&buf, chunk_w * chunk_spp, size, bits);
-                    buf = packed;
-                    // GDAL 3.13.3 silently clamps bilevel samples; wider packed domains warn.
-                    if did_clip && bits > 1 {
-                        clipped.store(true, std::sync::atomic::Ordering::Relaxed);
-                    }
-                } else {
-                    apply_predictor(&mut buf, layout.predictor, chunk_w * chunk_spp, chunk_spp, size);
-                }
-                let valid = (chunk_w.min(self.cols - x0), h.min(self.rows - y0));
-                compression.compress_reusing(buf, &ChunkInfo { w: chunk_w, h, spp: chunk_spp, t, valid }, codec, scratch)
+                with_data!(self.data.as_ref(), v => encoder.encode(Samples::whole(v, self.cols, self.rows, self.bands), plane, x0, y0, scratch))
             },
         );
         let chunks = chunks.into_iter().collect::<Result<Vec<_>>>()?;
-        let clipped_bits = packed_bits.filter(|_| clipped.load(std::sync::atomic::Ordering::Relaxed));
-        let (bits, format) = sample_format(t);
-        let bits = layout.nbits.unwrap_or(bits);
-        // Complex samples: twice the bits, `SampleFormat` 5 (integers) or 6 (floats).
-        let (bits, format) = if parts == 2 { (bits * 2, format + 3) } else { (bits, format) };
-        let mut tags = vec![
-            (256, Value::Longs(vec![self.cols as u32])),
-            (257, Value::Longs(vec![self.rows as u32])),
-            (258, Value::Shorts(vec![bits; spp])),
-            (259, Value::Shorts(vec![compression.code()])),
-            (262, Value::Shorts(vec![layout.photometric])),
-            (277, Value::Shorts(vec![spp as u16])),
-            (284, Value::Shorts(vec![if layout.planar { 2 } else { 1 }])),
-            (339, Value::Shorts(vec![format; spp])),
-        ];
-        if !layout.extra.is_empty() {
-            tags.push((338, Value::Shorts(layout.extra.clone())));
-        }
-        if layout.predictor > 1 {
-            tags.push((317, Value::Shorts(vec![layout.predictor])));
-        }
-        if layout.photometric == 6 {
-            // YCbCrSubSampling: the JPEG streams' 4:2:0.
-            tags.push((530, Value::Shorts(vec![2, 2])));
-        }
-        // LercParameters: LERC 2.4, and the compression over its blobs (none, Deflate, Zstandard).
-        match compression {
-            Compression::Lerc => tags.push((50674, Value::Longs(vec![4, 0]))),
-            Compression::LercDeflate => tags.push((50674, Value::Longs(vec![4, 1]))),
-            Compression::LercZstd => tags.push((50674, Value::Longs(vec![4, 2]))),
-            _ => {}
-        }
-        if tiled {
-            tags.push((322, Value::Longs(vec![chunk_w as u32])));
-            tags.push((323, Value::Longs(vec![chunk_h as u32])));
-        } else {
-            tags.push((278, Value::Longs(vec![chunk_h as u32])));
-        }
+        let clipped_bits = encoder.clipped_bits();
+        let tags = structural_tags(self.cols, self.rows, self.bands, t, compression, layout, (chunk_w, chunk_h));
         Ok(Image { tags, chunks, tiled, clipped_bits })
     }
 }
 
-/// Applies a TIFF predictor to the little-endian rows of a chunk, as libtiff does: 2 differences
+/// The tags of an image's structure (its size, samples, compression, predictor and chunk size),
+/// without the chunk offsets and byte counts: an image of `cols` x `rows` pixels of `bands`
+/// bands of type `t`, cut into chunks of `chunk` (width, height) pixels, tiles when `layout` has
+/// tiles and strips of `chunk.1` rows otherwise.
+fn structural_tags(
+    cols: usize,
+    rows: usize,
+    bands: usize,
+    t: DataType,
+    compression: Compression,
+    layout: &Layout,
+    (chunk_w, chunk_h): (usize, usize),
+) -> Vec<(u16, Value)> {
+    let parts = layout.parts;
+    let spp = bands / parts;
+    let (bits, format) = sample_format(t);
+    let bits = layout.nbits.unwrap_or(bits);
+    // Complex samples: twice the bits, `SampleFormat` 5 (integers) or 6 (floats).
+    let (bits, format) = if parts == 2 { (bits * 2, format + 3) } else { (bits, format) };
+    let mut tags = vec![
+        (256, Value::Longs(vec![cols as u32])),
+        (257, Value::Longs(vec![rows as u32])),
+        (258, Value::Shorts(vec![bits; spp])),
+        (259, Value::Shorts(vec![compression.code()])),
+        (262, Value::Shorts(vec![layout.photometric])),
+        (277, Value::Shorts(vec![spp as u16])),
+        (284, Value::Shorts(vec![if layout.planar { 2 } else { 1 }])),
+        (339, Value::Shorts(vec![format; spp])),
+    ];
+    if !layout.extra.is_empty() {
+        tags.push((338, Value::Shorts(layout.extra.clone())));
+    }
+    if layout.predictor > 1 {
+        tags.push((317, Value::Shorts(vec![layout.predictor])));
+    }
+    if layout.photometric == 6 {
+        // YCbCrSubSampling: the JPEG streams' 4:2:0.
+        tags.push((530, Value::Shorts(vec![2, 2])));
+    }
+    // LercParameters: LERC 2.4, and the compression over its blobs (none, Deflate, Zstandard).
+    match compression {
+        Compression::Lerc => tags.push((50674, Value::Longs(vec![4, 0]))),
+        Compression::LercDeflate => tags.push((50674, Value::Longs(vec![4, 1]))),
+        Compression::LercZstd => tags.push((50674, Value::Longs(vec![4, 2]))),
+        _ => {}
+    }
+    if layout.tile.is_some() {
+        tags.push((322, Value::Longs(vec![chunk_w as u32])));
+        tags.push((323, Value::Longs(vec![chunk_h as u32])));
+    } else {
+        tags.push((278, Value::Longs(vec![chunk_h as u32])));
+    }
+    tags
+}
+
+/// Band-major samples of a region of an image, where they are: band `b`'s row `y` starts at
+/// `b * band_stride + y * cols` of `data`. A raster's pixels, rows of them in a caller's slab, or
+/// the block row a writer holds.
+#[derive(Clone, Copy)]
+struct Samples<'a, T> {
+    data: &'a [T],
+    cols: usize,
+    rows: usize,
+    bands: usize,
+    band_stride: usize,
+}
+
+impl<'a, T> Samples<'a, T> {
+    /// The `bands` bands of `cols` x `rows` pixels of `data`, one after the other.
+    fn whole(data: &'a [T], cols: usize, rows: usize, bands: usize) -> Self {
+        Self { data, cols, rows, bands, band_stride: cols * rows }
+    }
+
+    /// Rows `range` of every band.
+    fn rows(self, range: std::ops::Range<usize>) -> Self {
+        Self { data: &self.data[range.start * self.cols..], rows: range.len(), ..self }
+    }
+
+    /// The bands from `first` on.
+    fn bands_from(self, first: usize) -> Self {
+        Self { data: &self.data[first * self.band_stride..], bands: self.bands - first, ..self }
+    }
+
+    /// `n` samples of band `b`'s row `y`, from column `x0` on.
+    fn row(&self, b: usize, y: usize, x0: usize, n: usize) -> &'a [T] {
+        &self.data[b * self.band_stride + y * self.cols + x0..][..n]
+    }
+}
+
+/// How an image's chunks are cut, predicted, packed and compressed: everything about them but
+/// their pixels, shared by the threads compressing them.
+struct ChunkEncoder<'a> {
+    t: DataType,
+    compression: Compression,
+    codec: &'a CodecParams,
+    layout: &'a Layout,
+    chunk_w: usize,
+    chunk_h: usize,
+    tiled: bool,
+    /// The samples of the chunks to leave out: `SPARSE_OK`'s nodata, or 0, when the samples hold
+    /// it exactly.
+    empty: Option<f64>,
+    packed_bits: Option<u16>,
+    clipped: std::sync::atomic::AtomicBool,
+}
+
+impl<'a> ChunkEncoder<'a> {
+    /// Chunks of `chunk` (width, height) pixels: tiles when `layout` has tiles, else strips of
+    /// at most that height. `empty`: as [`Level::sparse_image`]'s.
+    fn new(
+        t: DataType,
+        compression: Compression,
+        codec: &'a CodecParams,
+        layout: &'a Layout,
+        (chunk_w, chunk_h): (usize, usize),
+        empty: Option<f64>,
+    ) -> Self {
+        let size = t.size_bytes();
+        Self {
+            t,
+            compression,
+            codec,
+            layout,
+            chunk_w,
+            chunk_h,
+            tiled: layout.tile.is_some(),
+            empty: empty.filter(|&v| representable(t, v)),
+            packed_bits: layout.nbits.filter(|&bits| bits != (size * 8) as u16),
+            clipped: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// The bit depth samples were clipped to, when a chunk encoded so far clipped some.
+    fn clipped_bits(&self) -> Option<u16> {
+        self.packed_bits.filter(|_| self.clipped.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// The compressed chunk of plane `plane` (0 for pixel interleaving) whose top-left pixel is
+    /// `(x0, y0)` of `src`, padded with zeros past its edges (tiles), or ending at its last row
+    /// (strips); an empty chunk when it is left out. `scratch`: an LZW encoder to reuse.
+    fn encode<T: Pixel>(
+        &self,
+        src: Samples<'_, T>,
+        plane: usize,
+        x0: usize,
+        y0: usize,
+        scratch: &mut Option<super::tiff_lzw::Encoder>,
+    ) -> Result<Vec<u8>> {
+        let (layout, chunk_w) = (self.layout, self.chunk_w);
+        let parts = layout.parts;
+        let size = self.t.size_bytes();
+        let spp = src.bands / parts;
+        // Samples per chunk (each of `parts` values).
+        let chunk_spp = if layout.planar { 1 } else { spp };
+        // A complex sample's parts are interleaved like the bands of a pixel.
+        let (src, samples) = if layout.planar { (src.bands_from(plane * parts), parts) } else { (src, spp * parts) };
+        // Strips stop at the last row; tiles are padded to full size.
+        let h = if self.tiled { self.chunk_h } else { self.chunk_h.min(src.rows - y0) };
+        if let Some(v) = self.empty
+            && all_samples_equal(src, samples, x0, y0, chunk_w, h, v)
+        {
+            return Ok(Vec::new());
+        }
+        let mut buf = chunk_bytes(src, samples, x0, y0, chunk_w, h);
+        if let Some(bits) = self.packed_bits {
+            let (packed, did_clip) = pack_unsigned_rows(&buf, chunk_w * chunk_spp, size, bits);
+            buf = packed;
+            // GDAL 3.13.3 silently clamps bilevel samples; wider packed domains warn.
+            if did_clip && bits > 1 {
+                self.clipped.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        } else {
+            apply_predictor(&mut buf, layout.predictor, chunk_w * chunk_spp, chunk_spp, size);
+        }
+        let valid = (chunk_w.min(src.cols - x0), h.min(src.rows - y0));
+        self.compression.compress_reusing(buf, &ChunkInfo { w: chunk_w, h, spp: chunk_spp, t: self.t, valid }, self.codec, scratch)
+    }
+}
+
+// Applies a TIFF predictor to the little-endian rows of a chunk, as libtiff does: 2 differences
 /// each sample with the previous pixel's (as unsigned integers of the sample size, wrapping); 3
 /// splits each row's samples into byte planes, most significant first, then differences each
 /// byte with the one `stride` bytes before.
@@ -2111,16 +2222,15 @@ fn representable(t: DataType, v: f64) -> bool {
     v.fract() == 0.0 && (lo..=hi).contains(&(v as i128))
 }
 
-/// Whether the samples of every band of band-major `data` (`cols` x `rows` pixels a band) in the
-/// chunk of `chunk_w` x `h` pixels at `(x0, y0)`, within the image, are all `v`, bit for bit.
-#[allow(clippy::too_many_arguments)]
-fn all_samples_equal<T: Pixel>(data: &[T], cols: usize, rows: usize, x0: usize, y0: usize, chunk_w: usize, h: usize, v: f64) -> bool {
+/// Whether the first `samples` bands of `src` in the chunk of `chunk_w` x `h` pixels at
+/// `(x0, y0)`, within the region, are all `v`, bit for bit.
+fn all_samples_equal<T: Pixel>(src: Samples<'_, T>, samples: usize, x0: usize, y0: usize, chunk_w: usize, h: usize, v: f64) -> bool {
     let (mut want, mut got) = ([0u8; 8], [0u8; 8]);
     T::from_f64(v).put_le(&mut want[..T::SIZE]);
-    let n = chunk_w.min(cols - x0);
-    data.chunks_exact(cols * rows).all(|band| {
-        (y0..rows.min(y0 + h)).all(|y| {
-            band[y * cols + x0..][..n].iter().all(|s| {
+    let n = chunk_w.min(src.cols - x0);
+    (0..samples).all(|b| {
+        (y0..src.rows.min(y0 + h)).all(|y| {
+            src.row(b, y, x0, n).iter().all(|s| {
                 s.put_le(&mut got[..T::SIZE]);
                 got == want
             })
@@ -2128,26 +2238,22 @@ fn all_samples_equal<T: Pixel>(data: &[T], cols: usize, rows: usize, x0: usize, 
     })
 }
 
-/// The pixel-interleaved little-endian bytes of a chunk of `chunk_w` x `h` pixels at `(x0, y0)`,
-/// padded with zeros past the image's edges.
-#[allow(clippy::too_many_arguments)]
-fn chunk_bytes<T: Pixel>(data: &[T], cols: usize, rows: usize, spp: usize, x0: usize, y0: usize, chunk_w: usize, h: usize) -> Vec<u8> {
+/// The pixel-interleaved little-endian bytes of the first `spp` bands of `src` in a chunk of
+/// `chunk_w` x `h` pixels at `(x0, y0)`, padded with zeros past the region's edges.
+fn chunk_bytes<T: Pixel>(src: Samples<'_, T>, spp: usize, x0: usize, y0: usize, chunk_w: usize, h: usize) -> Vec<u8> {
     let size = T::SIZE;
     let row_len = chunk_w * spp * size;
     let mut buf = vec![0u8; row_len * h];
-    let band_len = cols * rows;
-    let n = chunk_w.min(cols - x0);
-    for row in 0..h.min(rows.saturating_sub(y0)) {
+    let n = chunk_w.min(src.cols - x0);
+    for row in 0..h.min(src.rows.saturating_sub(y0)) {
         let dst = &mut buf[row * row_len..][..n * spp * size];
-        let src = (y0 + row) * cols + x0;
         if spp == 1 {
-            for (d, v) in dst.chunks_exact_mut(size).zip(&data[src..src + n]) {
+            for (d, v) in dst.chunks_exact_mut(size).zip(src.row(0, y0 + row, x0, n)) {
                 v.put_le(d);
             }
         } else {
             for b in 0..spp {
-                let band = &data[b * band_len + src..][..n];
-                for (c, v) in band.iter().enumerate() {
+                for (c, v) in src.row(b, y0 + row, x0, n).iter().enumerate() {
                     v.put_le(&mut dst[(c * spp + b) * size..][..size]);
                 }
             }
@@ -2156,7 +2262,7 @@ fn chunk_bytes<T: Pixel>(data: &[T], cols: usize, rows: usize, spp: usize, x0: u
     buf
 }
 
-/// Pack unsigned little-endian samples MSB first, padding each row to a byte boundary.
+// Pack unsigned little-endian samples MSB first, padding each row to a byte boundary.
 /// GDAL 3.13.3 clips values to the stored unsigned domain, rather than masking high bits.
 fn pack_unsigned_rows(input: &[u8], row_samples: usize, size: usize, bits: u16) -> (Vec<u8>, bool) {
     let bits = usize::from(bits);
@@ -2493,6 +2599,8 @@ pub(crate) use super::common::{xml_escape, xml_unescape};
 /// predictors, tiles or strips, pixel or band interleaving, georeferencing (rotated or by GCPs),
 /// metadata, color tables, RPCs and GDAL's internal mask are written as by
 /// [`crate::write_raster_dataset`]; overviews and COGs need the whole raster and are not.
+/// A tiled GeoTIFF without a mask can instead be written tile by tile, in any order
+/// ([`GeoTiffWriter::write_tile`]), its tiles compressed on any thread ([`TileEncoder`]).
 ///
 /// ```no_run
 /// use terrio::{GeoTiffWriter, RasterDataset, RasterWriteOptions};
@@ -2534,14 +2642,18 @@ struct TiffRows {
     block_rows: usize,
     chunk_w: usize,
     across: usize,
+    /// The chunks of a block: one per plane (band) with planar interleaving, else one.
+    planes: usize,
     offsets: Vec<u64>,
     counts: Vec<u64>,
-    /// Rows received but not yet written (less than a block row), band after band.
+    /// The block row held until its rows are given: a block's rows (or the raster's rows, when
+    /// fewer) of each band, band after band, of which the first `pending_rows` were given;
+    /// empty until rows that do not complete a block row are given.
     pending: RasterData,
     pending_mask: Vec<u8>,
     pending_rows: usize,
     rows_done: usize,
-    /// Whether a block row failed to be written: the file is incomplete, and nothing more is
+    /// Whether a block row or a tile failed to be written: the file is incomplete, and nothing more is
     /// written to it.
     failed: bool,
     tags: Vec<(u16, Value)>,
@@ -2549,6 +2661,139 @@ struct TiffRows {
     mask: Option<(Vec<u64>, Vec<u64>)>,
     /// The samples of the blocks to leave out (`SPARSE_OK`): nodata, or 0.
     empty: Option<f64>,
+    /// The samples of the tiles never given, written when the file is finished: nodata, or 0.
+    fill: f64,
+    /// The number tying the tiles its encoders compress to the writer.
+    id: u64,
+    /// Whether each tile was given, row after row of tiles; empty until one is given.
+    tiles_done: Vec<bool>,
+}
+
+/// The tiles of a tiled GeoTIFF ([`GeoTiffWriter::tile_grid`]): their size, how many there are
+/// across and down, and the pixels of the raster each covers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TileGrid {
+    tile_width: usize,
+    tile_height: usize,
+    cols: usize,
+    rows: usize,
+}
+
+impl TileGrid {
+    /// The width and height of a tile, in pixels.
+    pub fn tile_size(&self) -> (usize, usize) {
+        (self.tile_width, self.tile_height)
+    }
+
+    /// The number of tiles across and down.
+    pub fn tiles(&self) -> (usize, usize) {
+        (self.cols.div_ceil(self.tile_width), self.rows.div_ceil(self.tile_height))
+    }
+
+    /// The pixels of the raster tile `(col, row)` covers, `(x, y, width, height)`: a tile's size
+    /// cut at the raster's right and bottom edges. `None` past the last tile.
+    pub fn window(&self, col: usize, row: usize) -> Option<(usize, usize, usize, usize)> {
+        let (across, down) = self.tiles();
+        if col >= across || row >= down {
+            return None;
+        }
+        let (x, y) = (col * self.tile_width, row * self.tile_height);
+        Some((x, y, self.tile_width.min(self.cols - x), self.tile_height.min(self.rows - y)))
+    }
+}
+
+/// The source of the writer numbers that tie a [`CompressedTile`] to its writer.
+static NEXT_WRITER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Compresses the tiles of a tiled GeoTIFF ([`GeoTiffWriter::tile_encoder`]) on any thread, while
+/// the writer appends those compressed before ([`GeoTiffWriter::write_compressed_tile`]). It holds
+/// the writer's encoding (compression, predictor, layout, `SPARSE_OK`), not its file: clones are
+/// cheap, and it is `Send` and `Sync`.
+#[derive(Clone)]
+pub struct TileEncoder {
+    writer: u64,
+    grid: TileGrid,
+    bands: usize,
+    planes: usize,
+    data_type: DataType,
+    compression: Compression,
+    codec: CodecParams,
+    layout: Layout,
+    empty: Option<f64>,
+}
+
+impl std::fmt::Debug for TileEncoder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TileEncoder").field("grid", &self.grid).field("bands", &self.bands).finish_non_exhaustive()
+    }
+}
+
+impl TileEncoder {
+    /// The tiles of the GeoTIFF.
+    pub fn grid(&self) -> TileGrid {
+        self.grid
+    }
+
+    /// Compresses tile `(col, row)` from its pixels, `data`: band after band, each the rows of the
+    /// tile's window in the raster ([`TileGrid::window`]), of the raster's sample type. A tile
+    /// cut at the raster's right or bottom edge is given without padding, and padded with zeros
+    /// in the file, as GDAL pads it. With `SPARSE_OK`, a tile whose samples are all nodata (or 0
+    /// without nodata) is left out.
+    ///
+    /// # Errors
+    /// When `T` is not the raster's sample type, the tile does not exist, `data` does not hold
+    /// its pixels, or the compression fails.
+    pub fn compress<T: RasterElement>(&self, col: usize, row: usize, data: &[T]) -> Result<CompressedTile> {
+        if T::DATA_TYPE != self.data_type {
+            return Err(Error::InvalidArgument("the tile is not of the raster's data type".into()));
+        }
+        let (across, down) = self.grid.tiles();
+        let (_, _, w, h) = self
+            .grid
+            .window(col, row)
+            .ok_or_else(|| Error::InvalidArgument(format!("no tile ({col}, {row}): the GeoTIFF has {across} x {down} tiles")))?;
+        if Some(data.len()) != w.checked_mul(h).and_then(|n| n.checked_mul(self.bands)) {
+            return Err(Error::InvalidArgument(format!("{} values for a tile of {w} x {h} pixels of {} bands", data.len(), self.bands)));
+        }
+        let encoder = ChunkEncoder::new(self.data_type, self.compression, &self.codec, &self.layout, self.grid.tile_size(), self.empty);
+        let src = Samples::whole(data, w, h, self.bands);
+        let mut scratch = None;
+        let chunks = (0..self.planes).map(|plane| encoder.encode(src, plane, 0, 0, &mut scratch)).collect::<Result<Vec<_>>>()?;
+        Ok(CompressedTile { writer: self.writer, col, row, chunks, clipped_bits: encoder.clipped_bits() })
+    }
+}
+
+/// A tile [`TileEncoder::compress`] compressed, for [`GeoTiffWriter::write_compressed_tile`] to
+/// append to the file it was compressed for: one chunk per band with `INTERLEAVE=BAND`, else one.
+pub struct CompressedTile {
+    writer: u64,
+    col: usize,
+    row: usize,
+    chunks: Vec<Vec<u8>>,
+    clipped_bits: Option<u16>,
+}
+
+impl std::fmt::Debug for CompressedTile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CompressedTile").field("col", &self.col).field("row", &self.row).field("bytes", &self.len()).finish()
+    }
+}
+
+impl CompressedTile {
+    /// The tile's column and row in the grid of tiles.
+    pub fn position(&self) -> (usize, usize) {
+        (self.col, self.row)
+    }
+
+    /// The compressed bytes: 0 for a tile `SPARSE_OK` leaves out.
+    pub fn len(&self) -> usize {
+        self.chunks.iter().map(Vec::len).sum()
+    }
+
+    /// Whether `SPARSE_OK` leaves the tile out of the file: it has no bytes.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }
 
 impl std::fmt::Debug for GeoTiffWriter {
@@ -2627,6 +2872,142 @@ impl GeoTiffWriter {
                 writer.admit(data, rows, mask, true)?;
                 writer.take_admitted(data.clone(), rows, mask.map(<[u8]>::to_vec))
             }
+        }
+    }
+
+    /// Appends `rows` full rows of every band from a slice of the raster's sample type (band
+    /// after band, as for [`Self::write_rows`]) without copying them into a [`RasterData`]: a
+    /// GeoTIFF compresses whole rows of blocks from `data` where they are, and copies only rows
+    /// that do not complete a row of blocks, to be written with the next rows. A COG copies the
+    /// rows, as [`Self::write_rows`] does, to compute its overviews.
+    ///
+    /// ```no_run
+    /// use terrio::{GeoTiffWriter, RasterDataset, RasterWriteOptions};
+    ///
+    /// # fn header() -> RasterDataset { unimplemented!() }
+    /// let header: RasterDataset = header(); // 1000 columns, 1 band of Float32
+    /// let mut w = GeoTiffWriter::create("dem.tif", &header, &RasterWriteOptions::default())?;
+    /// let grid: Vec<f32> = vec![0.0; 1000 * 256]; // 256 rows
+    /// w.write_rows_slice(&grid, 256, None)?;
+    /// # Ok::<(), terrio::Error>(())
+    /// ```
+    ///
+    /// # Errors
+    /// As [`Self::write_rows`]'s, and when `T` is not the raster's sample type (`f32` for
+    /// [`DataType::F32`]).
+    pub fn write_rows_slice<T: RasterElement>(&mut self, data: &[T], rows: usize, mask: Option<&[u8]>) -> Result<()> {
+        match &mut self.inner {
+            RowWriter::Tiff(t) => t.write_rows_slice(data, rows, mask),
+            RowWriter::Cog(c) => {
+                let writer = c.get_mut().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let data = T::wrap(data.to_vec());
+                writer.admit(&data, rows, mask, false)?;
+                writer.take_admitted(data, rows, mask.map(<[u8]>::to_vec))
+            }
+        }
+    }
+
+    /// The tiles of a tiled GeoTIFF, which [`Self::write_tile`] writes in any order; `None` for
+    /// strips and COGs.
+    pub fn tile_grid(&self) -> Option<TileGrid> {
+        match &self.inner {
+            RowWriter::Tiff(t) => t.tile_grid(),
+            RowWriter::Cog(_) => None,
+        }
+    }
+
+    /// The number of tiles given so far.
+    pub fn tiles_written(&self) -> usize {
+        match &self.inner {
+            RowWriter::Tiff(t) => t.tiles_written(),
+            RowWriter::Cog(_) => 0,
+        }
+    }
+
+    /// Writes tile `(col, row)` of a tiled GeoTIFF from its pixels: band after band, the rows of
+    /// the tile's window ([`TileGrid::window`]: a tile cut at the raster's right or bottom edge is
+    /// given without padding). Tiles are written in any order, each once, and appended to the file
+    /// as they come; those never written are filled with nodata (or 0) when the file is finished,
+    /// or left out with `SPARSE_OK=YES`, as GDAL fills or leaves out the blocks never written. A
+    /// file is written in tiles or in rows ([`Self::write_rows`]), not both.
+    ///
+    /// To compress tiles on several threads, give them a [`TileEncoder`] ([`Self::tile_encoder`])
+    /// and append what they compress with [`Self::write_compressed_tile`].
+    ///
+    /// ```no_run
+    /// use terrio::{GeoTiffWriter, RasterDataset, RasterWriteOptions};
+    ///
+    /// # fn header() -> RasterDataset { unimplemented!() }
+    /// let header: RasterDataset = header(); // 1 band of Float32
+    /// let options = RasterWriteOptions { tile_size: Some(256), ..Default::default() };
+    /// let mut w = GeoTiffWriter::create("dem.tif", &header, &options)?;
+    /// let grid = w.tile_grid().expect("tiled");
+    /// let (across, down) = grid.tiles();
+    /// for row in (0..down).rev() {
+    ///     for col in 0..across {
+    ///         let (_, _, width, height) = grid.window(col, row).unwrap();
+    ///         w.write_tile(col, row, &vec![0f32; width * height])?;
+    ///     }
+    /// }
+    /// w.finish()?;
+    /// # Ok::<(), terrio::Error>(())
+    /// ```
+    ///
+    /// # Errors
+    /// As [`TileEncoder::compress`]'s and [`Self::write_compressed_tile`]'s, and
+    /// [`Error::Unsupported`] as [`Self::tile_encoder`]'s.
+    pub fn write_tile<T: RasterElement>(&mut self, col: usize, row: usize, data: &[T]) -> Result<()> {
+        let tile = self.tile_encoder()?.compress(col, row, data)?;
+        self.write_compressed_tile(tile)
+    }
+
+    /// The encoder of the tiles of a tiled GeoTIFF, which compresses them on any thread while the
+    /// writer appends those already compressed ([`Self::write_compressed_tile`]).
+    ///
+    /// ```no_run
+    /// use terrio::{GeoTiffWriter, RasterDataset, RasterWriteOptions};
+    ///
+    /// # fn header() -> RasterDataset { unimplemented!() }
+    /// # fn tile_pixels(col: usize, row: usize) -> Vec<f32> { unimplemented!() }
+    /// let header: RasterDataset = header(); // 1 band of Float32
+    /// let options = RasterWriteOptions { tile_size: Some(256), compression: Some("DEFLATE".into()), ..Default::default() };
+    /// let mut w = GeoTiffWriter::create("dem.tif", &header, &options)?;
+    /// let encoder = w.tile_encoder()?;
+    /// let (across, down) = encoder.grid().tiles();
+    /// let (tx, rx) = std::sync::mpsc::sync_channel(16);
+    /// std::thread::scope(|s| -> terrio::Result<()> {
+    ///     for row in 0..down {
+    ///         let (tx, encoder) = (tx.clone(), encoder.clone());
+    ///         s.spawn(move || (0..across).for_each(|col| tx.send(encoder.compress(col, row, &tile_pixels(col, row))).unwrap()));
+    ///     }
+    ///     drop(tx);
+    ///     rx.into_iter().try_for_each(|tile| w.write_compressed_tile(tile?))
+    /// })?;
+    /// w.finish()?;
+    /// # Ok::<(), terrio::Error>(())
+    /// ```
+    ///
+    /// # Errors
+    /// [`Error::Unsupported`] for strips, COGs and a GeoTIFF with an internal mask.
+    pub fn tile_encoder(&self) -> Result<TileEncoder> {
+        match &self.inner {
+            RowWriter::Tiff(t) => t.tile_encoder(),
+            RowWriter::Cog(_) => Err(Error::Unsupported("a COG is written in rows: tiles in any order are written to GeoTIFFs".into())),
+        }
+    }
+
+    /// Appends a tile the writer's [`TileEncoder`] compressed, at the end of the file, and records
+    /// its offset and byte count (none for a tile `SPARSE_OK` leaves out).
+    ///
+    /// # Errors
+    /// When the tile was compressed for another file, or written already, rows were given, a
+    /// block failed to be written before, or the file cannot be written. Once a tile failed to be
+    /// written, the writer refuses every later call with [`Error::InvalidData`] (the call that
+    /// found the failure returns its error): the file may hold part of the tile.
+    pub fn write_compressed_tile(&mut self, tile: CompressedTile) -> Result<()> {
+        match &mut self.inner {
+            RowWriter::Tiff(t) => t.write_compressed_tile(tile),
+            RowWriter::Cog(_) => Err(Error::Unsupported("a COG is written in rows: tiles in any order are written to GeoTIFFs".into())),
         }
     }
 
@@ -2749,6 +3130,7 @@ impl TiffRows {
         if let Some(cm) = plan.color_map {
             tags.push((320, cm));
         }
+        tags.extend(structural_tags(cols, rows, bands, r.data_type, opts.compression, &layout, (chunk_w, block_rows)));
         let n = planes
             .checked_mul(across)
             .and_then(|n| n.checked_mul(down))
@@ -2784,6 +3166,7 @@ impl TiffRows {
             block_rows,
             chunk_w,
             across,
+            planes,
             offsets,
             counts,
             pending: RasterData::new_filled(r.data_type, 0, 0.0),
@@ -2794,6 +3177,9 @@ impl TiffRows {
             tags,
             mask: with_mask.then(|| (Vec::new(), Vec::new())),
             empty: opts.sparse.then(|| opts.nodata_as_read(r.data_type).unwrap_or(0.0)),
+            fill: opts.nodata_as_read(r.data_type).unwrap_or(0.0),
+            id: NEXT_WRITER.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            tiles_done: Vec::new(),
         })
     }
 
@@ -2806,16 +3192,35 @@ impl TiffRows {
     /// type), and of the mask (0 for invalid pixels) when the file has one.
     ///
     /// # Errors
-    /// When a block row failed to be written, or the data is not of the raster's data type; with
-    /// `rows` not zero, when it does not hold `rows` rows of every band, rows go past the raster's
-    /// height, the file has a mask and `mask` does not hold its rows, a mask is given for a file
-    /// without one, or the file cannot be written.
+    /// As [`Self::write_rows_slice`]'s.
     pub fn write_rows(&mut self, data: &RasterData, rows: usize, mask: Option<&[u8]>) -> Result<()> {
         if self.failed {
             return Err(Error::InvalidData("a block row of the GeoTIFF failed to be written".into()));
         }
         if data.data_type() != self.data_type {
             return Err(Error::InvalidArgument("the rows are not of the raster's data type".into()));
+        }
+        with_data!(data, v => self.write_rows_slice(v, rows, mask))
+    }
+
+    /// Appends `rows` full rows of every band from `data` (band after band) where they are: whole
+    /// rows of blocks are compressed from `data`, and only rows that do not complete one are
+    /// copied, to be written with the next rows.
+    ///
+    /// # Errors
+    /// When a block row failed to be written, or `T` is not the raster's data type; with
+    /// `rows` not zero, when `data` does not hold `rows` rows of every band, rows go past the
+    /// raster's height, the file has a mask and `mask` does not hold its rows, a mask is given for
+    /// a file without one, or the file cannot be written.
+    pub fn write_rows_slice<T: RasterElement>(&mut self, data: &[T], rows: usize, mask: Option<&[u8]>) -> Result<()> {
+        if self.failed {
+            return Err(Error::InvalidData("a block row of the GeoTIFF failed to be written".into()));
+        }
+        if T::DATA_TYPE != self.data_type {
+            return Err(Error::InvalidArgument("the rows are not of the raster's data type".into()));
+        }
+        if !self.tiles_done.is_empty() {
+            return Err(Error::InvalidArgument("tiles were given: the GeoTIFF is written in tiles, not rows".into()));
         }
         if rows == 0 {
             return Ok(());
@@ -2841,23 +3246,88 @@ impl TiffRows {
             }
             (Some(_), m) => m,
         };
-        self.check_row_working_set(data, rows, mask)?;
+        self.check_row_working_set(data.len(), rows, mask)?;
+        let src = Samples::whole(data, self.cols, rows, self.bands);
+        let cols = self.cols;
+        let mask_rows = |r: std::ops::Range<usize>| mask.map(|m| &m[r.start * cols..r.end * cols]);
         let mut y = 0;
+        // The rows completing the block row held, written with it.
+        if self.pending_rows > 0 {
+            y = (self.block_height() - self.pending_rows).min(rows);
+            self.hold(src.rows(0..y), mask_rows(0..y))?;
+            if self.pending_rows == self.block_height() {
+                self.flush_pending::<T>()?;
+            }
+        }
+        // Whole block rows (and the raster's last rows), compressed where they are.
         while y < rows {
-            let count = (self.block_rows - self.pending_rows).min(rows - y);
-            let part = if y == 0 && count == rows {
-                std::borrow::Cow::Borrowed(data)
-            } else {
-                std::borrow::Cow::Owned(slice_rows(data, rows, y..y + count, self.cols, self.bands))
-            };
-            self.append_block_rows(&part, count, mask.map(|m| &m[y * self.cols..(y + count) * self.cols]))?;
-            y += count;
+            let h = self.block_height();
+            if rows - y < h {
+                return self.hold(src.rows(y..rows), mask_rows(y..rows));
+            }
+            if let Err(e) = self.flush_block_row(src.rows(y..y + h), mask_rows(y..y + h)) {
+                // The rows of the block row are kept, as when they were held, and nothing more
+                // is written: the file may hold part of the block row.
+                self.failed = true;
+                self.hold(src.rows(y..y + h), mask_rows(y..y + h))?;
+                return Err(e);
+            }
+            y += h;
         }
         Ok(())
     }
 
+    /// The rows of the next block row: the block height, or the raster's rows left.
+    fn block_height(&self) -> usize {
+        self.block_rows.min(self.rows - self.rows_done)
+    }
+
+    /// Copies rows that do not complete a block row after those held, to be written with the
+    /// next rows. The block row held is allocated once, of a block's rows of every band.
+    fn hold<T: RasterElement>(&mut self, src: Samples<'_, T>, mask: Option<&[u8]>) -> Result<()> {
+        let held = self.block_rows.min(self.rows);
+        let stride = held * self.cols;
+        if self.pending.len() != stride * self.bands {
+            self.pending = crate::dataset::fallible::raster_data(self.data_type, stride * self.bands, 0.0, "a GeoTIFF block row")?;
+        }
+        let pending =
+            T::slice_mut(&mut self.pending).ok_or_else(|| Error::InvalidArgument("the rows are not of the raster's data type".into()))?;
+        let at = self.pending_rows * self.cols;
+        let n = src.rows * self.cols;
+        for b in 0..self.bands {
+            if n > 0 {
+                pending[b * stride + at..][..n].copy_from_slice(src.row(b, 0, 0, n));
+            }
+        }
+        if let Some(m) = mask {
+            self.pending_mask.extend_from_slice(m);
+        }
+        self.pending_rows += src.rows;
+        Ok(())
+    }
+
+    /// Writes the block row held, complete.
+    fn flush_pending<T: RasterElement>(&mut self) -> Result<()> {
+        let pending = std::mem::replace(&mut self.pending, RasterData::new_filled(self.data_type, 0, 0.0));
+        let mask = std::mem::take(&mut self.pending_mask);
+        let held = self.block_rows.min(self.rows);
+        let samples = T::slice(&pending).ok_or_else(|| Error::InvalidArgument("the rows are not of the raster's data type".into()))?;
+        let src = Samples { data: samples, cols: self.cols, rows: self.pending_rows, bands: self.bands, band_stride: held * self.cols };
+        let written = self.flush_block_row(src, self.mask.is_some().then_some(mask.as_slice()));
+        // Kept for the next block row; for a failed one, every row given stays held, and nothing
+        // more is written: the file may hold part of the block row.
+        self.pending = pending;
+        if let Err(e) = written {
+            self.pending_mask = mask;
+            self.failed = true;
+            return Err(e);
+        }
+        self.pending_rows = 0;
+        Ok(())
+    }
+
     /// Admit the retained input, one block row's scratch, concurrent LZW encoders and the index arrays (GDAL 3.13.3).
-    fn check_row_working_set(&self, data: &RasterData, rows: usize, mask: Option<&[u8]>) -> Result<()> {
+    fn check_row_working_set(&self, input_len: usize, rows: usize, mask: Option<&[u8]>) -> Result<()> {
         let size = self.data_type.size_bytes();
         let pixels = self.cols.checked_mul(self.block_rows.min(self.rows));
         let row = pixels.and_then(|n| n.checked_mul(self.bands)).and_then(|n| n.checked_mul(size));
@@ -2883,15 +3353,14 @@ impl TiffRows {
             Some(0)
         };
         let lzw_scratch = if self.compression == Compression::Lzw {
-            let planes = if self.layout.planar { self.bands.checked_div(self.layout.parts) } else { Some(1) };
-            planes
-                .and_then(|planes| self.across.checked_mul(planes))
+            self.across
+                .checked_mul(self.planes)
                 .and_then(|chunks| chunks.min(crate::par::threads()).checked_mul(super::tiff_lzw::Encoder::SCRATCH_BYTES))
         } else {
             Some(0)
         };
         let bytes = [
-            data.len().checked_mul(size),
+            input_len.checked_mul(size),
             self.pending.len().checked_mul(size),
             row.and_then(|n| n.checked_mul(2)),
             image.and_then(|n| n.checked_mul(2)),
@@ -2907,89 +3376,26 @@ impl TiffRows {
             .map_err(Error::ResourceLimit)
     }
 
-    /// Appends at most the remainder of one block row, retaining band-major order.
-    fn append_block_rows(&mut self, data: &RasterData, rows: usize, mask: Option<&[u8]>) -> Result<()> {
-        // Pending rows are kept band after band, in the raster's type; these rows follow them, or
-        // are read where they are when none is pending.
-        let old = self.pending_rows;
-        let (cols, bands) = (self.cols, self.bands);
-        let data_type = self.data_type;
-        let empty = || RasterData::new_filled(data_type, 0, 0.0);
-        let all = if old > 0 {
-            let joined = append_rows(&self.pending, old, 0, data, rows, cols, bands)?;
-            // Freed once copied.
-            self.pending = empty();
-            std::borrow::Cow::Owned(joined)
-        } else {
-            std::borrow::Cow::Borrowed(data)
-        };
-        if let Some(m) = mask {
-            self.pending_mask.extend_from_slice(m);
+    /// Compresses (in parallel) and writes a block row (or the raster's last rows), `src`, and
+    /// its mask's rows.
+    fn flush_block_row<T: Pixel>(&mut self, src: Samples<'_, T>, mask: Option<&[u8]>) -> Result<()> {
+        let (cols, across, h) = (self.cols, self.across, src.rows);
+        let encoder =
+            ChunkEncoder::new(self.data_type, self.compression, &self.codec, &self.layout, (self.chunk_w, self.block_rows), self.empty);
+        let chunks = crate::par::map_range_init_coarse(
+            self.planes * across,
+            || None,
+            |scratch, i| encoder.encode(src, i / across, (i % across) * self.chunk_w, 0, scratch),
+        );
+        let clipped_bits = encoder.clipped_bits();
+        let chunks = chunks.into_iter().collect::<Result<Vec<_>>>()?;
+        if let Some(bits) = clipped_bits {
+            crate::warnings::warn(format!("One or more pixels clipped to fit {bits} bit domain."));
         }
-        // The complete block rows (and the last rows of the raster), compressed together, then
-        // the rows left over, kept for the next call.
-        let total = old + rows;
-        let start = if self.rows_done + total == self.rows { total } else { total / self.block_rows * self.block_rows };
-        let written = if start == 0 {
-            Ok(())
-        } else if start == total {
-            self.flush_block_rows(&all, start)
-        } else {
-            // Freed before the rows left over are copied.
-            let slab = slice_rows(&all, total, 0..start, cols, bands);
-            self.flush_block_rows(&slab, start)
-        };
-        if let Err(e) = written {
-            // Every row given so far stays pending, as before the write, and nothing more is
-            // written: the file may hold part of the block row.
-            self.pending = all.into_owned();
-            self.pending_rows = total;
-            self.failed = true;
-            return Err(e);
-        }
-        self.pending = match start {
-            0 => all.into_owned(),
-            _ if start == total => empty(),
-            _ => slice_rows(&all, total, start..total, cols, bands),
-        };
-        if self.mask.is_some() {
-            self.pending_mask.drain(..start * cols);
-        }
-        self.pending_rows = total - start;
-        Ok(())
-    }
-
-    /// Compresses (in parallel) and writes `h` rows `data` (band after band): whole block rows, or
-    /// the raster's last rows.
-    fn flush_block_rows(&mut self, data: &RasterData, h: usize) -> Result<()> {
-        let (cols, bands) = (self.cols, self.bands);
-        let level = Level { cols, rows: h, bands, data: std::borrow::Cow::Borrowed(data) };
-        // Tiles are padded to full height.
-        let layout = Layout { rows_per_strip: Some(self.block_rows as u32), extra: self.layout.extra.clone(), ..self.layout };
-        let img = level.sparse_image(self.data_type, self.compression, &self.codec, &layout, self.empty)?;
-        img.report_clipping();
         let block_row = self.rows_done / self.block_rows;
-        let per_plane = self.across * self.rows.div_ceil(self.block_rows);
-        // The chunks of each plane, block row after block row.
-        let slab_per_plane = self.across * h.div_ceil(self.block_rows);
-        for (k, chunk) in img.chunks.iter().enumerate() {
-            // A chunk left out keeps its offset and byte count of 0.
-            if chunk.is_empty() {
-                continue;
-            }
-            let (plane, j) = (k / slab_per_plane, k % slab_per_plane);
-            let idx = plane * per_plane + block_row * self.across + j;
-            self.offsets[idx] = self.pos;
-            self.counts[idx] = chunk.len() as u64;
-            self.file.write_all(chunk)?;
-            self.pos += chunk.len() as u64;
-            self.check_size()?;
-        }
-        if self.tags.iter().all(|(t, _)| *t != 256) {
-            self.tags.extend(img.tags);
-        }
-        if self.mask.is_some() {
-            let m = &self.pending_mask[..h * cols];
+        let per_plane = across * self.rows.div_ceil(self.block_rows);
+        self.append_chunks(&chunks, |k| (k / across) * per_plane + block_row * across + k % across)?;
+        if let Some(m) = mask {
             let mi = mask_image(m, cols, h, (self.chunk_w, self.block_rows, self.layout.tile.is_some()))?;
             for chunk in mi.chunks {
                 let offset = self.pos;
@@ -3003,6 +3409,105 @@ impl TiffRows {
             }
         }
         self.rows_done += h;
+        Ok(())
+    }
+
+    /// The tiles of a tiled GeoTIFF; `None` for strips.
+    fn tile_grid(&self) -> Option<TileGrid> {
+        self.layout.tile.map(|_| TileGrid { tile_width: self.chunk_w, tile_height: self.block_rows, cols: self.cols, rows: self.rows })
+    }
+
+    /// The number of tiles given so far.
+    fn tiles_written(&self) -> usize {
+        self.tiles_done.iter().filter(|&&done| done).count()
+    }
+
+    /// The encoder of the GeoTIFF's tiles.
+    fn tile_encoder(&self) -> Result<TileEncoder> {
+        let grid = self.tile_grid().ok_or_else(|| Error::Unsupported("tiles are written to tiled GeoTIFFs (TILED=YES)".into()))?;
+        if self.mask.is_some() {
+            return Err(Error::Unsupported("a GeoTIFF with an internal mask is written in rows, not tiles".into()));
+        }
+        Ok(TileEncoder {
+            writer: self.id,
+            grid,
+            bands: self.bands,
+            planes: self.planes,
+            data_type: self.data_type,
+            compression: self.compression,
+            codec: self.codec,
+            layout: self.layout.clone(),
+            empty: self.empty,
+        })
+    }
+
+    /// Appends a tile its encoder compressed.
+    fn write_compressed_tile(&mut self, tile: CompressedTile) -> Result<()> {
+        if self.failed {
+            return Err(Error::InvalidData("a block of the GeoTIFF failed to be written".into()));
+        }
+        if tile.writer != self.id {
+            return Err(Error::InvalidArgument("the tile was compressed for another GeoTIFF".into()));
+        }
+        if self.rows_written() > 0 {
+            return Err(Error::InvalidArgument("rows were given: the GeoTIFF is written in rows, not tiles".into()));
+        }
+        let (across, down) = (self.across, self.rows.div_ceil(self.block_rows));
+        if self.tiles_done.is_empty() {
+            self.tiles_done = crate::dataset::fallible::filled(across * down, false, "the GeoTIFF tiles written")?;
+        }
+        let k = tile.row * across + tile.col;
+        if self.tiles_done[k] {
+            return Err(Error::InvalidArgument(format!("tile ({}, {}) was written already", tile.col, tile.row)));
+        }
+        if let Some(bits) = tile.clipped_bits {
+            crate::warnings::warn(format!("One or more pixels clipped to fit {bits} bit domain."));
+        }
+        if let Err(e) = self.append_chunks(&tile.chunks, |plane| plane * across * down + k) {
+            // The file may hold part of the tile: nothing more is written to it.
+            self.failed = true;
+            return Err(e);
+        }
+        self.tiles_done[k] = true;
+        Ok(())
+    }
+
+    /// Appends chunks to the file, the `i`th at index `index(i)` of the image's chunks; a chunk
+    /// left out (empty) keeps its offset and byte count of 0.
+    fn append_chunks(&mut self, chunks: &[Vec<u8>], index: impl Fn(usize) -> usize) -> Result<()> {
+        for (i, chunk) in chunks.iter().enumerate() {
+            if chunk.is_empty() {
+                continue;
+            }
+            let idx = index(i);
+            self.offsets[idx] = self.pos;
+            self.counts[idx] = chunk.len() as u64;
+            self.file.write_all(chunk)?;
+            self.pos += chunk.len() as u64;
+            self.check_size()?;
+        }
+        Ok(())
+    }
+
+    /// Writes the tiles not given as GDAL fills the blocks never written: nodata, or 0; unless
+    /// `SPARSE_OK` leaves them out (offset and byte count 0, read as nodata, or 0).
+    fn fill_missing_tiles(&mut self) -> Result<()> {
+        if self.empty.is_some_and(|v| representable(self.data_type, v)) {
+            return Ok(());
+        }
+        let encoder = self.tile_encoder()?;
+        let (across, down) = encoder.grid.tiles();
+        for row in 0..down {
+            for col in 0..across {
+                if self.tiles_done[row * across + col] {
+                    continue;
+                }
+                let (_, _, w, h) = encoder.grid.window(col, row).unwrap_or_default();
+                let fill = crate::dataset::fallible::raster_data(self.data_type, w * h * self.bands, self.fill, "a GeoTIFF tile")?;
+                let tile = with_data!(&fill, v => encoder.compress(col, row, v))?;
+                self.write_compressed_tile(tile)?;
+            }
+        }
         Ok(())
     }
 
@@ -3021,9 +3526,11 @@ impl TiffRows {
     /// When rows are missing, a block row failed to be written, or the file cannot be written.
     pub fn finish(mut self) -> Result<()> {
         if self.failed {
-            return Err(Error::InvalidData("a block row of the GeoTIFF failed to be written".into()));
+            return Err(Error::InvalidData("a block of the GeoTIFF failed to be written".into()));
         }
-        if self.rows_written() != self.rows {
+        if !self.tiles_done.is_empty() {
+            self.fill_missing_tiles()?;
+        } else if self.rows_written() != self.rows {
             return Err(Error::InvalidArgument(format!("{} rows written of {}", self.rows_written(), self.rows)));
         }
         let tiled = self.layout.tile.is_some();
@@ -7997,5 +8504,322 @@ following conditions:
             let warned: &[&str] = if lossy { &["SPARSE_OK is ignored with a lossy compression: every block is written"] } else { &[] };
             assert_eq!(crate::warnings::take(), warned, "{extra:?}");
         }
+    }
+
+    /// Rows given as typed slices (`write_rows_slice`) make a GeoTIFF byte for byte the same
+    /// however they are split into calls: whole rows of blocks at once, rows that complete the
+    /// rows held, or rows that do not complete a row of blocks; and the same as the rows given as
+    /// one `RasterData`. Tiles and strips, pixel and band interleaving, predictors 2 and 3, and an
+    /// internal mask; the file reads back as the rows given.
+    #[test]
+    fn rows_given_as_slices_write_the_same_file_however_they_are_split() {
+        fn check<T: RasterElement + Pixel>(values: &[T], bands: usize, co: &[(&str, &str)], with_mask: bool) {
+            let (cols, rows) = (65, 35);
+            let data = T::wrap(values.to_vec());
+            let raster = overview_fixture(bands, T::DATA_TYPE, data.clone());
+            let mut header = crate::RasterDataset::new(raster, false);
+            header.raster.data = RasterData::new_filled(T::DATA_TYPE, 0, 0.0);
+            let options = crate::RasterWriteOptions {
+                compression: Some("DEFLATE".into()),
+                creation_options: co.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+                mask: with_mask.then(Vec::new),
+                ..Default::default()
+            };
+            let mask: Vec<u8> = (0..cols * rows).map(|i| if i % 7 == 0 { 0 } else { 255 }).collect();
+            let dir = tempfile::tempdir().unwrap();
+            let write = |name: &str, splits: &[usize], slices: bool| {
+                let path = dir.path().join(name);
+                let mut w = GeoTiffWriter::create(path.to_str().unwrap(), &header, &options).unwrap();
+                let mut y = 0;
+                for &n in splits.iter().chain(std::iter::once(&(rows - splits.iter().sum::<usize>()))) {
+                    let part = slice_rows(&data, rows, y..y + n, cols, bands);
+                    let m = with_mask.then(|| &mask[y * cols..(y + n) * cols]);
+                    if slices {
+                        w.write_rows_slice(T::slice(&part).unwrap(), n, m).unwrap();
+                    } else {
+                        w.write_rows(&part, n, m).unwrap();
+                    }
+                    y += n;
+                }
+                assert_eq!(w.rows_written(), rows);
+                w.finish().unwrap();
+                std::fs::read(path).unwrap()
+            };
+            let case = format!("{:?}, {bands} band(s), {co:?}, mask {with_mask}", T::DATA_TYPE);
+            let whole = write("whole.tif", &[], false);
+            // Whole block rows, then rows that do not complete one, then rows completing them and
+            // block rows beyond, one row at a time, and nothing.
+            for splits in [&[][..], &[32], &[5, 11, 0, 16], &[3, 40 - 8], &[1; 34]] {
+                assert_eq!(write("slices.tif", splits, true), whole, "{case}, {splits:?}");
+            }
+            let back = crate::open_raster(dir.path().join("whole.tif").to_str().unwrap()).unwrap();
+            assert!(T::slice(&back.raster.data).is_some_and(|v| v == values), "{case}");
+        }
+        let n: usize = 65 * 35;
+        let floats: Vec<f32> = (0..n * 2).map(|i| (i as f32 * 0.37).sin() * 100.0).collect();
+        let ints: Vec<i16> = (0..n).map(|i| (i % 517) as i16 - 200).collect();
+        let bytes: Vec<u8> = (0..n * 3).map(|i| (i * 7 % 251) as u8).collect();
+        let tiles = [("TILED", "YES"), ("BLOCKXSIZE", "16"), ("BLOCKYSIZE", "16")];
+        for co in [&tiles[..], &[("BLOCKYSIZE", "16")]] {
+            let with = |extra: &[(&'static str, &'static str)]| [co, extra].concat();
+            check(&floats, 2, &with(&[("PREDICTOR", "3")]), false);
+            check(&floats, 2, &with(&[("PREDICTOR", "3"), ("INTERLEAVE", "BAND")]), false);
+            check(&ints, 1, &with(&[("PREDICTOR", "2")]), true);
+            check(&bytes, 3, &with(&[("INTERLEAVE", "BAND")]), true);
+        }
+    }
+
+    /// A slice of another type than the raster's is refused, whatever its length, before rows
+    /// are taken.
+    #[test]
+    fn rows_of_another_type_are_refused() {
+        let raster = overview_fixture(1, DataType::F32, RasterData::F32(vec![0.0; 65 * 35]));
+        let mut header = crate::RasterDataset::new(raster, false);
+        header.raster.data = RasterData::F32(Vec::new());
+        let dir = tempfile::tempdir().unwrap();
+        for driver in [None, Some(crate::formats::RasterDriver::Cog)] {
+            let path = dir.path().join("typed.tif");
+            let options = crate::RasterWriteOptions { driver, ..Default::default() };
+            let mut w = GeoTiffWriter::create(path.to_str().unwrap(), &header, &options).unwrap();
+            assert!(matches!(w.write_rows_slice(&[0.0f64; 65], 1, None), Err(Error::InvalidArgument(_))), "{driver:?}");
+            assert!(matches!(w.write_rows_slice(&[0i32; 0], 0, None), Err(Error::InvalidArgument(_))), "{driver:?}");
+            assert_eq!(w.rows_written(), 0);
+            w.write_rows_slice(&[0.0f32; 65 * 35], 35, None).unwrap();
+            w.finish().unwrap();
+        }
+    }
+
+    /// The chunks of the first image of a TIFF file: their bytes, by index (empty when left out).
+    fn tiff_chunks(path: &std::path::Path) -> Vec<Vec<u8>> {
+        let bytes = std::fs::read(path).unwrap();
+        let mut dec = tiff::decoder::Decoder::new(std::fs::File::open(path).unwrap()).unwrap();
+        let tables = crate::geotiff::ChunkTables::read(&mut dec).unwrap();
+        tables.offsets.iter().zip(&tables.counts).map(|(&o, &n)| bytes[o as usize..(o + n) as usize].to_vec()).collect()
+    }
+
+    /// The pixels of tile `(col, row)` of band-major `data` (`bands` bands of `cols` x `rows`),
+    /// cut at the raster's edges, band after band.
+    fn tile_pixels<T: Copy>(data: &[T], (cols, rows, bands): (usize, usize, usize), grid: TileGrid, col: usize, row: usize) -> Vec<T> {
+        let (x, y, w, h) = grid.window(col, row).unwrap();
+        (0..bands).flat_map(|b| (y..y + h).flat_map(move |r| data[b * cols * rows + r * cols + x..][..w].iter().copied())).collect()
+    }
+
+    /// A fixed shuffle of the tiles of a grid.
+    fn shuffled(grid: TileGrid) -> Vec<(usize, usize)> {
+        let (across, down) = grid.tiles();
+        let mut order: Vec<(usize, usize)> = (0..down).flat_map(|r| (0..across).map(move |c| (c, r))).collect();
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        for i in (1..order.len()).rev() {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            order.swap(i, (state % (i as u64 + 1)) as usize);
+        }
+        order
+    }
+
+    /// Tiles given in any order, from any thread, make a GeoTIFF whose chunks are byte for byte
+    /// those of the same raster given in rows, and which reads back as it: edge tiles cut by the
+    /// raster's right and bottom edges (padded in the file), pixel and band interleaving,
+    /// predictors 2 and 3, LZW, Deflate and Zstandard, classic and BigTIFF.
+    #[test]
+    fn tiles_given_in_any_order_write_the_chunks_rows_write() {
+        fn check<T: RasterElement + Pixel>(values: &[T], bands: usize, co: &[(&str, &str)]) {
+            let (cols, rows) = (65, 35);
+            let data = T::wrap(values.to_vec());
+            let mut header = crate::RasterDataset::new(overview_fixture(bands, T::DATA_TYPE, data.clone()), false);
+            header.raster.data = RasterData::new_filled(T::DATA_TYPE, 0, 0.0);
+            let options = crate::RasterWriteOptions {
+                creation_options: [("TILED", "YES"), ("BLOCKXSIZE", "16"), ("BLOCKYSIZE", "16")]
+                    .iter()
+                    .chain(co)
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+                ..Default::default()
+            };
+            let case = format!("{:?}, {bands} band(s), {co:?}", T::DATA_TYPE);
+            let dir = tempfile::tempdir().unwrap();
+            let (by_rows, by_tiles) = (dir.path().join("rows.tif"), dir.path().join("tiles.tif"));
+            let mut w = GeoTiffWriter::create(by_rows.to_str().unwrap(), &header, &options).unwrap();
+            w.write_rows_slice(values, rows, None).unwrap();
+            w.finish().unwrap();
+            let mut w = GeoTiffWriter::create(by_tiles.to_str().unwrap(), &header, &options).unwrap();
+            let encoder = w.tile_encoder().unwrap();
+            let grid = encoder.grid();
+            assert_eq!((grid.tile_size(), grid.tiles(), grid.window(4, 2)), ((16, 16), (5, 3), Some((64, 32, 1, 3))), "{case}");
+            assert_eq!(w.tile_grid(), Some(grid));
+            let order = shuffled(grid);
+            // Compressed on threads, appended here as they come.
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::scope(|s| {
+                for part in order.chunks(4) {
+                    let (tx, encoder) = (tx.clone(), encoder.clone());
+                    s.spawn(move || {
+                        for &(c, r) in part {
+                            tx.send(encoder.compress(c, r, &tile_pixels(values, (cols, rows, bands), grid, c, r)).unwrap()).unwrap();
+                        }
+                    });
+                }
+                drop(tx);
+                for tile in rx {
+                    w.write_compressed_tile(tile).unwrap();
+                }
+            });
+            assert_eq!(w.tiles_written(), order.len(), "{case}");
+            w.finish().unwrap();
+            assert_eq!(tiff_chunks(&by_tiles), tiff_chunks(&by_rows), "{case}");
+            assert_eq!(std::fs::metadata(&by_tiles).unwrap().len(), std::fs::metadata(&by_rows).unwrap().len(), "{case}");
+            let back = crate::open_raster(by_tiles.to_str().unwrap()).unwrap();
+            assert!(T::slice(&back.raster.data).is_some_and(|v| v == values), "{case}");
+        }
+        let n: usize = 65 * 35;
+        let floats: Vec<f32> = (0..n * 2).map(|i| (i as f32 * 0.37).sin() * 100.0).collect();
+        let doubles: Vec<f64> = (0..n).map(|i| (i as f64 * 0.11).cos() * 1e6).collect();
+        let shorts: Vec<i16> = (0..n * 2).map(|i| (i % 517) as i16 - 200).collect();
+        let ints: Vec<i32> = (0..n).map(|i| (i as i32 * 7919) % 100_003 - 50_000).collect();
+        let bytes: Vec<u8> = (0..n * 3).map(|i| (i * 7 % 251) as u8).collect();
+        check(&floats, 2, &[("COMPRESS", "DEFLATE"), ("PREDICTOR", "3")]);
+        check(&floats, 2, &[("COMPRESS", "LZW"), ("PREDICTOR", "3"), ("INTERLEAVE", "BAND")]);
+        check(&doubles, 1, &[("COMPRESS", "ZSTD"), ("PREDICTOR", "3"), ("BIGTIFF", "YES")]);
+        check(&shorts, 2, &[("COMPRESS", "LZW"), ("PREDICTOR", "2")]);
+        check(&ints, 1, &[("COMPRESS", "ZSTD"), ("PREDICTOR", "2")]);
+        check(&bytes, 3, &[("COMPRESS", "DEFLATE"), ("INTERLEAVE", "BAND")]);
+        check(&bytes, 3, &[("COMPRESS", "NONE")]);
+    }
+
+    /// Tiles never given are written when the file is finished as GDAL writes the blocks never
+    /// written: of nodata, or 0 without nodata; with `SPARSE_OK=YES`, they are left out (offset and
+    /// byte count 0), with the tiles given whose samples are all nodata. Either way the file reads
+    /// as the raster of the tiles given, nodata elsewhere.
+    #[test]
+    fn tiles_not_given_are_filled_or_left_out() {
+        let (cols, rows) = (65, 35);
+        let dir = tempfile::tempdir().unwrap();
+        for (nodata, planar, sparse) in [
+            (Some(-9999.0), false, false),
+            (None, false, false),
+            (Some(-9999.0), false, true),
+            (None, true, true),
+            (Some(-9999.0), true, false),
+        ] {
+            let fill = nodata.unwrap_or(0.0) as f32;
+            let mut values: Vec<f32> = (0..cols * rows * 2).map(|i| (i % 97) as f32 + 1.0).collect();
+            let mut raster = overview_fixture(2, DataType::F32, RasterData::F32(vec![0.0; cols * rows * 2]));
+            raster.nodata = nodata.unwrap_or(-9999.0);
+            let mut header = crate::RasterDataset::new(raster, nodata.is_some());
+            header.raster.data = RasterData::F32(Vec::new());
+            let mut co =
+                vec![("TILED", "YES"), ("BLOCKXSIZE", "16"), ("BLOCKYSIZE", "16"), ("SPARSE_OK", if sparse { "YES" } else { "NO" })];
+            if planar {
+                co.push(("INTERLEAVE", "BAND"));
+            }
+            let options = crate::RasterWriteOptions {
+                compression: Some("DEFLATE".into()),
+                creation_options: co.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+                ..Default::default()
+            };
+            let path = dir.path().join("partial.tif");
+            let mut w = GeoTiffWriter::create(path.to_str().unwrap(), &header, &options).unwrap();
+            let grid = w.tile_grid().unwrap();
+            // Tile (1, 1) is all nodata; (0, 2), an edge tile, and (4, 0) are never given.
+            for y in 16..32 {
+                for x in 16..32 {
+                    values[y * cols + x] = fill;
+                    values[cols * rows + y * cols + x] = fill;
+                }
+            }
+            let missing = [(0, 2), (4, 0)];
+            for (c, r) in shuffled(grid).into_iter().filter(|t| !missing.contains(t)) {
+                w.write_tile(c, r, &tile_pixels(&values, (cols, rows, 2), grid, c, r)).unwrap();
+            }
+            w.finish().unwrap();
+            let case = format!("nodata {nodata:?}, planar {planar}, SPARSE_OK {sparse}");
+            for &(c, r) in &missing {
+                let (x, y, tw, th) = grid.window(c, r).unwrap();
+                for b in 0..2 {
+                    for yy in y..y + th {
+                        values[b * cols * rows + yy * cols + x..][..tw].fill(fill);
+                    }
+                }
+            }
+            let back = crate::open_raster(path.to_str().unwrap()).unwrap();
+            assert_eq!(back.raster.data.as_f32_slice().unwrap(), &values[..], "{case}");
+            let chunks = tiff_chunks(&path);
+            let per_plane = 15;
+            let left_out: Vec<usize> = (0..chunks.len()).filter(|&i| chunks[i].is_empty()).collect();
+            let expected: Vec<usize> = if sparse {
+                let tiles = [6, 10, 4];
+                let mut all: Vec<usize> = if planar { tiles.iter().flat_map(|t| [*t, t + per_plane]).collect() } else { tiles.to_vec() };
+                all.sort_unstable();
+                all
+            } else {
+                Vec::new()
+            };
+            assert_eq!(left_out, expected, "{case}");
+        }
+    }
+
+    /// Tiles are refused, before anything is written, by strips, COGs and files with a mask, and
+    /// when they do not exist, do not hold the tile's pixels, are of another type, were written
+    /// already, come from another writer's encoder, or follow rows; rows are refused after tiles.
+    #[test]
+    fn tiles_out_of_place_are_refused() {
+        let raster = overview_fixture(1, DataType::U8, RasterData::U8(vec![1; 65 * 35]));
+        let mut header = crate::RasterDataset::new(raster, false);
+        header.raster.data = RasterData::U8(Vec::new());
+        let dir = tempfile::tempdir().unwrap();
+        let path = |name: &str| dir.path().join(name).to_str().unwrap().to_string();
+        let tiled = crate::RasterWriteOptions { tile_size: Some(16), ..Default::default() };
+        let cog = crate::RasterWriteOptions { driver: Some(crate::formats::RasterDriver::Cog), ..Default::default() };
+        let masked = crate::RasterWriteOptions { tile_size: Some(16), mask: Some(Vec::new()), ..Default::default() };
+        for options in [crate::RasterWriteOptions::default(), cog, masked] {
+            let mut w = GeoTiffWriter::create(&path("other.tif"), &header, &options).unwrap();
+            assert!(matches!(w.tile_encoder(), Err(Error::Unsupported(_))), "{options:?}");
+            assert!(matches!(w.write_tile(0, 0, &[1u8; 256]), Err(Error::Unsupported(_))), "{options:?}");
+        }
+        let mut w = GeoTiffWriter::create(&path("tiles.tif"), &header, &tiled).unwrap();
+        let encoder = w.tile_encoder().unwrap();
+        assert_eq!(encoder.grid().window(5, 0), None);
+        assert!(matches!(encoder.compress(5, 0, &[1u8; 256]), Err(Error::InvalidArgument(_))));
+        assert!(matches!(encoder.compress(0, 2, &[1u8; 256]), Err(Error::InvalidArgument(_))), "an edge tile of 16 x 3");
+        assert!(matches!(encoder.compress(0, 0, &[1u16; 256]), Err(Error::InvalidArgument(_))));
+        let other = GeoTiffWriter::create(&path("other.tif"), &header, &tiled).unwrap().tile_encoder().unwrap();
+        assert!(matches!(w.write_compressed_tile(other.compress(0, 0, &[1u8; 256]).unwrap()), Err(Error::InvalidArgument(_))));
+        w.write_tile(0, 2, &[1u8; 16 * 3]).unwrap();
+        assert!(matches!(w.write_tile(0, 2, &[1u8; 16 * 3]), Err(Error::InvalidArgument(_))));
+        assert!(matches!(w.write_rows_slice(&[1u8; 65], 1, None), Err(Error::InvalidArgument(_))));
+        assert_eq!((w.tiles_written(), w.rows_written()), (1, 0));
+        w.finish().unwrap();
+        let mut w = GeoTiffWriter::create(&path("rows.tif"), &header, &tiled).unwrap();
+        w.write_rows_slice(&[1u8; 65], 1, None).unwrap();
+        assert!(matches!(w.write_tile(0, 0, &[1u8; 256]), Err(Error::InvalidArgument(_))));
+        assert_eq!((w.tiles_written(), w.rows_written()), (0, 1));
+    }
+
+    /// A tile that failed to be written leaves the writer refusing every later tile, rows and
+    /// `finish`: the file may hold part of it.
+    #[test]
+    fn a_failed_tile_stops_the_writer() {
+        let raster = overview_fixture(1, DataType::U8, RasterData::U8(vec![1; 65 * 35]));
+        let mut header = crate::RasterDataset::new(raster, false);
+        header.raster.data = RasterData::U8(Vec::new());
+        let dir = tempfile::tempdir().unwrap();
+        let options = crate::RasterWriteOptions { tile_size: Some(16), ..Default::default() };
+        let mut w = GeoTiffWriter::create(dir.path().join("failed.tif").to_str().unwrap(), &header, &options).unwrap();
+        let RowWriter::Tiff(t) = &mut w.inner else { unreachable!("a GeoTIFF") };
+        t.pos = u64::from(u32::MAX);
+        assert!(w.write_tile(0, 0, &[1u8; 256]).is_err());
+        assert!(matches!(w.write_tile(1, 0, &[1u8; 256]), Err(Error::InvalidData(_))));
+        assert_eq!(w.tiles_written(), 0);
+        assert!(w.finish().is_err());
+    }
+
+    /// Tile encoders and writers can be shared between threads.
+    #[test]
+    fn tile_encoders_are_send_and_sync() {
+        fn shared<T: Send + Sync>() {}
+        shared::<TileEncoder>();
+        shared::<CompressedTile>();
+        shared::<GeoTiffWriter>();
     }
 }
