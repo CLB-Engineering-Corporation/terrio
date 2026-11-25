@@ -49,6 +49,7 @@ pub(crate) mod sqlite;
 pub(crate) mod sqlite_edit;
 #[cfg(feature = "sqlite")]
 pub(crate) mod sqlite_repack;
+mod tiff_lzw;
 pub(crate) mod vector;
 pub(crate) mod webp;
 pub(crate) mod wkt;
@@ -266,7 +267,14 @@ pub(crate) fn open_raw(path: &str) -> Option<Result<common::RawRaster>> {
 /// reads the file so.
 pub(crate) fn open_lazy(path: &str) -> Option<Result<crate::LazyRaster>> {
     if let Some(result) = open_raw(path) {
-        return Some(result.map(common::RawRaster::into_lazy));
+        return Some(result.and_then(|mut raw| {
+            if raw.header.driver == RasterDriver::EHdr
+                && let crate::vfs::Location::Local(p) = crate::vfs::Location::parse(path)
+            {
+                raw.attach_ovr(&p)?;
+            }
+            Ok(raw.into_lazy())
+        }));
     }
     #[cfg(feature = "zarr")]
     if let Some(result) = zarr::open_lazy(path) {

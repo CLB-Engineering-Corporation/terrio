@@ -29,14 +29,18 @@ hecras = ["terrio/hecras"]
 ## pure Rust.
 parquet-zstd = ["terrio/parquet-zstd"]
 ## GeoTIFF/COG Zstandard with the zstd C library (`terrio/libzstd-geotiff`), opt-in: the wheels
-## write and read it in pure Rust (`ruzstd`), as the Pyodide wheel does whatever the features.
+## write and read it in pure Rust (`zrip`), as the Pyodide wheel does whatever the features.
 libzstd-geotiff = ["terrio/libzstd-geotiff", "terrio-cli/libzstd-geotiff"]
 ## GeoTIFF, EPT and GeoParquet Zstandard with the zstd C library (`terrio/libzstd`).
 libzstd = ["terrio/libzstd", "libzstd-geotiff"]
-## Remote inputs (`terrio/remote`), in the native wheels by default; HTTPS is `rustls` with `ring`
-## (CLB fork). The Pyodide wheel builds no HTTP client whatever the features.
+## Remote inputs (`terrio/remote`), in the native wheels by default; HTTPS is `rustls` with
+## `rustls-graviola`. The Pyodide wheel builds no HTTP client whatever the features.
 remote = ["terrio/remote", "terrio-cli/remote"]
-default = ["hecras", "remote"]
+## HTTPS with `ring` on CPUs `rustls-graviola` cannot run on (`terrio/ring-fallback`). On by
+## default in the CLB fork's wheels, so HTTPS works on every CPU as it did with `ring` alone;
+## needs a C compiler.
+ring-fallback = ["remote", "terrio/ring-fallback", "terrio-cli/ring-fallback"]
+default = ["hecras", "remote", "ring-fallback"]
 
 [dependencies]
 terrio.workspace = true

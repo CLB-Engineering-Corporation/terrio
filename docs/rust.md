@@ -2,7 +2,7 @@
 
 ```toml
 [dependencies]
-terrio = "0.9"
+terrio = "0.10"
 ```
 
 The API reference, with an example on each entry point, is on [docs.rs](https://docs.rs/terrio);
@@ -100,70 +100,55 @@ Row-streamed COG output computes the same pixels, whatever the input row chunk s
 retaining the whole source image.
 
 COGs build factors 2, 4, 8, … until the image fits in one tile, unless
-`RasterWriteOptions::overviews` gives the factors: those levels are then built as for a GeoTIFF
-(each from the previous one, `ceil(cols / f) x ceil(rows / f)`) and written as the COG's, as
-GDAL's COG driver reuses overviews built on its source by `gdaladdo` (`OVERVIEWS=AUTO` or
+`RasterWriteOptions::overviews` gives the factors (CLB fork): those levels are then built as for a
+GeoTIFF (each from the previous one, `ceil(cols / f) x ceil(rows / f)`) and written as the COG's,
+as GDAL's COG driver reuses overviews built on its source by `gdaladdo` (`OVERVIEWS=AUTO` or
 `FORCE_USE_EXISTING`; `NONE` or `IGNORE_EXISTING` with factors is refused rather than ignored).
 
-The CLB fork adds the `COG_OVERVIEW_POLICY` creation option. Its default, `GDAL_3_13`, is the
-behaviour above, upstream's. `COG_OVERVIEW_POLICY=SOURCE` selects the fork's source-block
-overviews instead: levels of `ceil(cols / f) x ceil(rows / f)` pixels, `nearest`, `average`,
-`min`, `max` or `mode` (`average` by default, `nearest` for palette COGs). The area-matched
-overviews and the overview report below need it, and supplied overview arrays of ceil sizes (as
-GDAL's GTiff driver and `gdaladdo` build them) are written under it. (`SOURCE` was the fork's
-default until 2026-11-21.)
+The CLB fork adds the `COG_OVERVIEW_POLICY` creation option. Its default, `GDAL_3_13`, is
+upstream's behaviour. `COG_OVERVIEW_POLICY=SOURCE` selects the fork's source-block overviews
+instead: levels of `ceil(cols / f) x ceil(rows / f)` pixels, `nearest`, `average`, `min`, `max`
+or `mode` (`average` by default, `nearest` for palette COGs), each reduced from the original
+source blocks independently (`nearest` samples the block center, `average` skips nodata and
+rounds only the final result; categorical methods keep native sample precision). For `SOURCE`
+rasters carrying a dataset mask, nearest/average/mode use the recursive mask-weighted kernels at
+SOURCE's ceil dimensions, and masked min/max are refused.
 
-Without explicit factors, the unmasked `SOURCE` policy reduces each automatic
-overview level from the original source blocks independently: `nearest` samples the block center (clamped at image edges), and
-`average` skips nodata and rounds only the final result. Categorical methods retain native
-sample precision, including UInt64 values above 2⁵³. With `ALPHA=YES`, color averages are
-weighted by the last band's alpha; alpha itself is averaged normally. Row-streamed COG output
-uses the same reduction, independently of the input row chunk size, without retaining the whole
-source image. Independent overview levels and complete average output rows run in parallel on
-native builds and sequentially in WebAssembly. Each output cell still accumulates its source
-samples in row-major order, including across streamed input slabs; block-local sums avoid
-per-sample updates to persistent row buffers. Reading the source for each level still costs
-O(levels × source pixels) work, more than recursively reducing already-rounded overviews.
-Mode counts native sample values with hash tables, retaining the first value to reach the
-highest count when frequencies tie; floating-point signed zeros count as the same value.
+COG creation options are those of GDAL's COG driver, and the CLB fork's writer refuses an option
+it would not act on rather than ignoring it: a GeoTIFF option (`TILED`, `BLOCKXSIZE`), an unknown
+key, an `OVERVIEW_COMPRESS`, `OVERVIEW_PREDICTOR`, `OVERVIEW_QUALITY` or `MAX_Z_ERROR_OVERVIEW`
+unlike the image's (overviews are written as the full-resolution image), or
+`TILING_SCHEME`/`GEOTIFF_VERSION` other than their defaults. `NUM_THREADS` is accepted. `LEVEL`
+sets the DEFLATE (1 to 9) or ZSTD (1 to 22) level, also over LERC, and `LERC_ENCODER` chooses
+GDAL's LERC blobs (`GDAL`, the default) or lerc-writer's smallest (`COMPACT`).
 
-COG creation options are those of GDAL's COG driver, and the writer refuses an option it would
-not act on rather than ignoring it: a GeoTIFF option (`TILED`, `BLOCKXSIZE`), an unknown key, an
-`OVERVIEW_COMPRESS`, `OVERVIEW_PREDICTOR`, `OVERVIEW_QUALITY` or `MAX_Z_ERROR_OVERVIEW` unlike the
-image's (overviews are written as the full-resolution image), or `TILING_SCHEME`/`GEOTIFF_VERSION`
-other than their defaults. `NUM_THREADS` and `SPARSE_OK` are accepted (every tile is written).
-`PREDICTOR=YES` is resolved as GDAL's COG driver resolves it: 3 for floating-point rasters and 2
-for integers (`STANDARD` is 2, `FLOATING_POINT` 3); a GeoTIFF's `YES` stays 2. `LEVEL` sets the
-DEFLATE (1 to 9) or ZSTD (1 to 22) level, also over LERC. `OVERVIEW_RESAMPLING`, else
-`RESAMPLING`, sets the overview method, and `OVERVIEWS` is `AUTO`, `IGNORE_EXISTING`
-(computed), `FORCE_USE_EXISTING` (the overviews supplied) or `NONE`. As GDAL, a COG's
-`GDAL_METADATA` carries `OVERVIEW_RESAMPLING` and LERC's `MAX_Z_ERROR` (or
-`COMPRESSION_REVERSIBILITY=LOSSLESS`) in the `IMAGE_STRUCTURE` domain.
+`area_matched`, and `area_matched_mode` for classes, are terrio's own (GDAL 3.13 has no
+equivalent): overviews of a raster with nodata whose valid cells cover the valid area of the
+full-resolution image, where `average` grows it at every level (see
+[Formats](formats.md#overviews-that-keep-the-valid-area)). They are written whole, never in rows,
+and each band's metadata records what its levels keep:
 
-`overview_resampling = "area_matched"` (`"area_matched_mode"` for categorical rasters) builds
-overviews whose valid area matches the full resolution's: `average` marks a coarse pixel valid when
-any of its pixels is, so a flood extent grows at every level (by 22% to 56% on HEC-RAS depth
-grids), and `nearest` speckles its margin. Each level keeps `round(valid / f²)` cells, the most
-covered first, solving a threshold on the coverage histogram and breaking ties by the number of
-kept neighbours then a deterministic hash, and holds the mean of their valid pixels (the mode for
-categorical rasters, the lowest value on ties). It needs a nodata value and
-`COG_OVERVIEW_POLICY=SOURCE`. The algorithm and its output are ras2cng's
-`build_area_matched_overviews`.
+```rust,no_run
+let ds = terrio::open_raster("depth.tif")?;
+let options = terrio::RasterWriteOptions {
+    driver: Some(terrio::formats::RasterDriver::Cog),
+    compression: Some("DEFLATE".into()),
+    overview_resampling: Some("area_matched".into()),
+    ..Default::default()
+};
+terrio::write_raster_dataset(&ds, "depth_cog.tif", &options)?;
+let written = terrio::open_raster("depth_cog.tif")?;
+let items = &written.band_metadata[0].items; // OVERVIEW_AREA_RATIOS, OVERVIEW_BASE_VALID_PIXELS
+# let _ = items;
+# Ok::<(), terrio::Error>(())
+```
 
-`write_raster_dataset_with_report` returns what was measured while building them, an
-`OverviewReport`: per band, the valid area each level keeps (kept cells × f² over the valid
-full-resolution pixels, ras2cng's `overview_area_ratios`) and the valid pixel count. The file
-carries the same values in the `OVERVIEW_REPORT` metadata domain (`OVERVIEW_METHOD`,
-`OVERVIEW_FACTORS`, `OVERVIEW_AREA_RATIOS`, `OVERVIEW_BASE_VALID_PIXELS`), which GDAL and rasterio
-read (`tags(ns="OVERVIEW_REPORT")`); Python's `Raster.write` returns the report as a dict.
-
-`RasterWriteOptions::overview_report_metadata` also stores the report in the default domain
-(rasterio's `tags()`), under item names of the caller's choosing, in the header written with the
-overviews, so that a reader of that domain needs no pass of its own over the raster: the area
-ratios as Python's `"%.6f"` (`terrio::format_fixed6`: correctly rounded from the binary value,
-ties to even), comma-separated, and the valid pixel count; with several bands, the bands' values
-are separated by `;`. A name also given in `metadata` is refused. Nothing is stored when no
-level is built.
+The CLB fork's `COG_OVERVIEW_POLICY=SOURCE` builds area-matched levels as ras2cng's
+`build_area_matched_overviews` does instead, output for output: levels of
+`ceil(cols / f) x ceil(rows / f)` cells, each from the 2 x 2 cells of the one before, keeping
+`round(valid / f²)` cells, with the report also recorded in an `OVERVIEW_REPORT` metadata domain
+(`OVERVIEW_METHOD`, `OVERVIEW_FACTORS`, `OVERVIEW_AREA_RATIOS`, `OVERVIEW_BASE_VALID_PIXELS`;
+rasterio: `tags(ns="OVERVIEW_REPORT")`):
 
 ```rust,no_run
 let ds = terrio::open_raster("depth.tif")?;
@@ -178,59 +163,25 @@ let options = terrio::RasterWriteOptions {
     area_matched_nan_valid: true,
     ..Default::default()
 };
-terrio::write_raster_dataset(&ds, "depth_cog.tif", &options)?;
+let report = terrio::write_raster_dataset_with_report(&ds, "depth_cog.tif", &options)?;
+# let _ = report;
 # Ok::<(), terrio::Error>(())
 ```
 
-Area-matched overviews count NaN as nodata. `area_matched_nan_valid` counts NaN under a numeric
-nodata (a HEC-RAS float32 grid with -9999) as valid instead, as rasterio's mask does: NaN pixels
-add to the coverage, and the mean of a kept cell holding one is NaN at every level, as ras2cng's
-NumPy builder computes it (a mode is never NaN). Under a NaN nodata it changes nothing. LERC
-stores NaN pixels as masked, as GDAL does, and they read back as NaN without their sign or
-payload; lossless codecs keep the bits.
+Either way `write_raster_dataset_with_report` returns what was measured while building the
+levels, an `OverviewReport`: per band, the valid area each level keeps and the valid pixel count
+(Python's `Raster.write` returns it as a dict). `RasterWriteOptions::overview_report_metadata`
+also stores it in the default domain (rasterio's `tags()`), under item names of the caller's
+choosing: the area ratios as Python's `"%.6f"` (`terrio::format_fixed6`), comma-separated, and
+the valid pixel count; with several bands, the bands' values are separated by `;`. A name also
+given in `metadata` is refused. Nothing is stored when no level is built.
 
-Either way the report's `nan_pixels` counts, per band, the NaN samples under a numeric nodata,
-from the same pass (it is not stored in the file). A caller that must treat NaN as rasterio's mask
-does, but writes without `area_matched_nan_valid`, can refuse the result on a non-zero count
-instead of scanning the raster first.
-
-Overviews computed elsewhere are written as they are with `RasterWriteOptions::overview_data`
-(GDAL's `OVERVIEWS=FORCE_USE_EXISTING`): the levels of factors 2, 4, 8…, each of the raster's
-bands and data type, of `ceil(cols / f) x ceil(rows / f)` pixels with `COG_OVERVIEW_POLICY=SOURCE`
-(the sizes of GDAL's GTiff overviews, as here), or halved and floored from level to level under
-the default `GDAL_3_13`. A level of another size is refused.
-
-```rust,no_run
-use std::sync::Arc;
-
-let ds = terrio::open_raster("depth.tif")?;
-# let (level2, level4) = (ds.raster.clone(), ds.raster.clone());
-let options = terrio::RasterWriteOptions {
-    driver: Some(terrio::formats::RasterDriver::Cog),
-    compression: Some("DEFLATE".into()),
-    creation_options: vec![
-        ("PREDICTOR".into(), "YES".into()),
-        ("OVERVIEWS".into(), "FORCE_USE_EXISTING".into()),
-        ("COG_OVERVIEW_POLICY".into(), "SOURCE".into()),
-    ],
-    overview_data: vec![Arc::new(level2), Arc::new(level4)],
-    metadata: vec![("overview_method".into(), "area_matched_mean".into())],
-    ..Default::default()
-};
-terrio::write_raster_dataset(&ds, "depth_cog.tif", &options)?;
-# Ok::<(), terrio::Error>(())
-```
-
-`COG_OVERVIEW_POLICY=GDAL_3_13`, the default, is the upstream recursive GDAL overview
-implementation with floor-sized levels, including alpha and dataset masks, and supports `rms`,
-`bilinear`, `cubic`, `cubicspline`, `lanczos` and `gauss` besides SOURCE's methods. `SOURCE` is
-opt-in and carries the scientific area-matched/supplied-array extensions described above.
-Neither policy implies a performance advantage.
-
-For `SOURCE` rasters carrying a dataset mask, nearest/average/mode use the
-upstream recursive mask-weighted kernels at SOURCE's ceil dimensions. Masked
-min/max are explicitly refused. This mask-aware extension differs from the
-unmasked SOURCE reductions; it does not silently discard source validity.
+Area-matched overviews count NaN as nodata. `area_matched_nan_valid` (SOURCE's levels only)
+counts NaN under a numeric nodata (a HEC-RAS float32 grid with -9999) as valid instead, as
+rasterio's mask does: NaN pixels add to the coverage, and the mean of a kept cell holding one is
+NaN at every level, as ras2cng's NumPy builder computes it (a mode is never NaN). The report's
+`nan_pixels` counts, per band, the NaN samples under a numeric nodata (it is not stored in the
+file).
 
 Native WebP TIFF output supports pixel-interleaved Byte RGB and RGBA.
 `WEBP_LOSSLESS=YES` preserves all samples, including transparent colors;
@@ -244,6 +195,40 @@ The same codecs and creation options are available in WebAssembly.
 `write_vector(&layers, path, &VectorWriteOptions)` writes layers; GeoPackage holds several.
 `ops::vector_filter::write_vector_with_mode` appends to or overwrites the layers of an existing
 output; GeoPackages are updated keeping their other tables.
+
+Set `VectorWriteOptions::preserve_fid` to copy `Feature::fid` into a GeoPackage's
+`INTEGER PRIMARY KEY` column, as `ogr2ogr -preserve_fid` does for explicit IDs.
+
+```rust,no_run
+let points = terrio::open_vector("points.geojson", &Default::default())?;
+let options = terrio::VectorWriteOptions { preserve_fid: true, ..Default::default() };
+terrio::write_vector(&points.layers, "points.gpkg", &options)?;
+# Ok::<(), terrio::Error>(())
+```
+
+IDs must be unique within each layer. Appends also reject IDs already in the
+destination layer and use its existing primary-key column name. `signed_fid`
+interprets the ID bits as a signed 64-bit SQLite integer, including zero, `-1`
+and both limits. GDAL reserves `-1` as its unset-ID sentinel, while Terrio can
+copy a stored GeoPackage row ID of `-1`.
+
+The feature ID supplies the key. A case-insensitive attribute with the same name
+as the key (`properties.fid` in a typical GeoJSON export) must be a single integer
+field. A matching value is represented by the key column. An absent or null value
+leaves the feature ID in effect. A different value, incompatible type or ambiguous
+field name is an error. Without the option, a newly written layer still uses an
+eligible integer `fid` attribute or assigns keys from one in feature order, and
+an append continues the existing sequence.
+
+The write option uses the IDs present on the `Feature` values. `Feature::fid`
+always holds a number, so the writer cannot distinguish reader-generated IDs from
+explicit source IDs. The GeoJSON reader substitutes zero-based positions for missing, negative or
+non-integer IDs; if any feature has a string ID, every feature uses its position. This can differ
+from `ogr2ogr -preserve_fid`, lose explicit numeric IDs in a mixed collection, or produce a
+collision with another explicit ID. The writer does not recover those original IDs. To preserve
+original IDs, use a reader that exposes them numerically, or supply `Feature::fid` explicitly.
+Preservation buffers stream
+inputs so arbitrary ID order can be sorted and validated before writing.
 
 ## Streams
 
@@ -448,6 +433,28 @@ let small = cog.read_resampled(&options)?; // the 512 x 512 overview's tiles, ge
 # Ok::<(), terrio::Error>(())
 ```
 
+Use `WindowSampling::Integer` to match GDAL's nearest-neighbour `RasterIO` with an integer
+window. It requires whole-pixel offsets and sizes within the raster and rounds the window
+at each overview, including an explicitly selected level. The output georeferencing uses
+the requested full-resolution window. `WindowSampling::Fractional` is the default, even
+when all four window coordinates are whole numbers.
+
+```rust,no_run
+use terrio::{ResampledReadOptions, WindowSampling};
+
+let mut raster = terrio::open_raster_lazy("terrain.tif")?;
+let options = ResampledReadOptions {
+    window: Some((3.0, 5.0, 61.0, 47.0)),
+    size: (17, 23),
+    ..Default::default()
+};
+let pixels = raster.read_resampled_with_sampling(&options, WindowSampling::Integer)?;
+# Ok::<(), terrio::Error>(())
+```
+
+The mask methods also accept the mode through `read_resampled_masks_with_sampling` and
+`read_resampled_with_masks_and_sampling`.
+
 - `OverviewSelection::Auto` (the default) chooses as `GDALBandGetBestOverviewLevel2`: when the
   output is smaller than the window, the least reduced axis sets the desired reduction, and full
   resolution then each overview is a candidate below that times 1.2 for nearest neighbour or 1.0
@@ -585,9 +592,11 @@ The commands are also available through the CLI and MCP. Python has `buffer`, `d
 to layers read and written as streams through `VectorTranslateOptions::geometry_op` (which is
 also `ogr2ogr`'s `-simplify`/`-segmentize`). `vector_geom::combine` (`CombineOptions`) and
 `vector_geom::sort` (`SortMethod`) take whole layers; `vector_geom::force_to` is OGR's `forceTo`.
-The single-geometry algorithms are `ops::simplify::{simplify_preserve_topology, segmentize}`
-and `ops::hull::{convex_hull, concave_hull, concave_hull_of_polygons}`. They are pure Rust and
-included in WebAssembly builds.
+The single-geometry algorithms are `ops::simplify::{simplify_preserve_topology, segmentize}`,
+`ops::simplify_dp::simplify_douglas_peucker` (`GeometryOp::SimplifyDouglasPeucker`) and
+`ops::hull::{convex_hull, concave_hull, concave_hull_of_polygons}`;
+`ops::simplify_dp::{simplify_wkb, simplify_wkb_many}` run Douglas-Peucker on WKB, the latter in
+parallel over features. They are pure Rust and included in WebAssembly builds.
 
 ```rust,no_run
 use terrio::ops::vector_geom::{self, CombineOptions, ConcaveHullOptions, GeometryOp, SortMethod};
@@ -930,7 +939,7 @@ features off and names the ones it uses, for a smaller dependency tree, faster b
 smaller WebAssembly module. A COG writer, say:
 
 ```toml
-terrio = { version = "0.9", default-features = false, features = ["geotiff"] }
+terrio = { version = "0.10", default-features = false, features = ["geotiff"] }
 ```
 
 The core, always built, is GeoTIFF and COG (deflate, LZW, PackBits, ZSTD, WebP and JPEG), the
@@ -962,12 +971,13 @@ operations and the streams. The other drivers are features:
 | `gdal` | off | The optional GDAL backend: formats terrio has no driver for, through GDAL (needs GDAL installed). See [the GDAL backend](gdal.md#the-optional-gdal-backend). |
 | `ndarray` | off | Raster pixels as `ndarray` arrays, without copying them: views, owned transfers and the masks of lazy reads, with the crate re-exported as `terrio::ndarray`; floating-point windows as owned arrays, bands first or last. See [ndarray](#ndarray). |
 | `cad` | on | DWG and DXF, read and written, through acadrust. See [CAD drawings](formats.md#cad-drawings-dwg-and-dxf). |
-| `drivers` | on | Every driver above that is on by default: the default features but `remote`. `default-features = false, features = ["drivers"]` builds them all without a C compiler. |
-| `libzstd-geotiff` | off | GeoTIFF/COG Zstandard (ZSTD and LERC_ZSTD chunks written, ZSTD chunks read) through the zstd C library, natively: the C library's bytes at each of its 22 levels, written in 0.7 to 1.15 of the time on one thread. Without it (the default), and always in WebAssembly, GeoTIFF Zstandard is the pure-Rust `ruzstd` (the `zstd-rust` crate), which reads these as fast and writes them to within about 3% of the size at levels 1 to 9; levels 10 and up are its `Best`, up to 23.5% larger than the C library's level 19 and 3.5 to 5 times faster (see [Testing](testing.md), "Zstandard: pure Rust against the C library"). Needs a C compiler. |
+| `drivers` | on | Every driver above that is on by default: the default features but `remote` (CLB fork). |
+| `libzstd-geotiff` | off | GeoTIFF/COG Zstandard (ZSTD and LERC_ZSTD chunks written, ZSTD chunks read) through the zstd C library, natively: levels above 4, which the default `zrip` writes at level 4. Needs a C compiler. |
 | `libzstd-ept` | off | EPT tiles' Zstandard through the zstd C library, natively. |
 | `libzstd-geoparquet` | off | The Zstandard of the GeoParquet pages terrio compresses and decompresses itself through the zstd C library, natively: then the same bytes as `parquet-zstd`'s. |
 | `libzstd` | off | `libzstd-geotiff`, `libzstd-ept` and `libzstd-geoparquet`: every Zstandard path but Zarr's through the zstd C library. |
 | `parquet-zstd` | off | ZSTD GeoParquet pages written by the `parquet` crate's own codec, the zstd C library. Without it terrio compresses the pages in pure Rust (or with `libzstd-geoparquet`), to the same pages. |
+| `ring-fallback` | off | HTTPS with `ring` (needs a C compiler) on x86-64 and AArch64 CPUs without the features `rustls-graviola` needs; without it, HTTPS on such a CPU fails naming them. See [the architecture notes](architecture.md). Implies `remote`. On by default in the CLB fork's `terrio-cli` and Python package. |
 
 The drivers stay in the API whatever the features (`formats::RasterDriver`,
 `formats::VectorDriver`): those a build leaves out are listed as neither read nor written, and

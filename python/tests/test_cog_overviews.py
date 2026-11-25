@@ -9,241 +9,820 @@ Tolerance: none. terrio follows GDAL 3.12.1's overview code function by function
 (`gcore/overview.cpp`), so any difference fails.
 """
 
-from xml.etree import ElementTree
-
 import numpy as np
 import pytest
 
 import terrio
+import terrio.rio as trio
+import terrio.rio.shutil  # noqa: F401
 
-TRANSFORM = (500000.0, 10.0, 0.0, 4000000.0, 0.0, -10.0)
-# Area-matched COG overviews and their report are the opt-in SOURCE policy's (CLB fork; the
-# default is GDAL 3.13's, which refuses them).
-SOURCE = {"COG_OVERVIEW_POLICY": "SOURCE"}
+rasterio = pytest.importorskip("rasterio")
+import rasterio.shutil  # noqa: E402, F811 - importorskip assigned rasterio
+from rasterio.enums import Resampling as RR  # noqa: E402
+from rasterio.transform import from_origin  # noqa: E402
+
+from terrio.rio.enums import Resampling as TR  # noqa: E402
+
+METHODS = [
+    "NEAREST",
+    "AVERAGE",
+    "RMS",
+    "BILINEAR",
+    "CUBIC",
+    "CUBICSPLINE",
+    "LANCZOS",
+    "MODE",
+    "GAUSS",
+]
+
+# (width, height, bands, dtype, nodata): odd and even sizes, 1 and 3 bands, with and without
+# nodata. 875 halves to 437, as the 875 x 875 level of a 14000 x 14000 raster does.
+CASES = [
+    (1000, 1000, 1, "uint8", None),
+    (1001, 999, 3, "uint8", 0),
+    (1001, 999, 3, "uint16", None),
+    (3001, 2999, 1, "uint16", 0),
+    (1001, 999, 1, "int16", -9999),
+    (875, 875, 3, "int16", None),
+    (1001, 999, 1, "float32", None),
+    (875, 875, 3, "float32", -9999.0),
+]
+
+RANGES = {"uint8": (0, 255), "uint16": (0, 10000), "int16": (-3000, 3000), "float32": (-50.0, 50.0)}
 
 
-def river(width=1300, height=1100, nodata=-9999.0):
-    """A diagonal band of valid pixels 7 wide: `average` overviews widen it at every level."""
-    y, x = np.mgrid[0:height, 0:width]
-    a = (1.0 + x % 10).astype("float32")
-    a[np.abs(x - y) > 3] = nodata
-    return a
+def _source(path, width, height, bands, dtype, nodata, **profile):
+    """A smooth field plus noise, with scattered nodata pixels and a nodata block."""
+    rng = np.random.default_rng(width * 7 + height + bands)
+    y, x = np.mgrid[0:height, 0:width].astype("float64")
+    lo, hi = RANGES[dtype]
+    planes = []
+    for b in range(bands):
+        base = (np.sin(x / (17 + 5 * b)) + np.cos(y / (23 + 3 * b))) * 0.25 + 0.5
+        planes.append(lo + (hi - lo) * np.clip(base + rng.normal(0, 0.05, base.shape), 0, 1))
+    data = np.stack(planes).astype(dtype)
+    if nodata is not None:
+        holes = rng.random((height, width)) < 0.02
+        holes[: height // 3, : width // 4] = True
+        data[:, holes] = nodata
+    with rasterio.open(
+        path,
+        "w",
+        driver="GTiff",
+        width=width,
+        height=height,
+        count=bands,
+        dtype=dtype,
+        nodata=nodata,
+        crs="EPSG:32613",
+        transform=from_origin(400000, 4500000, 10, 10),
+        **profile,
+    ) as dst:
+        dst.write(data)
+    return str(path)
 
 
-def raster(a, nodata=-9999.0):
-    return terrio.Raster.from_array(a, TRANSFORM, "EPSG:32610", nodata)
+def _levels(path):
+    """Every level (full resolution, then each overview) of a file, read by GDAL."""
+    with rasterio.open(path) as ds:
+        count = len(ds.overviews(1))
+        out = [ds.read()]
+    for i in range(count):
+        with rasterio.open(path, overview_level=i) as ds:
+            out.append(ds.read())
+    return out
 
 
-def overviews(path):
-    r = terrio.open_raster(str(path), lazy=True)
-    return [np.asarray(r.read(overview=i))[0] for i in range(len(r.overviews))]
+def _assert_same(expected, actual, what):
+    a, b = _levels(expected), _levels(actual)
+    assert [x.shape for x in b] == [x.shape for x in a], f"{what}: levels"
+    for i, (x, y) in enumerate(zip(a, b, strict=True)):
+        same = (x == y) | (np.isnan(x) & np.isnan(y)) if x.dtype.kind == "f" else x == y
+        if not same.all():
+            d = np.abs(x.astype("float64") - y.astype("float64"))[~same]
+            pytest.fail(
+                f"{what}: level {i} {x.shape}: {np.mean(~same):.4%} of pixels differ, "
+                f"max |d| {np.nanmax(d) if d.size else 'nan'}"
+            )
 
 
-def assert_overview_method(path, rasterio, public_tags, expected):
-    """GDAL 3.13 exposes this IMAGE_STRUCTURE item; older readers may filter it.
+def _gdal_cog(src, dst, **options):
+    rasterio.shutil.copy(src, dst, driver="COG", compress="deflate", **options)
+    return str(dst)
 
-    Always verify the actual TIFF metadata, including on older GDAL readers. The
-    OVERVIEW_REPORT domain and decoded values have their own unconditional checks.
-    """
-    encoded = path.read_bytes()
-    start = encoded.index(b"<GDALMetadata>")
-    end = encoded.index(b"</GDALMetadata>", start) + len(b"</GDALMetadata>")
-    metadata = ElementTree.fromstring(encoded[start:end])
-    items = [
-        item.text
-        for item in metadata.findall("Item")
-        if item.get("name") == "OVERVIEW_RESAMPLING" and item.get("domain") == "IMAGE_STRUCTURE"
+
+@pytest.mark.parametrize("method", METHODS)
+@pytest.mark.parametrize(
+    "case", CASES, ids=lambda c: "x".join(map(str, c[:3])) + f"-{c[3]}-nd{c[4]}"
+)
+def test_overviews_are_gdals(tmp_path, case, method):
+    """Each resampling, through `terrio.convert` (the native path) and `OVERVIEW_RESAMPLING`."""
+    src = _source(tmp_path / "src.tif", *case)
+    gdal = _gdal_cog(src, tmp_path / "gdal.tif", overview_resampling=method)
+    ours = str(tmp_path / "terrio.tif")
+    terrio.convert(
+        src, ours, format="COG", compress="DEFLATE", options={"OVERVIEW_RESAMPLING": method.lower()}
+    )
+    _assert_same(gdal, ours, f"convert {method}")
+
+
+@pytest.mark.parametrize("path", ["convert", "rio_copy", "rio_open", "raster_write"])
+def test_default_resampling_is_gdals_cubic(tmp_path, path):
+    """No resampling asked for, as in ingestion: GDAL's default (CUBIC), on every path."""
+    src = _source(tmp_path / "src.tif", 1001, 999, 3, "uint16", 0)
+    gdal = _gdal_cog(src, tmp_path / "gdal.tif")
+    ours = str(tmp_path / "terrio.tif")
+    if path == "convert":
+        terrio.convert(src, ours, format="COG", compress="DEFLATE")
+    elif path == "rio_copy":
+        with trio.open(src) as ds:
+            profile = ds.profile.copy()
+        profile.update(driver="COG", compress="deflate")
+        trio.shutil.copy(src, ours, **profile)
+    elif path == "rio_open":
+        with trio.open(src) as ds:
+            profile, data = ds.profile.copy(), ds.read()
+        profile.update(driver="COG", compress="deflate")
+        with trio.open(ours, "w", **profile) as dst:
+            dst.write(data)
+    else:
+        terrio.open(src).write(ours, driver="COG", compress="DEFLATE")
+    _assert_same(gdal, ours, path)
+
+
+@pytest.mark.parametrize("word", ["YES", "TRUE", "STANDARD", "FLOATING_POINT", "2", "FALSE", "NO"])
+@pytest.mark.parametrize("dtype", ["float32", "int16", "uint8"])
+def test_cog_predictor_words_are_gdals(tmp_path, dtype, word):
+    """GDAL's COG driver resolves PREDICTOR=YES by data type (3 for floats, 2 otherwise) and
+    takes STANDARD and FLOATING_POINT: terrio writes the predictor GDAL writes, reports it while
+    writing as GDAL reports it afterwards, and the same pixels at every level."""
+    src = _source(tmp_path / "src.tif", 1001, 999, 1, dtype, None)
+    if word == "FLOATING_POINT" and dtype != "float32":
+        # GDAL refuses the floating-point predictor for integers, and so does terrio.
+        with pytest.raises(Exception, match="PREDICTOR=3"):
+            _gdal_cog(src, tmp_path / "gdal.tif", predictor=word)
+        with pytest.raises(terrio.TerrioError, match="PREDICTOR=3"):
+            terrio.convert(
+                src,
+                str(tmp_path / "x.tif"),
+                format="COG",
+                compress="DEFLATE",
+                options={"PREDICTOR": word},
+            )
+        return
+    gdal = _gdal_cog(src, tmp_path / "gdal.tif", predictor=word)
+    with rasterio.open(gdal) as ds:
+        expected = ds.tags(ns="IMAGE_STRUCTURE").get("PREDICTOR")
+    ours = str(tmp_path / "terrio.tif")
+    terrio.convert(src, ours, format="COG", compress="DEFLATE", options={"PREDICTOR": word})
+    with rasterio.open(ours) as ds:
+        assert ds.tags(ns="IMAGE_STRUCTURE").get("PREDICTOR") == expected
+    _assert_same(gdal, ours, f"PREDICTOR={word}")
+    with trio.open(src) as ds:
+        profile, data = ds.profile.copy(), ds.read()
+    profile.update(driver="COG", compress="deflate", predictor=word)
+    written = str(tmp_path / "written.tif")
+    with trio.open(written, "w", **profile) as dst:
+        assert dst.tags(ns="IMAGE_STRUCTURE").get("PREDICTOR") == expected
+        dst.write(data)
+    with rasterio.open(written) as ds:
+        assert ds.tags(ns="IMAGE_STRUCTURE").get("PREDICTOR") == expected
+
+
+@pytest.mark.parametrize("driver", ["COG", "GTiff"])
+@pytest.mark.parametrize(
+    "dtype, compress",
+    [("float32", "packbits"), ("complex64", "deflate")],
+    ids=["packbits", "complex"],
+)
+def test_predictor_reported_only_where_written(tmp_path, driver, dtype, compress):
+    """A compression without a predictor (PACKBITS) or complex samples write no predictor tag:
+    the dataset being written reports none either, as the written file does."""
+    data = (np.arange(2 * 40 * 30).reshape(2, 40, 30) * 0.25).astype(dtype)
+    path = str(tmp_path / "written.tif")
+    profile = dict(driver=driver, dtype=dtype, width=30, height=40, count=2, compress=compress)
+    if driver == "GTiff":
+        profile.update(tiled=True, blockxsize=16, blockysize=16)
+    with trio.open(path, "w", predictor="YES", **profile) as dst:
+        assert dst.tags(ns="IMAGE_STRUCTURE").get("PREDICTOR") is None
+        dst.write(data)
+    with rasterio.open(path) as ds:
+        assert ds.tags(ns="IMAGE_STRUCTURE").get("PREDICTOR") is None
+        np.testing.assert_array_equal(ds.read(), data)
+
+
+@pytest.mark.parametrize("key", ["overview_resampling", "resampling"])
+def test_resampling_keywords_on_rio_paths(tmp_path, key):
+    """rasterio's `overview_resampling` and GDAL's `RESAMPLING` creation option."""
+    src = _source(tmp_path / "src.tif", 875, 875, 1, "float32", -9999.0)
+    gdal = _gdal_cog(src, tmp_path / "gdal.tif", **{key: "lanczos"})
+    ours = str(tmp_path / "terrio.tif")
+    trio.shutil.copy(src, ours, driver="COG", compress="deflate", **{key: "lanczos"})
+    _assert_same(gdal, ours, key)
+    written = str(tmp_path / "written.tif")
+    terrio.open(src).write(
+        written, driver="COG", compress="DEFLATE", options={key.upper(): "LANCZOS"}
+    )
+    _assert_same(gdal, written, f"Raster.write {key}")
+
+
+def test_paletted_default_is_nearest(tmp_path):
+    """GDAL's COG driver resamples paletted rasters with NEAREST by default (terrio.rio keeps
+    the color table; `terrio.convert` does not carry one)."""
+    src = str(tmp_path / "src.tif")
+    rng = np.random.default_rng(1)
+    with rasterio.open(
+        src, "w", driver="GTiff", width=1001, height=999, count=1, dtype="uint8"
+    ) as dst:
+        dst.write(rng.integers(0, 8, (1, 999, 1001), dtype="uint8"))
+        dst.write_colormap(1, {i: (i * 30, 255 - i * 30, i * 10, 255) for i in range(8)})
+    gdal = _gdal_cog(src, tmp_path / "gdal.tif")
+    ours = str(tmp_path / "terrio.tif")
+    trio.shutil.copy(src, ours, driver="COG", compress="deflate")
+    _assert_same(gdal, ours, "paletted")
+
+
+def test_overview_count_and_tiled_source(tmp_path):
+    """`OVERVIEW_COUNT`, and a tiled source, whose blocks set those GDAL computes overviews in."""
+    src = _source(
+        tmp_path / "src.tif",
+        3001,
+        2999,
+        3,
+        "uint8",
+        None,
+        tiled=True,
+        blockxsize=256,
+        blockysize=256,
+    )
+    for options in (
+        {"overview_resampling": "bilinear"},
+        {"overview_resampling": "cubic", "overview_count": 2},
+    ):
+        gdal = _gdal_cog(src, tmp_path / "gdal.tif", **options)
+        ours = str(tmp_path / "terrio.tif")
+        terrio.convert(
+            src,
+            ours,
+            format="COG",
+            compress="DEFLATE",
+            options={k.upper(): str(v) for k, v in options.items()},
+        )
+        _assert_same(gdal, ours, f"tiled source {options}")
+
+
+# Overviews of rasters with an alpha band or a per-dataset mask. GDAL weights each level's
+# kernel by the mask of the level it is computed from (`GDALRegenerateOverviewsMultiBand`): an
+# alpha band by itself, the other bands by the alpha band (of two- or four-band rasters), by the
+# internal mask, or by their nodata mask, which comes before the alpha band. The internal mask's
+# own overviews come first, each weighted by itself.
+
+# The resamplings an ingestion pipeline uses (None: the COG driver's default, as it asks for none).
+MASK_METHODS = [None, "NEAREST", "AVERAGE", "BILINEAR", "CUBIC", "MODE", "GAUSS"]
+
+# kind: (bands, dtype, nodata, alpha, internal mask).
+MASKED = {
+    "rgba": (4, "uint8", None, True, False),
+    "rgba-nodata": (4, "uint8", 0, True, False),
+    "mask-rgb": (3, "uint8", None, False, True),
+    "mask-u16-nodata": (1, "uint16", 0, False, True),
+    "mask-f32": (1, "float32", None, False, True),
+}
+
+
+def _masked_source(path, kind, width, height, **profile):
+    """A smooth field; an alpha band with a transparent block, soft edges (partial alpha) and
+    holes, or the same as an internal mask (0 or 255)."""
+    bands, dtype, nodata, alpha, mask = MASKED[kind]
+    rng = np.random.default_rng(width + height + bands)
+    y, x = np.mgrid[0:height, 0:width].astype("float64")
+    lo, hi = RANGES[dtype]
+    colors = bands - 1 if alpha else bands
+    planes = [
+        lo
+        + (hi - lo)
+        * np.clip(
+            np.sin(x / (15 + 4 * b)) * 0.3
+            + np.cos(y / 21) * 0.2
+            + 0.5
+            + rng.normal(0, 0.05, x.shape),
+            0,
+            1,
+        )
+        for b in range(colors)
     ]
-    assert items == [expected]
-    version = tuple(int(part) for part in rasterio.__gdal_version__.split(".")[:2])
-    # Skip only the public-tag exposure check on an older reader that filters it.
-    if "OVERVIEW_RESAMPLING" in public_tags or version >= (3, 13):
-        assert public_tags["OVERVIEW_RESAMPLING"] == expected
+    a = np.full((height, width), 255.0)
+    a[: height // 3, : width // 4] = 0
+    edge = (x > width // 2) & (x < width // 2 + 40)
+    a[edge] = (x[edge] - width // 2) * 6
+    a[rng.random(a.shape) < 0.02] = 0
+    data = np.stack(planes).astype(dtype)
+    if nodata is not None:
+        data[:, rng.random((height, width)) < 0.02] = nodata
+    if alpha:
+        data = np.concatenate([data, a[None].astype(dtype)])
+    kw = {"photometric": "RGB", "alpha": "YES"} if alpha else {}
+    with rasterio.Env(GDAL_TIFF_INTERNAL_MASK=True):
+        with rasterio.open(
+            path,
+            "w",
+            driver="GTiff",
+            width=width,
+            height=height,
+            count=bands,
+            dtype=dtype,
+            nodata=nodata,
+            crs="EPSG:32613",
+            transform=from_origin(400000, 4500000, 10, 10),
+            **kw,
+            **profile,
+        ) as dst:
+            dst.write(data)
+            if mask:
+                dst.write_mask(np.where(a > 0, 255, 0).astype("uint8"))
+    return str(path)
 
 
-def test_area_matched_overviews_keep_the_wet_area(tmp_path):
-    a = river()
-    valid = int((a != -9999).sum())
-    avg, am = tmp_path / "avg.tif", tmp_path / "am.tif"
-    raster(a).write(str(avg), driver="COG", compress="DEFLATE", options=SOURCE)
-    raster(a).write(
-        str(am),
+def _levels_and_masks(path):
+    """Every level's pixels and masks (`read_masks`: the internal mask's overviews, or the alpha
+    band's), read by GDAL."""
+    out = []
+    with rasterio.open(path) as ds:
+        count = len(ds.overviews(1))
+        out.append((ds.read(), ds.read_masks()))
+    for i in range(count):
+        with rasterio.open(path, overview_level=i) as ds:
+            out.append((ds.read(), ds.read_masks()))
+    return out
+
+
+def _assert_same_masked(expected, actual, what):
+    a, b = _levels_and_masks(expected), _levels_and_masks(actual)
+    assert [x[0].shape for x in b] == [x[0].shape for x in a], f"{what}: levels"
+    for i, ((x, xm), (y, ym)) in enumerate(zip(a, b, strict=True)):
+        diff = np.mean(xm != ym)
+        assert diff == 0, f"{what}: level {i} {x.shape}: {diff:.4%} of the mask differs"
+        same = (x == y) | (np.isnan(x) & np.isnan(y)) if x.dtype.kind == "f" else x == y
+        if not same.all():
+            d = np.abs(x.astype("float64") - y.astype("float64"))[~same]
+            pytest.fail(
+                f"{what}: level {i} {x.shape}: {np.mean(~same):.4%} of pixels differ, "
+                f"max |d| {np.nanmax(d) if d.size else 'nan'}"
+            )
+
+
+@pytest.mark.parametrize("method", MASK_METHODS, ids=lambda m: m or "default")
+@pytest.mark.parametrize("kind", list(MASKED))
+def test_masked_overviews_are_gdals(tmp_path, kind, method):
+    """An ingestion pipeline's call (the source's profile, `driver="COG"`, `compress="deflate"`
+    through `shutil.copy`) on rasters with an alpha band or an internal mask: every level's pixels
+    and masks, over three levels (cascaded from the mask overviews)."""
+    src = _masked_source(tmp_path / "src.tif", kind, 2100, 1900)
+    extra = {} if method is None else {"overview_resampling": method}
+    with rasterio.open(src) as ds:
+        profile = ds.profile | {"driver": "COG", "compress": "deflate"} | extra
+    gdal = str(tmp_path / "gdal.tif")
+    rasterio.shutil.copy(src, gdal, **profile)
+    ours = str(tmp_path / "terrio.tif")
+    trio.shutil.copy(src, ours, **profile)
+    _assert_same_masked(gdal, ours, f"{kind} {method}")
+
+
+@pytest.mark.parametrize("size", [(1001, 999), (2100, 1900)], ids=["2-levels", "3-levels"])
+@pytest.mark.parametrize("kind", ["rgba", "mask-rgb", "mask-u16-nodata", "mask-f32"])
+def test_masked_overviews_on_rio_open(tmp_path, kind, size):
+    """`rio.open(..., "w", driver="COG")`, with the alpha band among the bands or `write_mask`.
+
+    rasterio buffers such a write in a MEM dataset, whose mask band GDAL creates without a
+    dataset (`MEMRasterBand::CreateMaskBand`): the temporary mask overviews then lack
+    INTERNAL_MASK_FLAGS_1, so the mask's overviews after the first are weighted by an all-valid
+    mask rather than by their own values, as a file's mask is (the shutil.copy path above), and
+    the data's by those Byte overviews."""
+    src = _masked_source(tmp_path / "src.tif", kind, *size)
+    gdal, ours = str(tmp_path / "gdal.tif"), str(tmp_path / "terrio.tif")
+    for mod, out in ((rasterio, gdal), (trio, ours)):
+        with mod.open(src) as ds:
+            profile = ds.profile | {"driver": "COG", "compress": "deflate", "blocksize": 256}
+            data, mask, colorinterp = ds.read(), ds.dataset_mask(), ds.colorinterp
+        with mod.open(out, "w", **profile) as dst:
+            dst.colorinterp = colorinterp
+            dst.write(data)
+            if MASKED[kind][4]:
+                dst.write_mask(mask)
+    _assert_same_masked(gdal, ours, f"rio.open {kind}")
+
+
+_BUILD_METHODS = [m for m in MASK_METHODS if m]
+
+
+@pytest.mark.parametrize("method", _BUILD_METHODS)
+@pytest.mark.parametrize("kind", ["rgba", "mask-rgb", "mask-f32"])
+def test_masked_build_overviews_are_gdals(tmp_path, kind, method):
+    """`build_overviews` on a GeoTIFF with an alpha band or an internal mask, whose mask
+    overviews GDAL builds first (with nearest neighbour, each from the full resolution)."""
+    src = _masked_source(tmp_path / "src.tif", kind, 1001, 999)
+    gdal, ours = str(tmp_path / "gdal.tif"), str(tmp_path / "terrio.tif")
+    for mod, out, enums in ((rasterio, gdal, RR), (trio, ours, TR)):
+        with mod.open(src) as ds:
+            profile = ds.profile | {
+                "tiled": True,
+                "blockxsize": 256,
+                "blockysize": 256,
+                "compress": "deflate",
+            }
+            data, mask = ds.read(), ds.dataset_mask()
+            colorinterp = ds.colorinterp
+        with mod.open(out, "w", **profile) as dst:
+            dst.colorinterp = colorinterp
+            dst.write(data)
+            if MASKED[kind][4]:
+                dst.write_mask(mask)
+            dst.build_overviews([2, 4, 8], enums[method.lower()])
+    _assert_same_masked(gdal, ours, f"build_overviews {kind} {method}")
+
+
+@pytest.mark.parametrize("kind", ["ycbcr-jpeg", "palette", "gray-resampling-given"])
+def test_ingestion_call_structure_is_gdals(tmp_path, kind):
+    """The ingestion call's photometric interpretation and IMAGE_STRUCTURE metadata: GDAL's COG
+    driver has no PHOTOMETRIC option (a YCbCr source's profile asks for one), and records the
+    overviews' resampling (`OVERVIEW_RESAMPLING`: as given, else CUBIC, NEAREST if paletted)."""
+    src = str(tmp_path / "src.tif")
+    rng = np.random.default_rng(3)
+    y, x = np.mgrid[0:999, 0:1001]
+    field = (np.sin(x / 17) * 60 + np.cos(y / 23) * 50 + 120 + rng.normal(0, 5, x.shape)).clip(
+        0, 255
+    )
+    profile = dict(
+        driver="GTiff",
+        width=1001,
+        height=999,
+        crs="EPSG:32613",
+        transform=from_origin(400000, 4500000, 10, 10),
+    )
+    extra = {}
+    if kind == "ycbcr-jpeg":
+        profile.update(count=3, dtype="uint8", photometric="YCBCR", compress="jpeg", tiled=True)
+        data = np.stack([field, field[::-1], field[:, ::-1]]).astype("uint8")
+    elif kind == "palette":
+        profile.update(count=1, dtype="uint8")
+        data = (field[None] // 26).astype("uint8")
+    else:
+        profile.update(count=1, dtype="uint16")
+        data = (field[None] * 200).astype("uint16")
+        extra = {"overview_resampling": "average"}
+    with rasterio.open(src, "w", **profile) as dst:
+        dst.write(data)
+        if kind == "palette":
+            dst.write_colormap(
+                1, {c: (25 * c, 255 - 20 * c, (60 * c) % 256, 255) for c in range(10)}
+            )
+    outputs = {}
+    for name, mod in (("gdal", rasterio), ("terrio", trio)):
+        out = str(tmp_path / f"{name}.tif")
+        with mod.open(src) as ds:
+            p = ds.profile.copy()
+        p.update({"driver": "COG", "compress": "deflate"}, **extra)
+        mod.shutil.copy(src, out, **p)
+        with rasterio.open(out) as ds:
+            outputs[name] = (
+                ds.profile.get("photometric"),
+                ds.colorinterp,
+                ds.tags(ns="IMAGE_STRUCTURE"),
+            )
+        if kind != "palette":
+            continue
+        with rasterio.open(out) as ds:
+            outputs[name] += (ds.colormap(1),)
+    assert outputs["terrio"] == outputs["gdal"]
+    _assert_same_masked(str(tmp_path / "gdal.tif"), str(tmp_path / "terrio.tif"), kind)
+
+
+@pytest.mark.parametrize("kind", ["u16-average", "rgb-nearest", "rgb-mask", "rgb-mask-after"])
+def test_ingestion_call_copies_source_overviews(tmp_path, kind):
+    """A source with overviews of its own: GDAL's COG driver copies them (OVERVIEWS=AUTO), with
+    their levels, values, masks (or makes the mask's when it has none) and `RESAMPLING`."""
+    src = str(tmp_path / "src.tif")
+    if kind == "u16-average":
+        _source(src, 1001, 999, 1, "uint16", 0, tiled=True, blockxsize=256, blockysize=256)
+    else:
+        _masked_source(src, "mask-rgb", 1001, 999, tiled=True, blockxsize=256, blockysize=256)
+    with rasterio.open(src, "r+") as ds:
+        mask = ds.dataset_mask()
+        ds.build_overviews([2, 4, 8], RR.nearest if kind == "rgb-nearest" else RR.average)
+    if kind == "rgb-mask-after":
+        # Rewritten with the overviews first and the mask after, which then has none.
+        with rasterio.open(src) as ds:
+            profile, data = ds.profile, ds.read()
+        with rasterio.open(src, "w", **profile) as dst:
+            dst.write(data)
+            dst.build_overviews([2, 4, 8], RR.average)
+            dst.write_mask(mask)
+    for name, mod in (("gdal", rasterio), ("terrio", trio)):
+        with mod.open(src) as ds:
+            p = ds.profile.copy()
+        p.update({"driver": "COG", "compress": "deflate"})
+        mod.shutil.copy(src, str(tmp_path / f"{name}.tif"), **p)
+    gdal, ours = str(tmp_path / "gdal.tif"), str(tmp_path / "terrio.tif")
+    with rasterio.open(gdal) as g, rasterio.open(ours) as t:
+        assert t.overviews(1) == g.overviews(1) == [2, 4, 8]
+        assert t.tags(ns="IMAGE_STRUCTURE") == g.tags(ns="IMAGE_STRUCTURE")
+    _assert_same_masked(gdal, ours, kind)
+
+
+def test_force_use_existing_writes_a_vrt_source_overviews(tmp_path):
+    """OVERVIEWS=FORCE_USE_EXISTING from a source terrio does not copy overviews from (a VRT):
+    its overviews are read and written as they are, as GDAL's COG driver writes them, not
+    dropped."""
+    tif = _source(tmp_path / "src.tif", 1001, 999, 1, "uint16", 0, tiled=True)
+    with rasterio.open(tif, "r+") as ds:
+        ds.build_overviews([2, 4], RR.average)
+    vrt = str(tmp_path / "src.vrt")
+    rasterio.shutil.copy(tif, vrt, driver="VRT")
+    for name, mod in (("gdal", rasterio), ("terrio", trio)):
+        mod.shutil.copy(
+            vrt,
+            str(tmp_path / f"{name}.tif"),
+            driver="COG",
+            compress="deflate",
+            overviews="FORCE_USE_EXISTING",
+        )
+    gdal, ours = str(tmp_path / "gdal.tif"), str(tmp_path / "terrio.tif")
+    with rasterio.open(gdal) as g, rasterio.open(ours) as t:
+        assert t.overviews(1) == g.overviews(1) == [2, 4]
+    for ours_level, gdal_level in zip(_levels(ours), _levels(gdal), strict=True):
+        np.testing.assert_array_equal(ours_level, gdal_level)
+
+
+@pytest.mark.parametrize("as_rasters", [False, True], ids=["arrays", "rasters"])
+def test_supplied_overviews_round_trip(tmp_path, as_rasters):
+    """Overviews supplied to `Raster.write` are written as GDAL's COG driver writes a source's
+    existing ones (OVERVIEWS=FORCE_USE_EXISTING): gdaladdo's ceil sizes and every pixel, with
+    no intermediate file; `metadata=` items are set over the raster's own."""
+    src = _source(tmp_path / "src.tif", 1001, 999, 2, "int16", -9999, tiled=True)
+    with rasterio.open(src, "r+") as ds:
+        ds.build_overviews([2, 4], RR.average)
+        ds.update_tags(SOURCE="gdaladdo")
+    gdal = _gdal_cog(src, tmp_path / "gdal.tif", overviews="FORCE_USE_EXISTING")
+    levels = _levels(src)
+    with rasterio.open(src) as ds:
+        transform, crs, nodata = ds.transform.to_gdal(), ds.crs.to_string(), ds.nodata
+    base = terrio.Raster.from_array(levels[0], transform, crs, nodata, metadata={"SOURCE": "x"})
+    supplied = levels[1:]
+    if as_rasters:
+        supplied = [terrio.Raster.from_array(a, transform, crs, nodata) for a in supplied]
+    ours = str(tmp_path / "terrio.tif")
+    base.write(
+        ours,
         driver="COG",
         compress="DEFLATE",
-        options=SOURCE,
-        overview_resampling="area_matched",
+        options={"OVERVIEWS": "FORCE_USE_EXISTING"},
+        overviews=supplied,
+        metadata={"SOURCE": "gdaladdo"},
     )
-    for i, (ov_avg, ov_am) in enumerate(zip(overviews(avg), overviews(am), strict=True)):
-        f = 2 ** (i + 1)
-        assert int((ov_avg != -9999).sum()) * f * f / valid > 1.2
-        assert int((ov_am != -9999).sum()) == round(valid / (f * f))
-    # Without nodata there is no wet area to match.
-    with pytest.raises(terrio.TerrioError):
-        terrio.Raster.from_array(a, TRANSFORM, "EPSG:32610").write(
-            str(tmp_path / "x.tif"),
+    assert [x.shape for x in _levels(ours)[1:]] == [(2, 500, 501), (2, 250, 251)]
+    with rasterio.open(gdal) as g, rasterio.open(ours) as t:
+        assert t.tags()["SOURCE"] == g.tags()["SOURCE"] == "gdaladdo"
+        assert t.nodata == g.nodata
+        assert t.tags(ns="IMAGE_STRUCTURE")["LAYOUT"] == "COG"
+    _assert_same(gdal, ours, "supplied overviews")
+
+
+def test_supplied_overviews_follow_gdal_overviews_option(tmp_path):
+    """OVERVIEWS as GDAL's COG driver reads it: FORCE_USE_EXISTING never generates overviews (none
+    without existing ones, with a warning); NONE and IGNORE_EXISTING would discard supplied ones,
+    and factors or a resampling with them contradict them, so those are refused."""
+    a = np.arange(48 * 64, dtype="float32").reshape(48, 64)
+    r = terrio.Raster.from_array(a, [0, 1, 0, 48, 0, -1], "EPSG:32615")
+    ov = a[::2, ::2].copy()
+    with pytest.warns(UserWarning, match="FORCE_USE_EXISTING"):
+        r.write(
+            str(tmp_path / "none.tif"),
             driver="COG",
-            options=SOURCE,
-            overview_resampling="area_matched",
+            tile_size=16,
+            options={"OVERVIEWS": "FORCE_USE_EXISTING"},
         )
-    # The default GDAL 3.13 policy refuses them and names the policy that builds them.
-    with pytest.raises(terrio.TerrioError, match="COG_OVERVIEW_POLICY=SOURCE"):
-        raster(a).write(str(tmp_path / "d.tif"), driver="COG", overview_resampling="area_matched")
-
-
-def test_supplied_overviews_round_trip(tmp_path):
-    a = river()
-    levels = [np.full((550, 650), 3.5, "float32"), np.full((275, 325), -9999, "float32")]
-    levels[0][:10] = -9999
-    out = tmp_path / "s.tif"
-    raster(a).write(
-        str(out),
-        driver="COG",
-        compress="DEFLATE",
-        options={"PREDICTOR": "YES", "OVERVIEWS": "FORCE_USE_EXISTING"},
-        overviews=[levels[0], raster(levels[1])],
-        metadata={"overview_method": "supplied"},
-    )
-    for got, want in zip(overviews(out), levels, strict=True):
-        np.testing.assert_array_equal(got, want)
-    np.testing.assert_array_equal(np.asarray(terrio.open_raster(str(out)).read())[0], a)
-    # The wrong size is refused, as is resampling supplied overviews.
+    with rasterio.open(tmp_path / "none.tif") as ds:
+        assert ds.overviews(1) == []
+    r.write(str(tmp_path / "auto.tif"), driver="COG", tile_size=16)
+    with rasterio.open(tmp_path / "auto.tif") as ds:
+        assert ds.overviews(1) == [2, 4]
+    for kwargs in (
+        {"options": {"OVERVIEWS": "NONE"}},
+        {"options": {"OVERVIEWS": "IGNORE_EXISTING"}},
+        {"overview_resampling": "average"},
+        {"options": {"OVERVIEW_RESAMPLING": "AVERAGE"}},
+        # GDAL's COG driver falls back to RESAMPLING, and ignores both with existing overviews.
+        {"options": {"RESAMPLING": "AVERAGE"}},
+        {"options": {"OVERVIEWS": "FORCE_USE_EXISTING", "RESAMPLING": "AVERAGE"}},
+        # Area-matched overviews are computed as well: they are not combined with supplied ones.
+        {"options": {"OVERVIEW_RESAMPLING": "AREA_MATCHED"}},
+        {"overview_resampling": "area_matched"},
+    ):
+        with pytest.raises(terrio.TerrioError):
+            r.write(str(tmp_path / "x.tif"), driver="COG", overviews=[ov], **kwargs)
+    # The raster being written is already borrowed: an error, not a PanicException.
+    with pytest.raises(terrio.TerrioError, match="its own overview"):
+        r.write(str(tmp_path / "x.tif"), driver="COG", overviews=[r])
     with pytest.raises(terrio.TerrioError):
-        raster(a).write(
-            str(tmp_path / "b.tif"), driver="COG", overviews=[np.zeros((549, 650), "float32")]
-        )
+        r.write(str(tmp_path / "x.tif"), driver="COG", overviews=[ov, 4])
     with pytest.raises(terrio.TerrioError):
-        raster(a).write(
-            str(tmp_path / "c.tif"),
-            driver="COG",
-            overviews=[levels[0]],
-            overview_resampling="average",
-        )
+        r.write(str(tmp_path / "x.tif"), driver="COG", overviews=[a])
+    with pytest.raises(terrio.TerrioError):
+        r.write(str(tmp_path / "x.asc"), metadata={"A": "1"})
 
 
-@pytest.mark.parametrize("dtype,expected", [("float32", 3), ("int16", 2), ("uint8", 2)])
-def test_predictor_yes_follows_gdal_cog(tmp_path, dtype, expected):
-    rasterio = pytest.importorskip("rasterio")
-    a = (np.arange(64 * 48).reshape(48, 64) % 97).astype(dtype)
-    out = tmp_path / "p.tif"
-    raster(a, nodata=0).write(
-        str(out), driver="COG", compress="DEFLATE", options={"PREDICTOR": "YES"}
-    )
-    with rasterio.open(out) as src:
-        assert src.tags(ns="IMAGE_STRUCTURE")["PREDICTOR"] == str(expected)
-        np.testing.assert_array_equal(src.read(1), a)
+def test_supplied_overviews_keep_complex_identity(tmp_path):
+    """A complex band is two Float32 component bands, so a one-band complex64 level matches a
+    two-band float32 raster's band count and type: refused either way round, as an array or a
+    Raster, while a complex level of a complex raster is written."""
+    t = [0, 1, 0, 48, 0, -1]
+    real = np.arange(2 * 48 * 64, dtype="float32").reshape(2, 48, 64)
+    cplx = (real[0] + 1j * real[1]).astype("complex64")[None]
+    real_r = terrio.Raster.from_array(real, t, "EPSG:32615")
+    cplx_r = terrio.Raster.from_array(cplx, t, "EPSG:32615")
+    real_ov, cplx_ov = real[:, ::2, ::2].copy(), cplx[:, ::2, ::2].copy()
+    for raster, level in (
+        (real_r, cplx_ov),
+        (real_r, terrio.Raster.from_array(cplx_ov, t, "EPSG:32615")),
+        (cplx_r, real_ov),
+        (cplx_r, terrio.Raster.from_array(real_ov, t, "EPSG:32615")),
+    ):
+        with pytest.raises(terrio.TerrioError, match="complex"):
+            raster.write(
+                str(tmp_path / "x.tif"), driver="COG", compress="DEFLATE", overviews=[level]
+            )
+    out = tmp_path / "complex.tif"
+    cplx_r.write(str(out), driver="COG", compress="DEFLATE", tile_size=16, overviews=[cplx_ov])
+    with rasterio.open(out) as ds:
+        assert ds.dtypes[0] == "complex64"
+        assert ds.overviews(1) == [2]
+        np.testing.assert_array_equal(ds.read(1, out_shape=(24, 32)), cplx_ov[0])
+    real_r.write(str(tmp_path / "real.tif"), driver="COG", compress="DEFLATE", overviews=[real_ov])
 
 
+@pytest.mark.parametrize("complex_dtype", ["CInt16", "CInt32"])
+def test_supplied_complex_arrays_keep_integer_components(tmp_path, complex_dtype):
+    """Convert supplied complex arrays to the base's integer component type.
+
+    Args:
+        tmp_path: Isolated output directory.
+        complex_dtype: Physical complex sample type of the base raster.
+    """
+    real = np.arange(48 * 64, dtype="float64").reshape(48, 64)
+    if complex_dtype == "CInt32":
+        real += 2**24 + 1
+    values = real + 1j * (-real - 3)
+    raster = terrio.Raster.from_array(values, [0, 1, 0, 48, 0, -1], complex_dtype=complex_dtype)
+    level = values[::2, ::2].copy()
+    path = tmp_path / "integer-complex.tif"
+    raster.write(str(path), driver="COG", compress="DEFLATE", tile_size=16, overviews=[level])
+    back = terrio.open_raster(str(path), lazy=True)
+    assert back.data_type == complex_dtype
+    np.testing.assert_array_equal(back.read(1, overview=0, out_dtype="complex128"), level)
+
+
+def test_cog_writes_stream(tmp_path, monkeypatch):
+    """terrio.rio writes COGs without copying the whole raster into Rust (`Raster.from_array`),
+    level rows computed as they come: a memory property no file shows (the files are GDAL's)."""
+    src = _source(tmp_path / "src.tif", 1001, 999, 3, "uint16", 0)
+    gdal = _gdal_cog(src, tmp_path / "gdal.tif")
+    with trio.open(src) as ds:
+        profile = ds.profile | {"driver": "COG", "compress": "deflate"}
+        data = ds.read()
+
+    def whole(*args, **kwargs):
+        raise AssertionError("the COG write copied the whole raster")
+
+    monkeypatch.setattr(terrio._terrio.Raster, "from_array", whole)
+    trio.shutil.copy(src, str(tmp_path / "copy.tif"), **profile)
+    with trio.open(str(tmp_path / "open.tif"), "w", **profile) as dst:
+        dst.write(data)
+    monkeypatch.undo()
+    _assert_same(gdal, str(tmp_path / "copy.tif"), "shutil.copy")
+    _assert_same(gdal, str(tmp_path / "open.tif"), "rio.open")
+
+
+def _cog_view(path):
+    """A COG as GDAL reads it: structure, nodata, descriptions and each level's pixels and masks."""
+    with rasterio.open(path) as ds:
+        keys = ("dtype", "count", "interleave", "blockxsize", "blockysize", "compress", "tiled")
+        view = {
+            "image_structure": ds.tags(ns="IMAGE_STRUCTURE"),
+            "profile": {k: ds.profile.get(k) for k in keys},
+            "nodata": repr(ds.nodatavals),
+            "descriptions": ds.descriptions,
+            "overviews": ds.overviews(1),
+        }
+        levels = [(ds.read(), ds.read_masks())]
+    for i in range(len(view["overviews"])):
+        with rasterio.open(path, overview_level=i) as ds:
+            levels.append((ds.read(), ds.read_masks()))
+    return view, levels
+
+
+def _assert_same_cog(gdal, ours):
+    (gv, gl), (tv, tl) = _cog_view(gdal), _cog_view(ours)
+    assert tv == gv
+    for (ga, gm), (ta, tm) in zip(gl, tl, strict=True):
+        assert np.array_equal(ta, ga, equal_nan=True) and np.array_equal(tm, gm)
+
+
+def test_multiband_float32_image_chip(tmp_path):
+    """A statistics service's image chip: a multi-band float32 COG, NaN nodata, DEFLATE and band
+    descriptions through MemoryFile.open(driver="COG"), as GDAL writes it."""
+    import rasterio.io
+
+    import terrio.rio.io
+
+    values = np.random.default_rng(3).random((3, 900, 1100), dtype="float32")
+    values[:, :40, :50] = np.nan
+    values[1, 500:, 700:] = np.nan
+    for name, memory_file in (
+        ("gdal", rasterio.io.MemoryFile),
+        ("terrio", terrio.rio.io.MemoryFile),
+    ):
+        with memory_file() as memory:
+            with memory.open(
+                driver="COG",
+                height=900,
+                width=1100,
+                count=3,
+                dtype="float32",
+                crs="EPSG:32633",
+                transform=from_origin(5e5, 4.1e6, 10.0, 10.0),
+                nodata=np.nan,
+                compress="DEFLATE",
+            ) as dataset:
+                dataset.write(values)
+                for band_index, band in enumerate(("ndvi", "evi", "ndwi"), start=1):
+                    dataset.set_band_description(band_index, band)
+            (tmp_path / f"{name}.tif").write_bytes(memory.read())
+    _assert_same_cog(str(tmp_path / "gdal.tif"), str(tmp_path / "terrio.tif"))
+
+
+@pytest.mark.parametrize("memory", [False, True], ids=["open", "memoryfile"])
 @pytest.mark.parametrize(
     "options",
-    [
-        {"TILED": "YES"},
-        {"BLOCKXSIZE": "256"},
-        {"OVERVIEWS": "FORCE_USE_EXISTING"},
-        {"COG_OVERVIEW_POLICY": "SOURCE", "RESAMPLING": "CUBIC"},
-        {"COMPRESS": "DEFLATE", "OVERVIEW_COMPRESS": "LZW"},
-    ],
+    [{}, {"compress": "NONE"}, {"compress": "DEFLATE"}, {"interleave": "pixel"}],
+    ids=["default", "none", "deflate", "pixel"],
 )
-def test_cog_options_not_acted_on_are_refused(tmp_path, options):
-    with pytest.raises(terrio.TerrioError):
-        raster(river(64, 48)).write(str(tmp_path / "x.tif"), driver="COG", options=options)
+@pytest.mark.parametrize("count", [1, 3])
+def test_cog_open_interleave(tmp_path, count, options, memory):
+    """rasterio writes a COG by copying a MEM dataset, band-interleaved: GDALDriver::CreateCopy
+    keeps BAND unless INTERLEAVE or a COMPRESS other than NONE is given."""
+    import rasterio.io
 
+    import terrio.rio.io
 
-def test_gdal_reads_terrio_cogs_as_its_own(tmp_path):
-    rasterio = pytest.importorskip("rasterio")
-    cogeo = pytest.importorskip("rio_cogeo.cogeo")
-    a = river()
-    out = tmp_path / "l.tif"
-    raster(a).write(
-        str(out),
+    data = (np.arange(count * 700 * 600) % 251).astype("uint16").reshape(count, 700, 600)
+    kw = dict(
         driver="COG",
-        compress="LERC",
-        options={**SOURCE, "MAX_Z_ERROR": "0.01", "OVERVIEW_RESAMPLING": "area_matched"},
-        metadata={"compression_lossy": "true"},
+        height=700,
+        width=600,
+        count=count,
+        dtype="uint16",
+        crs="EPSG:32633",
+        transform=from_origin(0, 700, 1, 1),
+        **options,
     )
-    assert cogeo.cog_validate(str(out), quiet=True)[0]
-    with rasterio.open(out) as src:
-        ims = src.tags(ns="IMAGE_STRUCTURE")
-        assert ims["LAYOUT"] == "COG"
-        assert ims["MAX_Z_ERROR"] == "0.01"
-        assert_overview_method(out, rasterio, ims, "AREA_MATCHED")
-        assert src.tags()["compression_lossy"] == "true"
-        assert np.nanmax(np.abs(src.read(1) - a)) <= 0.01 + 1e-6
+    for name, mod, memory_file in (
+        ("gdal", rasterio, rasterio.io.MemoryFile),
+        ("terrio", trio, terrio.rio.io.MemoryFile),
+    ):
+        path = tmp_path / f"{name}.tif"
+        if memory:
+            with memory_file() as mf:
+                with mf.open(**kw) as ds:
+                    ds.write(data)
+                path.write_bytes(mf.read())
+        else:
+            with mod.open(path, "w", **kw) as ds:
+                ds.write(data)
+    _assert_same_cog(str(tmp_path / "gdal.tif"), str(tmp_path / "terrio.tif"))
 
 
-def test_cog_overview_factors_are_written(tmp_path):
-    a = river()
-    cog, gtiff = tmp_path / "f.tif", tmp_path / "g.tif"
-    raster(a).write(str(cog), driver="COG", overviews=[2, 4, 8], overview_resampling="average")
-    raster(a).write(str(gtiff), driver="GTiff", overviews=[2, 4, 8], overview_resampling="average")
-    got, want = overviews(cog), overviews(gtiff)
-    assert [o.shape for o in got] == [(550, 650), (275, 325), (138, 163)]
-    for g, w in zip(got, want, strict=True):
-        np.testing.assert_array_equal(g, w)
-    assert terrio.validate_cog(str(cog))[0]
-    for options in ({"OVERVIEWS": "NONE"}, {"OVERVIEWS": "IGNORE_EXISTING"}):
-        with pytest.raises(terrio.TerrioError):
-            raster(a).write(str(tmp_path / "x.tif"), driver="COG", overviews=[2], options=options)
-
-
-def test_cog_overview_factors_match_gdal_reuse(tmp_path):
-    """GDAL builds source overviews with gdaladdo; COG reuses them (OVERVIEWS=AUTO)."""
-    rasterio = pytest.importorskip("rasterio")
-    from rasterio.enums import Resampling
-    from rasterio.shutil import copy
-
-    a = river()
-    src = tmp_path / "src.tif"
-    raster(a).write(str(src))
-    with rasterio.open(src, "r+") as ds:
-        ds.build_overviews([2, 4, 8], Resampling.nearest)
-    gdal = tmp_path / "gdal.tif"
-    copy(src, gdal, driver="COG")
-    ours = tmp_path / "ours.tif"
-    raster(a).write(str(ours), driver="COG", overviews=[2, 4, 8], overview_resampling="nearest")
-    with rasterio.open(gdal) as g, rasterio.open(ours) as o:
-        assert g.overviews(1) == o.overviews(1) == [2, 4, 8]
-        for f in (2, 4, 8):
-            shape = (1, -(-a.shape[0] // f), -(-a.shape[1] // f))
-            np.testing.assert_array_equal(g.read(out_shape=shape), o.read(out_shape=shape))
-
-
-def test_area_matched_write_reports_the_area_ratios(tmp_path):
-    a = river()
-    a[100:180, 900:1000] = 7.0  # a pond away from the river
-    valid = int((a != -9999).sum())
-    for driver, kwargs, method in [
-        ("COG", {"options": SOURCE}, "area_matched"),
-        ("COG", {"options": SOURCE}, "area_matched_mode"),
-        ("GTiff", {"overviews": [2, 4]}, "area_matched"),
-    ]:
-        out = tmp_path / f"{driver}_{method}.tif"
-        report = raster(a).write(str(out), driver=driver, overview_resampling=method, **kwargs)
-        assert report["method"] == method
-        assert report["factors"] == [2, 4]
-        assert report["base_valid_pixels"] == [valid]
-        # Exactly the area the written levels keep, as ras2cng computes it from them.
-        expected = [
-            int((ov != -9999).sum()) * f * f / valid
-            for ov, f in zip(overviews(out), report["factors"], strict=True)
-        ]
-        assert report["area_ratios"] == [expected]
-    # Nothing to report for other overviews.
-    assert raster(a).write(str(tmp_path / "avg.tif"), driver="COG") is None
-    assert raster(a).write(str(tmp_path / "plain.tif")) is None
-
-
-def test_area_ratios_in_image_structure_metadata(tmp_path):
-    rasterio = pytest.importorskip("rasterio")
-    a = river()
-    out = tmp_path / "am.tif"
-    report = raster(a).write(
-        str(out), driver="COG", options=SOURCE, overview_resampling="area_matched"
-    )
-    with rasterio.open(out) as src:
-        assert_overview_method(out, rasterio, src.tags(ns="IMAGE_STRUCTURE"), "AREA_MATCHED")
-        tags = src.tags(ns="OVERVIEW_REPORT")
-        assert src.tags() == {"AREA_OR_POINT": "Area"}  # the default domain stays the caller's
-    assert tags["OVERVIEW_METHOD"] == "area_matched"
-    assert tags["OVERVIEW_FACTORS"] == "2,4"
-    assert [float(v) for v in tags["OVERVIEW_AREA_RATIOS"].split(",")] == report["area_ratios"][0]
-    assert int(tags["OVERVIEW_BASE_VALID_PIXELS"]) == report["base_valid_pixels"][0]
+@pytest.mark.parametrize("options", [{}, {"compress": "deflate"}], ids=["default", "deflate"])
+@pytest.mark.parametrize("src_interleave", ["pixel", "band"])
+@pytest.mark.parametrize("driver", ["COG", "GTiff"])
+def test_copy_keeps_source_interleave(tmp_path, driver, src_interleave, options):
+    """`shutil.copy` is GDAL's CreateCopy: the source's interleaving unless INTERLEAVE or a
+    COMPRESS other than NONE is given, else the drivers' PIXEL."""
+    src = str(tmp_path / "src.tif")
+    with rasterio.open(
+        src,
+        "w",
+        driver="GTiff",
+        height=300,
+        width=400,
+        count=3,
+        dtype="uint16",
+        crs="EPSG:32633",
+        transform=from_origin(0, 300, 1, 1),
+        interleave=src_interleave,
+    ) as ds:
+        ds.write((np.arange(3 * 300 * 400) % 999).astype("uint16").reshape(3, 300, 400))
+    for name, mod in (("gdal", rasterio), ("terrio", trio)):
+        mod.shutil.copy(src, str(tmp_path / f"{name}.tif"), driver=driver, **options)
+    with rasterio.open(tmp_path / "gdal.tif") as g, rasterio.open(tmp_path / "terrio.tif") as t:
+        assert t.tags(ns="IMAGE_STRUCTURE") == g.tags(ns="IMAGE_STRUCTURE")
+        assert np.array_equal(t.read(), g.read())

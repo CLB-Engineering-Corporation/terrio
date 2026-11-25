@@ -1,167 +1,195 @@
-//! Area-matched overviews: coarse levels whose valid (wet) area matches the full-resolution
-//! image's, instead of growing at every level as GDAL's `average` (a coarse pixel is valid when any
-//! of its source pixels is) or speckling the margin as `nearest`.
-//!
-//! The algorithm is ras2cng's `cog.build_area_matched_overviews` (CLB Engineering, MIT), ported
-//! so that its outputs are identical. Each level `k` (factor `f = 2^k`) carries, per coarse cell,
-//! the number of valid full-resolution pixels it covers (its weight) and their sum. The number of
-//! cells to keep is `round(valid / f^2)` (ties to even), and a threshold on the weight is solved
-//! for from the weight histogram so that the heaviest cells are kept. The cells exactly at the
-//! threshold are broken by coherence (how many of their four neighbours are already kept, most
-//! first), then by a deterministic hash of their index, so that the margin stays connected and two
-//! builds of the same raster give the same level. Kept cells hold the mean of their valid source
-//! pixels (rounded half to even for integer types), or, for categorical rasters, the mode of the
-//! 2x2 modes of the level below (the lowest value breaking ties). Others are nodata.
-//!
-//! Level 1 is reduced from the full-resolution pixels, each later level from the one before (odd
-//! sizes padded with empty cells), so a level is `ceil(cols / f) x ceil(rows / f)`, as the COG
-//! writer sizes its overviews.
+// SPDX-FileCopyrightText: Copyright (c) 2024 William M. Katzenmeyer, P.E., C.F.M. / CLB Engineering
+// SPDX-FileCopyrightText: Copyright (c) 2026 Qiusheng Wu and Terrio contributors
+// SPDX-License-Identifier: MIT
+//
+// Derived from (translated to Rust and modified):
+//   ras2cng v0.15.0:
+//     ras2cng/cog.py
 
+//! Overviews that keep the valid area of the full-resolution image (`OVERVIEW_RESAMPLING`
+//! `area_matched`, and `area_matched_mode` for categorical rasters).
+//!
+//! GDAL's `average` (GDAL 3.12.1 `gcore/overview.cpp`) makes a coarse pixel valid when any of its
+//! source pixels is, so the valid area of a thin or ragged extent (a flood-depth grid, a river or
+//! burn mask) grows at every level; `nearest` keeps it only on average and speckles the margin.
+//! An area-matched level instead keeps as many valid cells as its pixels need to cover the valid
+//! full-resolution area, those covering the most valid pixels first:
+//!
+//! - Each source pixel belongs to the coarse cell whose footprint holds its centre, so a level of
+//!   GDAL's size (half the previous one, rounded down, for a COG) partitions the pixels of the
+//!   level before it: 2 x 2 pixels when the size halves exactly, 2 or 3 per axis otherwise. Each
+//!   cell carries the number of valid full-resolution pixels it covers (its weight) and their sum,
+//!   level 1 from the image, each later level from the one before.
+//! - A level of `w x h` cells over a `cols x rows` image keeps `round(valid * w * h / (cols *
+//!   rows))` cells (half to even): the heaviest, those exactly at the threshold weight ranked by
+//!   how many of their four neighbours are already kept (most first), then by a deterministic hash
+//!   of their index, favouring connectivity without guaranteeing it, with reproducible output.
+//! - A kept cell holds the mean of its valid pixels (rounded half to even for integer types), or
+//!   for `area_matched_mode` the most frequent value of the cells below it (of the pixels, at level
+//!   1), the lowest on ties. A mean equal to the nodata value is replaced as GDAL replaces one
+//!   (`GDALGetNoDataReplacementValue`). Other cells are nodata.
+//!
+//! NaN is never valid. The method is ras2cng's (`cog.build_area_matched_overviews`, MIT), translated
+//! to Rust from its NumPy implementation and adapted to GDAL's level sizes. When every
+//! level halves exactly, the levels are those of ras2cng's NumPy implementation, value for value;
+//! ras2cng sizes odd levels by rounding up instead, so its pixels differ from these there.
+
+// The CLB fork's area-matched overviews of COG_OVERVIEW_POLICY=SOURCE: ras2cng's own algorithm,
+// ceil-sized, output for output, with NaN optionally valid and a report of what each level keeps.
+pub(crate) mod ras2cng;
+
+use crate::Result;
 use crate::pixel::Pixel;
+use wbraster::raster::RasterData;
 
-/// The levels of one band and the valid area each reproduces.
-pub(crate) struct AreaMatchedBand<T> {
-    /// The levels, from the largest (factor 2), each `ceil(cols / f) * ceil(rows / f)` values.
-    pub(crate) levels: Vec<Vec<T>>,
-    /// Per level, the kept cells times `f^2` over the full-resolution valid pixels.
+/// The two area-matched methods.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AreaMatched {
+    /// The mean of the valid pixels (`area_matched`).
+    Mean,
+    /// The most frequent value, for categorical rasters (`area_matched_mode`).
+    Mode,
+}
+
+impl AreaMatched {
+    /// The method named `s` (`area_matched` or `area_matched_mode`, in any case).
+    pub(crate) fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "area_matched" => Some(Self::Mean),
+            "area_matched_mode" => Some(Self::Mode),
+            _ => None,
+        }
+    }
+}
+
+/// The band metadata item holding, for each overview level, the valid area it keeps over the
+/// band's valid full-resolution area (its kept cells times the area of a cell in full-resolution
+/// pixels, over the valid pixels), comma-separated: `1` when a level keeps the area exactly.
+/// Cell area is the uniform overview-grid area (`base pixels / overview cells`), not the
+/// number of source pixel centres assigned to an individual footprint on an odd-sized grid.
+pub(crate) const AREA_RATIOS_ITEM: &str = "OVERVIEW_AREA_RATIOS";
+/// The band metadata item holding the band's valid full-resolution pixels, which the ratios of
+/// [`AREA_RATIOS_ITEM`] are relative to.
+pub(crate) const BASE_VALID_PIXELS_ITEM: &str = "OVERVIEW_BASE_VALID_PIXELS";
+
+/// What a band's area-matched levels keep.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct BandReport {
+    /// Per level, the valid area kept over the valid full-resolution area (1 for an empty band).
     pub(crate) area_ratios: Vec<f64>,
     /// The valid full-resolution pixels.
     pub(crate) base_valid: u64,
-    /// The full-resolution NaN samples under a numeric nodata, counted whether or not `nan_valid`
-    /// makes them valid (0 under a NaN nodata and on integer bands).
-    pub(crate) nan_pixels: u64,
 }
 
-/// One level's accumulators: per cell, the sum and count of valid full-resolution pixels, and the
-/// modal value (categorical rasters).
-struct Accumulators {
+impl BandReport {
+    /// The band metadata items of the report ([`AREA_RATIOS_ITEM`], [`BASE_VALID_PIXELS_ITEM`]),
+    /// the ratios as shortest round-trip decimals.
+    pub(crate) fn items(&self) -> [(String, String); 2] {
+        let ratios: Vec<String> = self.area_ratios.iter().map(|r| format!("{r}")).collect();
+        [(AREA_RATIOS_ITEM.to_string(), ratios.join(",")), (BASE_VALID_PIXELS_ITEM.to_string(), self.base_valid.to_string())]
+    }
+}
+
+/// One level of a band: per cell, the sum and count (weight) of the valid full-resolution pixels it
+/// covers, and its native modal value (`area_matched_mode`; None for an empty footprint).
+struct Cells<T> {
     cols: usize,
     rows: usize,
-    sums: Vec<f64>,
-    weights: Vec<u64>,
-    modes: Vec<f64>,
-    mode_valid: Vec<bool>,
+    /// Per cell, the sum and the weight.
+    acc: Vec<(f64, u64)>,
+    modes: Vec<Option<T>>,
 }
 
-/// Whether a sample is valid: not nodata, and not NaN unless `nan_valid` and the nodata value is
-/// not NaN itself (rasterio's mask, which ras2cng reads: a numeric nodata leaves NaN valid).
-#[inline]
-fn valid(v: f64, nodata: f64, nan_valid: bool) -> bool {
-    if v.is_nan() { nan_valid && !nodata.is_nan() } else { v != nodata }
-}
-
-/// The mode of the valid values of a 2x2 block (in row order: top left, top right, bottom left,
-/// bottom right) as ras2cng's `_reduce_mode` computes it: the value matched by the most valid
-/// values, the lowest on ties. Not valid when no value is.
-#[inline]
-fn block_mode(values: [f64; 4], valid: [bool; 4]) -> (f64, bool) {
-    let mut counts = [-1i32; 4];
-    for i in 0..4 {
-        if valid[i] {
-            counts[i] = (0..4).filter(|&j| valid[j] && values[j] == values[i]).count() as i32;
-        }
+impl<T> Cells<T> {
+    fn weight(&self, i: usize) -> u64 {
+        self.acc[i].1
     }
-    let best = *counts.iter().max().unwrap_or(&-1);
-    let mode = (0..4).filter(|&i| counts[i] == best).map(|i| values[i]).fold(f64::INFINITY, f64::min);
-    (mode, best > 0)
 }
 
-impl Accumulators {
-    /// Level 1, from a band of `cols` x `rows` samples.
-    /// Returns the accumulators, the valid pixels and the NaN samples under a numeric nodata.
-    fn first<T: Pixel>(band: &[T], cols: usize, rows: usize, nodata: f64, nan_valid: bool, categorical: bool) -> (Self, u64, u64) {
-        let (oc, or) = (cols.div_ceil(2), rows.div_ceil(2));
-        let n = oc * or;
-        let mut acc = Self {
-            cols: oc,
-            rows: or,
-            sums: vec![0.0; n],
-            weights: vec![0; n],
-            modes: if categorical { vec![0.0; n] } else { Vec::new() },
-            mode_valid: if categorical { vec![false; n] } else { Vec::new() },
-        };
-        let mut base_valid = 0u64;
-        let mut nan_pixels = 0u64;
-        let numeric_nodata = !nodata.is_nan();
-        for oy in 0..or {
-            for ox in 0..oc {
-                let mut values = [0.0f64; 4];
-                let mut ok = [false; 4];
-                for (k, (dy, dx)) in [(0, 0), (0, 1), (1, 0), (1, 1)].into_iter().enumerate() {
-                    let (y, x) = (2 * oy + dy, 2 * ox + dx);
-                    if y < rows && x < cols {
-                        let v = band[y * cols + x].to_f64();
-                        if numeric_nodata && v.is_nan() {
-                            nan_pixels += 1;
-                        }
-                        if valid(v, nodata, nan_valid) {
-                            values[k] = v;
-                            ok[k] = true;
-                        }
+/// For each of `m` cells along an axis, the range of the `n` cells (or pixels) of the level
+/// before whose centres fall in its footprint: index `x` goes to `floor((x + 0.5) * m / n)`.
+fn groups(n: usize, m: usize) -> Vec<std::ops::Range<usize>> {
+    let (n64, m64) = (n as u128, m as u128);
+    let mut start = 0;
+    (0..m)
+        .map(|c| {
+            // The first index whose centre lies beyond the footprint of `c`: the smallest x with
+            // (2x + 1) * m >= 2 * (c + 1) * n.
+            let end = if c + 1 == m { n } else { ((2 * (c as u128 + 1) * n64).div_ceil(m64).saturating_sub(1)).div_ceil(2) as usize };
+            let range = start..end.max(start);
+            start = range.end;
+            range
+        })
+        .collect()
+}
+
+/// The most frequent native value (all valid, none NaN), lowest on ties; None when empty.
+fn mode<T: Pixel + PartialOrd>(values: &mut [T]) -> Option<T> {
+    values.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal).then_with(|| a.to_f64().total_cmp(&b.to_f64())));
+    let (mut best, mut best_count) = (None, 0usize);
+    let mut i = 0;
+    while i < values.len() {
+        let mut j = i + 1;
+        // Equal values (-0 and 0 among them) are counted together.
+        while j < values.len() && values[j] == values[i] {
+            j += 1;
+        }
+        if j - i > best_count {
+            (best, best_count) = (Some(values[i]), j - i);
+        }
+        i = j;
+    }
+    best
+}
+
+/// A level of `cols x rows` cells from the `n_cols x n_rows` cells of the level before (or the
+/// image's pixels), `cell(y, x)` giving the sum, weight and modal value of a valid one. Sums add
+/// the cells of each row in order, then the rows, which for 2 x 2 cells is NumPy's order for
+/// `reshape(h, 2, w, 2).sum(axis=(1, 3))`.
+fn reduce<T: Pixel + PartialOrd>(
+    (n_cols, n_rows): (usize, usize),
+    (cols, rows): (usize, usize),
+    mode_of: Option<AreaMatched>,
+    cell: impl Fn(usize, usize) -> Option<(f64, u64, T)> + Sync,
+) -> Cells<T> {
+    let xs = groups(n_cols, cols);
+    let ys = groups(n_rows, rows);
+    let categorical = mode_of == Some(AreaMatched::Mode);
+    // Each row is filled in place. Modes retain native samples, including 64-bit class IDs.
+    // -0 is the identity of IEEE addition: adding to it keeps every value, -0 included.
+    let mut acc = vec![(-0.0f64, 0u64); cols * rows];
+    crate::par::chunks_mut(&mut acc, cols, |oy, line| {
+        for (out, xr) in line.iter_mut().zip(&xs) {
+            for y in ys[oy].clone() {
+                let mut row = -0.0f64;
+                for x in xr.clone() {
+                    if let Some((s, w, _)) = cell(y, x) {
+                        row += s;
+                        out.1 += w;
                     }
                 }
-                let o = oy * oc + ox;
-                acc.sums[o] = sum4(values);
-                acc.weights[o] = ok.iter().filter(|v| **v).count() as u64;
-                base_valid += acc.weights[o];
-                if categorical {
-                    (acc.modes[o], acc.mode_valid[o]) = block_mode(values, ok);
-                }
+                out.0 += row;
             }
         }
-        (acc, base_valid, nan_pixels)
-    }
-
-    /// The next (half-size) level.
-    fn reduce(&self, categorical: bool) -> Self {
-        let (oc, or) = (self.cols.div_ceil(2), self.rows.div_ceil(2));
-        let n = oc * or;
-        let mut next = Self {
-            cols: oc,
-            rows: or,
-            sums: vec![0.0; n],
-            weights: vec![0; n],
-            modes: if categorical { vec![0.0; n] } else { Vec::new() },
-            mode_valid: if categorical { vec![false; n] } else { Vec::new() },
-        };
-        for oy in 0..or {
-            for ox in 0..oc {
-                let mut sums = [0.0f64; 4];
-                let mut weight = 0u64;
-                let mut values = [0.0f64; 4];
-                let mut ok = [false; 4];
-                for (k, (dy, dx)) in [(0, 0), (0, 1), (1, 0), (1, 1)].into_iter().enumerate() {
-                    let (y, x) = (2 * oy + dy, 2 * ox + dx);
-                    if y < self.rows && x < self.cols {
-                        let i = y * self.cols + x;
-                        sums[k] = self.sums[i];
-                        weight += self.weights[i];
-                        if categorical {
-                            values[k] = self.modes[i];
-                            ok[k] = self.mode_valid[i];
-                        }
-                    }
+    });
+    let mut modes = Vec::new();
+    if categorical {
+        modes = vec![None; cols * rows];
+        crate::par::chunks_mut(&mut modes, cols, |oy, line| {
+            let mut values = Vec::new();
+            for (out, xr) in line.iter_mut().zip(&xs) {
+                values.clear();
+                for y in ys[oy].clone() {
+                    values.extend(xr.clone().filter_map(|x| cell(y, x).map(|(_, _, m)| m)));
                 }
-                let o = oy * oc + ox;
-                next.sums[o] = sum4(sums);
-                next.weights[o] = weight;
-                if categorical {
-                    (next.modes[o], next.mode_valid[o]) = block_mode(values, ok);
-                }
+                *out = mode(&mut values);
             }
-        }
-        next
+        });
     }
+    Cells { cols, rows, acc, modes }
 }
 
-/// The sum of a 2x2 block in NumPy's order for `reshape(h, 2, w, 2).sum(axis=(1, 3))`: the
-/// columns of each row, then the rows.
-#[inline]
-fn sum4(v: [f64; 4]) -> f64 {
-    (v[0] + v[1]) + (v[2] + v[3])
-}
-
-/// ras2cng's `_dither`: a deterministic hash of a cell index (SplitMix64's finalizer).
+/// A deterministic hash of a cell index (SplitMix64's finalizer), as ras2cng's `_dither`.
 #[inline]
 fn dither(index: u64, salt: u64) -> u64 {
     let mut x = index ^ salt;
@@ -172,134 +200,232 @@ fn dither(index: u64, salt: u64) -> u64 {
     x
 }
 
-/// Which cells of a level of factor `factor` stay valid so that the level reproduces the
-/// full-resolution valid area (ras2cng's `_select_area_matched`).
-fn select(weights: &[u64], cols: usize, rows: usize, factor: u64, base_valid: u64) -> Vec<bool> {
-    let capacity = factor * factor;
-    let target = (base_valid as f64 / capacity as f64).round_ties_even() as u64;
-    let wet: Vec<bool> = weights.iter().map(|w| *w > 0).collect();
+/// `num / den` rounded half to even.
+fn round_ratio(num: u128, den: u128) -> u128 {
+    let (q, r) = (num / den, num % den);
+    match (2 * r).cmp(&den) {
+        std::cmp::Ordering::Greater => q + 1,
+        std::cmp::Ordering::Equal => q + (q & 1),
+        std::cmp::Ordering::Less => q,
+    }
+}
+
+/// Which cells of a level stay valid: `target` of them, the heaviest first (ras2cng's
+/// `_select_area_matched`), ties at the threshold weight broken by kept 4-neighbours, then by
+/// the dither salted with the level's factor, then by the index (highest first).
+fn select<T>(cells: &Cells<T>, target: u64, factor: u64) -> Result<Vec<bool>> {
+    let wet: Vec<bool> = cells.acc.iter().map(|c| c.1 > 0).collect();
     if target == 0 {
-        return vec![false; weights.len()];
+        return Ok(vec![false; wet.len()]);
     }
-    let wet_count = wet.iter().filter(|w| **w).count() as u64;
-    if wet_count == 0 || target >= wet_count {
-        return wet;
+    let mut weights: Vec<u64> = cells.acc.iter().map(|c| c.1).filter(|w| *w > 0).collect();
+    if target > weights.len() as u64 {
+        return Err(crate::Error::Unsupported(format!(
+            "area-matched overview needs {target} valid cells; available nonempty footprints: {}",
+            weights.len()
+        )));
     }
-    let mut counts = vec![0u64; capacity as usize + 1];
-    for w in weights {
-        counts[(*w).min(capacity) as usize] += 1;
+    if target == weights.len() as u64 {
+        return Ok(wet);
     }
-    let mut accumulated = 0u64;
-    let mut threshold = 0u64;
-    for level in (1..=capacity).rev() {
-        if accumulated + counts[level as usize] >= target {
-            threshold = level;
-            break;
-        }
-        accumulated += counts[level as usize];
-    }
-    if threshold == 0 {
-        return wet;
-    }
-    let mut keep: Vec<bool> = weights.iter().map(|w| *w > threshold).collect();
-    let remaining = (target - accumulated) as usize;
-    let ties: Vec<usize> = (0..weights.len()).filter(|&i| weights[i] == threshold).collect();
+    // The target-th heaviest weight: the threshold.
+    let k = target as usize - 1;
+    let threshold = *weights.select_nth_unstable_by(k, |a, b| b.cmp(a)).1;
+    let mut keep: Vec<bool> = cells.acc.iter().map(|c| c.1 > threshold).collect();
+    let above = keep.iter().filter(|v| **v).count();
+    let remaining = k + 1 - above;
+    let ties: Vec<usize> = (0..keep.len()).filter(|&i| cells.weight(i) == threshold).collect();
     if remaining >= ties.len() {
-        for i in ties {
-            keep[i] = true;
-        }
-        return keep;
+        ties.into_iter().for_each(|i| keep[i] = true);
+        return Ok(keep);
     }
-    // Ties by the number of kept 4-neighbours (most first), then the dither (highest first), then
-    // the index (highest first), as NumPy's reversed stable `lexsort((dither, coherence))`.
+    let (cols, rows) = (cells.cols, cells.rows);
     let salt = factor.wrapping_mul(0x2545_F491);
     let mut ranked: Vec<(u8, u64, usize)> = ties
         .iter()
         .map(|&i| {
             let (y, x) = (i / cols, i % cols);
-            let mut c = 0u8;
-            if y > 0 && keep[i - cols] {
-                c += 1;
-            }
-            if y + 1 < rows && keep[i + cols] {
-                c += 1;
-            }
-            if x > 0 && keep[i - 1] {
-                c += 1;
-            }
-            if x + 1 < cols && keep[i + 1] {
-                c += 1;
-            }
-            (c, dither(i as u64, salt), i)
+            let neighbours = [y > 0 && keep[i - cols], y + 1 < rows && keep[i + cols], x > 0 && keep[i - 1], x + 1 < cols && keep[i + 1]];
+            (neighbours.iter().filter(|n| **n).count() as u8, dither(i as u64, salt), i)
         })
         .collect();
     ranked.sort_unstable_by(|a, b| b.cmp(a));
     for &(_, _, i) in &ranked[..remaining] {
         keep[i] = true;
     }
-    keep
+    Ok(keep)
 }
 
-/// The area-matched levels of one band of `cols` x `rows` samples: `count` levels of factors 2,
-/// 4, 8... `integral` rounds the means of integer types half to even, as NumPy's `rint`.
-/// `nan_valid` counts NaN samples as valid under a numeric nodata, as rasterio's mask does: they
-/// add to the coverage, and the mean of a cell holding one is NaN (NumPy's sum propagates it).
-/// They never make a mode: NaN equals no value, so a block of NaNs only has no mode.
+/// The area-matched levels of a band of `cols x rows` samples, of the `sizes` given (each no
+/// larger than the one before), with their nominal decimation `factors` (which salt the tie
+/// breaking). `nodata` is the band's nodata value, `replacement` the value a mean equal to it
+/// takes instead, and `integral` whether the type is an integer type.
+/// Means use f64 accumulation, following the ported NumPy algorithm, so Int64/UInt64 means
+/// can lose low bits above f64 precision (even when the source samples are all equal).
+/// Mode selection and nodata comparisons retain native integer values.
+///
+/// # Errors
+/// `InvalidData` when a size is larger than the level before it; `Unsupported` when the
+/// rounded valid-area target exceeds the number of footprints containing valid pixels, or
+/// a kept footprint has an undefined mean (for example, opposite infinities).
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn area_matched_band<T: Pixel>(
-    band: &[T],
-    cols: usize,
-    rows: usize,
+pub(crate) fn band<T: Pixel + PartialOrd>(
+    data: &[T],
+    (cols, rows): (usize, usize),
+    sizes: &[(usize, usize)],
+    factors: &[u64],
+    method: AreaMatched,
     nodata: f64,
-    nan_valid: bool,
-    count: usize,
-    categorical: bool,
+    replacement: f64,
     integral: bool,
-) -> AreaMatchedBand<T> {
-    let mut out =
-        AreaMatchedBand { levels: Vec::with_capacity(count), area_ratios: Vec::with_capacity(count), base_valid: 0, nan_pixels: 0 };
-    if count == 0 {
-        return out;
-    }
-    let (mut acc, base_valid, nan_pixels) = Accumulators::first(band, cols, rows, nodata, nan_valid, categorical);
-    out.base_valid = base_valid;
-    out.nan_pixels = nan_pixels;
-    for k in 0..count {
-        if k > 0 {
-            acc = acc.reduce(categorical);
+) -> Result<(Vec<Vec<T>>, BandReport)> {
+    // The nodata value as the type holds it; an integer band has none when it is not one of its
+    // values.
+    let key = T::from_f64(nodata);
+    let signed = T::from_f64(-1.0).to_f64() < 0.0;
+    let upper = 2.0f64.powi((T::SIZE * 8 - usize::from(signed)) as i32);
+    let lower = if signed { -upper } else { 0.0 };
+    let has_key = !integral || (nodata.fract() == 0.0 && nodata >= lower && nodata < upper);
+    let valid = |v: T| !v.to_f64().is_nan() && !(has_key && v == key);
+    let mut levels = Vec::with_capacity(sizes.len());
+    let mut report = BandReport { area_ratios: Vec::with_capacity(sizes.len()), base_valid: 0 };
+    let mut previous: Option<Cells<T>> = None;
+    for (k, &(w, h)) in sizes.iter().enumerate() {
+        let from = previous.as_ref().map_or((cols, rows), |p| (p.cols, p.rows));
+        if w == 0 || h == 0 || w > from.0 || h > from.1 {
+            return Err(crate::Error::InvalidData(format!("area-matched overview {w}x{h} is larger than the level before it")));
         }
-        let factor = 1u64 << (k + 1);
-        let keep = select(&acc.weights, acc.cols, acc.rows, factor, base_valid);
-        let kept = keep.iter().filter(|v| **v).count() as u64;
-        out.area_ratios.push(if base_valid == 0 { 0.0 } else { (kept * factor * factor) as f64 / base_valid as f64 });
+        let cells = match &previous {
+            None => reduce(from, (w, h), Some(method), |y, x| {
+                let v = data[y * cols + x];
+                valid(v).then_some((v.to_f64(), 1, v))
+            }),
+            Some(p) => reduce(from, (w, h), Some(method), |y, x| {
+                let i = y * p.cols + x;
+                let (s, w) = p.acc[i];
+                (w > 0).then(|| (s, w, p.modes.get(i).copied().flatten().unwrap_or_default()))
+            }),
+        };
+        if k == 0 {
+            report.base_valid = cells.acc.iter().map(|c| c.1).sum();
+        }
+        let base = report.base_valid as u128;
+        let (pixels, n_cells) = ((cols * rows) as u128, (w * h) as u128);
+        let target = round_ratio(base * n_cells, pixels) as u64;
+        let factor = factors.get(k).copied().unwrap_or(1 << (k + 1));
+        let keep = select(&cells, target, factor)?;
+        if method == AreaMatched::Mean && cells.acc.iter().zip(&keep).any(|(&(sum, _), &kept)| kept && sum.is_nan()) {
+            return Err(crate::Error::Unsupported(format!(
+                "area-matched overview {w}x{h} has an undefined mean in a kept cell (for example, opposite infinities)"
+            )));
+        }
+        let kept = keep.iter().filter(|v| **v).count() as u128;
+        report.area_ratios.push(match base {
+            0 => 1.0,
+            // Exactly ras2cng's `kept * f * f / valid` when the level divides the image evenly.
+            _ if pixels % n_cells == 0 => (kept * (pixels / n_cells)) as f64 / base as f64,
+            _ => (kept * pixels) as f64 / (n_cells * base) as f64,
+        });
         let level: Vec<T> = (0..keep.len())
             .map(|i| {
-                let v = if categorical {
-                    if keep[i] && acc.mode_valid[i] { acc.modes[i] } else { nodata }
-                } else if keep[i] && acc.weights[i] > 0 {
-                    let mean = acc.sums[i] / acc.weights[i] as f64;
-                    if integral { mean.round_ties_even() } else { mean }
-                } else {
-                    nodata
+                if !keep[i] {
+                    return T::from_f64(nodata);
+                }
+                let v = match method {
+                    AreaMatched::Mode => cells.modes[i].expect("a kept footprint has a native modal value"),
+                    AreaMatched::Mean => {
+                        let (sum, weight) = cells.acc[i];
+                        let mean = sum / weight as f64;
+                        T::from_f64(if integral { mean.round_ties_even() } else { mean })
+                    }
                 };
-                T::from_f64(v)
+                if has_key && v == key { T::from_f64(replacement) } else { v }
             })
             .collect();
-        out.levels.push(level);
+        levels.push(level);
+        previous = Some(cells);
     }
-    out
+    Ok((levels, report))
 }
+
+/// Wraps typed samples in the `RasterData` of their type.
+pub(crate) trait IntoRasterData: Pixel + PartialOrd {
+    fn into_data(v: Vec<Self>) -> RasterData;
+}
+
+macro_rules! into_data {
+    ($($t:ty => $variant:ident),*) => {$(
+        impl IntoRasterData for $t {
+            fn into_data(v: Vec<Self>) -> RasterData {
+                RasterData::$variant(v)
+            }
+        }
+    )*};
+}
+into_data!(u8 => U8, i8 => I8, u16 => U16, i16 => I16, u32 => U32, i32 => I32, u64 => U64, i64 => I64, f32 => F32, f64 => F64);
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn halving(cols: usize, rows: usize, n: usize) -> Vec<(usize, usize)> {
+        (1..=n).map(|k| (cols >> k, rows >> k)).collect()
+    }
+
     #[test]
-    fn mode_takes_the_most_frequent_then_lowest_valid_value() {
-        assert_eq!(block_mode([3.0, 1.0, 3.0, 1.0], [true; 4]), (1.0, true));
-        assert_eq!(block_mode([3.0, 1.0, 3.0, 2.0], [true; 4]), (3.0, true));
-        assert_eq!(block_mode([3.0, 1.0, 3.0, 2.0], [false, true, false, true]), (1.0, true));
-        assert!(!block_mode([0.0; 4], [false; 4]).1);
+    fn groups_hold_the_centres_of_each_footprint() {
+        assert_eq!(groups(8, 4), vec![0..2, 2..4, 4..6, 6..8]);
+        // GDAL's footprints of 7 pixels in 3 cells: [0, 2.33), [2.33, 4.67), [4.67, 7).
+        assert_eq!(groups(7, 3), vec![0..2, 2..5, 5..7]);
+        assert_eq!(groups(5, 2), vec![0..2, 2..5]);
+        assert_eq!(groups(5, 3), vec![0..2, 2..3, 3..5]);
+        assert_eq!(groups(3, 1), vec![0..3]);
+        for (n, m) in [(1, 1), (9, 4), (100, 33), (6705, 3352), (4852, 2426), (1000, 1)] {
+            let g = groups(n, m);
+            assert_eq!(g.first().map(|r| r.start), Some(0));
+            assert_eq!(g.last().map(|r| r.end), Some(n));
+            assert!(g.windows(2).all(|p| p[0].end == p[1].start), "{n} {m}");
+            for (c, r) in g.iter().enumerate() {
+                assert!(!r.is_empty());
+                for x in r.clone() {
+                    assert_eq!((2 * x + 1) * m / (2 * n), c, "{n} {m} {x}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn mode_takes_the_most_frequent_then_lowest_value() {
+        assert_eq!(mode(&mut [3.0, 1.0, 3.0, 1.0]), Some(1.0));
+        assert_eq!(mode(&mut [3.0, 1.0, 3.0, 2.0]), Some(3.0));
+        assert_eq!(mode(&mut [1.0, 2.0]), Some(1.0));
+        assert_eq!(mode::<f64>(&mut []), None);
+    }
+
+    #[test]
+    fn categorical_classes_and_nodata_keep_native_integer_precision() {
+        let class = 9_007_199_254_740_993u64;
+        for nodata in [0.0, 9_007_199_254_740_992.0] {
+            let (levels, report) = band(&[class; 4], (2, 2), &[(1, 1)], &[2], AreaMatched::Mode, nodata, 1.0, true).unwrap();
+            assert_eq!(levels, vec![vec![class]]);
+            assert_eq!(report.base_valid, 4);
+        }
+        let class = -9_007_199_254_740_993i64;
+        let (levels, _) = band(&[class; 4], (2, 2), &[(1, 1)], &[2], AreaMatched::Mode, 0.0, 1.0, true).unwrap();
+        assert_eq!(levels, vec![vec![class]]);
+        let (levels, report) = band(&[u64::MAX; 4], (2, 2), &[(1, 1)], &[2], AreaMatched::Mode, 2.0f64.powi(64), 1.0, true).unwrap();
+        assert_eq!(levels, vec![vec![u64::MAX]]);
+        assert_eq!(report.base_valid, 4, "an out-of-range nodata declaration is not a native class");
+    }
+
+    #[test]
+    fn an_unattainable_sparse_odd_size_area_target_is_refused() {
+        let mut data = vec![0u8; 49];
+        for y in 2..5 {
+            data[y * 7 + 2..y * 7 + 5].fill(1);
+        }
+        let error = band(&data, (7, 7), &[(3, 3)], &[3], AreaMatched::Mean, 0.0, 1.0, true).unwrap_err();
+        assert!(error.to_string().contains("needs 2 valid cells; available nonempty footprints: 1"), "{error}");
     }
 
     #[test]
@@ -311,100 +437,114 @@ mod tests {
     }
 
     #[test]
+    fn rounding_is_half_to_even() {
+        assert_eq!(round_ratio(5, 2), 2);
+        assert_eq!(round_ratio(7, 2), 4);
+        assert_eq!(round_ratio(9, 4), 2);
+        assert_eq!(round_ratio(11, 4), 3);
+    }
+
+    /// A diagonal band of valid pixels, which `average` would widen at every level.
+    fn diagonal(cols: usize, rows: usize, nd: f32) -> Vec<f32> {
+        (0..rows).flat_map(|y| (0..cols).map(move |x| if (x as i64 - y as i64).abs() <= 2 { (x + y) as f32 } else { nd })).collect()
+    }
+
+    #[test]
     fn levels_keep_the_valid_area() {
-        // A diagonal band of valid pixels: `average` would mark every touched coarse cell valid.
-        let (cols, rows) = (64, 48);
         let nd = -9999.0f32;
-        let band: Vec<f32> =
-            (0..rows).flat_map(|y| (0..cols).map(move |x| if (x as i32 - y as i32).abs() <= 2 { (x + y) as f32 } else { nd })).collect();
-        let out = area_matched_band(&band, cols, rows, nd as f64, false, 3, false, false);
-        assert_eq!(out.levels.len(), 3);
-        assert_eq!(out.levels[0].len(), 32 * 24);
-        assert_eq!(out.levels[2].len(), 8 * 6);
-        let valid = band.iter().filter(|v| **v != nd).count() as u64;
-        assert_eq!(out.base_valid, valid);
-        for (k, level) in out.levels.iter().enumerate() {
-            let f = 1u64 << (k + 1);
-            let kept = level.iter().filter(|v| **v != nd).count() as u64;
-            assert_eq!(kept, (valid as f64 / (f * f) as f64).round_ties_even() as u64, "level {k}");
-            assert!((out.area_ratios[k] - (kept * f * f) as f64 / valid as f64).abs() < 1e-12);
+        for (cols, rows) in [(64, 48), (67, 45), (33, 70)] {
+            let band_data = diagonal(cols, rows, nd);
+            let sizes = halving(cols, rows, 3);
+            let (levels, report) =
+                band(&band_data, (cols, rows), &sizes, &[2, 4, 8], AreaMatched::Mean, nd as f64, -9998.0, false).unwrap();
+            let valid = band_data.iter().filter(|v| **v != nd).count() as u64;
+            assert_eq!(report.base_valid, valid);
+            for (k, (level, &(w, h))) in levels.iter().zip(&sizes).enumerate() {
+                assert_eq!(level.len(), w * h);
+                let kept = level.iter().filter(|v| **v != nd).count() as u64;
+                let target = round_ratio(valid as u128 * (w * h) as u128, (cols * rows) as u128) as u64;
+                assert_eq!(kept, target, "{cols}x{rows} level {k}");
+                let ratio = kept as f64 * (cols * rows) as f64 / (w * h) as f64 / valid as f64;
+                assert!((report.area_ratios[k] - ratio).abs() < 1e-12);
+            }
+            // Deterministic.
+            let again = band(&band_data, (cols, rows), &sizes, &[2, 4, 8], AreaMatched::Mean, nd as f64, -9998.0, false).unwrap();
+            assert_eq!(levels, again.0);
         }
-        // Deterministic.
-        let again = area_matched_band(&band, cols, rows, nd as f64, false, 3, false, false);
-        assert_eq!(out.levels, again.levels);
     }
 
     #[test]
     fn means_of_kept_cells_and_integer_rounding() {
         // One 2x2 block of 1, 2, 2, 2 (mean 1.75) beside an empty block.
-        let band: Vec<i16> = vec![1, 2, 0, 0, 2, 2, 0, 0];
-        let out = area_matched_band(&band, 4, 2, 0.0, false, 1, false, true);
-        assert_eq!(out.levels[0], vec![2, 0]);
+        let data: Vec<i16> = vec![1, 2, 0, 0, 2, 2, 0, 0];
+        let (levels, _) = band(&data, (4, 2), &[(2, 1)], &[2], AreaMatched::Mean, 0.0, 1.0, true).unwrap();
+        assert_eq!(levels[0], vec![2, 0]);
         // Half-way means round to even.
-        let band: Vec<i16> = vec![1, 2, 3, 4, 3, 2, 5, 6];
-        let out = area_matched_band(&band, 4, 2, -1.0, false, 1, false, true);
-        assert_eq!(out.levels[0], vec![2, 4]);
-        let out = area_matched_band(&band, 4, 2, -1.0, false, 1, true, true);
-        assert_eq!(out.levels[0], vec![2, 3]);
+        let data: Vec<i16> = vec![1, 2, 3, 4, 3, 2, 5, 6];
+        let (levels, _) = band(&data, (4, 2), &[(2, 1)], &[2], AreaMatched::Mean, -1.0, 0.0, true).unwrap();
+        assert_eq!(levels[0], vec![2, 4]);
+        let (levels, _) = band(&data, (4, 2), &[(2, 1)], &[2], AreaMatched::Mode, -1.0, 0.0, true).unwrap();
+        assert_eq!(levels[0], vec![2, 3]);
+        // A mean equal to the nodata value takes the replacement value.
+        let data: Vec<i16> = vec![-2, 0];
+        let (levels, _) = band(&data, (2, 1), &[(1, 1)], &[2], AreaMatched::Mean, -1.0, 0.0, true).unwrap();
+        assert_eq!(levels[0], vec![0]);
     }
 
     #[test]
-    fn nan_under_a_numeric_nodata_is_valid_when_asked() {
-        let nd = -9999.0f32;
-        // A 4x2 band: the left block holds a NaN, the right block one valid pixel.
-        let band = vec![2.0f32, 1.0, nd, nd, f32::NAN, 3.0, 5.0, nd];
-        let out = area_matched_band(&band, 4, 2, nd as f64, true, 1, false, false);
-        // Five valid pixels (the NaN counts): round(5 / 4) = 1 cell, the fuller one, whose mean is NaN.
-        assert_eq!(out.base_valid, 5);
-        assert_eq!(out.nan_pixels, 1);
-        assert!(out.levels[0][0].is_nan());
-        assert_eq!(out.levels[0][1], nd);
-        assert_eq!(out.area_ratios, vec![4.0 / 5.0]);
-        // By default the NaN is invalid: three valid pixels on the left, mean 2.
-        let out = area_matched_band(&band, 4, 2, nd as f64, false, 1, false, false);
-        assert_eq!(out.base_valid, 4);
-        // Counted the same way when NaN is not valid.
-        assert_eq!(out.nan_pixels, 1);
-        assert_eq!(out.levels[0], vec![2.0, nd]);
-        // The NaN reaches every coarser level holding the cell.
-        let big: Vec<f32> = (0..64).map(|i| if i == 9 { f32::NAN } else { 1.0 }).collect();
-        let out = area_matched_band(&big, 8, 8, nd as f64, true, 3, false, false);
-        assert_eq!(out.base_valid, 64);
-        assert!(out.levels[0][0].is_nan() && out.levels[0].iter().filter(|v| v.is_nan()).count() == 1);
-        assert!(out.levels[1][0].is_nan() && out.levels[2][0].is_nan());
-        // A NaN nodata keeps NaN invalid.
-        let out = area_matched_band(&[f32::NAN, 1.0, f32::NAN, f32::NAN], 2, 2, f64::NAN, true, 1, false, false);
-        assert_eq!(out.base_valid, 1);
-        // NaN under a NaN nodata is nodata, not counted.
-        assert_eq!(out.nan_pixels, 0);
-        // Integer bands have no NaN: unchanged.
-        let ints: Vec<i16> = vec![1, 2, 0, 0, 2, 2, 0, 0];
-        assert_eq!(
-            area_matched_band(&ints, 4, 2, 0.0, true, 1, false, true).levels,
-            area_matched_band(&ints, 4, 2, 0.0, false, 1, false, true).levels
-        );
-    }
-
-    #[test]
-    fn valid_nans_cover_but_never_make_a_mode() {
-        let nd = -9999.0f32;
-        // Left block: all NaN (covered, no mode). Right block: 1, NaN, 1, nodata (mode 1).
-        let band = vec![f32::NAN, f32::NAN, 1.0, f32::NAN, f32::NAN, f32::NAN, 1.0, nd];
-        let out = area_matched_band(&band, 4, 2, nd as f64, true, 1, true, false);
-        assert_eq!(out.base_valid, 7);
-        // round(7 / 4) = 2 cells kept; the left one has no mode, so it stays nodata.
-        assert_eq!(out.levels[0], vec![nd, 1.0]);
-        assert_eq!(out.area_ratios, vec![8.0 / 7.0]);
+    fn odd_levels_partition_the_pixels_of_the_level_before() {
+        // A 5 x 1 row in 2 cells: pixels 0-1 and 2-4.
+        let data = [1.0f32, 3.0, 5.0, 7.0, 9.0];
+        let (levels, report) = band(&data, (5, 1), &[(2, 1)], &[2], AreaMatched::Mean, -1.0, -2.0, false).unwrap();
+        assert_eq!(levels[0], vec![2.0, 7.0]);
+        assert_eq!(report.base_valid, 5);
+        assert_eq!(report.area_ratios, vec![1.0]);
     }
 
     #[test]
     fn nan_is_never_valid() {
-        let band = vec![f32::NAN, 1.0, f32::NAN, f32::NAN];
-        let out = area_matched_band(&band, 2, 2, f64::NAN, false, 1, false, false);
+        let data = [f32::NAN, 1.0, f32::NAN, f32::NAN];
+        let (levels, report) = band(&data, (2, 2), &[(1, 1)], &[2], AreaMatched::Mean, f64::NAN, 0.0, false).unwrap();
         // One valid pixel of four: round(1 / 4) = 0 cells kept.
-        assert!(out.levels[0][0].is_nan());
-        let band = vec![2.0f32, 1.0, f32::NAN, 3.0];
-        let out = area_matched_band(&band, 2, 2, -9999.0, false, 1, false, false);
-        assert_eq!(out.levels[0], vec![2.0]);
+        assert!(levels[0][0].is_nan());
+        assert_eq!(report.base_valid, 1);
+        let data = [2.0f32, 1.0, f32::NAN, 3.0];
+        let (levels, _) = band(&data, (2, 2), &[(1, 1)], &[2], AreaMatched::Mean, -9999.0, 0.0, false).unwrap();
+        assert_eq!(levels[0], vec![2.0]);
+    }
+
+    /// An undefined mean cannot silently turn a counted valid cell into NaN; mode retains
+    /// native infinity classes, and a defined infinite mean remains valid.
+    #[test]
+    fn undefined_kept_means_are_refused() {
+        let data = [f64::INFINITY, f64::NEG_INFINITY, 1.0, 2.0];
+        let error = band(&data, (2, 2), &[(1, 1)], &[2], AreaMatched::Mean, 0.0, 1.0, false).unwrap_err();
+        assert!(error.to_string().contains("undefined mean"), "{error}");
+        let (levels, report) = band(&data, (2, 2), &[(1, 1)], &[2], AreaMatched::Mode, 0.0, 1.0, false).unwrap();
+        assert_eq!(levels, vec![vec![f64::NEG_INFINITY]]);
+        assert_eq!(report.area_ratios, vec![1.0]);
+        let data = [f64::INFINITY; 4];
+        let (levels, report) = band(&data, (2, 2), &[(1, 1)], &[2], AreaMatched::Mean, 0.0, 1.0, false).unwrap();
+        assert_eq!(levels, vec![vec![f64::INFINITY]]);
+        assert_eq!(report.area_ratios, vec![1.0]);
+        // Each first-level mean is defined; only their coarser footprint is undefined.
+        let data = [f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY];
+        let error = band(&data, (4, 1), &[(2, 1), (1, 1)], &[2, 4], AreaMatched::Mean, 0.0, 1.0, false).unwrap_err();
+        assert!(error.to_string().contains("undefined mean"), "{error}");
+    }
+
+    #[test]
+    fn an_empty_band_keeps_nothing() {
+        let data = [0u8; 16];
+        let (levels, report) = band(&data, (4, 4), &[(2, 2), (1, 1)], &[2, 4], AreaMatched::Mean, 0.0, 1.0, true).unwrap();
+        assert_eq!(levels, vec![vec![0; 4], vec![0]]);
+        assert_eq!(report, BandReport { area_ratios: vec![1.0, 1.0], base_valid: 0 });
+        assert_eq!(report.items()[0].1, "1,1");
+    }
+
+    #[test]
+    fn levels_larger_than_the_one_before_are_refused() {
+        let data = [1.0f32; 4];
+        assert!(band(&data, (2, 2), &[(3, 1)], &[2], AreaMatched::Mean, 0.0, 1.0, false).is_err());
     }
 }

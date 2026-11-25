@@ -1,0 +1,249 @@
+"""The CLB fork's COG options: COG_OVERVIEW_POLICY=SOURCE (ras2cng's area-matched overviews and
+their report), integer COG overview factors, strict COG creation options, and supplied levels.
+"""
+
+from xml.etree import ElementTree
+
+import numpy as np
+import pytest
+
+import terrio
+
+TRANSFORM = (500000.0, 10.0, 0.0, 4000000.0, 0.0, -10.0)
+# Area-matched COG overviews and their report are the opt-in SOURCE policy's (CLB fork; the
+# default is GDAL 3.13's, which refuses them).
+SOURCE = {"COG_OVERVIEW_POLICY": "SOURCE"}
+
+
+def river(width=1300, height=1100, nodata=-9999.0):
+    """A diagonal band of valid pixels 7 wide: `average` overviews widen it at every level."""
+    y, x = np.mgrid[0:height, 0:width]
+    a = (1.0 + x % 10).astype("float32")
+    a[np.abs(x - y) > 3] = nodata
+    return a
+
+
+def raster(a, nodata=-9999.0):
+    return terrio.Raster.from_array(a, TRANSFORM, "EPSG:32610", nodata)
+
+
+def overviews(path):
+    r = terrio.open_raster(str(path), lazy=True)
+    return [np.asarray(r.read(overview=i))[0] for i in range(len(r.overviews))]
+
+
+def assert_overview_method(path, rasterio, public_tags, expected):
+    """GDAL 3.13 exposes this IMAGE_STRUCTURE item; older readers may filter it.
+
+    Always verify the actual TIFF metadata, including on older GDAL readers. The
+    OVERVIEW_REPORT domain and decoded values have their own unconditional checks.
+    """
+    encoded = path.read_bytes()
+    start = encoded.index(b"<GDALMetadata>")
+    end = encoded.index(b"</GDALMetadata>", start) + len(b"</GDALMetadata>")
+    metadata = ElementTree.fromstring(encoded[start:end])
+    items = [
+        item.text
+        for item in metadata.findall("Item")
+        if item.get("name") == "OVERVIEW_RESAMPLING" and item.get("domain") == "IMAGE_STRUCTURE"
+    ]
+    assert items == [expected]
+    version = tuple(int(part) for part in rasterio.__gdal_version__.split(".")[:2])
+    # Skip only the public-tag exposure check on an older reader that filters it.
+    if "OVERVIEW_RESAMPLING" in public_tags or version >= (3, 13):
+        assert public_tags["OVERVIEW_RESAMPLING"] == expected
+
+
+def test_area_matched_overviews_keep_the_wet_area(tmp_path):
+    a = river()
+    valid = int((a != -9999).sum())
+    avg, am = tmp_path / "avg.tif", tmp_path / "am.tif"
+    raster(a).write(str(avg), driver="COG", compress="DEFLATE", options=SOURCE)
+    raster(a).write(
+        str(am),
+        driver="COG",
+        compress="DEFLATE",
+        options=SOURCE,
+        overview_resampling="area_matched",
+    )
+    for i, (ov_avg, ov_am) in enumerate(zip(overviews(avg), overviews(am), strict=True)):
+        f = 2 ** (i + 1)
+        assert int((ov_avg != -9999).sum()) * f * f / valid > 1.2
+        assert int((ov_am != -9999).sum()) == round(valid / (f * f))
+    # Without nodata there is no wet area to match.
+    with pytest.raises(terrio.TerrioError):
+        terrio.Raster.from_array(a, TRANSFORM, "EPSG:32610").write(
+            str(tmp_path / "x.tif"),
+            driver="COG",
+            options=SOURCE,
+            overview_resampling="area_matched",
+        )
+    # The default GDAL 3.13 policy builds upstream's area-matched levels (GDAL's sizes), which
+    # refuse NaN validity: that is SOURCE's (ras2cng's) only.
+    raster(a).write(str(tmp_path / "d.tif"), driver="COG", overview_resampling="area_matched")
+    with pytest.raises(terrio.TerrioError, match="COG_OVERVIEW_POLICY=SOURCE"):
+        raster(a).write(
+            str(tmp_path / "e.tif"),
+            driver="COG",
+            overview_resampling="area_matched",
+            area_matched_nan_valid=True,
+        )
+
+
+def test_supplied_overviews_round_trip(tmp_path):
+    a = river()
+    levels = [np.full((550, 650), 3.5, "float32"), np.full((275, 325), -9999, "float32")]
+    levels[0][:10] = -9999
+    out = tmp_path / "s.tif"
+    raster(a).write(
+        str(out),
+        driver="COG",
+        compress="DEFLATE",
+        options={"PREDICTOR": "YES", "OVERVIEWS": "FORCE_USE_EXISTING"},
+        overviews=[levels[0], raster(levels[1])],
+        metadata={"overview_method": "supplied"},
+    )
+    for got, want in zip(overviews(out), levels, strict=True):
+        np.testing.assert_array_equal(got, want)
+    np.testing.assert_array_equal(np.asarray(terrio.open_raster(str(out)).read())[0], a)
+    # A level larger than the image is refused, as is resampling supplied overviews.
+    with pytest.raises(terrio.TerrioError):
+        raster(a).write(
+            str(tmp_path / "b.tif"), driver="COG", overviews=[np.zeros((1101, 1300), "float32")]
+        )
+    with pytest.raises(terrio.TerrioError):
+        raster(a).write(
+            str(tmp_path / "c.tif"),
+            driver="COG",
+            overviews=[levels[0]],
+            overview_resampling="average",
+        )
+
+
+@pytest.mark.parametrize("dtype,expected", [("float32", 3), ("int16", 2), ("uint8", 2)])
+def test_predictor_yes_follows_gdal_cog(tmp_path, dtype, expected):
+    rasterio = pytest.importorskip("rasterio")
+    a = (np.arange(64 * 48).reshape(48, 64) % 97).astype(dtype)
+    out = tmp_path / "p.tif"
+    raster(a, nodata=0).write(
+        str(out), driver="COG", compress="DEFLATE", options={"PREDICTOR": "YES"}
+    )
+    with rasterio.open(out) as src:
+        assert src.tags(ns="IMAGE_STRUCTURE")["PREDICTOR"] == str(expected)
+        np.testing.assert_array_equal(src.read(1), a)
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        {"TILED": "YES"},
+        {"BLOCKXSIZE": "256"},
+        {"OVERVIEWS": "SOMETIMES"},
+        {"COG_OVERVIEW_POLICY": "SOURCE", "RESAMPLING": "CUBIC"},
+        {"COMPRESS": "DEFLATE", "OVERVIEW_COMPRESS": "LZW"},
+    ],
+)
+def test_cog_options_not_acted_on_are_refused(tmp_path, options):
+    with pytest.raises(terrio.TerrioError):
+        raster(river(64, 48)).write(str(tmp_path / "x.tif"), driver="COG", options=options)
+
+
+def test_gdal_reads_terrio_cogs_as_its_own(tmp_path):
+    rasterio = pytest.importorskip("rasterio")
+    cogeo = pytest.importorskip("rio_cogeo.cogeo")
+    a = river()
+    out = tmp_path / "l.tif"
+    raster(a).write(
+        str(out),
+        driver="COG",
+        compress="LERC",
+        options={**SOURCE, "MAX_Z_ERROR": "0.01", "OVERVIEW_RESAMPLING": "area_matched"},
+        metadata={"compression_lossy": "true"},
+    )
+    assert cogeo.cog_validate(str(out), quiet=True)[0]
+    with rasterio.open(out) as src:
+        ims = src.tags(ns="IMAGE_STRUCTURE")
+        assert ims["LAYOUT"] == "COG"
+        assert ims["MAX_Z_ERROR"] == "0.01"
+        assert_overview_method(out, rasterio, ims, "AREA_MATCHED")
+        assert src.tags()["compression_lossy"] == "true"
+        assert np.nanmax(np.abs(src.read(1) - a)) <= 0.01 + 1e-6
+
+
+def test_cog_overview_factors_are_written(tmp_path):
+    a = river()
+    cog, gtiff = tmp_path / "f.tif", tmp_path / "g.tif"
+    raster(a).write(str(cog), driver="COG", overviews=[2, 4, 8], overview_resampling="average")
+    raster(a).write(str(gtiff), driver="GTiff", overviews=[2, 4, 8], overview_resampling="average")
+    got, want = overviews(cog), overviews(gtiff)
+    assert [o.shape for o in got] == [(550, 650), (275, 325), (138, 163)]
+    for g, w in zip(got, want, strict=True):
+        np.testing.assert_array_equal(g, w)
+    assert terrio.validate_cog(str(cog))[0]
+    for options in ({"OVERVIEWS": "NONE"}, {"OVERVIEWS": "IGNORE_EXISTING"}):
+        with pytest.raises(terrio.TerrioError):
+            raster(a).write(str(tmp_path / "x.tif"), driver="COG", overviews=[2], options=options)
+
+
+def test_cog_overview_factors_match_gdal_reuse(tmp_path):
+    """GDAL builds source overviews with gdaladdo; COG reuses them (OVERVIEWS=AUTO)."""
+    rasterio = pytest.importorskip("rasterio")
+    from rasterio.enums import Resampling
+    from rasterio.shutil import copy
+
+    a = river()
+    src = tmp_path / "src.tif"
+    raster(a).write(str(src))
+    with rasterio.open(src, "r+") as ds:
+        ds.build_overviews([2, 4, 8], Resampling.nearest)
+    gdal = tmp_path / "gdal.tif"
+    copy(src, gdal, driver="COG")
+    ours = tmp_path / "ours.tif"
+    raster(a).write(str(ours), driver="COG", overviews=[2, 4, 8], overview_resampling="nearest")
+    with rasterio.open(gdal) as g, rasterio.open(ours) as o:
+        assert g.overviews(1) == o.overviews(1) == [2, 4, 8]
+        for f in (2, 4, 8):
+            shape = (1, -(-a.shape[0] // f), -(-a.shape[1] // f))
+            np.testing.assert_array_equal(g.read(out_shape=shape), o.read(out_shape=shape))
+
+
+def test_area_matched_write_reports_the_area_ratios(tmp_path):
+    a = river()
+    a[100:180, 900:1000] = 7.0  # a pond away from the river
+    valid = int((a != -9999).sum())
+    for driver, kwargs, method in [
+        ("COG", {"options": SOURCE}, "area_matched"),
+        ("COG", {"options": SOURCE}, "area_matched_mode"),
+        ("GTiff", {"overviews": [2, 4]}, "area_matched"),
+    ]:
+        out = tmp_path / f"{driver}_{method}.tif"
+        report = raster(a).write(str(out), driver=driver, overview_resampling=method, **kwargs)
+        assert report["method"] == method
+        assert report["factors"] == [2, 4]
+        assert report["base_valid_pixels"] == [valid]
+        # Exactly the area the written levels keep, as ras2cng computes it from them.
+        expected = [
+            int((ov != -9999).sum()) * f * f / valid
+            for ov, f in zip(overviews(out), report["factors"], strict=True)
+        ]
+        assert report["area_ratios"] == [expected]
+    # Nothing to report for other overviews.
+    assert raster(a).write(str(tmp_path / "avg.tif"), driver="COG") is None
+    assert raster(a).write(str(tmp_path / "plain.tif")) is None
+
+
+def test_area_ratios_in_image_structure_metadata(tmp_path):
+    rasterio = pytest.importorskip("rasterio")
+    a = river()
+    out = tmp_path / "am.tif"
+    report = raster(a).write(
+        str(out), driver="COG", options=SOURCE, overview_resampling="area_matched"
+    )
+    with rasterio.open(out) as src:
+        assert_overview_method(out, rasterio, src.tags(ns="IMAGE_STRUCTURE"), "AREA_MATCHED")
+        tags = src.tags(ns="OVERVIEW_REPORT")
+        assert src.tags() == {"AREA_OR_POINT": "Area"}  # the default domain stays the caller's
+    assert tags["OVERVIEW_METHOD"] == "area_matched"
+    assert tags["OVERVIEW_FACTORS"] == "2,4"
+    assert [float(v) for v in tags["OVERVIEW_AREA_RATIOS"].split(",")] == report["area_ratios"][0]
+    assert int(tags["OVERVIEW_BASE_VALID_PIXELS"]) == report["base_valid_pixels"][0]

@@ -104,6 +104,38 @@ also bounds LERC Deflate/Zstandard inflation and the decoded size declared by
 embedded LERC and JPEG headers, before mask or pixel decoding. It is not a cap
 on total process memory or the codec's working buffers.
 
+An image stored as one strip (TIFF 6.0 allows it, and an image without `RowsPerStrip` is one)
+can decode to more than the limit. A window of such a strip is read by the rows it needs, when
+those rows, at the strip's full width and with all of its samples, fit the limit, and the strip
+stores whole-byte samples of its type, most significant bit first, as BlackIsZero, RGB or a
+palette. Uncompressed rows are read at their offsets in the file. A Deflate, LZW, Zstandard or
+PackBits strip is decoded from its start to the window's last row, the rows before the window
+dropped as they are decoded. A Zstandard stream is decoded up to its frame's window further, or
+to the end of the frame when that comes first, since its decoder hands out bytes only once they
+leave that window. Deflate, LZW and Zstandard strips may use horizontal differencing on integer
+samples or the floating-point predictor on floating-point ones. The read then holds the window,
+up to 8 MiB of stored bytes, 8 MiB of rows (or one row, when a row is larger) and the decoder's
+state: about 17 MiB, whatever the strip's size; a row more with the floating-point predictor,
+and the frame's window (at most 128 MiB) with Zstandard.
+
+A window near the end of a compressed strip decodes the rows before it, so a compressed strip
+is read by rows only when it declares at most four times the limit (1 GiB at the default 256
+MiB), and only by a read that decodes at most that much in all, summed over the strips and
+bands it reads, each strip from its start to the last row the read needs there: as much as a
+window over four chunks at the limit decodes. That bounds the decoding a read does, however few
+bytes the strips store. At the default limit, a read of the last pixel of a 1 GiB strip of
+zeros, stored in 1 MB of Deflate or 33 KB of Zstandard, takes 0.2 to 0.4 s. A larger compressed
+strip, or a read that would decode more, is refused at once, as before; raising the limit
+raises the bound. An uncompressed strip is read by rows whatever its size, as nothing of it is
+decoded. For files you do not trust, `TERRIO_MAX_DECLARED_BYTES` (below) bounds what a raster
+declares further. A nearest-neighbour read smaller than the image reads the rows it samples the
+same way, the strip once, holding one row at a time (a row must fit the limit); it decodes a
+strip within the limit to its end, as a window does, and reads a strip that a sparse file
+leaves out as nodata. A read of the whole strip, a window whose rows do not fit the limit, a
+strip whose stored bytes cannot decode to its rows, and a strip of another compression or
+layout (WhiteIsZero, YCbCr, CMYK, samples of less than a byte, complex or Float16 samples, or
+`FillOrder` 2) are decoded whole, and refused over the limit, as before.
+
 TIFF masks follow the image's own `NewSubfileType` reduced-resolution flag, including a
 reduced first image with a reduced mask (flag 5) or a unique legacy mask (flag 4).
 GDAL 3.13.3 ignores a first-image flag-5 mask; Terrio deliberately honors it, so masked
@@ -135,6 +167,10 @@ For files you do not trust, two options bound what a raster may declare, whateve
 |---|---|
 | `TERRIO_MAX_DECLARED_BYTES` | this many bytes of pixels: width x height x bands x bytes per sample, in the type terrio reads the samples as (8 for GRIB's Float64 bands) |
 | `TERRIO_MAX_BANDS` | this many bands (a complex band counts once) |
+
+No read decodes more than its raster declares, so `TERRIO_MAX_DECLARED_BYTES` also bounds what a
+read of GeoTIFF strips over the chunk limit decodes by rows, which is at most four times the chunk
+limit, `TERRIO_TIFF_MAX_CHUNK_BYTES`, in any case (above).
 
 The CLI and MCP take these limits from the process environment; MCP operators set
 them on the server process, so the same admission policy covers every tool call.
@@ -209,6 +245,27 @@ with the `libzstd` feature: without it, as in the default build and in WebAssemb
 chunks are compressed at the one level their encoder has. A level out of range is refused,
 whatever the compression.
 
+`SPARSE_OK=YES` leaves out of a GeoTIFF the blocks of its full-resolution image whose samples are
+all nodata, or 0 without nodata, in every band the block holds: every band of the file, or, with
+`INTERLEAVE=BAND`, only the block's own band, so that each band's blocks are left out on their own.
+Their offset and byte count are 0. The samples must equal, bit for bit, the nodata that readers read
+from the file's tag. A NaN nodata is written `nan`, so a block of a NaN with another sign or payload
+is kept. The overviews and the mask are written whole. Every block is written when nodata is not a
+value of the samples (a fraction or a value out of range for integers). Every block is also written,
+with a warning:
+
+- with a lossy compression (JPEG, WebP unless lossless, LERC with a `MAX_Z_ERROR` above 0),
+  which stores a block of nodata only approximately;
+- when a band's nodata in the file's `.aux.xml` sidecar differs from the file's nodata: bands of
+  different nodata, or a sidecar of an earlier file that the writer keeps.
+
+A COG writes every tile, and warns that it does.
+
+terrio reads the pixels of a block left out of a GeoTIFF as nodata, or 0, whichever writer left it
+out: read whole or by window, from an overview, or over HTTP. That nodata is the file's (exactly,
+for 64-bit integer samples) or, in local reads, a band's own from the `.aux.xml` sidecar, as the
+double terrio holds it.
+
 `NBITS` writes unsigned samples packed into 1–8 bits for Byte, 9–16 bits for
 UInt16 and 17–32 bits for UInt32. Rows begin on byte boundaries; bits are stored
 most significant first. GTiff supports strips or tiles and COG is tiled. Both support pixel/band
@@ -267,6 +324,49 @@ Within a `DEFLATE` chunk, at every level, the encoder also looks for a match one
 it where it is longer than the matches its hash chains (and, at levels 6–9, its run-boundary
 candidates) find, so rows that repeat the row above, as in rasters of uniform blocks such as land
 cover maps, classifications and masks, are coded as copies of whole rows.
+
+### Overviews that keep the valid area
+
+GDAL's `average` makes an overview pixel valid when any of its source pixels is, so the valid
+area of a thin or ragged raster (a flood-depth grid, a river or burn mask) grows at every level,
+and more at each coarser one. `nearest` keeps it on average, but drops or adds isolated pixels
+along the margin. terrio's `OVERVIEW_RESAMPLING=AREA_MATCHED` (`overview_resampling`
+`area_matched`), for GeoTIFF overviews at factors and COG overviews, keeps the area instead:
+
+- Each level has GDAL's size, and each of its cells covers the source pixels whose centres fall in
+  its footprint. A level keeps as many valid cells as cover the valid full-resolution area,
+  rounded to the nearest cell: those covering the most valid pixels, ties going to the cells with
+  the most kept neighbours, then to a deterministic hash of the cell. This favours connectivity
+  without guaranteeing a connected margin, and two writes give the same file. A level is refused
+  if too few footprints contain valid pixels to meet the rounded target without inventing values.
+- A kept cell holds the mean of its valid pixels (rounded half to even for integer types), and
+  others hold nodata. Means accumulate in `f64`, following the ported NumPy algorithm; Int64
+  and UInt64 means can lose low bits, for example a constant `2^60 + 1` becomes `2^60`.
+  `AREA_MATCHED_MODE` holds the most frequent class instead (of the cells of the level below,
+  the lowest on ties), retaining native integer class values for categorical rasters.
+  A kept cell with an undefined mean, such as opposite infinities, is refused rather than
+  stored as NaN while counted as valid.
+- The raster needs one shared nodata value across all bands (NaN is never valid). Distinct
+  per-band declarations, per-dataset masks, alpha bands and complex bands are refused. A COG
+  with these overviews is written whole, not a strip at a time.
+- Each overview declares nodata, including Int64 and UInt64 levels, so readers mask cells
+  excluded from the reported valid area.
+- Each band's metadata records what its levels keep, as default-domain items that GDAL's COG and
+  GTiff drivers copy with the band: `OVERVIEW_AREA_RATIOS`, the nominal area each level keeps
+  over the valid full-resolution area (comma-separated, `1` when it is kept exactly), and
+  `OVERVIEW_BASE_VALID_PIXELS`. A COG records the method as GDAL's COG driver records one,
+  `IMAGE_STRUCTURE`'s `OVERVIEW_RESAMPLING=AREA_MATCHED`.
+  Nominal area is the kept-cell count times the uniform overview-grid cell area (base pixel
+  count divided by overview cell count), rather than the sum of selected source-footprint
+  weights, which can differ on odd-sized grids.
+
+```sh
+terrio convert depth.tif depth_cog.tif -f COG --co COMPRESS=DEFLATE --co OVERVIEW_RESAMPLING=AREA_MATCHED
+terrio info depth_cog.tif
+```
+
+The overview pixels differ from those of every GDAL method by design; the full-resolution image is
+written as with any other method.
 
 JPEG 2000 is decoded and encoded with the Rust port of OpenJPEG, the codec of GDAL's JP2OpenJPEG
 driver, so pixels are GDAL's (Sentinel-2 L1C and L2A bands included). Georeferencing comes from
@@ -353,13 +453,38 @@ spectral and run-length packings, GRIB1 complex packing; NDFD's and MOS's own pr
 Opened lazily (`terrio.rio.open`, `open_raster(..., lazy=True)`), only the bands read are decoded,
 as GDAL decodes them. Remote files are read by range, message by message as GDAL reads them, with
 no `.idx` or `.index` sidecar: at open one 16 KiB block per message for its section headers, then a
-band's message when the band is read; a server that ignores range requests is refused.
+band's message when the band is read; a server that ignores range requests is refused. In a
+message of several fields, each field after the first costs one more request of a few hundred
+bytes: its sections come after the data of the field before it, which the open skips. Reading the
+bands of such a message one at a time fetches the message for each; a read of several bands
+fetches it once for the bands it decodes at once. A GRIB1 message whose nodata depends on its
+values is read whole at open, and dropped once its nodata is known: reading its band fetches it
+again.
+Regular, nonempty local files are read by position in the same way, without holding the file in memory: at open the
+section headers of each message (the whole message for a GRIB1 field whose nodata depends on its
+values, one such message at a time; not the data of the fields of a GRIB2 message, which comes
+before the next field's headers), then a band's message when the band is read. The open holds
+one message's header at a time, and nothing it read is kept once the
+file is open. Non-regular paths, such as FIFOs, and paths reporting zero size fall back to reading
+the whole input into memory. The dataset keeps the file open until it is closed, as a lazy GeoTIFF reader does. A
+read of several bands holds the messages of the bands it decodes at once: as many bands as hold in
+256 MiB, counting their decoded Float64 values and those messages (at least one). The bands read are
+kept in the process-wide [decoded block cache](remote-data.md#decoded-block-cache)
+(`TERRIO_CACHEMAX`), with the decoded chunks of other files: a band is decoded anew when a read
+needs rows of it that the cache no longer holds, because the bands one read asks for are larger than
+the cache, or because other reads have since taken their place. A local file changed in place after
+it is opened is not snapshotted (see the [decoded block cache](remote-data.md#decoded-block-cache)):
+a read may combine bands decoded before the change with bands decoded from the new bytes, or fail,
+so close its readers before changing it in place and open them again afterwards.
 
 Terrio's GRIB driver limits each field to 16,777,216 points by default, including constant and
 compressed fields. This is 128 MiB of decoded Float64 values; decoder buffers and multi-band reads
 use additional memory. To allow larger fields, set the environment variable `TERRIO_GRIB_MAX_POINTS`
-to a larger positive integer. The limit is checked on the raster's grid (the first field's) when
-a file is opened, and on each field before it is decoded, for local, remote and in-memory files.
+to a larger positive integer. The limit bounds what a decode allocates: it is checked on the
+raster's grid (the first field's) when a file is opened, and on each field before it is decoded, for
+local, remote and in-memory files. The variable is read from the process environment each time, and
+a band in the block cache is checked again before a read takes it from there: a band decoded before
+the limit was lowered, by any reader of the file, is refused as its decode would be.
 A resource-limit or allocation refusal is not retried with GDAL, including when `open` detects a file by its content.
 
 GRIB2 is written as GDAL's GRIB driver writes it (`terrio.rio.open(path, "w", driver="GRIB")`,

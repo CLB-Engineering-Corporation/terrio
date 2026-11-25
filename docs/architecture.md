@@ -6,7 +6,7 @@ crates/terrio        the library
   formats.rs         the driver registry, with GDAL's short names
   drivers/           terrio's own raster drivers; drivers/vector/ its vector drivers
   geotiff.rs, cog.rs GeoTIFF tags and decoding, lazy window and overview reads
-  block_cache.rs     process-wide LRU cache of decoded GeoTIFF tiles and strips
+  block_cache.rs     process-wide LRU cache of decoded GeoTIFF tiles and strips and GRIB bands
   resampled_read.rs  overview-aware resampled window reads (GDAL RasterIO semantics)
   catalog.rs         GTI-compatible indexed raster catalogs with bounded source caching
   stac.rs, stacta.rs STAC items, API searches, STACIT mosaics and STACTA tiled assets
@@ -86,27 +86,28 @@ times as long to write them on one thread, 0.61 to 1.16 times on eight (docs/tes
 "Zstandard: pure Rust against the C library"), and the C library is opt-in (`libzstd-geotiff`).
 Three choices keep the drivers pure Rust:
 
-- Zstandard is decoded and written with `ruzstd`: GeoTIFF/COG, Zarr, EPT and GeoParquet's
-  pages. terrio uses
-  `zstd-rust`, CLB's fork of `ruzstd` with the `Default`, `Better` and `Best` levels, a decoder of
-  whole frames and the row match finder of the reference implementation, from git
-  (gpt-cmdr/zstd-rs; not on crates.io) under the `ruzstd` name. zstd's levels map to its four:
-  2 and below `Fastest`, 0 and 3 to 5 `Default`, 6 to 9 `Better`, 10 and up `Best`. Its output
-  decodes to the same bytes as the zstd C library's and each reads the other's. The opt-in
-  `libzstd-geotiff`, `libzstd-ept` and `libzstd-geoparquet` features (or `libzstd`, all three) use the C library
-  natively for EPT and GeoParquet too.
-- HTTPS uses `rustls` with `ring` on every architecture (CLB fork). `ring` is C and assembly, so
-  the `remote` feature needs a C compiler; it detects the CPU's features at run time and runs on
-  any CPU. Upstream uses `rustls-graviola` on x86-64 and AArch64, which panics on CPUs without
-  AVX2, ADX or BMI2; see `docs/CONSOLIDATION-2026-11.md`. `remote` is a default feature but not
-  part of `drivers`, so a build with `default-features = false, features = ["drivers"]` still
-  needs no C compiler, and has no remote inputs.
+- Zstandard is decoded and written with `zrip`, GeoParquet's pages included. The opt-in
+  `libzstd-geotiff`, `libzstd-ept` and `libzstd-geoparquet` features (or `libzstd`, all three; CLB
+  fork) use the zstd C library natively instead, which writes levels above 4: `zrip` writes levels
+  up to 4, and level 4 for higher ones.
+- HTTPS uses `rustls` with `rustls-graviola`, whose cryptography is Rust and assembly and needs no
+  C compiler. It requires `aes`, `pclmulqdq`, `ssse3`, `avx`, `avx2`, `adx`, `bmi1` and `bmi2` on
+  x86-64 (most CPUs since about 2014), and `aes`, `sha2`, `pmull` and `neon` on AArch64. terrio
+  checks them once per process, before the first HTTPS request: on a CPU without them (an Intel
+  before Haswell or Broadwell, an AMD before Zen, many Atom, Celeron and Pentium parts, or a
+  virtual machine that hides the flags), HTTPS requests fail with an error naming the missing
+  features, where graviola itself would panic, and plain HTTP works. The opt-in `ring-fallback`
+  feature uses `ring` on those CPUs instead, at the cost of a C compiler; the CLB fork's
+  `terrio` command and Python wheels turn it on, so HTTPS works there on every CPU. Other
+  architectures, for which no release is built, use `ring`, which needs a C compiler. `remote`
+  is a default feature but not part of `drivers` (CLB fork), so a build with
+  `default-features = false, features = ["drivers"]` has no remote inputs.
 - GeoParquet is written with Snappy or Zstandard. The `parquet` crate's Zstandard is the C
-  library, so terrio has the crate write ZSTD pages uncompressed and compresses each page itself
-  (`drivers/vector/geoparquet_zstd.rs`): the pages, encodings, dictionaries, statistics and page
-  index are the crate's, and only the compressed bytes differ from the crate's own codec. The
-  opt-in `parquet-zstd` feature uses the crate's codec (the C library) instead. Reading also takes
-  gzip, LZ4 and Brotli.
+  library, so terrio (CLB fork) has the crate write ZSTD pages uncompressed and compresses each
+  page itself (`drivers/vector/geoparquet_zstd.rs`): the pages, encodings, dictionaries,
+  statistics and page index are the crate's, and only the compressed bytes differ from the
+  crate's own codec. The opt-in `parquet-zstd` feature uses the crate's codec (the C library)
+  instead. Reading also takes gzip, LZ4 and Brotli.
 
 JPEG 2000 uses a Rust port of OpenJPEG, in WebAssembly too: terrio supplies the C allocator calls
 the port makes. JPEG is decoded by terrio's own decoder, which reproduces libjpeg's arithmetic;

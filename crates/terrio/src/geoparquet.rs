@@ -124,7 +124,7 @@ impl ParquetCompression {
             Self::Uncompressed => (Compression::UNCOMPRESSED, None),
             Self::Snappy => (Compression::SNAPPY, None),
             // By default the crate writes the pages uncompressed and terrio compresses each one:
-            // pure Rust (`ruzstd`), or the zstd C library with `libzstd-geoparquet`. Pages,
+            // pure Rust (`zrip`), or the zstd C library with `libzstd-geoparquet`. Pages,
             // encodings, dictionaries and statistics are the crate's either way.
             Self::Zstd(level) if terrio_zstd => {
                 ZstdLevel::try_new(level).map_err(arg)?;

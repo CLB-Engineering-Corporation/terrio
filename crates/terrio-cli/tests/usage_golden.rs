@@ -8,15 +8,15 @@ use std::collections::BTreeMap;
 use std::process::{Command, Stdio};
 
 /// Expected schema version of the CLI catalog.
-const EXPECTED_SCHEMA_VERSION: &str = "0.1.12";
+const EXPECTED_SCHEMA_VERSION: &str = "0.1.14";
 
 /// Digest of the canonical catalog for the current `schema_version`.
 ///
 /// CLB fork: the fork's commands have options upstream's do not (`sample --lazy`,
 /// `calc --max-memory`, `dem shaded-relief` among them), so this is the digest of the fork's
 /// catalog at upstream's schema version, which is left as upstream numbers it. Upstream's digest
-/// for 0.1.12 at 80c9e7a is 06f08ba491340183e24f3d5d39390aa36fe0b646ffe9cf6ad67c130666057e1d.
-const CATALOG_SHA256: &str = "b52b62320cf574e53d944c9627e3eb655be737127b14a5b6ae6b3a32734c64d9";
+/// for 0.1.14 at ef45a4c is f52d92dcb763278c4ab24935bc8d5ee6e1e46a79cb59fb44c1ad47d340220d78.
+const CATALOG_SHA256: &str = "2b5f25e33e83cdc8ac5c5f9cd8cb1ed6a5a98e768588352bfd5544bb2799a061";
 
 /// Rebuilds every object with its keys sorted, so the digest does not depend on whether
 /// `serde_json`'s `preserve_order` feature is enabled by the crates built alongside this one.

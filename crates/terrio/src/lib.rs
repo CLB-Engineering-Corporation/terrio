@@ -198,8 +198,11 @@
 //! [`formats::VectorDriver`], listed as neither read nor written: opening or writing their files
 //! fails with [`Error::Unsupported`] ("built without the `zarr` feature").
 //!
-//! - `libzstd` (off by default): Zstandard through the zstd C library natively, for faster decoding
-//!   and higher compression levels than the default pure-Rust `ruzstd`.
+//! - `libzstd` (off by default): Zstandard through the zstd C library natively, for compression
+//!   levels above 4, which the default pure-Rust `zrip` writes at level 4.
+//! - `ring-fallback` (off by default): HTTPS with `ring`, which needs a C compiler, on x86-64 and
+//!   AArch64 CPUs without the features `rustls-graviola` needs (AVX2, ADX and BMI2 among them on
+//!   x86-64). Without it, HTTPS on such a CPU fails with an error naming the missing features.
 //! - `gdal` (off by default): the optional GDAL backend (`gdal_backend`), which opens the formats
 //!   terrio has no driver for through GDAL, and writes rasters with GDAL's drivers. It is the only
 //!   C dependency, opt-in: GDAL must be installed.
@@ -304,6 +307,7 @@ mod resampled_read;
 pub mod s3;
 pub mod sparse;
 mod tiff_codecs;
+mod tiff_strip_rows;
 pub mod tiles;
 pub mod vector;
 mod zstandard;
@@ -362,7 +366,7 @@ pub use float_read::FloatReadOptions;
 #[cfg(feature = "ndarray")]
 #[cfg_attr(docsrs, doc(cfg(feature = "ndarray")))]
 pub use ndarray;
-pub use resampled_read::ResampledReadOptions;
+pub use resampled_read::{ResampledReadOptions, WindowSampling};
 // Raster pixels as `ndarray` arrays, without copying them.
 #[cfg(feature = "ndarray")]
 #[cfg_attr(docsrs, doc(cfg(feature = "ndarray")))]

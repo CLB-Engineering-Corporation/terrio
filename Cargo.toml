@@ -1,9 +1,9 @@
 [workspace]
 resolver = "3"
-members = ["crates/*", "python", "js", "js/fetch", "js/zarr", "js/cog"]
+members = ["crates/*", "python", "js", "js/fetch", "js/zarr", "js/cog", "js/geoparquet"]
 
 [workspace.package]
-version = "0.9.0"
+version = "0.10.0"
 edition = "2024"
 license = "MIT"
 rust-version = "1.90"
@@ -14,11 +14,11 @@ authors = ["Qiusheng Wu <giswqs@gmail.com>"]
 [workspace.dependencies]
 # Memory-mapped reads of SQLite files (GeoPackage, MBTiles), native builds only.
 memmap2 = "0.9"
-# Every driver, without remote inputs (whose HTTPS is `ring`): the members that link them say so
-# (`remote`, a default feature of terrio, terrio-cli and the Python package), so
-# `--no-default-features` builds them without C. The zstd C library is opt-in (`libzstd-*`, `parquet-zstd`).
-terrio = { path = "crates/terrio", version = "0.9.0", default-features = false, features = ["drivers"] }
-terrio-crs = { path = "crates/terrio-crs", version = "0.2.4", default-features = false }
+# Every driver, without remote inputs: the members that link them say so (`remote`, a default
+# feature of terrio, terrio-cli and the Python package), so `--no-default-features` builds them
+# without C. The zstd C library is opt-in (`libzstd-*`, `parquet-zstd`).
+terrio = { path = "crates/terrio", version = "0.10.0", default-features = false, features = ["drivers"] }
+terrio-crs = { path = "crates/terrio-crs", version = "0.3.0", default-features = false }
 # For the Python package (not published to crates.io), so without a version to keep in step.
 terrio-cli = { path = "crates/terrio-cli", default-features = false }
 
@@ -63,7 +63,7 @@ quick-xml = "0.42"
 # GDAL's iconv recoding applied on top (drivers/vector/shapefile_cjk.rs).
 encoding_rs = "0.8.35"
 # Its Zstandard (zstd 0.13, a C library) is enabled by terrio-crs's `libzstd` feature only, for
-# terrio-crs built on its own: terrio decodes GeoTIFF Zstandard itself (zstd 0.14 or `ruzstd`).
+# terrio-crs built on its own: terrio decodes GeoTIFF Zstandard itself (zstd 0.14 or `zrip`).
 tiff = { version = "0.11", features = ["webp"] }
 half = "2"
 flate2 = "1"
@@ -71,13 +71,7 @@ fdeflate = "0.3"
 weezl = "0.2"
 png = "0.18"
 lz4_flex = { version = "0.14", default-features = false, features = ["alloc", "safe-decode", "checked-decode"] }
-# Pure-Rust Zstandard: `zstd-rust`, CLB's fork of `ruzstd` with the Default, Better and Best
-# levels, a decoder of whole frames and the matchers of the reference implementation (0.9 to 1.4
-# times the C library's time to decode, 1.2 to 1.7 times to compress, by platform: docs/testing.md),
-# under the `ruzstd` name so the code
-# keeps its `ruzstd::` paths. From git (gpt-cmdr/zstd-rs `main`); it is
-# not on crates.io.
-ruzstd = { package = "zstd-rust", git = "https://github.com/gpt-cmdr/zstd-rs", rev = "de91207843185acceda9f94b1623af8860c347e3" }
+zrip = { version = "0.8.25", default-features = false, features = ["std", "simd"] }
 # 0.10 reads HDF5 files written in the earliest format with version 1/2 compound datatypes
 # (every HEC-RAS geometry and plan file, among others) and old fill value messages
 # (roteiro-gis/netcdf-rust#95). Keep netcdf-reader and the direct hdf5-reader on compatible
@@ -89,8 +83,10 @@ hdf5-reader = { version = "0.13.0", default-features = false }
 # HEC-RAS geometry and plan HDF files (the `hecras` feature): the read-only engine behind
 # ras-commander. It owns every HEC-RAS rule, layer name and field name (its Arrow layer catalog);
 # terrio's driver only translates its values. 0.3.0 was the first release with the Arrow layer API;
-# 0.5.0's `arrow` feature pins Arrow `=59.0.0`, which is why the workspace is on Arrow 59 (CLB fork).
-ras-commander-fast-hdf = { version = "0.5.0", default-features = false, features = ["hdf", "mesh", "results"] }
+# 0.5.1's `arrow` feature takes Arrow 58 to 60; the CLB fork stays on Arrow 59, the Arrow of the
+# fast-hdf exporters FIM-commander uses, so their record batches pass to `terrio::geoparquet` as
+# they are (upstream is on 58).
+ras-commander-fast-hdf = { version = "0.5.1", default-features = false, features = ["hdf", "mesh", "results"] }
 # The portable decoder: the same pixels on every platform, closer to libjpeg's than its SIMD paths.
 jpeg-decoder = { version = "0.3", default-features = false, features = ["platform_independent"] }
 # GeoPackage JPEG tiles; the version wbraster already uses.
@@ -127,11 +123,12 @@ libc = "0.2"
 # Deflate through flate2 and zlib-rs only: `deflate` adds zopfli, which zip uses only for
 # compression levels above 9, and terrio never sets a level.
 zip = { version = "9.1", default-features = false, features = ["deflate-flate2-zlib-rs"] }
-# HTTPS with `rustls` and `ring` (C and assembly) in every native build (CLB fork; see
-# docs/CONSOLIDATION-2026-11.md, "Upstream migration: C dependencies"). Upstream supplies
-# `rustls-graviola` on x86-64 and AArch64, which panics on CPUs without AVX2, ADX or BMI2.
-ureq = { version = "3", default-features = false, features = ["gzip", "rustls", "rustls-webpki-roots"] }
-rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }
+# No TLS provider of its own: terrio supplies `rustls-graviola`, which needs no C compiler, and
+# `ring` with its `ring-fallback` feature on CPUs graviola cannot run on (the CLB fork's terrio-cli
+# and Python package turn it on).
+ureq = { version = "3", default-features = false, features = ["gzip", "rustls-no-provider", "rustls-webpki-roots"] }
+rustls-graviola = "0.4"
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12"] }
 # Test-only original DER snapshot for constrained-anchor regressions; update with webpki-roots.
 webpki-root-certs = "=1.0.12"
 webpki-roots = "1"
@@ -208,7 +205,11 @@ jxl-render = { opt-level = 3 }
 jxl-frame = { opt-level = 3 }
 jxl-coding = { opt-level = 3 }
 jxl-grid = { opt-level = 3 }
-zstd-rust = { opt-level = 3 }
+zrip = { opt-level = 3 }
+zrip-core = { opt-level = 3 }
+zrip-decode = { opt-level = 3 }
+zrip-encode = { opt-level = 3 }
+fearless_simd = { opt-level = 3 }
 lerc-core = { opt-level = 3 }
 lerc-reader = { opt-level = 3 }
 lerc-writer = { opt-level = 3 }

@@ -85,7 +85,6 @@ mod iau;
 mod keywords;
 mod math;
 mod methods;
-#[cfg(test)]
 mod model;
 mod params;
 mod parsed;
@@ -333,6 +332,27 @@ fn epsg_reference(s: &str) -> Option<u32> {
     }
     #[cfg(not(feature = "wbprojection-fallback"))]
     code
+}
+
+/// The EPSG code a CRS reference names, read from its text alone, without the CRS registry or
+/// the projection engine: `EPSG:<code>` (or `EPSG::<code>`), a bare code, the OGC URN and URL
+/// forms (`urn:ogc:def:crs:EPSG::<code>`, `http://www.opengis.net/def/crs/EPSG/0/<code>`), and
+/// 4326 for WGS 84's longitude/latitude aliases (`OGC:CRS84`, `CRS84`, `WGS84`, their URN and
+/// URL forms). `None` for anything else (WKT, PROJ strings, compound or other authorities'
+/// references) and for code 0. The code is not checked against the EPSG registry.
+pub fn epsg_reference_code(s: &str) -> Option<u32> {
+    // The text up to its first NUL, as `SpatialRef::parse` reads a definition.
+    let s = until_nul(s);
+    if is_wgs84_alias(&s.trim().to_ascii_uppercase()) {
+        return Some(4326);
+    }
+    canonical_epsg_reference(s).filter(|&code| code != 0)
+}
+
+/// Whether an upper-cased definition names WGS 84's longitude/latitude CRS (EPSG:4326) by an
+/// alias: `WGS84`, `OGC:CRS84`, `CRS84`, or their URN and URL forms.
+fn is_wgs84_alias(upper: &str) -> bool {
+    matches!(upper, "WGS84" | "WGS 84" | "OGC:CRS84" | "CRS84" | "URN:OGC:DEF:CRS:OGC:1.3:CRS84") || upper.ends_with("/OGC/1.3/CRS84")
 }
 
 /// Canonical authority forms are independent of the optional projection engine.
@@ -696,9 +716,7 @@ impl SpatialRef {
             return Err(Error::Crs("empty definition".into()));
         }
         let upper = s.to_ascii_uppercase();
-        if matches!(upper.as_str(), "WGS84" | "WGS 84" | "OGC:CRS84" | "CRS84" | "URN:OGC:DEF:CRS:OGC:1.3:CRS84")
-            || upper.ends_with("/OGC/1.3/CRS84")
-        {
+        if is_wgs84_alias(&upper) {
             return Self::from_epsg(4326);
         }
         if s.starts_with('+') {
@@ -1463,7 +1481,7 @@ pub fn wkt_proj(wkt: &str) -> Option<String> {
         return Some(p);
     }
     let root = crate::parsed::tree(wkt)?;
-    let c = if wkt2::handles(&root) { wkt2::to_proj(&root).ok()? } else { wkt1::to_proj(&root)? };
+    let c = if wkt2::handles(&root) { model::wkt2_to_proj(wkt).ok()? } else { model::wkt1_to_proj(wkt)? };
     Some(c.proj)
 }
 
@@ -1702,24 +1720,8 @@ pub fn identify_epsg(wkt: &str) -> Option<u32> {
         return None;
     }
     let own = Def::wkt_conversion(wkt);
-    // The same conversion on the same ellipsoid.
-    let same = |own: &Def, code: u32| {
-        let registered = SpatialRef { epsg: Some(code), ..Default::default() };
-        Def::new(&registered).is_ok_and(|d| same_content(own, &d))
-    };
-    // Among CRSs that match, the one named as the WKT's CRS (`RGF93 v2 (lon-lat)`, ESRI's `GCS_`
-    // prefix aside), else a current one over a deprecated one (as PROJ ranks them), else the base
-    // datum over its later realizations (`NAD83`, which EPSG lists as an alias of NAD83(HARN) too)
-    // unless the WKT names one, else the lowest code.
-    let key = |n: &str| epsg::datum_key(n.strip_prefix("GCS_").unwrap_or(n));
-    let name = wkt_name(wkt).map(|n| key(&n));
-    let named = |c: u32| epsg::get(c).is_some_and(|e| Some(key(&e.name)) == name);
-    let upper = wkt.to_ascii_uppercase();
-    let wkt_names_realization = REALIZATIONS.iter().any(|r| upper.contains(r));
-    let realization = |code: u32| {
-        let name = registry_name(code).map(|name| name.to_ascii_uppercase()).unwrap_or_default();
-        !wkt_names_realization && REALIZATIONS.iter().any(|r| name.contains(r))
-    };
+    let rank = Ranking::new(wkt_name(wkt).as_deref(), wkt);
+    let (same, named, realization) = (same_registered, |c| rank.named(c), |c| rank.realization(c));
     // A CRS of the table on these datums with the WKT's conversion, as GDAL finds it.
     let search = |datums: &[u32]| {
         let own = own.as_ref()?;
@@ -1744,7 +1746,7 @@ pub fn identify_epsg(wkt: &str) -> Option<u32> {
                 .min_by_key(|c| (!named(*c), *c));
         }
         if own.is_geographic() {
-            return geogs.filter(|c| same(own, *c)).min_by_key(|c| (!named(*c), epsg::is_deprecated(*c), realization(*c), *c));
+            return rank.geographic(geogs, own);
         }
         let method = conversion_method(wkt)?;
         let found = geogs.flat_map(epsg::projected_on).filter(|(c, m)| same_method(m, &method) && same(own, *c)).map(|(c, _)| *c);
@@ -1810,6 +1812,65 @@ pub fn identify_epsg(wkt: &str) -> Option<u32> {
     }
     #[cfg(not(feature = "wbprojection-fallback"))]
     None
+}
+
+/// Whether a registry CRS has a definition's conversion on its ellipsoid.
+fn same_registered(own: &Def, code: u32) -> bool {
+    let registered = SpatialRef { epsg: Some(code), ..Default::default() };
+    Def::new(&registered).is_ok_and(|d| same_content(own, &d))
+}
+
+/// How [`identify_epsg`] ranks the CRSs that match a WKT: the one named as the WKT's CRS
+/// (`RGF93 v2 (lon-lat)`, ESRI's `GCS_` prefix aside), else a current one over a deprecated one
+/// (as PROJ ranks them), else the base datum over its later realizations (`NAD83`, which EPSG
+/// lists as an alias of NAD83(HARN) too) unless the WKT names one, else the lowest code.
+struct Ranking {
+    name: Option<String>,
+    names_realization: bool,
+}
+
+impl Ranking {
+    /// For a CRS of this name, whose WKT (or names) is `text`.
+    fn new(name: Option<&str>, text: &str) -> Self {
+        let upper = text.to_ascii_uppercase();
+        Self { name: name.map(Self::key), names_realization: REALIZATIONS.iter().any(|r| upper.contains(r)) }
+    }
+
+    fn key(n: &str) -> String {
+        epsg::datum_key(n.strip_prefix("GCS_").unwrap_or(n))
+    }
+
+    fn named(&self, code: u32) -> bool {
+        epsg::get(code).is_some_and(|e| Some(Self::key(&e.name)) == self.name)
+    }
+
+    fn realization(&self, code: u32) -> bool {
+        let name = registry_name(code).map(|name| name.to_ascii_uppercase()).unwrap_or_default();
+        !self.names_realization && REALIZATIONS.iter().any(|r| name.contains(r))
+    }
+
+    /// The first of these geographic CRSs with `own`'s content.
+    fn geographic(&self, geogs: impl Iterator<Item = u32>, own: &Def) -> Option<u32> {
+        geogs.filter(|c| same_registered(own, *c)).min_by_key(|c| (!self.named(*c), epsg::is_deprecated(*c), self.realization(*c), *c))
+    }
+}
+
+/// The EPSG geographic CRS of a WKT 2 geodetic CRS's datum without a code, by the datum's name
+/// (else those whose CRSs ESRI writes with its name), on the CRS's ellipsoid and prime meridian,
+/// whatever its CS: as [`identify_epsg`] identifies a geographic CRS in degrees of that datum, the
+/// CRS's name ranking those that match.
+pub(crate) fn identify_datum(datum: &wkt2::DatumOf) -> Option<u32> {
+    let datums = epsg::datums_named(&datum.datum_name);
+    if datums.is_empty() {
+        return None;
+    }
+    let own = Def::from_proj(&datum.proj()).ok()?;
+    let rank = Ranking::new(
+        Some(without_code(&datum.crs_name)),
+        &[&datum.crs_name, &datum.datum_name, &datum.ellipsoid_name].map(|s| s.as_str()).join(" "),
+    );
+    let on = |datums: &[u32]| rank.geographic(datums.iter().flat_map(|d| epsg::geographic_on(*d)).copied(), &own);
+    on(&datums).or_else(|| on(epsg::datums_written_as(&datum.datum_name)))
 }
 
 /// A registry CRS's WKT 1, with its PROJ string as an extension when it is on the authalic sphere
@@ -1916,7 +1977,7 @@ pub(crate) fn strip_root_code(wkt: &str) -> Option<String> {
 /// The projection method (`+proj=tmerc`) of a WKT definition's conversion.
 fn conversion_method(wkt: &str) -> Option<String> {
     let root = crate::parsed::tree(wkt)?;
-    let c = if wkt2::handles(&root) { wkt2::to_proj(&root).ok()? } else { wkt1::to_proj(&root)? };
+    let c = if wkt2::handles(&root) { model::wkt2_to_proj(wkt).ok()? } else { model::wkt1_to_proj(wkt)? };
     c.proj.split_whitespace().next().map(str::to_string)
 }
 
@@ -2109,13 +2170,16 @@ fn looks_like_wkt(s: &str) -> bool {
 fn wkt_name(wkt: &str) -> Option<String> {
     let start = wkt.find('"')? + 1;
     let end = start + wkt[start..].find('"')?;
-    let name = &wkt[start..end];
-    // Generated definitions append the code: `WGS 84 / UTM zone 33N (EPSG:32633)`.
-    let name = match name.rfind(" (EPSG:") {
+    Some(without_code(&wkt[start..end]).to_string())
+}
+
+/// A CRS's name without the code generated definitions append (`WGS 84 / UTM zone 33N
+/// (EPSG:32633)`).
+fn without_code(name: &str) -> &str {
+    match name.rfind(" (EPSG:") {
         Some(i) if name.ends_with(')') => &name[..i],
         _ => name,
-    };
-    Some(name.to_string())
+    }
 }
 
 /// Options of a [`Transformer`].
@@ -2203,6 +2267,8 @@ pub struct Transformer {
     dst_geoid_grids: std::sync::OnceLock<Vec<std::sync::Arc<datum::Op>>>,
     emitted_diagnostics: std::sync::atomic::AtomicU8,
     diagnostics: std::sync::atomic::AtomicU8,
+    /// Why a `BOUNDCRS`'s transformation is not applied, of the source or target CRS: a warning.
+    unapplied: Vec<String>,
     warning_handler: fn(String),
     /// The time of time-dependent transformations, as GDAL sets it from the coordinate epochs.
     time: Option<f64>,
@@ -2229,6 +2295,9 @@ pub struct Transformer {
     src_horizontal: Def,
     /// Whether the vertical CRSs share their datum (heights only change unit).
     same_vertical_datum: bool,
+    /// Whether heights go through PROJ's ballpark vertical transformation, which makes the
+    /// horizontal transformations of unknown accuracy ([`route::Route::with_ballpark_heights`]).
+    ballpark_heights: bool,
 }
 
 impl Drop for Transformer {
@@ -2402,6 +2471,14 @@ impl Heights {
     }
 }
 
+/// Whether a geoid model's operation transforms heights: one with steps, or a registered one
+/// without (Saba to Saba height (1), of accuracy 0.2 m, whose heights are Saba's ellipsoidal
+/// heights), not the operation without steps or accuracy the table lists when the models' grids
+/// are missing, which stands for PROJ's ballpark vertical transformation.
+fn is_geoid_model(op: &datum::Op) -> bool {
+    !op.steps.is_empty() || op.accuracy >= 0.0
+}
+
 /// Picks and runs a geoid model for a point (degrees for the areas), `reverse` from heights to
 /// ellipsoidal heights. With the point, whether the operation that ran was a geoid model, rather
 /// than the operation without steps used when the model's grid is missing (which keeps heights
@@ -2414,7 +2491,7 @@ fn run_model(ops: &[std::sync::Arc<datum::Op>], p: datum::Point, reverse: bool) 
         |op, _| op.contains(lon, lat),
         |i| {
             datum::run_op(&ops[i], p, reverse, true).inspect(|_| {
-                applied.set(!ops[i].steps.is_empty());
+                applied.set(is_geoid_model(&ops[i]));
                 route::note(Some(&ops[i]), reverse, route::OpKind::Vertical);
             })
         },
@@ -2487,17 +2564,37 @@ impl Transformer {
     pub fn with_options(src: &SpatialRef, dst: &SpatialRef, opts: &TransformOptions) -> Result<Self> {
         let (mut s, mut d) = (Def::new(src)?, Def::new(dst)?);
         s.compatible_body(&d)?;
+        // Why a `BOUNDCRS`'s transformation is not applied, for the warning (#1012 item 12).
+        let unapplied: Vec<String> = [s.unapplied(), d.unapplied()].into_iter().flatten().map(str::to_string).collect();
         if opts.promote_to_3d {
             s.promote_to_3d();
             d.promote_to_3d();
         }
         let cartesian_src = s.is_geocentric().then(|| s.clone());
         let cartesian_dst = d.is_geocentric().then(|| d.clone());
+        let (src_3d, dst_3d, src_heights, dst_heights) = (s.geodetic_3d(), d.geodetic_3d(), s.has_height(), d.has_height());
         if cartesian_src.is_some() {
             s = s.geographic_endpoint();
         }
         if cartesian_dst.is_some() {
             d = d.geographic_endpoint();
+        }
+        // PROJ's transformations for each side, which may differ by direction (#1012 item 70).
+        s.facing(false, dst_heights);
+        d.facing(true, src_heights);
+        // From or into a CRS without heights (WGS 84 (2D)), PROJ keeps the height through the
+        // datum shift (#1012 item 8).
+        if src_3d && !dst_heights {
+            s.beside_2d(cartesian_src.is_some());
+        }
+        if dst_3d && !src_heights {
+            d.beside_2d(cartesian_dst.is_some());
+        }
+        if cartesian_src.is_some() && !dst_heights {
+            d.beside_geocentric();
+        }
+        if cartesian_dst.is_some() && !src_heights {
+            s.beside_geocentric();
         }
         let time = match (s.is_dynamic(), d.is_dynamic(), opts.source_coordinate_epoch, opts.target_coordinate_epoch) {
             (true, false, Some(e), _) => Some(e),
@@ -2505,7 +2602,34 @@ impl Transformer {
             (true, true, Some(e), Some(_)) => Some(e),
             _ => None,
         };
-        let mut route = route::Route::new(&s, &d);
+        let codes = (s.vertical().and_then(|v| v.code), d.vertical().and_then(|v| v.code));
+        let (vertical_ops, same_vertical_datum, vertical_codes) = match codes {
+            (Some(a), Some(b)) if a != b => {
+                let datum = |c: u32| epsg::vertical(c).map(|v| v.datum).filter(|d| *d != 0);
+                let same = datum(a).is_some() && datum(a) == datum(b);
+                let ops = if same { Vec::new() } else { epsg::vertical_transformations(a, b) };
+                (with_vertical_routes(ops, &s.horizontal(), false), same, (!same).then_some((a, b)))
+            }
+            _ => (Vec::new(), false, None),
+        };
+        // Heights through PROJ's ballpark vertical transformation, which makes every horizontal
+        // transformation chained with it of unknown accuracy (#1012 item 47): between heights of
+        // different references, with a vertical CRS on either side and none with a geoid model it
+        // can use (one side's model would run first), and no transformation between the vertical
+        // CRSs that can be used.
+        let has_heights = s.has_height() && d.has_height();
+        let modelled = |def: &Def| {
+            def.vertical()
+                .is_some_and(|v| !v.ballpark || v.models.iter().any(|(_, ops)| ops.iter().any(|o| o.available() && is_geoid_model(o))))
+        };
+        let ballpark_heights = has_heights
+            && !same_vertical_datum
+            && codes.0.is_none_or(|a| codes.1 != Some(a))
+            && (s.vertical().is_some() || d.vertical().is_some())
+            && !modelled(&s)
+            && !modelled(&d)
+            && !vertical_ops.iter().any(|(o, _)| o.available());
+        let mut route = if ballpark_heights { route::Route::with_ballpark_heights(&s, &d) } else { route::Route::new(&s, &d) };
         if opts.allow_ballpark == Some(false) && !route.disallow_ballpark() {
             return Err(Error::NoOperation("cannot find coordinate operations with ALLOW_BALLPARK=NO".into()));
         }
@@ -2518,23 +2642,13 @@ impl Transformer {
             }
             _ => None,
         };
-        let heights = ((s.has_height() && d.has_height()) || cartesian_src.is_some() || cartesian_dst.is_some()).then(|| {
+        let heights = has_heights.then(|| {
             Box::new(Heights {
                 src: Side::new(&s, true),
                 dst: Side::new(&d, false),
                 middle: std::sync::Mutex::new(std::collections::HashMap::new()),
             })
         });
-        let codes = (s.vertical().and_then(|v| v.code), d.vertical().and_then(|v| v.code));
-        let (vertical_ops, same_vertical_datum, vertical_codes) = match codes {
-            (Some(a), Some(b)) if a != b => {
-                let datum = |c: u32| epsg::vertical(c).map(|v| v.datum).filter(|d| *d != 0);
-                let same = datum(a).is_some() && datum(a) == datum(b);
-                let ops = if same { Vec::new() } else { epsg::vertical_transformations(a, b) };
-                (with_vertical_routes(ops, &s.horizontal(), false), same, (!same).then_some((a, b)))
-            }
-            _ => (Vec::new(), false, None),
-        };
         let src_horizontal = s.horizontal();
         let identity = src.same_as(dst) && motion.is_none();
         let wgs84_to_web_mercator = web_mercator_to_wgs84(dst, src);
@@ -2553,6 +2667,7 @@ impl Transformer {
             motion,
             vertical_ops,
             same_vertical_datum,
+            ballpark_heights,
             vertical_codes,
             all_vertical_ops: std::sync::OnceLock::new(),
             src_horizontal,
@@ -2566,7 +2681,8 @@ impl Transformer {
             src_geoid_grids: std::sync::OnceLock::new(),
             dst_geoid_grids: std::sync::OnceLock::new(),
             emitted_diagnostics: std::sync::atomic::AtomicU8::new(0),
-            diagnostics: std::sync::atomic::AtomicU8::new(0),
+            diagnostics: std::sync::atomic::AtomicU8::new(if unapplied.is_empty() { 0 } else { 16 }),
+            unapplied,
             warning_handler: warnings::warn,
         })
     }
@@ -2713,7 +2829,11 @@ impl Transformer {
 
     fn best_route(&self) -> &route::Route {
         self.best_route.get_or_init(|| {
-            let mut route = route::Route::all(&self.src, &self.dst);
+            let mut route = if self.ballpark_heights {
+                route::Route::all_with_ballpark_heights(&self.src, &self.dst)
+            } else {
+                route::Route::all(&self.src, &self.dst)
+            };
             if self.policy.allow_ballpark == Some(false) {
                 // The primary route was already validated by with_options; retain the
                 // same restriction when considering unavailable operations.
@@ -2742,6 +2862,11 @@ impl Transformer {
         ] {
             if flags & bit != 0 {
                 (self.warning_handler)(message.into());
+            }
+        }
+        if flags & 16 != 0 {
+            for message in &self.unapplied {
+                (self.warning_handler)(message.clone());
             }
         }
     }
@@ -2813,7 +2938,7 @@ impl Transformer {
             self.note_missing_grid(x, y, p);
             if self.policy.allow_ballpark == Some(false) { self.route.selected(&self.src, x, y, p).0 } else { None }
         };
-        if self.policy.allow_ballpark == Some(false) && selected.is_none_or(|op| op.ballpark) {
+        if self.policy.allow_ballpark == Some(false) && selected.is_none_or(|op| op.has_ballpark()) {
             return Err(Error::NoOperation("ALLOW_BALLPARK=NO: no non-ballpark coordinate operation for this point".into()));
         }
         Ok(selected)
@@ -2896,7 +3021,7 @@ impl Transformer {
             self.best_route().apply_selected(&self.src, x, y, p, false, selected)
         } else {
             self.route.apply_reporting(&self.src, x, y, p, false, &|op, outside| {
-                if self.policy.allow_ballpark == Some(false) && op.is_none_or(|op| op.ballpark) {
+                if self.policy.allow_ballpark == Some(false) && op.is_none_or(|op| op.has_ballpark()) {
                     refused_ballpark.set(true);
                 } else {
                     self.record_operation(op, outside);
@@ -2922,6 +3047,36 @@ impl Transformer {
     /// transformations; the time replaces the coordinate epoch of the options.
     pub fn transform_4d(&self, x: f64, y: f64, z: f64, t: f64) -> Result<(f64, f64, f64)> {
         self.transform_at(x, y, z, Some(t))
+    }
+
+    /// Whether PROJ 9.9.0's candidate operations between the two CRSs (`proj_create_operations`)
+    /// include a non-ballpark transformation whose area meets both CRSs' extents. No particular
+    /// point is selected. False when only PROJ's ballpark ("Ballpark geographic offset") links
+    /// their datums; true between CRSs of one datum, which need no transformation.
+    ///
+    /// Missing grids count when PROJ's grid catalog lists a direct-download URL, regardless of
+    /// whether networking is enabled. Locally available grids count too. The check covers the
+    /// horizontal datum, including geocentric, geographic 3D and compound CRSs; it does not
+    /// check vertical datum transformations or geoid models.
+    ///
+    /// ```
+    /// use terrio_crs::{SpatialRef, Transformer};
+    /// let wgs84 = SpatialRef::from_epsg(4326)?;
+    /// assert!(Transformer::new(&SpatialRef::from_epsg(4230)?, &wgs84)?.has_non_ballpark_operation());
+    /// let bessel = SpatialRef::parse("+proj=longlat +ellps=bessel")?;
+    /// assert!(!Transformer::new(&bessel, &wgs84)?.has_non_ballpark_operation());
+    /// # Ok::<(), terrio_crs::Error>(())
+    /// ```
+    pub fn has_non_ballpark_operation(&self) -> bool {
+        let route = route::Route::all(&self.src, &self.dst);
+        // Route::all restores registry operations with missing grids before comparing datums;
+        // the comparison is not necessarily between the original definitions' `ops` lists.
+        // CRSs terrio takes as of one datum without knowing it (defined by their ellipsoids):
+        // PROJ's null transformation on one ellipsoid, else its ballpark.
+        if route.same_datum() && (self.src.datum_code().is_none() || self.dst.datum_code().is_none()) {
+            return fits::same_ellipsoid(&self.src.ell, &self.dst.ell);
+        }
+        route.has_transformation()
     }
 
     /// The coordinate operation [`Transformer::transform_3d`] uses for a point: the
@@ -3106,6 +3261,30 @@ impl Transformer {
         let (lon, lat) = self.src.unproject(x, y).ok_or_else(fail)?;
         let _ = self.check_point_policy(x, y, datum::Point { lon, lat, h: z, t })?;
         let p0 = datum::Point { lon, lat, h: self.src.vertical().map_or(z, |v| v.to_metres(z)), t };
+        // Through PROJ's ballpark vertical transformation: the horizontal transformation PROJ
+        // picks among those of unknown accuracy, and the height kept.
+        if self.ballpark_heights {
+            for def in [&self.src, &self.dst] {
+                if let Some(v) = def.vertical() {
+                    self.check_vertical_policy(!v.models.is_empty())?;
+                }
+            }
+            self.note_missing_geoid(&self.src_geoid_grids, self.src.vertical(), p0);
+            route::note(None, false, route::OpKind::Vertical);
+            // The height runs through the horizontal transformation, which keeps it unless PROJ
+            // runs it between geographic 3D CRSs, in the vertical CRS's unit, where PROJ's
+            // pipeline converts it: to and from NAD27 / Texas North + NGVD29 height (ftUS)
+            // (EPSG:7407), its Helmert runs at the height in US survey feet (5 mm apart at 100 m).
+            let h = match (self.src.vertical(), self.dst.vertical()) {
+                (_, Some(v)) => v.height_of(p0.h),
+                _ => z,
+            };
+            let (tx, ty, h) = self.transform_2d(x, y, h, t)?;
+            if let Some((lon, lat)) = self.dst.unproject(tx, ty) {
+                self.note_missing_geoid(&self.dst_geoid_grids, self.dst.vertical(), datum::Point { lon, lat, h, t });
+            }
+            return Ok((tx, ty, if self.dst.vertical().is_some() { h } else { self.src.vertical().map_or(h, |v| v.to_metres(h)) }));
+        }
         // To ellipsoidal heights, on the source CRS or a geoid model's CRS.
         let (mut start, mut geoid) = (None, false);
         for (i, ops) in &h.src.models {
@@ -3333,7 +3512,7 @@ impl Transformer {
             let route = self.best_route();
             let (selected, _) = route.selected(&self.src, x, y, p);
             if selected.is_some_and(|op| !op.available())
-                || (self.policy.allow_ballpark == Some(false) && selected.is_none_or(|op| op.ballpark))
+                || (self.policy.allow_ballpark == Some(false) && selected.is_none_or(|op| op.has_ballpark()))
             {
                 return None;
             }
@@ -3341,7 +3520,7 @@ impl Transformer {
         } else {
             let refused_ballpark = std::cell::Cell::new(false);
             let q = self.route.apply_reporting(&self.src, x, y, p, false, &|op, _| {
-                if self.policy.allow_ballpark == Some(false) && op.is_none_or(|op| op.ballpark) {
+                if self.policy.allow_ballpark == Some(false) && op.is_none_or(|op| op.has_ballpark()) {
                     refused_ballpark.set(true);
                 }
             })?;
@@ -3353,6 +3532,30 @@ impl Transformer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Missing destination geoid warnings use the destination datum's coordinates.
+    /// GDAL 3.13.3 uses the same horizontal datum shift for this compound CRS.
+    #[test]
+    fn ballpark_height_warning_uses_destination_coordinates() {
+        grid::without_grids(|| {
+            let src = SpatialRef::from_epsg(4979).unwrap();
+            let dst = SpatialRef::from_epsg(7405).unwrap();
+            for covers_destination in [true, false] {
+                let t = Transformer::new(&src, &dst).unwrap();
+                assert!(t.ballpark_heights);
+                let (x, y, _) = t.transform_2d(-2.0, 54.0, 100.0, None).unwrap();
+                let (lon, lat) = t.dst.unproject(x, y).unwrap();
+                let destination = (lon.to_degrees(), lat.to_degrees());
+                assert!((destination.0 + 2.0).abs() > 1e-5);
+                let center = if covers_destination { destination } else { (-2.0, 54.0) };
+                let mut model = datum::Op::world(Vec::new());
+                model.bounds = [center.0 - 1e-7, center.1 - 1e-7, center.0 + 1e-7, center.1 + 1e-7];
+                assert!(t.dst_geoid_grids.set(vec![std::sync::Arc::new(model)]).is_ok());
+                t.transform_3d(-2.0, 54.0, 100.0).unwrap();
+                assert_eq!(t.diagnostics.load(std::sync::atomic::Ordering::Relaxed) & 8 != 0, covers_destination);
+            }
+        });
+    }
 
     /// Polar bounds from GDAL 3.12.1 include an interior pole and every longitude.
     #[test]
@@ -3778,6 +3981,7 @@ mod tests {
         ];
         for (input, canonical, legacy) in cases {
             assert_eq!(canonical_epsg_reference(input), canonical, "canonical: {input}");
+            assert_eq!(epsg_reference_code(input), canonical.filter(|&c| c != 0), "without the engine: {input}");
             #[cfg(feature = "wbprojection-fallback")]
             {
                 assert_eq!(wbp::epsg_from_srs_reference(input), legacy, "upstream: {input}");

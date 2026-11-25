@@ -38,8 +38,7 @@ jobs:
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-      # The CLB fork: the crates depend on `zstd-rust` from git, which `cargo publish` refuses, and
-      # the fork publishes no crates. Their file lists are checked, and the build verified: the
+      # The CLB fork publishes no crates. Their file lists are checked, and the build verified: the
       # same commands as release.yml's `crates` job.
       - name: Package terrio-crs, terrio and terrio-cli (file lists) and build them
         run: |

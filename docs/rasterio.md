@@ -85,10 +85,16 @@ It needs only NumPy and [affine](https://github.com/rasterio/affine) (installed 
   still be decoded repeatedly. Streamed output is published only after writing succeeds, and
   copying onto a symlink or hardlink of the source is refused. An unrelated destination symlink
   is replaced with the completed output file; its former target is left unchanged.
-  A copy whose source has a dataset mask, or overviews a COG copies, or that is compressed with
-  JPEG, WebP, LERC or JPEG XL, holds the source's pixels until it is written, as a smaller
-  GeoTIFF does. A copy whose source fails to read leaves its destination as it was, held or
-  written in rows: an existing file keeps its content, and no file is left where there was none.
+  A source's dataset mask is read with its pixels, in the same rows, and written with them. A
+  mask that fails to read raises `RasterioIOError`, as pixels that fail to read do, in every copy,
+  held or written in rows, and from `dataset_mask` and `read_masks`. `RasterioIOError` and
+  terrio's `TerrioIOError` are both `OSError`s: code that catches the core's `TerrioIOError` around
+  a copy or a mask read should catch `OSError`.
+  A copy whose source has overviews a COG copies, or that is compressed with JPEG, WebP, LERC or
+  JPEG XL, or whose mask goes to a `.msk` sidecar (`GDAL_TIFF_INTERNAL_MASK=NO`), holds the
+  source's pixels and mask until it is written, as a smaller GeoTIFF does. A copy whose source
+  fails to read leaves its destination as it was, held or written in rows: an existing file
+  keeps its content, and no file is left where there was none.
   GeoTIFFs are written with GDAL's
   layout for the profile: strips or tiles (`tiled`, `blockxsize`, `blockysize`), pixel or band
   interleaving, compression (`lzw`, `deflate`, `zstd`, `packbits`) with predictors 2 and 3,
@@ -106,8 +112,12 @@ It needs only NumPy and [affine](https://github.com/rasterio/affine) (installed 
   `cubic`, `nearest` for paletted rasters). A COG takes no `photometric` option: three Byte bands,
   or four compressed with WebP, are red, green and blue by default, and any other color
   interpretation set on the dataset, or copied by `shutil.copy`, is kept, as it is by an `r+`
-  update.
-  `cubic`, `nearest` for paletted rasters).
+  update. With `sparse_ok=True`, a GeoTIFF leaves out each block whose pixels are all nodata (or 0
+  without nodata) in every band the block holds: every band, or, with `interleave="band"`, its own.
+  Its offset and byte count are 0, and it reads as nodata (or 0). Above the in-memory limit, an
+  `.aux.xml` left beside the path by an earlier file is kept: when it gives a band another nodata,
+  every block is written, with a warning, as it is with a lossy compression (JPEG, WebP unless
+  lossless, LERC with a `MAX_Z_ERROR` above 0). A COG writes every tile, and warns that it does.
   A new dataset reports the color interpretation its file reads back when none is set, unless the
   file has another number of bands: a four-band WebP whose alpha band is opaque everywhere is
   written, and reads back, as three-band RGB; an MBTiles archive reads back as four bands, and a
@@ -256,7 +266,8 @@ directory to keep the downloads).
 - Lossy GeoTIFF codecs: JPEG in YCbCr decodes as GDAL decodes it; LERC, LZMA and JPEG XL chunks
   are decoded, with parity against GDAL not measured.
 - `r+` rewrites the file (overviews are rebuilt from the updated pixels, where GDAL keeps the old
-  ones). COG writes stream row by row, except COGs with an internal mask, copied source overviews,
+  ones), every block of it: the blocks a sparse GeoTIFF left out are written, as nodata (or 0).
+  COG writes stream row by row, except COGs with an internal mask, copied source overviews,
   explicit overview factors, and compressions other than NONE, LZW, DEFLATE, ZSTD and PACKBITS,
   which are written from the whole raster, as are GeoTIFFs with overviews.
 - Band-level color tables only on band 1, as terrio's raster model holds them.
