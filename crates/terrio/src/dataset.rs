@@ -1748,12 +1748,14 @@ pub struct RasterWriteOptions {
     pub compression: Option<String>,
     /// Write GeoTIFF tiles of this size (COG tiles default to 512).
     pub tile_size: Option<u32>,
-    /// Force BigTIFF.
+    /// Force BigTIFF (GeoTIFF and COG), whatever the `BIGTIFF` creation option says: the same as
+    /// `BIGTIFF=YES` (see [`RasterWriteOptions::bigtiff_policy`]).
     pub bigtiff: bool,
     /// Format-specific creation options, as GDAL names them (`KEY`, `VALUE`): Zarr
     /// `FORMAT=ZARR_V2|ZARR_V3`; netCDF `FORMAT=NC|NC2|NC5`; GeoTIFF `TILED=YES`,
     /// `BLOCKXSIZE`, `BLOCKYSIZE`, `INTERLEAVE=PIXEL|BAND`, `PHOTOMETRIC=MINISBLACK|RGB|PALETTE`,
-    /// `ALPHA=YES`, `BIGTIFF=YES`, `COMPRESS`, and terrio's `GEOREFERENCED=NO` (no geotransform).
+    /// `ALPHA=YES`, `BIGTIFF=YES|NO|IF_NEEDED|IF_SAFER` ([`BigTiffPolicy`]), `COMPRESS`, and
+    /// terrio's `GEOREFERENCED=NO` (no geotransform).
     pub creation_options: Vec<(String, String)>,
     /// Descriptive metadata of each band (GeoTIFF: written to the `GDAL_METADATA` tag).
     pub band_metadata: Vec<BandMetadata>,
@@ -1812,6 +1814,78 @@ pub struct RasterWriteOptions {
     /// from 64 to 4096), of 128 otherwise, and the blocks set how its kernels round. Set by
     /// [`crate::LazyRaster::write`].
     pub source_block_size: Option<(usize, usize)>,
+}
+
+/// Whether a GeoTIFF or COG is written as a BigTIFF: GDAL's `BIGTIFF` creation option, which
+/// [`RasterWriteOptions::bigtiff_policy`] reads.
+///
+/// GDAL (3.13) decides from the image's uncompressed size, the bands' samples of its padded
+/// tiles (or of its rows, in strips), and terrio makes the same choice. terrio also writes a
+/// BigTIFF where a classic TIFF would not hold the file: with [`BigTiffPolicy::IfNeeded`] or
+/// [`BigTiffPolicy::IfSafer`] when its compressed size is known (an in-memory raster or a COG) or
+/// estimated (rows written as they come: a quarter more than the uncompressed size) to exceed
+/// 4 GiB, where GDAL writes a classic TIFF and fails once it does.
+///
+/// ```
+/// use terrio::BigTiffPolicy;
+///
+/// assert_eq!("if_safer".parse::<BigTiffPolicy>()?, BigTiffPolicy::IfSafer);
+/// assert_eq!(BigTiffPolicy::default().to_string(), "IF_NEEDED");
+/// # Ok::<(), terrio::Error>(())
+/// ```
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum BigTiffPolicy {
+    /// `IF_NEEDED`, the default: a BigTIFF when an uncompressed image exceeds 4.2 GB
+    /// (4,200,000,000 bytes), or the file would exceed 4 GiB.
+    #[default]
+    IfNeeded,
+    /// `IF_SAFER`: a BigTIFF when the uncompressed image, compressed or not, exceeds 2 GB
+    /// (2,000,000,000 bytes), or the file would exceed 4 GiB.
+    IfSafer,
+    /// `YES` (or `TRUE`, `ON`, `1`): always a BigTIFF.
+    Yes,
+    /// `NO` (or `FALSE`, `OFF`, `0`): always a classic TIFF. Writing fails, as in GDAL, before any
+    /// pixel is written when an uncompressed image exceeds 4.2 GB, and otherwise once the file
+    /// would exceed 4 GiB.
+    No,
+}
+
+impl BigTiffPolicy {
+    /// The policy of a `BIGTIFF` value, case-insensitive; `None` for other values (which GDAL
+    /// warns about and reads as `YES`, unless they mean no).
+    pub fn parse(value: &str) -> Option<Self> {
+        Some(match value.trim().to_ascii_uppercase().as_str() {
+            "IF_NEEDED" => Self::IfNeeded,
+            "IF_SAFER" => Self::IfSafer,
+            "YES" | "TRUE" | "ON" | "1" => Self::Yes,
+            "NO" | "FALSE" | "OFF" | "0" => Self::No,
+            _ => return None,
+        })
+    }
+
+    /// The option's value, as GDAL names it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::IfNeeded => "IF_NEEDED",
+            Self::IfSafer => "IF_SAFER",
+            Self::Yes => "YES",
+            Self::No => "NO",
+        }
+    }
+}
+
+impl std::str::FromStr for BigTiffPolicy {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        Self::parse(s).ok_or_else(|| Error::InvalidArgument(format!("invalid BIGTIFF '{s}' (YES, NO, IF_NEEDED or IF_SAFER)")))
+    }
+}
+
+impl std::fmt::Display for BigTiffPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 /// A ground control point: a pixel position and its georeferenced coordinates, as GDAL's
@@ -2105,12 +2179,14 @@ fn write_raster_with_nodata(
     let compression = options.compression.as_deref().map(parse_compression).transpose()?;
     match driver {
         RasterDriver::Cog => {
-            let opts = wbraster::CogWriteOptions { compression, bigtiff: Some(options.bigtiff), tile_size: options.tile_size };
+            let bigtiff = Some(options.bigtiff_policy()? == BigTiffPolicy::Yes);
+            let opts = wbraster::CogWriteOptions { compression, bigtiff, tile_size: options.tile_size };
             raster.write_cog_with_options(path, &opts)?;
         }
         RasterDriver::GTiff => {
             let layout = options.tile_size.map(|t| wbraster::GeoTiffLayout::Tiled { tile_width: t, tile_height: t });
-            let opts = wbraster::GeoTiffWriteOptions { compression, bigtiff: Some(options.bigtiff), layout };
+            let bigtiff = Some(options.bigtiff_policy()? == BigTiffPolicy::Yes);
+            let opts = wbraster::GeoTiffWriteOptions { compression, bigtiff, layout };
             raster.write_geotiff_with_options(path, &opts)?;
         }
         RasterDriver::VRT => {
@@ -2331,6 +2407,32 @@ pub(crate) fn ensure_writable_location(path: &str) -> Result<()> {
 }
 
 impl RasterWriteOptions {
+    /// Whether a GeoTIFF or COG is written as a BigTIFF: [`BigTiffPolicy::Yes`] when
+    /// [`RasterWriteOptions::bigtiff`] is set, otherwise the last `BIGTIFF` creation option
+    /// (names are case-insensitive), and [`BigTiffPolicy::IfNeeded`] without one.
+    ///
+    /// # Errors
+    /// When the `BIGTIFF` value is not one of GDAL's (`YES`, `NO`, `IF_NEEDED`, `IF_SAFER`).
+    ///
+    /// ```
+    /// use terrio::{BigTiffPolicy, RasterWriteOptions};
+    ///
+    /// let options =
+    ///     RasterWriteOptions { creation_options: vec![("BIGTIFF".into(), "IF_SAFER".into())], ..Default::default() };
+    /// assert_eq!(options.bigtiff_policy()?, BigTiffPolicy::IfSafer);
+    /// # Ok::<(), terrio::Error>(())
+    /// ```
+    pub fn bigtiff_policy(&self) -> Result<BigTiffPolicy> {
+        if self.bigtiff {
+            return Ok(BigTiffPolicy::Yes);
+        }
+        self.creation_options
+            .iter()
+            .rev()
+            .find(|(k, _)| k.eq_ignore_ascii_case("BIGTIFF"))
+            .map_or(Ok(BigTiffPolicy::IfNeeded), |(_, v)| v.parse())
+    }
+
     /// Selects a compatible inherited unsigned TIFF width (GDAL 3.13.3 NBITS).
     /// Returns `None` for inconsistent/missing source widths, an explicit NBITS override,
     /// incompatible output options, or nodata outside the stored domain. With uncompressed

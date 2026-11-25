@@ -284,6 +284,34 @@ def test_bigtiff_keyword_overrides_creation_option(tmp_path, inputs, operation, 
 @pytest.mark.parametrize(
     "operation", ["translate", "write_raster", "create_raster", "Raster.write"]
 )
+@pytest.mark.parametrize("format_name", ["GTiff", "COG"])
+@pytest.mark.parametrize(
+    ("policy", "bigtiff"),
+    [("YES", True), ("no", False), ("IF_NEEDED", False), ("If_Safer", False)],
+)
+def test_bigtiff_creation_option_values(tmp_path, inputs, operation, format_name, policy, bigtiff):
+    """Check GDAL's BIGTIFF values on small rasters: only YES makes a BigTIFF."""
+    path = tmp_path / "policy.tif"
+    write_operation(operation, inputs, path, format=format_name, options={"BIGTIFF": policy})
+    assert (path.read_bytes()[:4] in (b"II+\x00", b"MM\x00+")) is bigtiff
+
+
+@pytest.mark.parametrize("format_name", ["GTiff", "COG"])
+def test_unknown_bigtiff_creation_option_is_refused(tmp_path, inputs, format_name):
+    """Check that a BIGTIFF value GDAL does not define is an error, not a guess."""
+    with pytest.raises(ValueError, match="BIGTIFF"):
+        write_operation(
+            "translate",
+            inputs,
+            tmp_path / "x.tif",
+            format=format_name,
+            options={"BIGTIFF": "SOMETIMES"},
+        )
+
+
+@pytest.mark.parametrize(
+    "operation", ["translate", "write_raster", "create_raster", "Raster.write"]
+)
 @pytest.mark.parametrize(
     ("format_name", "options", "block_size"),
     [

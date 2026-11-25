@@ -29,7 +29,8 @@ use wbraster::raster::RasterData;
 ///     nodata: The nodata value, or `None`.
 ///     metadata: Dataset metadata items.
 ///     compress: The compression, as for `Raster.write`.
-///     bigtiff: Write a BigTIFF (by default, when the file may exceed 4 GB).
+///     bigtiff: Write a BigTIFF, whatever `options["BIGTIFF"]` says (by default, GDAL's
+///         `BIGTIFF=IF_NEEDED`: when the file may exceed 4 GB).
 ///     options: GDAL creation options (COG's: `BLOCKSIZE`, `OVERVIEW_RESAMPLING`, `PREDICTOR`...).
 ///     band_metadata: One dictionary per band, as for `Raster.write`.
 ///     colormap: A color table, as for `Raster.write`.

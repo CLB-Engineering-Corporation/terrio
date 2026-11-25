@@ -352,6 +352,26 @@ LZW. LERC levels must lie within `MAX_Z_ERROR` plus one Float32 spacing of the s
 values (the decoded sample's rounding; GDAL's own levels need the same allowance), with nodata
 pixels exact; the two LERC encoders' bytes are not compared.
 
+## BigTIFF creation options
+
+`python scripts/conformance.py DATA --only bigtiff --strict` runs
+`scripts/compare_bigtiff_with_gdal.py` (osgeo, GDAL 3.13.3). Its 17 large cases create the same
+empty image with GDAL (`SPARSE_OK=TRUE`, as `gdal_create`) and with `terrio create-raster`, on
+both sides of the sizes where GDAL's choice changes: 4.2 GB of padded tiles for `IF_NEEDED`
+and `NO` (uncompressed images only), 2 GB for `IF_SAFER` (compressed or not), strips unpadded,
+every band counted. Each pair must be two classic TIFFs, two BigTIFFs or two refusals, and GDAL
+must read terrio's file. Blocks of zeros are left out, so no file takes more than a few
+megabytes. Its 16 small cases convert a Float32 raster to GeoTIFF and COG with each policy,
+compressed or not: a classic TIFF unless `BIGTIFF=YES`, as GDAL's, read back by GDAL sample for
+sample.
+
+The unit tests of `drivers/gtiff_write.rs` hold the same thresholds, and the COG case GDAL's COG
+driver measures (its overviews count, unpadded). Where GDAL writes a classic TIFF that later
+fails past 4 GiB (`IF_NEEDED` with compression), terrio writes a BigTIFF when the file is known
+to exceed 4 GiB (written whole, or a COG) or estimated to (rows written as they come, a quarter
+more than the uncompressed samples): a known difference, which the suite's 4.2 GB DEFLATE case
+reports as not compared.
+
 ## TIFF block metadata
 
 `python scripts/conformance.py DATA --only tiff-block-tags --strict` requires

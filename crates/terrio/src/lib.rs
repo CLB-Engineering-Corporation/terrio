@@ -335,9 +335,9 @@ pub use cog_validate::{
 /// The memory the process can use, which reads refuse windows past.
 pub use dataset::fallible::usable_memory;
 pub use dataset::{
-    BandMetadata, Dataset, Gcp, Geolocation, RasterDataset, RasterWriteOptions, VectorDataset, VectorOpenOptions, VectorWriteOptions,
-    geo_transform, is_north_up, list_layers, open, open_raster, open_raster_with_tiff_limits, open_vector, read_gcps, write_netcdf_groups,
-    write_raster, write_raster_dataset, write_vector,
+    BandMetadata, BigTiffPolicy, Dataset, Gcp, Geolocation, RasterDataset, RasterWriteOptions, VectorDataset, VectorOpenOptions,
+    VectorWriteOptions, geo_transform, is_north_up, list_layers, open, open_raster, open_raster_with_tiff_limits, open_vector, read_gcps,
+    write_netcdf_groups, write_raster, write_raster_dataset, write_vector,
 };
 pub use drivers::gtiff_write::GeoTiffWriter;
 pub use drivers::vector::citygml_write::{CityGmlLod0Surface, CityGmlVersion};
