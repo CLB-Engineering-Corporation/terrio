@@ -48,7 +48,7 @@ enum Codec {
     Jxl,
     Lzma,
     /// Zstandard, with the zstd C library natively with the `libzstd` feature, with `zrip`
-    /// otherwise ([`crate::zstandard::frames`]).
+    /// otherwise ([`crate::zstandard::frames_into`]).
     Zstd,
     /// LZW of 8 to 64-bit samples, decoded whole: the `tiff` crate's reader fails on some chunks
     /// it reads row by row (edge tiles narrower than the tile).
@@ -188,7 +188,7 @@ fn decompress(compression: u16, raw: &[u8], limit: usize, out: &mut Vec<u8>) -> 
         LZMA => bounded(&mut lzma_rust2::XzReader::new(raw, true), out).map_err(|e| invalid(format!("LZMA: {e}")))?,
         #[cfg(not(feature = "lzma"))]
         LZMA => return Err(disabled("lzma")),
-        ZSTD => *out = crate::zstandard::frames(raw, limit)?,
+        ZSTD => crate::zstandard::frames_into(raw, limit, out)?,
         32773 => {
             // PackBits: a count byte n, then n + 1 literal bytes (n >= 0) or one byte repeated
             // 1 - n times (n < 0, -128 skipped): at most 64 bytes out per byte in.
@@ -1775,6 +1775,23 @@ mod tests {
         assert_eq!(format!("{edge:?}"), format!("{:?}", dec.read_chunk(1).unwrap()));
         let expected: Vec<u8> = (0..16u8).flat_map(|r| (0..4u8).map(move |c| (r * 16 + c).wrapping_mul(5))).collect();
         assert_eq!(format!("{edge:?}"), format!("{:?}", DecodingResult::U8(expected)));
+    }
+
+    #[test]
+    fn zstd_chunks_decode_into_the_reused_scratch_buffer() {
+        let chunk: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
+        let raw = crate::zstandard::compress(&chunk, 0).unwrap();
+        let mut out = Vec::with_capacity(1 << 16);
+        let buffer = out.as_ptr();
+        for _ in 0..2 {
+            decompress(ZSTD, &raw, chunk.len(), &mut out).unwrap();
+            assert_eq!(out, chunk);
+            assert_eq!(out.as_ptr(), buffer, "a ZSTD chunk replaced the scratch allocation");
+        }
+        // A limit short of the stream still reads its first bytes into the same buffer.
+        decompress(ZSTD, &raw, 1000, &mut out).unwrap();
+        assert_eq!(out, chunk[..1000]);
+        assert_eq!(out.as_ptr(), buffer);
     }
 
     #[test]

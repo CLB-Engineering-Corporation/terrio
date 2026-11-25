@@ -14,47 +14,33 @@ use crate::tiff_strip_rows::Rows;
 use std::io::{Read, Seek, SeekFrom};
 use std::sync::Arc;
 
-mod sealed {
-    use super::{DecodingResult, RasterData};
+/// The sample types [`LazyRaster::read_geotiff_samples_into`] reads: the same sealed trait as
+/// [`RasterElement`], under the name this read first published.
+pub use crate::pixel::RasterElement as TiffSample;
+use crate::pixel::RasterElement;
 
-    pub trait Sealed: Sized {
-        fn decoded(chunk: &DecodingResult) -> Option<&[Self]>;
-        fn scalar(data: RasterData) -> Option<Self>;
-    }
+/// A decoded chunk's samples, if they are of type `T`.
+fn decoded<T: RasterElement>(chunk: &DecodingResult) -> Option<&[T]> {
+    let values: &dyn std::any::Any = match chunk {
+        DecodingResult::U8(v) => v,
+        DecodingResult::I8(v) => v,
+        DecodingResult::U16(v) => v,
+        DecodingResult::I16(v) => v,
+        DecodingResult::U32(v) => v,
+        DecodingResult::I32(v) => v,
+        DecodingResult::U64(v) => v,
+        DecodingResult::I64(v) => v,
+        DecodingResult::F32(v) => v,
+        DecodingResult::F64(v) => v,
+        DecodingResult::F16(_) => return None,
+    };
+    values.downcast_ref::<Vec<T>>().map(Vec::as_slice)
 }
 
-/// A numeric sample type for [`LazyRaster::read_geotiff_samples_into`].
-///
-/// Implemented for the ten primitive types held by [`RasterData`].
-pub trait TiffSample: sealed::Sealed + Copy + Send + Sync {
-    /// The GeoTIFF sample type accepted for this Rust type.
-    const DATA_TYPE: DataType;
+/// The first value of `data`, if it holds type `T`.
+fn scalar<T: RasterElement>(data: &RasterData) -> Option<T> {
+    T::slice(data)?.first().copied()
 }
-
-macro_rules! samples {
-    ($($ty:ty => $variant:ident),* $(,)?) => {$(
-        impl sealed::Sealed for $ty {
-            fn decoded(chunk: &DecodingResult) -> Option<&[Self]> {
-                match chunk {
-                    DecodingResult::$variant(values) => Some(values),
-                    _ => None,
-                }
-            }
-
-            fn scalar(data: RasterData) -> Option<Self> {
-                match data {
-                    RasterData::$variant(values) => values.first().copied(),
-                    _ => None,
-                }
-            }
-        }
-
-        impl TiffSample for $ty {
-            const DATA_TYPE: DataType = DataType::$variant;
-        }
-    )*};
-}
-samples!(u8 => U8, i8 => I8, u16 => U16, i16 => I16, u32 => U32, i32 => I32, u64 => U64, i64 => I64, f32 => F32, f64 => F64);
 
 pub(super) enum DirectSource {
     File(crate::geotiff::FileCursor),
@@ -131,7 +117,7 @@ impl LazyRaster {
     /// raster.read_geotiff_samples_into(Window::new(20, 30, 128, 64), 1, None, &mut elevations)?;
     /// # Ok::<(), terrio::Error>(())
     /// ```
-    pub fn read_geotiff_samples_into<T: TiffSample>(
+    pub fn read_geotiff_samples_into<T: RasterElement>(
         &self,
         window: Window,
         band: usize,
@@ -183,7 +169,7 @@ impl TiffRaster {
         image.direct.get().and_then(Option::as_ref).ok_or_else(unsupported)
     }
 
-    fn read_into<T: TiffSample>(&self, w: Window, band: usize, level: usize, dst: &mut [T]) -> Result<()> {
+    fn read_into<T: RasterElement>(&self, w: Window, band: usize, level: usize, dst: &mut [T]) -> Result<()> {
         let image = &self.levels[level];
         if let Some(i) = image.external
             && let Some(ovr) = &self.ovr
@@ -206,7 +192,7 @@ impl TiffRaster {
         {
             return Err(unsupported());
         }
-        let nodata = T::scalar(nodata_filled(&self.tags, self.data_type, &[band], 1, 1, 1)?)
+        let nodata = scalar::<T>(&nodata_filled(&self.tags, self.data_type, &[band], 1, 1, 1)?)
             .ok_or_else(|| Error::InvalidData("TIFF nodata type differs from band type".into()))?;
         let first_y = w.y / ch;
         let first_rows = (ch - w.y % ch).min(w.height);
@@ -287,7 +273,7 @@ impl TiffRaster {
                         Ok(samples)
                     }
                 })?;
-                let values = T::decoded(samples).ok_or_else(|| Error::InvalidData("TIFF chunks differ in sample type".into()))?;
+                let values = decoded::<T>(samples).ok_or_else(|| Error::InvalidData("TIFF chunks differ in sample type".into()))?;
                 place(dst, values, &ChunkGeom { x0, y0, dw, dh, spp }, w, &[(sample, 0)]);
             }
             Ok(())

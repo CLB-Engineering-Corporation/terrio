@@ -187,6 +187,14 @@ def compare_tiles(name, dtype, bands, co, directory, keep=None, sparse=False):
     return dict(name=name, status="identical", detail=detail)
 
 
+def run_cli(cmd):
+    """Runs `cmd`, raising its exit status and stderr when it fails."""
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode:
+        raise RuntimeError(f"{Path(cmd[0]).name} {cmd[1]} exited with status {result.returncode}: {result.stderr.strip()}")
+    return result
+
+
 def compare_translate(name, terrio_cli, co, directory):
     """`terrio translate --co SPARSE_OK=YES` against `gdal_translate -co SPARSE_OK=TRUE`."""
     nodata = -9999.0
@@ -201,7 +209,7 @@ def compare_translate(name, terrio_cli, co, directory):
     cmd = [terrio_cli, "translate", str(dense), str(ours)]
     for k, v in {**options, "SPARSE_OK": "YES"}.items():
         cmd += ["--co", f"{k}={v}"]
-    subprocess.run(cmd, check=True, capture_output=True)
+    run_cli(cmd)
     gdal.Translate(str(theirs), str(dense), creationOptions=[f"{k}={v}" for k, v in {**options, "SPARSE_OK": "TRUE"}.items()])
     a, meta_a, omitted_a = structure(ours)
     b, meta_b, omitted_b = structure(theirs)
@@ -234,7 +242,6 @@ def blocks_bytes(path):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("data", type=Path, nargs="?")
     parser.add_argument("--terrio", default=shutil.which("terrio") or "target/release/terrio")
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args()
