@@ -301,7 +301,7 @@ pub(crate) trait WindowSource: Send + Sync {
         None
     }
     /// A TIFF block's file offset and byte count, without reading its pixels.
-    fn tiff_block_range(&mut self, _band: usize, _x: usize, _y: usize, _overview: Option<usize>) -> Result<Option<(u64, u64)>> {
+    fn tiff_block_range(&self, _band: usize, _x: usize, _y: usize, _overview: Option<usize>) -> Result<Option<(u64, u64)>> {
         Ok(None)
     }
     /// Whether the source exposes a dataset-level validity mask.
@@ -418,7 +418,7 @@ impl SharedRaster {
     }
 }
 impl WindowSource for SharedRaster {
-    fn tiff_block_range(&mut self, band: usize, x: usize, y: usize, overview: Option<usize>) -> Result<Option<(u64, u64)>> {
+    fn tiff_block_range(&self, band: usize, x: usize, y: usize, overview: Option<usize>) -> Result<Option<(u64, u64)>> {
         self.lock()?.tiff_block_range(band, x, y, overview)
     }
     fn geotransform_present(&self) -> Option<bool> {
@@ -1378,16 +1378,31 @@ impl LazyRaster {
 
     /// A TIFF tile or strip's `(file offset, byte count)` from its cached chunk tables.
     /// Bands are numbered from 1 over components, two per complex band, as in
-    /// `band_count()`. Block coordinates and overview indices are numbered from 0.
+    /// [`Self::band_count`]. Block coordinates and overview indices are numbered from 0.
     /// Returns `None` for other formats or an absent band, block or overview.
-    /// External overview offsets refer to the overview file. No pixels are decoded.
-    /// Reference: GDAL 3.12.1's TIFF `BLOCK_OFFSET_x_y` / `BLOCK_SIZE_x_y` items.
-    pub fn tiff_block_range(&mut self, band: usize, x: usize, y: usize, overview: Option<usize>) -> Result<Option<(u64, u64)>> {
+    /// A zero byte count denotes a sparse block. External overview offsets refer to the
+    /// overview file. No pixels are decoded.
+    ///
+    /// Several threads can query the same reader. Direct TIFF readers lock the decoder only
+    /// to load a level's tables on first use. Later queries use the cached tables without
+    /// taking that lock. Shared source aliases can serialize access to their backing reader.
+    ///
+    /// Reference: GDAL 3.13.3's TIFF `BLOCK_OFFSET_x_y` / `BLOCK_SIZE_x_y` items. Terrio
+    /// returns the stored pair for sparse blocks, for which GDAL leaves the items absent.
+    ///
+    /// ```no_run
+    /// let raster = terrio::open_raster_lazy("dem.tif")?;
+    /// if let Some((_, 0)) = raster.tiff_block_range(1, 0, 0, None)? {
+    ///     // Skip the sparse tile when planning byte-range reads.
+    /// }
+    /// # Ok::<(), terrio::Error>(())
+    /// ```
+    pub fn tiff_block_range(&self, band: usize, x: usize, y: usize, overview: Option<usize>) -> Result<Option<(u64, u64)>> {
         let _scope = self.enter_asset_read()?;
         if band == 0 || band > self.band_count() {
             return Ok(None);
         }
-        match &mut self.inner {
+        match &self.inner {
             Inner::Tiff(t) => match overview.map_or(Some(0), |i| i.checked_add(1)) {
                 Some(level) => t.block_range(band, x, y, level),
                 None => Ok(None),
@@ -2762,7 +2777,7 @@ impl Level {
 }
 
 struct TiffRaster {
-    // Shared reads take this lock only while preparing a level for its first destination read.
+    // Shared reads take this lock only while preparing a level on first use.
     // Ordinary reads own the raster mutably and access the decoder without locking.
     decoder: Mutex<TiffDecoder>,
     direct_source: Option<DirectSource>,
@@ -3078,31 +3093,42 @@ impl TiffRaster {
         }
     }
 
-    fn block_range(&mut self, band: usize, x: usize, y: usize, level: usize) -> Result<Option<(u64, u64)>> {
+    fn block_range(&self, band: usize, x: usize, y: usize, level: usize) -> Result<Option<(u64, u64)>> {
         let Some(image) = self.levels.get(level) else { return Ok(None) };
         let (width, height) = image.block;
         if width == 0 || height == 0 || x >= image.width.div_ceil(width) || y >= image.height.div_ceil(height) {
             return Ok(None);
         }
         if let Some(external) = image.external {
-            return match self.ovr.as_mut() {
+            return match self.ovr.as_ref() {
                 Some(ovr) => ovr.block_range(band, x, y, external),
                 None => Ok(None),
             };
         }
         let across = image.width.div_ceil(width);
         let rows = image.height.div_ceil(height);
-        let error = self.limits.error();
-        let dec = decoder_mut(&mut self.decoder);
-        dec.select(image.ifd).map_err(error)?;
-        let storage = image.storage(&mut dec.decoder).map_err(error)?;
+        let (storage, tables) = match (image.storage.get(), image.tables.get()) {
+            (Some(&storage), Some(tables)) => (storage, tables),
+            _ => {
+                let error = self.limits.error();
+                let mut dec = self.decoder.lock().map_err(|_| Error::InvalidData("TIFF decoder lock poisoned".into()))?;
+                // Another caller may have initialized this level while we waited.
+                match (image.storage.get(), image.tables.get()) {
+                    (Some(&storage), Some(tables)) => (storage, tables),
+                    _ => {
+                        dec.select(image.ifd).map_err(error)?;
+                        (image.storage(&mut dec.decoder).map_err(error)?, image.tables(&mut dec.decoder).map_err(error)?)
+                    }
+                }
+            }
+        };
         let plane = if storage.planar { (band - 1) / if self.complex { 2 } else { 1 } } else { 0 };
         let Some(index) =
             plane.checked_mul(rows).and_then(|v| v.checked_add(y)).and_then(|v| v.checked_mul(across)).and_then(|v| v.checked_add(x))
         else {
             return Ok(None);
         };
-        Ok(image.tables(&mut dec.decoder).map_err(error)?.get(index))
+        Ok(tables.get(index))
     }
 
     /// Reads a window of some bands (numbered from 1) of a level, band-major: CMYK read as GDAL
@@ -4876,6 +4902,56 @@ mod tests {
         let peak = crate::geotiff::PEAK_WORKERS.load(std::sync::atomic::Ordering::Relaxed);
         let limit = crate::geotiff::decode_worker_limit();
         assert!(peak <= limit, "{peak} decode workers at once, over the {limit} allowed");
+    }
+
+    #[test]
+    fn sparse_tiff_block_ranges_are_shared_without_pixel_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sparse.tif");
+        let mut pixels = vec![0; 32 * 16];
+        for row in pixels.as_chunks_mut::<32>().0 {
+            row[..16].fill(100);
+        }
+        write_tiled_tiff(&path, (32, 16, 1), RasterData::U8(pixels), &[("SPARSE_OK", "YES")]);
+        let bytes = std::fs::read(path).unwrap();
+        let file = crate::sparse::SparseFile::with_block_size(bytes.len() as u64, 16);
+        file.insert(0, &bytes);
+        let raster = LazyRaster::from_sparse(file.clone()).unwrap().unwrap();
+        let Inner::Tiff(tiff) = &raster.inner else { panic!("expected a TIFF reader") };
+        let barrier = std::sync::Barrier::new(8);
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    barrier.wait();
+                    let sparse = raster.tiff_block_range(1, 1, 0, None).unwrap();
+                    assert_eq!(sparse, Some((0, 0)));
+                });
+            }
+        });
+        let stored = raster.tiff_block_range(1, 0, 0, None).unwrap().unwrap();
+        assert!(stored.0 > 0 && stored.1 > 0);
+        file.trim(0);
+
+        // Cached queries must still finish while the decoder is unavailable, even if no source
+        // bytes remain cached. A timeout releases the lock before joining the worker.
+        std::thread::scope(|scope| {
+            let lock = tiff.decoder.lock().unwrap();
+            let (send, receive) = std::sync::mpsc::channel();
+            let raster = &raster;
+            scope.spawn(move || {
+                let _ = send.send([
+                    raster.tiff_block_range(1, 0, 0, None),
+                    raster.tiff_block_range(1, 1, 0, None),
+                    raster.tiff_block_range(1, 2, 0, None),
+                    raster.tiff_block_range(1, 0, 0, Some(usize::MAX)),
+                    raster.tiff_block_range(2, 0, 0, None),
+                ]);
+            });
+            let result = receive.recv_timeout(std::time::Duration::from_secs(5));
+            drop(lock);
+            assert_eq!(result.unwrap().map(Result::unwrap), [Some(stored), Some((0, 0)), None, None, None]);
+        });
+        assert!(file.missing().is_empty(), "cached queries requested no file bytes");
     }
 
     /// A remote file read through a `SparseFile` (terrio-js's `openUrl`) decodes its tiles on the

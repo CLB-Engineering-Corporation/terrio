@@ -403,14 +403,18 @@ tiles' compressed chunks byte for byte to those of the same raster written in ro
 ## TIFF block metadata
 
 `python scripts/conformance.py DATA --only tiff-block-tags --strict` requires
-all 15 checks in `python/tests/test_rio_block_tags.py`, including corrupt-table
+all 16 checks in `python/tests/test_rio_block_tags.py`, including corrupt-table
 open-time refusal and propagation of a native corruption exception at the facade
 query boundary. TIFF-domain
 `BLOCK_OFFSET_x_y` and `BLOCK_SIZE_x_y` items match the file's chunk arrays and
 GDAL exactly for tiles, strips, classic TIFF, BigTIFF, planar/interleaved bands,
 complex samples, MemoryFile, overviews and real Landsat data. External overview
 offsets refer to the `.ovr` file. Block items are queried individually and are
-not enumerated in `tags()`.
+not enumerated in `tags()`. Concurrent queries through one handle also check a
+GDAL-written sparse TIFF: stored tiles match GDAL, while Terrio reports the stored
+zero offset and size of omitted tiles that GDAL leaves absent. The Rust regression
+evicts the source bytes and holds the decoder lock while cached range queries
+complete, with no file bytes requested.
 
 The loopback HTTP COG test measures transferred bytes and requests. Opening
 the dataset and querying all base blocks transfers less than one quarter of
