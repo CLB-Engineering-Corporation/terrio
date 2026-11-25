@@ -837,23 +837,20 @@ fn zarr_arrays_read_what_lazy_rasters_read() {
 #[test]
 fn caller_fetched_node_names_keep_url_delimiters() {
     use terrio::sparse::{ObjectRange, SparseObjects};
-    let dir = tempfile::tempdir().unwrap();
-    let store = dir.path().join("s.zarr");
-    std::fs::create_dir_all(store.join("a#?/c/0")).unwrap();
-    std::fs::write(store.join("zarr.json"), r#"{"zarr_format": 3, "node_type": "group", "attributes": {}}"#).unwrap();
+    let group = r#"{"zarr_format": 3, "node_type": "group", "attributes": {}}"#;
     let meta = r#"{"zarr_format": 3, "node_type": "array", "shape": [2, 2], "data_type": "uint8", "fill_value": 0,
         "chunk_grid": {"name": "regular", "configuration": {"chunk_shape": [2, 2]}},
         "chunk_key_encoding": {"name": "default", "configuration": {"separator": "/"}},
         "codecs": [{"name": "bytes"}], "attributes": {}}"#;
-    std::fs::write(store.join("a#?/zarr.json"), meta).unwrap();
-    std::fs::write(store.join("a#?/c/0/0"), [1u8, 2, 3, 4]).unwrap();
+    let fixture = [("zarr.json", group.as_bytes()), ("a#?/zarr.json", meta.as_bytes()), ("a#?/c/0/0", &[1u8, 2, 3, 4])];
     let objects = Arc::new(SparseObjects::new());
     let fetch = |objects: &SparseObjects| {
         let missing = objects.missing();
         assert!(!missing.is_empty(), "permanent error without missing objects");
         for (key, range) in missing {
             assert_eq!(range, ObjectRange::Whole);
-            objects.insert(&key, range, std::fs::read(store.join(&key)).ok());
+            let bytes = fixture.iter().find(|(name, _)| *name == key).map(|(_, bytes)| bytes.to_vec());
+            objects.insert(&key, range, bytes);
         }
     };
     let mut rounds = 0;
