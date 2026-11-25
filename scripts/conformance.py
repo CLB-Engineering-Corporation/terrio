@@ -136,6 +136,7 @@ GDAL_FREE_SUITES = frozenset(
         "longitude-period",
         "pointclouds",
         "pyogrio-buffers",
+        "tiff-read-into",
         "vsi",
         "webp-writer",
         "wkt1-strict-export",
@@ -2487,6 +2488,22 @@ def suite_wkt1_strict_export(ctx):
     return suite
 
 
+def suite_tiff_read_into(ctx):
+    """Compare TIFF samples read directly into a NumPy destination with GDAL."""
+    suite = Suite("tiff-read-into", "TIFF reads into caller buffers", "GDAL via rasterio",
+                  "Exact native samples for strips, partial edge tiles, pixel and band "
+                  "interleave, sparse blocks, nodata and unscaled integer and float values.")
+    missing = missing_modules("terrio", "pytest", "numpy", "rasterio")
+    if missing:
+        suite.skipped = "needs " + ", ".join(missing)
+        return suite
+    import rasterio
+    suite.reference = f"GDAL {rasterio.__gdal_version__} via rasterio {rasterio.__version__}"
+    complete, detail = _pytest_module_conformance(ctx, "test_rio_read_into.py", expected_count=26)
+    suite.cases.append(Case("TIFF", "native samples in caller buffers", IDENTICAL if complete else DIFFERS, detail))
+    return suite
+
+
 def suite_tiff_block_tags(ctx):
     """Compare TIFF block addresses with file tables and GDAL.
 
@@ -4690,6 +4707,7 @@ SUITES = OrderedDict(
         ("transform-batches", suite_transform_batches),
         ("transform-bounds", suite_transform_bounds),
         ("tiff-block-tags", suite_tiff_block_tags),
+        ("tiff-read-into", suite_tiff_read_into),
         ("geojson-crs", suite_geojson_crs),
         ("geocentric", suite_geocentric),
         ("perspective", suite_perspective),

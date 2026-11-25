@@ -273,6 +273,20 @@ fn overview_data(options: &JsValue) -> Result<Vec<std::sync::Arc<terrio::Raster>
         .collect()
 }
 
+fn band_window(raster: &LazyRaster, window: Option<&[u32]>, overview: Option<usize>) -> Result<Window, JsError> {
+    Ok(match window {
+        Some(&[x, y, w, h]) => Window::new(x as usize, y as usize, w as usize, h as usize),
+        Some(_) => return Err(JsError::new("window is [col_off, row_off, width, height]")),
+        None => {
+            let (w, h) = match overview {
+                None => (raster.width(), raster.height()),
+                Some(i) => raster.overviews().get(i).copied().ok_or_else(|| JsError::new(&format!("no overview {i}")))?,
+            };
+            Window::full(w, h)
+        }
+    })
+}
+
 /// Pixels as a typed array of their own type.
 fn typed_array(data: RasterData) -> JsValue {
     match data {
@@ -830,19 +844,74 @@ impl Dataset {
     #[wasm_bindgen(js_name = readBand)]
     pub fn read_band(&self, band: usize, window: Option<Vec<u32>>, overview: Option<usize>) -> Result<JsValue, JsError> {
         let mut r = self.raster()?;
-        let window = match window.as_deref() {
-            Some(&[x, y, w, h]) => Window::new(x as usize, y as usize, w as usize, h as usize),
-            Some(_) => return Err(JsError::new("window is [col_off, row_off, width, height]")),
-            None => {
-                let (w, h) = match overview {
-                    None => (r.width(), r.height()),
-                    Some(i) => r.overviews().get(i).copied().ok_or_else(|| JsError::new(&format!("no overview {i}")))?,
-                };
-                Window::full(w, h)
-            }
-        };
+        let window = band_window(&r, window.as_deref(), overview)?;
         let ds = r.read_window(window, &WindowOptions { bands: vec![band], overview }).map_err(js_err)?;
         Ok(typed_array(ds.raster.data))
+    }
+
+    /// Reads a band into an existing typed array of the band's native type.
+    ///
+    /// The window and overview are as in `readBand`. The destination must hold exactly
+    /// `width * height` samples. Pixels cross from WebAssembly memory in batches.
+    #[wasm_bindgen(js_name = readBandInto)]
+    pub fn read_band_into(&self, band: usize, out: JsValue, window: Option<Vec<u32>>, overview: Option<usize>) -> Result<(), JsError> {
+        let mut raster = self.raster()?;
+        let window = band_window(&raster, window.as_deref(), overview)?;
+        let extent = band_window(&raster, None, overview)?;
+        if !window.fits(extent.width, extent.height) || !(1..=raster.band_count()).contains(&band) {
+            return Err(JsError::new("band or window is outside the image"));
+        }
+        let len = window.width.checked_mul(window.height).ok_or_else(|| JsError::new("window is too large"))?;
+        let options = WindowOptions { bands: vec![band], overview };
+        let dtype = raster.band_data_type(band);
+        let row_bytes = window.width.saturating_mul(dtype.size_bytes());
+        let target_rows = ((16 << 20) / row_bytes).max(1);
+        let block_rows = raster.block_size().map_or(1, |(_, h)| h);
+        let rows = (target_rows / block_rows).max(1) * block_rows;
+        macro_rules! read_into {
+            ($($variant:ident => $array:ident),* $(,)?) => {
+                match dtype {
+                    $(terrio::DataType::$variant => {
+                        let out = out.dyn_into::<js_sys::$array>().map_err(|_| {
+                            JsError::new(concat!("destination must be a ", stringify!($array)))
+                        })?;
+                        if out.length() as usize != len {
+                            return Err(JsError::new("destination length must equal the window's pixel count"));
+                        }
+                        let mut buf = Vec::new();
+                        let end = window.y + window.height;
+                        let mut y = window.y;
+                        while y < end {
+                            let h = (rows - y % block_rows).min(end - y);
+                            let slab = Window::new(window.x, y, window.width, h);
+                            let n = h * window.width;
+                            if n > buf.len() {
+                                buf.try_reserve_exact(n - buf.len()).map_err(|_| JsError::new("cannot allocate band read buffer"))?;
+                                buf.resize(n, Default::default());
+                            }
+                            let data = match raster.read_geotiff_samples_into(slab, band, overview, &mut buf[..n]) {
+                                Ok(()) => None,
+                                Err(terrio::Error::Unsupported(_)) => Some(raster.read_window(slab, &options).map_err(js_err)?.raster.data),
+                                Err(error) => return Err(js_err(error)),
+                            };
+                            let values = match &data {
+                                Some(RasterData::$variant(values)) => values,
+                                Some(_) => return Err(JsError::new("band returned a different sample type")),
+                                None => &buf[..n],
+                            };
+                            let start = (y - window.y) * window.width;
+                            out.subarray(start as u32, (start + n) as u32).copy_from(values);
+                            y += h;
+                        }
+                    })*
+                }
+            };
+        }
+        read_into!(
+            U8 => Uint8Array, I8 => Int8Array, U16 => Uint16Array, I16 => Int16Array, U32 => Uint32Array, I32 => Int32Array,
+            U64 => BigUint64Array, I64 => BigInt64Array, F32 => Float32Array, F64 => Float64Array,
+        );
+        Ok(())
     }
 
     /// Reads a window into an output of another size, as GDAL's `RasterIO` reads it

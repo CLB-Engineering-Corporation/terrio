@@ -372,6 +372,16 @@ to exceed 4 GiB (written whole, or a COG) or estimated to (rows written as they 
 more than the uncompressed samples): a known difference, which the suite's 4.2 GB DEFLATE case
 reports as not compared.
 
+## TIFF reads into caller buffers
+
+`python scripts/conformance.py DATA --only tiff-read-into --strict` compares
+caller-buffer reads with GDAL 3.12.2 via rasterio. The samples must match exactly
+for strips and tiles (including partial edge tiles), pixel and band interleave,
+and Byte, Int16 and Float32 bands. Stored nodata and NaN values are preserved, and
+scale and offset metadata remain separate from the samples. Sparse blocks are
+also checked. Rust tests compare concurrent reads with the owned TIFF read and
+verify zero additional worker decoder opens after the file is renamed.
+
 ## TIFF block metadata
 
 `python scripts/conformance.py DATA --only tiff-block-tags --strict` requires
