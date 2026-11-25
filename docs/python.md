@@ -56,7 +56,7 @@ mask = terrio.open_raster("masked.tif", lazy=True).read_mask()  # a GeoTIFF's in
 w = terrio.GeoTiffWriter("big.tif", 100000, 80000, 1, "uint16", transform, crs="EPSG:32610",
                          compress="DEFLATE", tile_size=512, mask=True)
 for rows, valid in row_blocks:  # (1, n, 100000) uint16 and (n, 100000) uint8 arrays
-    w.write(rows, valid)
+    w.write(rows, valid)  # read where they are when read-only and C-contiguous, else copied
 w.close()
 
 out = terrio.Raster.from_array(elevation * 3.28084, dem.transform, crs=dem.crs, nodata=dem.nodata)

@@ -1502,6 +1502,9 @@ impl PyGeoTiffWriter {
 
     /// Appends rows: a `(count, rows, width)` array (or `(rows, width)` for one band) of the
     /// writer's dtype, and the mask's `(rows, width)` uint8 rows (0 for invalid) when it has one.
+    /// A read-only C-contiguous array (`array.setflags(write=False)`) of the writer's real dtype
+    /// is compressed where it is, the GIL held meanwhile; other arrays are copied first, the GIL
+    /// released while they are written.
     ///
     /// Args:
     ///     array: The rows. Real output requires the matching NumPy dtype. Complex output
@@ -1527,10 +1530,6 @@ impl PyGeoTiffWriter {
         if bands != self.count || cols != self.width {
             return Err(invalid(format!("expected {} bands of {} columns, got {bands} of {cols}", self.count, self.width)));
         }
-        let (data, complex) = raster_array_data(array, self.complex.then_some(self.data_type))?;
-        if complex != self.complex || data.data_type() != self.data_type {
-            return Err(invalid("the array's dtype is not the writer's"));
-        }
         // Flattened, a mask of the same size in another shape would mask other pixels.
         let mask: Option<Vec<u8>> = match mask {
             Some(m) if m.shape() != [rows, cols].as_slice() => {
@@ -1539,6 +1538,36 @@ impl PyGeoTiffWriter {
             Some(m) => Some(m.as_array().iter().copied().collect()),
             None => None,
         };
+        // A read-only C-contiguous array of the writer's dtype is read where it is, as
+        // `with_numpy` borrows arrays: with the GIL held, since a read-only flag does not exclude
+        // writable aliases, and without calling Python until the borrow ends.
+        let writeable: bool = array.getattr("flags")?.getattr("writeable")?.extract()?;
+        if !self.complex && !writeable && array.is_c_contiguous() {
+            let dtype = array.dtype();
+            macro_rules! borrowed {
+                ($($t:ty),*) => {$(
+                    if <$t as terrio::RasterElement>::DATA_TYPE == self.data_type
+                        && dtype.is_equiv_to(&numpy::dtype::<$t>(py))
+                        && let Ok(a) = array.cast::<PyArrayDyn<$t>>()
+                        && let Ok(a) = a.try_readonly()
+                        && let Ok(values) = a.as_slice()
+                    {
+                        let _ = terrio::warnings::take();
+                        let write = || w.write_rows_slice(values, rows, mask.as_deref());
+                        let written = std::panic::catch_unwind(std::panic::AssertUnwindSafe(write)).unwrap_or_else(|p| Err(crate::panicked(p)));
+                        drop(a);
+                        let warned = crate::issue_warnings(py, terrio::warnings::take());
+                        written.py()?;
+                        return warned;
+                    }
+                )*};
+            }
+            borrowed!(u8, i8, u16, i16, u32, i32, u64, i64, f32, f64);
+        }
+        let (data, complex) = raster_array_data(array, self.complex.then_some(self.data_type))?;
+        if complex != self.complex || data.data_type() != self.data_type {
+            return Err(invalid("the array's dtype is not the writer's"));
+        }
         with_warnings(py, || w.write_rows(&data, rows, mask.as_deref()))
     }
 
