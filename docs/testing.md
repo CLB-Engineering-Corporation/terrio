@@ -917,10 +917,13 @@ Float32 and Float64 data, lossless and lossy, one band or three pixel- or band-i
 NaN, a nodata value or a per-dataset mask, as GTiff and COG, nearest-neighbour overviews included.
 It checks that `LERC_ENCODER=COMPACT` blobs are no larger and within `MAX_Z_ERROR`, that other
 values are refused, that `LERC_VERSION` warns as GDAL warns and changes nothing, and that the
-`GDAL_METADATA` tag and the IMAGE_STRUCTURE items GDAL reads are GDAL's. Lossless Int8 and Byte
-blobs, which libLerc codes with Huffman codes, are a known difference (see
-[Formats](formats.md)): their pixels are compared, and `test_lossless_8bit_lerc_blobs_are_gdal_s`
-is a strict expected failure, which the conformance suite leaves out.
+`GDAL_METADATA` tag and the IMAGE_STRUCTURE items GDAL reads are GDAL's. It also compares a COG's
+blobs at `MAX_Z_ERROR_OVERVIEW` at every level, and its recorded items. Lossless Int8 and Byte
+tiles that libLerc codes with Huffman codes are a known difference (see [Formats](formats.md)):
+the other tiles' blobs and every pixel are compared, and `test_lossless_8bit_lerc_blobs_are_gdal_s`
+is a strict expected failure, which the conformance suite leaves out. The module asserts GDAL
+3.12's blobs: with GDAL 3.13 and later, the pixel-interleaved floating-point rows, whose edge-tile
+padding GDAL 3.13 masks, are strict expected failures.
 
 Standalone WebP creation options are checked with
 `python scripts/conformance.py DATA --only webp-writer --strict`, using the

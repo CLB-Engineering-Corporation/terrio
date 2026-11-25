@@ -53,6 +53,9 @@ pub(crate) enum Compression {
 pub(crate) struct CodecParams {
     /// LERC: the largest error allowed (0 for lossless).
     pub max_z_error: f64,
+    /// LERC: the largest error allowed in the overviews (`MAX_Z_ERROR_OVERVIEW`), when it is not
+    /// `max_z_error`: see [`CodecParams::at_level`].
+    pub max_z_error_overview: Option<f64>,
     /// LERC: write `lerc-writer`'s compact blobs (`LERC_ENCODER=COMPACT`) rather than the blobs
     /// GDAL writes (`GDAL`, the default).
     pub lerc_compact: bool,
@@ -74,6 +77,7 @@ impl Default for CodecParams {
     fn default() -> Self {
         Self {
             max_z_error: 0.0,
+            max_z_error_overview: None,
             lerc_compact: false,
             jpeg_quality: 75,
             jpeg_ycbcr: false,
@@ -81,6 +85,18 @@ impl Default for CodecParams {
             webp_lossless: false,
             deflate_level: crate::deflate_compress::Level::DEFAULT,
             zstd_level: 9,
+        }
+    }
+}
+
+impl CodecParams {
+    /// The parameters of image `level` of a file (0 is the full resolution, then the overviews):
+    /// LERC overviews are encoded at `MAX_Z_ERROR_OVERVIEW`, as GDAL 3.12.2 and 3.13.3 encode
+    /// them, which is `MAX_Z_ERROR` when it is not given.
+    pub(crate) fn at_level(&self, level: usize) -> Self {
+        match self.max_z_error_overview {
+            Some(max_z_error) if level > 0 => Self { max_z_error, ..*self },
+            _ => *self,
         }
     }
 }
@@ -515,6 +531,8 @@ pub(crate) struct TiffOptions {
     pub codec: CodecParams,
     /// `MAX_Z_ERROR` as given, which GDAL records in the IMAGE_STRUCTURE metadata of a LERC file.
     pub max_z_error_text: Option<String>,
+    /// `MAX_Z_ERROR_OVERVIEW` as given, which GDAL records too.
+    pub max_z_error_overview_text: Option<String>,
     /// The raster's bands are pairs of real and imaginary parts (a complex dataset): written as
     /// complex samples (`SampleFormat` 5 or 6, GDAL's `CInt16`... `CFloat64`).
     pub complex: bool,
@@ -631,6 +649,7 @@ impl Default for TiffOptions {
             rpc: Vec::new(),
             codec: CodecParams::default(),
             max_z_error_text: None,
+            max_z_error_overview_text: None,
             complex: false,
             nbits: None,
             sparse: false,
@@ -924,11 +943,23 @@ impl TiffOptions {
                 .ok_or_else(|| Error::InvalidArgument(format!("invalid MAX_Z_ERROR '{v}'")))?;
             o.max_z_error_text = Some(v.to_string());
         }
+        // GDAL reads MAX_Z_ERROR_OVERVIEW as a number whatever it is (`CPLAtof`); terrio refuses
+        // what MAX_Z_ERROR refuses.
+        if let Some(v) = co("MAX_Z_ERROR_OVERVIEW") {
+            o.codec.max_z_error_overview = Some(
+                v.trim()
+                    .parse::<f64>()
+                    .ok()
+                    .filter(|e| *e >= 0.0)
+                    .ok_or_else(|| Error::InvalidArgument(format!("invalid MAX_Z_ERROR_OVERVIEW '{v}'")))?,
+            );
+            o.max_z_error_overview_text = Some(v.to_string());
+        }
         if let Some(v) = co("LERC_ENCODER") {
             o.codec.lerc_compact = match v.trim().to_ascii_uppercase().as_str() {
                 "GDAL" => false,
                 "COMPACT" => true,
-                other => return Err(Error::InvalidArgument(format!("invalid LERC_ENCODER '{other}' (GDAL, COMPACT)"))),
+                _ => return Err(Error::InvalidArgument(format!("invalid LERC_ENCODER '{v}' (GDAL, COMPACT)"))),
             };
         }
         if let Some((key, v)) = co("JPEG_QUALITY")
@@ -1288,13 +1319,20 @@ fn plan(raster: &Raster, opts: &TiffOptions) -> Result<Plan> {
     };
 
     // GDAL's GTiff and COG drivers record LERC's error bound, as the option was given, or that
-    // LERC is lossless (GDAL 3.13.3).
+    // LERC is lossless (GDAL 3.12.2, 3.13.3). With a MAX_Z_ERROR_OVERVIEW of another value, both
+    // options are recorded as given, MAX_Z_ERROR empty when it was not, whether or not the file
+    // has overviews.
     if matches!(opts.compression, Compression::Lerc | Compression::LercDeflate | Compression::LercZstd) {
-        image_structure.push(if opts.codec.max_z_error > 0.0 {
-            ("MAX_Z_ERROR".into(), opts.max_z_error_text.clone().unwrap_or_else(|| opts.codec.max_z_error.to_string()))
-        } else {
-            ("COMPRESSION_REVERSIBILITY".into(), "LOSSLESS".into())
-        });
+        let e = opts.codec.max_z_error;
+        let given = || opts.max_z_error_text.clone();
+        match opts.codec.max_z_error_overview.filter(|o| *o != e) {
+            Some(_) => {
+                image_structure.push(("MAX_Z_ERROR".into(), given().unwrap_or_default()));
+                image_structure.push(("MAX_Z_ERROR_OVERVIEW".into(), opts.max_z_error_overview_text.clone().unwrap_or_default()));
+            }
+            None if e > 0.0 => image_structure.push(("MAX_Z_ERROR".into(), given().unwrap_or_else(|| e.to_string()))),
+            None => image_structure.push(("COMPRESSION_REVERSIBILITY".into(), "LOSSLESS".into())),
+        }
     }
     let mut geo = geo_tags(raster, opts, &image_structure, ignored)?;
     if !opts.georeferenced || !opts.gcps.is_empty() || opts.geo_transform.is_some_and(|gt| !crate::is_north_up(&gt)) {
@@ -1480,7 +1518,7 @@ fn prepare(raster: &Raster, opts: &TiffOptions) -> Result<Prepared> {
     for (i, level) in levels.iter().enumerate() {
         // `SPARSE_OK` leaves out blocks of the full-resolution image only.
         let empty = (opts.sparse && i == 0).then(|| opts.nodata_as_read(raster.data_type).unwrap_or(0.0));
-        let mut img = level.sparse_image(raster.data_type, opts.compression, &opts.codec, &layout, empty)?;
+        let mut img = level.sparse_image(raster.data_type, opts.compression, &opts.codec.at_level(i), &layout, empty)?;
         img.report_clipping();
         if i > 0 {
             img.tags.push((254, Value::Longs(vec![1])));
@@ -3704,7 +3742,7 @@ impl CogWriter {
         let encode = move || -> Result<CogImages> {
             let (compression, codec, layout) = &*encoding;
             let mask = mask.map(|mask| mask_image(&mask, level.cols, rows, (tile, tile, true))).transpose()?;
-            Ok((level.image(data_type, *compression, codec, layout)?, mask))
+            Ok((level.image(data_type, *compression, &codec.at_level(i), layout)?, mask))
         };
         #[cfg(target_family = "wasm")]
         return self.add(i, rows, encode()?);
@@ -7866,8 +7904,8 @@ mod lerc_encoder_tests {
         assert!(matches!(refused, Err(Error::InvalidArgument(m)) if m.contains("LERC_ENCODER")));
     }
 
-    /// GDAL (3.13.3) records LERC's `MAX_Z_ERROR` as the option was given, or that LERC is
-    /// lossless, in the IMAGE_STRUCTURE items of `GDAL_METADATA`, in GeoTIFFs and COGs alike.
+    /// GDAL (3.12.2, 3.13.3) records LERC's `MAX_Z_ERROR` as the option was given, or that LERC
+    /// is lossless, in the IMAGE_STRUCTURE items of `GDAL_METADATA`, in GeoTIFFs and COGs alike.
     #[test]
     fn lerc_tags_match_gdal() {
         let ds = surface();
@@ -7885,6 +7923,62 @@ mod lerc_encoder_tests {
             assert!(md.contains(r#"<Item name="COMPRESSION_REVERSIBILITY" domain="IMAGE_STRUCTURE">LOSSLESS</Item>"#), "cog={cog}: {md}");
             assert!(!md.contains("MAX_Z_ERROR"), "cog={cog}: {md}");
         }
+    }
+
+    /// `MAX_Z_ERROR_OVERVIEW` is the overviews' error, and GDAL 3.12.2 records it, with
+    /// `MAX_Z_ERROR` as given (empty when it was not), when the two differ, overviews or not; the
+    /// same value records `MAX_Z_ERROR` alone, or LOSSLESS. Negative or unreadable values are
+    /// refused. (python/tests/test_lerc_encoder.py compares the files with GDAL's.)
+    #[test]
+    fn max_z_error_overview_is_the_overviews_error() {
+        let p = super::CodecParams { max_z_error: 0.01, max_z_error_overview: Some(0.1), ..Default::default() };
+        assert_eq!((p.at_level(0).max_z_error, p.at_level(1).max_z_error, p.at_level(2).max_z_error), (0.01, 0.1, 0.1));
+        let p = super::CodecParams { max_z_error: 0.01, ..Default::default() };
+        assert_eq!(p.at_level(2), p);
+        let ds = surface();
+        let metadata = |p: &str| {
+            let mut d = tiff::decoder::Decoder::new(std::fs::File::open(p).unwrap()).unwrap();
+            d.get_tag_ascii_string(tiff::tags::Tag::Unknown(42112)).unwrap_or_default()
+        };
+        let item = |name: &str, value: &str| format!(r#"<Item name="{name}" domain="IMAGE_STRUCTURE">{value}</Item>"#);
+        for cog in [false, true] {
+            for (mze, mzeo, expected) in [
+                ("0.01", "0.1", vec![item("MAX_Z_ERROR", "0.01"), item("MAX_Z_ERROR_OVERVIEW", "0.1")]),
+                ("0", "0.050", vec![item("MAX_Z_ERROR", "0"), item("MAX_Z_ERROR_OVERVIEW", "0.050")]),
+                ("0.1", "0", vec![item("MAX_Z_ERROR", "0.1"), item("MAX_Z_ERROR_OVERVIEW", "0")]),
+                ("0.01", "0.010", vec![item("MAX_Z_ERROR", "0.01")]),
+                ("0.0", "0", vec![item("COMPRESSION_REVERSIBILITY", "LOSSLESS")]),
+            ] {
+                let (_d, p) = write(&ds, cog, &[("MAX_Z_ERROR", mze), ("MAX_Z_ERROR_OVERVIEW", mzeo)]).unwrap();
+                let md = metadata(&p);
+                let at: Vec<usize> =
+                    expected.iter().map(|e| md.find(e.as_str()).unwrap_or_else(|| panic!("cog={cog} {e}: {md}"))).collect();
+                assert!(at.is_sorted(), "cog={cog}: {md}");
+                assert_eq!(md.matches("<Item name=\"MAX_Z_ERROR").count() + md.matches("REVERSIBILITY").count(), expected.len(), "{md}");
+            }
+            // Not given, MAX_Z_ERROR is recorded empty.
+            let options = RasterWriteOptions {
+                driver: Some(if cog { crate::formats::RasterDriver::Cog } else { crate::formats::RasterDriver::GTiff }),
+                compression: Some("LERC".into()),
+                tile_size: Some(128),
+                creation_options: vec![("MAX_Z_ERROR_OVERVIEW".into(), "0.1".into())],
+                ..Default::default()
+            };
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("x.tif").to_str().unwrap().to_string();
+            crate::write_raster_dataset(&ds, &path, &options).unwrap();
+            assert!(metadata(&path).contains(&item("MAX_Z_ERROR", "")), "{}", metadata(&path));
+            for bad in ["-1", "bogus", ""] {
+                let Err(Error::InvalidArgument(m)) = write(&ds, cog, &[("MAX_Z_ERROR_OVERVIEW", bad)]) else { panic!("{bad:?}") };
+                assert_eq!(m, format!("invalid MAX_Z_ERROR_OVERVIEW '{bad}'"));
+            }
+        }
+        // The full-resolution image is the same as without it; the overviews of a COG are not.
+        let (_a, with) = write(&ds, true, &[("MAX_Z_ERROR_OVERVIEW", "0.5")]).unwrap();
+        let (_b, without) = write(&ds, true, &[]).unwrap();
+        let read = |p: &str| crate::open_raster(p).unwrap().raster.data.to_f64_vec();
+        assert!(read(&with).iter().zip(read(&without)).all(|(a, b)| a == &b || (a.is_nan() && b.is_nan())));
+        assert!(std::fs::read(&with).unwrap().len() < std::fs::read(&without).unwrap().len());
     }
 
     /// Each chunk is the blob `lerc-writer` encodes with its GDAL profile.

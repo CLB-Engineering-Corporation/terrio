@@ -4570,7 +4570,7 @@ def suite_lerc_writer(ctx):
     s.cases.append(Case("Edge-tile padding", "float, integer, band- and pixel-interleaved; GTiff and COG",
                         IDENTICAL if complete else DIFFERS, detail))
     complete, detail = _pytest_module_conformance(ctx, "test_lerc_encoder.py", selection="not lossless_8bit",
-                                                  expected_count=284)
+                                                  expected_count=300)
     s.cases.append(Case("LERC blobs", "LERC, LERC_DEFLATE and LERC_ZSTD; Int8 to Float64, lossless and lossy; "
                         "one band, pixel and band interleaved; NaN, nodata and masks; GTiff and COG with overviews",
                         IDENTICAL if complete else DIFFERS,
@@ -4579,10 +4579,11 @@ def suite_lerc_writer(ctx):
                         "GDAL_METADATA and IMAGE_STRUCTURE items exact. " + detail))
     complete, detail = _pytest_module_conformance(ctx, "test_lerc_encoder.py", selection="lossless_8bit_lerc_reads",
                                                   expected_count=48)
-    s.cases.append(Case("LERC blobs", "lossless Int8 and Byte (libLerc's Huffman coding)",
+    s.cases.append(Case("LERC blobs, lossless 8-bit", "lossless Int8 and Byte (libLerc's Huffman coding)",
                         NOT_COMPARED if complete else DIFFERS,
                         "Known difference: lerc-writer 0.5.2's Huffman code table and codes are not libLerc's, "
-                        "so the blobs differ; the pixels and masks GDAL reads are the same. " + detail))
+                        "so those tiles differ; the other tiles' blobs and the pixels and masks GDAL reads are "
+                        "the same. " + detail))
     return s
 
 

@@ -9,13 +9,19 @@ bands pixel- and band-interleaved, NaN, a nodata value or a per-dataset mask, as
 in 128 x 128 tiles of a 300 x 200 raster, so the right and bottom tiles are partial.
 ``LERC_ENCODER=COMPACT`` writes other, no larger blobs within the same ``MAX_Z_ERROR``.
 
-One known difference: lossless Int8 and Byte data (``MAX_Z_ERROR`` below 1), which libLerc codes
-with Huffman codes where they are smaller than its tiles. lerc-writer 0.5.2 writes a version 2
-code table and its own codes there, where libLerc writes version 4, so those blobs differ; they
-decode to GDAL's pixels (``test_lossless_8bit_lerc_reads_as_gdal_s``), and
-``test_lossless_8bit_lerc_blobs_are_gdal_s`` fails until lerc-writer matches libLerc.
+Known differences:
 
-Reference: GDAL 3.12.2 (rasterio 1.5.2).
+- Lossless Int8 and Byte data (``MAX_Z_ERROR`` below 1), in the tiles libLerc codes with Huffman
+  codes (where they are smaller than its blocks). lerc-writer 0.5.2 writes a version 2 code table
+  and its own codes there, where libLerc writes version 4, so those blobs differ; the other tiles'
+  blobs and every pixel are GDAL's (``test_lossless_8bit_lerc_reads_as_gdal_s``), and
+  ``test_lossless_8bit_lerc_blobs_are_gdal_s`` fails until lerc-writer matches libLerc.
+- The module asserts GDAL 3.12's blobs. GDAL 3.13 also masks the padding of partial edge tiles of
+  pixel-interleaved floating-point bands, which terrio (as GDAL 3.12) does not, so those rows are
+  strict expected failures with GDAL 3.13 and later (``GDAL_313_PADDING``).
+
+Reference: GDAL 3.12.2 (rasterio 1.5.2); the pixel-interleaved floating-point rows also checked to
+differ, as expected, from GDAL 3.13.3.
 """
 
 import struct
@@ -31,6 +37,17 @@ rasterio = pytest.importorskip("rasterio")
 rasterio_shutil = pytest.importorskip("rasterio.shutil")
 MemoryFile = pytest.importorskip("rasterio.io").MemoryFile
 
+# The reference's major.minor version, read as conftest.py's `_reference_gdal_version` reads it.
+GDAL_VERSION = tuple(int(part) for part in rasterio.__gdal_version__.split(".")[:2])
+# GDAL 3.13 masks the padding of pixel-interleaved floating-point edge tiles; terrio writes GDAL
+# 3.12's blobs there (see the module's docstring).
+GDAL_313_PADDING = pytest.mark.xfail(
+    GDAL_VERSION >= (3, 13),
+    strict=True,
+    raises=AssertionError,
+    reason="GDAL 3.13 masks the padding of pixel-interleaved floating-point edge tiles, which "
+    "GDAL 3.12 and terrio do not",
+)
 W, H, TILE = 300, 200, 128
 GT = (500000.0, 10.0, 0.0, 4000000.0, 0.0, -10.0)
 NAN = float("nan")
@@ -166,6 +183,20 @@ def _id(case):
     return "-".join(parts)
 
 
+def _params(cases):
+    """The cases as pytest parameters, GDAL 3.13's padding rows marked."""
+    return [
+        pytest.param(
+            c,
+            id=_id(c),
+            marks=GDAL_313_PADDING
+            if c[0].startswith("float") and c[1] > 1 and c[2] == "pixel"
+            else (),
+        )
+        for c in cases
+    ]
+
+
 def _unzstd(data):
     """Decompresses a Zstandard frame with whichever library is installed."""
     try:
@@ -224,8 +255,12 @@ def _write(
     mask=None,
     encoder=None,
     overviews=False,
+    extra=None,
 ):
-    """Writes ``a`` with GDAL (rasterio) and Terrio; returns the two paths."""
+    """Writes ``a`` with GDAL (rasterio) and Terrio; returns the two paths.
+
+    ``mze`` None leaves MAX_Z_ERROR out; ``extra`` holds other creation options for both.
+    """
     gdal_path, terrio_path = tmp_path / "gdal.tif", tmp_path / f"terrio-{encoder}.tif"
     profile = dict(
         driver="GTiff",
@@ -241,16 +276,18 @@ def _write(
         src.write(a)
         if mask is not None:
             src.write_mask(mask)
-        extra = {"max_z_error": mze, "interleave": interleave}
+        co = {"interleave": interleave, **{k.lower(): v for k, v in (extra or {}).items()}}
+        if mze is not None:
+            co["max_z_error"] = mze
         if driver == "COG":
-            extra.update(blocksize=TILE)
-            extra.update(overview_resampling="nearest") if overviews else extra.update(
-                overviews="NONE"
-            )
+            co.update(blocksize=TILE)
+            co.update(overview_resampling="nearest") if overviews else co.update(overviews="NONE")
         else:
-            extra.update(tiled=True, blockxsize=TILE, blockysize=TILE)
-        rasterio_shutil.copy(src, gdal_path, driver=driver, compress=compress, **extra)
-    options = {"MAX_Z_ERROR": str(mze), "INTERLEAVE": interleave.upper()}
+            co.update(tiled=True, blockxsize=TILE, blockysize=TILE)
+        rasterio_shutil.copy(src, gdal_path, driver=driver, compress=compress, **co)
+    options = {"INTERLEAVE": interleave.upper(), **(extra or {})}
+    if mze is not None:
+        options["MAX_Z_ERROR"] = str(mze)
     if driver == "COG":
         if not overviews:
             options["OVERVIEWS"] = "NONE"
@@ -289,7 +326,7 @@ def _assert_blobs_are_gdal_s(gdal_path, terrio_path, compress):
 
 @pytest.mark.parametrize("driver", ["GTiff", "COG"])
 @pytest.mark.parametrize("compress", ["LERC", "LERC_DEFLATE", "LERC_ZSTD"])
-@pytest.mark.parametrize("case", CASES, ids=_id)
+@pytest.mark.parametrize("case", _params(CASES))
 def test_default_lerc_blobs_are_gdal_s(tmp_path, driver, compress, case):
     dt, bands, interleave, nodata, holes, mask, mze = case
     a = _array(dt, bands, nodata, holes)
@@ -326,10 +363,37 @@ def test_lossless_8bit_lerc_reads_as_gdal_s(tmp_path, driver, compress, case):
     _assert_reads_as_gdal_s(*paths)
     with rasterio.open(paths[1]) as t:
         np.testing.assert_array_equal(t.read(), a)
+    # Only the tiles GDAL codes with Huffman codes differ.
+    gdal, ours = _chunks(paths[0]), _chunks(paths[1])
+    assert [k for k, _ in gdal] == [k for k, _ in ours]
+    modes = [_lerc_mode(_blob(g, compress)) for _, g in gdal]
+    assert "huffman" in modes
+    for (key, g), (_, t), mode in zip(gdal, ours, modes, strict=True):
+        if mode != "huffman":
+            assert _blob(t, compress) == _blob(g, compress), f"{mode} tile {key}"
+
+
+def _lerc_mode(blob):
+    """How a Lerc2 v4 blob of 8-bit data codes its pixels: "constant", "one sweep", "tiles" or
+    "huffman" (libLerc's IEM_DeltaHuffman or IEM_Huffman)."""
+    assert blob[:6] == b"Lerc2 " and struct.unpack_from("<i", blob, 6)[0] == 4
+    depth = struct.unpack_from("<i", blob, 22)[0]
+    valid, _, _, data_type = struct.unpack_from("<4i", blob, 26)
+    assert data_type in (0, 1), data_type  # Char, Byte
+    max_z_error, z_min, z_max = struct.unpack_from("<3d", blob, 42)
+    pos = 66
+    pos += 4 + struct.unpack_from("<i", blob, pos)[0]  # the mask
+    if valid == 0 or z_min == z_max:
+        return "constant"
+    pos += 2 * depth  # each depth's minimum and maximum, one byte each
+    if blob[pos]:
+        return "one sweep"
+    return "huffman" if max_z_error == 0.5 and blob[pos + 1] in (1, 2) else "tiles"
 
 
 @pytest.mark.xfail(
     strict=True,
+    raises=AssertionError,
     reason="known difference: lerc-writer 0.5.2's Huffman coding (a version 2 code table) is not "
     "libLerc's (version 4), used for lossless 8-bit data where it is smaller than tiles",
 )
@@ -475,6 +539,37 @@ def _gdal_metadata(path):
             start = value if count > 4 else ifd + 10 + 12 * i
             return b[start : start + count].rstrip(b"\x00").decode()
     return None
+
+
+@pytest.mark.parametrize(
+    ("mze", "mzeo"), [("0.01", "0.1"), ("0", "0.05"), ("0.1", "0"), ("0.01", "0.01")]
+)
+@pytest.mark.parametrize("compress", ["LERC", "LERC_ZSTD"])
+def test_max_z_error_overview_is_gdal_s(tmp_path, compress, mze, mzeo):
+    """A COG's overviews at MAX_Z_ERROR_OVERVIEW: every level's blob, and GDAL_METADATA."""
+    a = _array("float32", 1, NAN)
+    paths = _write(
+        tmp_path, a, NAN, "COG", compress, mze, overviews=True, extra={"MAX_Z_ERROR_OVERVIEW": mzeo}
+    )
+    _assert_blobs_are_gdal_s(*paths, compress)
+    assert _gdal_metadata(paths[1]) == _gdal_metadata(paths[0]).rstrip("\n")
+    with rasterio.open(paths[1], overview_level=0) as t:
+        overview = t.read(1).astype("float64")
+    expected = a[0][::2, ::2].astype("float64")
+    valid = ~np.isnan(expected)
+    assert np.abs(overview[valid] - expected[valid]).max() <= float(mzeo) + 1e-5
+
+
+@pytest.mark.parametrize("driver", ["GTiff", "COG"])
+@pytest.mark.parametrize(
+    ("mze", "mzeo"), [("0.01", "0.1"), ("0", "0.05"), (None, "0.1"), ("0.0", "0")]
+)
+def test_max_z_error_overview_metadata_is_gdal_s(tmp_path, driver, mze, mzeo):
+    """Recorded with MAX_Z_ERROR as given (empty when it is not) when the two differ, overviews
+    or not, as GDAL records them."""
+    a = _array("float32", 1, NAN)
+    paths = _write(tmp_path, a, NAN, driver, "LERC", mze, extra={"MAX_Z_ERROR_OVERVIEW": mzeo})
+    assert _gdal_metadata(paths[1]) == _gdal_metadata(paths[0]).rstrip("\n")
 
 
 @pytest.mark.parametrize("driver", ["GTiff", "COG"])

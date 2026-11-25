@@ -56,11 +56,11 @@ fn translate_and_convert_pass_lerc_encoder_to_the_writer() {
 
             let result = terrio(
                 dir.path(),
-                &[command, "src.tif", "bad.tif", "--format", format, "--co", "COMPRESS=LERC", "--co", "LERC_ENCODER=FAST"],
+                &[command, "src.tif", "bad.tif", "--format", format, "--co", "COMPRESS=LERC", "--co", "LERC_ENCODER=fast"],
             );
             let stderr = String::from_utf8_lossy(&result.stderr);
             assert!(
-                !result.status.success() && stderr.contains("invalid LERC_ENCODER 'FAST' (GDAL, COMPACT)"),
+                !result.status.success() && stderr.contains("invalid LERC_ENCODER 'fast' (GDAL, COMPACT)"),
                 "{command} {format}: {stderr}"
             );
         }
