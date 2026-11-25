@@ -2594,18 +2594,91 @@ pub(crate) mod fallible {
         Ok(v)
     }
 
-    /// The bytes of memory the process can use, as GDAL 3.12.1 counts them
-    /// (`CPLGetUsablePhysicalRAM`): the physical memory (`MemTotal`), less under the memory limit
-    /// of the process's cgroup or of one above it (`memory.max`, or `memory.limit_in_bytes` in
-    /// cgroup version 1), and less under its address-space or resident-set limit (`RLIMIT_AS`,
-    /// `RLIMIT_RSS`). `None` where none of them can be read (systems without `/proc`).
+    /// A memory budget ceiling in bytes, based on total physical RAM and OS limits.
     ///
-    /// Where the system overcommits memory, an allocation of more succeeds and the process is
-    /// killed as its pages are written: a buffer sized from a file is checked against this first.
+    /// Linux uses `MemTotal` capped by cgroup, address-space and resident-set limits
+    /// (the semantics of GDAL 3.12.1's `CPLGetUsablePhysicalRAM`). Windows caps physical RAM
+    /// by the process's virtual address-space size and the immediate job's process and job
+    /// memory limits, when present. macOS caps physical RAM by the soft address-space limit.
+    /// Returns `None` when no budget can be determined, including on unsupported platforms.
+    ///
+    /// This is a ceiling for sizing allocations. It does not measure free memory, subtract
+    /// current usage, or guarantee that a given allocation will succeed.
     pub fn usable_memory() -> Option<u64> {
-        static PHYSICAL: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
-        let physical = *PHYSICAL.get_or_init(|| physical_memory(&|path| std::fs::read_to_string(path).ok()));
-        usable_within(physical, &std::fs::read_to_string("/proc/self/limits").unwrap_or_default())
+        #[cfg(target_os = "linux")]
+        {
+            static PHYSICAL: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+            let physical = *PHYSICAL.get_or_init(|| physical_memory(&|path| std::fs::read_to_string(path).ok()));
+            usable_within(physical, &std::fs::read_to_string("/proc/self/limits").unwrap_or_default())
+        }
+        #[cfg(windows)]
+        {
+            windows_memory()
+        }
+        #[cfg(target_os = "macos")]
+        {
+            macos_memory()
+        }
+        #[cfg(not(any(target_os = "linux", windows, target_os = "macos")))]
+        {
+            None
+        }
+    }
+
+    #[cfg(windows)]
+    fn windows_memory() -> Option<u64> {
+        use windows_sys::Win32::System::JobObjects::{
+            JOB_OBJECT_LIMIT_JOB_MEMORY, JOB_OBJECT_LIMIT_PROCESS_MEMORY, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+            JobObjectExtendedLimitInformation, QueryInformationJobObject,
+        };
+        use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+
+        let mut status = MEMORYSTATUSEX { dwLength: size_of::<MEMORYSTATUSEX>() as u32, ..Default::default() };
+        // SAFETY: status is writable and dwLength gives its size as required by the API.
+        let has_status = unsafe { GlobalMemoryStatusEx(&mut status) } != 0;
+        let mut job = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        // SAFETY: a null job handle asks about the calling process's immediate job.
+        // The output buffer has the layout and size required by this information class.
+        let has_job = unsafe {
+            QueryInformationJobObject(
+                std::ptr::null_mut(),
+                JobObjectExtendedLimitInformation,
+                std::ptr::from_mut(&mut job).cast(),
+                size_of_val(&job) as u32,
+                std::ptr::null_mut(),
+            )
+        } != 0;
+        let flags = job.BasicLimitInformation.LimitFlags;
+        [
+            has_status.then_some(status.ullTotalPhys).filter(|&bytes| bytes > 0),
+            has_status.then_some(status.ullTotalVirtual).filter(|&bytes| bytes > 0),
+            (has_job && flags & JOB_OBJECT_LIMIT_PROCESS_MEMORY != 0).then_some(job.ProcessMemoryLimit as u64),
+            (has_job && flags & JOB_OBJECT_LIMIT_JOB_MEMORY != 0).then_some(job.JobMemoryLimit as u64),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
+    }
+
+    #[cfg(target_os = "macos")]
+    fn macos_memory() -> Option<u64> {
+        let mut total = 0u64;
+        let mut len = size_of_val(&total);
+        // SAFETY: hw.memsize is a 64-bit value. The output buffer and its length are
+        // writable. A null input and zero input size make this a read-only query.
+        let has_total =
+            unsafe { libc::sysctlbyname(c"hw.memsize".as_ptr(), std::ptr::from_mut(&mut total).cast(), &mut len, std::ptr::null_mut(), 0) }
+                == 0;
+        let mut limit = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+        // SAFETY: limit is writable. On macOS RLIMIT_RSS aliases RLIMIT_AS.
+        let has_limit = unsafe { libc::getrlimit(libc::RLIMIT_AS, &mut limit) } == 0;
+        [
+            (has_total && len == size_of_val(&total) && total > 0).then_some(total),
+            (has_limit && limit.rlim_cur != libc::RLIM_INFINITY).then_some(limit.rlim_cur),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
     }
 
     /// [`usable_memory`] read from the files `read` gives (the file's text, `None` when it cannot
@@ -2618,6 +2691,7 @@ pub(crate) mod fallible {
 
     /// The least of `physical` and the address-space and resident-set limits in `limits`, the
     /// text of `/proc/self/limits`.
+    #[cfg(any(target_os = "linux", test))]
     fn usable_within(physical: Option<u64>, limits: &str) -> Option<u64> {
         // "Max address space   4294967296   4294967296   bytes": the soft limit, unless unlimited.
         let limit = |name: &str| {
@@ -2629,6 +2703,7 @@ pub(crate) mod fallible {
     /// GDAL's `CPLGetPhysicalRAM` on Linux: `MemTotal`, and the memory limits of the cgroups from
     /// the process's up to the root, the files read with `read` (the file's text, `None` when it
     /// cannot be read).
+    #[cfg(any(target_os = "linux", test))]
     pub(crate) fn physical_memory(read: &dyn Fn(&str) -> Option<String>) -> Option<u64> {
         let meminfo = read("/proc/meminfo")?;
         let total = meminfo.lines().find_map(|l| l.strip_prefix("MemTotal:"))?.trim().strip_suffix("kB")?.trim().parse::<u64>().ok()?;
@@ -2954,6 +3029,67 @@ mod tests {
         std::fs::copy(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/grib/temperature.grib2"), &path).unwrap();
         let result = crate::open(path.to_str().unwrap());
         assert!(matches!(result, Err(crate::Error::ResourceLimit(_))), "{result:?}");
+    }
+
+    #[cfg(any(target_os = "linux", windows, target_os = "macos"))]
+    #[test]
+    fn usable_memory_reports_a_plausible_host_budget() {
+        let bytes = crate::usable_memory().expect("the host reports a memory budget");
+        assert!((1 << 20..=1 << 50).contains(&bytes), "unexpected memory budget: {bytes} bytes");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn usable_memory_respects_the_current_job_limits() {
+        use std::os::windows::io::{FromRawHandle, OwnedHandle};
+        use windows_sys::Win32::System::JobObjects::{
+            AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_JOB_MEMORY, JOB_OBJECT_LIMIT_PROCESS_MEMORY,
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation, SetInformationJobObject,
+        };
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+        // A process cannot leave its job, so do not apply the limits to the test runner.
+        const CHILD: &str = "TERRIO_TEST_USABLE_MEMORY_JOB";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "dataset::tests::usable_memory_respects_the_current_job_limits"])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stdout));
+            return;
+        }
+
+        // SAFETY: null arguments request an unnamed job with default security.
+        let raw = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+        assert!(!raw.is_null(), "{}", std::io::Error::last_os_error());
+        // SAFETY: raw is a newly owned job handle. Keep it alive until the checks finish.
+        let _job = unsafe { OwnedHandle::from_raw_handle(raw) };
+        let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_PROCESS_MEMORY | JOB_OBJECT_LIMIT_JOB_MEMORY;
+        limits.ProcessMemoryLimit = 128 << 20;
+        limits.JobMemoryLimit = 256 << 20;
+        let set_limits = |limits: &JOBOBJECT_EXTENDED_LIMIT_INFORMATION| {
+            // SAFETY: raw is live and the input has the required layout and size.
+            let ok = unsafe {
+                SetInformationJobObject(
+                    raw,
+                    JobObjectExtendedLimitInformation,
+                    std::ptr::from_ref(limits).cast(),
+                    size_of_val(limits) as u32,
+                )
+            };
+            assert_ne!(ok, 0, "{}", std::io::Error::last_os_error());
+        };
+        set_limits(&limits);
+        // SAFETY: both handles are valid in this process.
+        let assigned = unsafe { AssignProcessToJobObject(raw, GetCurrentProcess()) };
+        assert_ne!(assigned, 0, "{}", std::io::Error::last_os_error());
+        assert_eq!(crate::usable_memory(), Some(128 << 20));
+
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_JOB_MEMORY;
+        set_limits(&limits);
+        assert_eq!(crate::usable_memory(), Some(256 << 20));
     }
 
     /// The memory a process can use counts its cgroup's limit and those of the groups above it
