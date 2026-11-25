@@ -198,6 +198,28 @@ pub(crate) fn sample_buffer(data_type: DataType, len: usize) -> Result<DecodingR
     })
 }
 
+/// Resizes a typed chunk scratch buffer without allocating again when its capacity is sufficient.
+pub(crate) fn resize_samples(buf: &mut DecodingResult, len: usize) -> std::io::Result<()> {
+    fn resize<T: Default + Clone>(values: &mut Vec<T>, len: usize) -> std::io::Result<()> {
+        fallible::reserve(values, len.saturating_sub(values.len()), "a TIFF chunk")?;
+        values.resize(len, T::default());
+        Ok(())
+    }
+    match buf {
+        DecodingResult::U8(v) => resize(v, len),
+        DecodingResult::I8(v) => resize(v, len),
+        DecodingResult::U16(v) => resize(v, len),
+        DecodingResult::I16(v) => resize(v, len),
+        DecodingResult::U32(v) => resize(v, len),
+        DecodingResult::I32(v) => resize(v, len),
+        DecodingResult::U64(v) => resize(v, len),
+        DecodingResult::I64(v) => resize(v, len),
+        DecodingResult::F16(v) => resize(v, len),
+        DecodingResult::F32(v) => resize(v, len),
+        DecodingResult::F64(v) => resize(v, len),
+    }
+}
+
 /// Shortens `buf` to `len` samples.
 pub(crate) fn truncate(buf: &mut DecodingResult, len: usize) {
     match buf {

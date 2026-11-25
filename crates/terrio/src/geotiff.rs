@@ -1226,7 +1226,7 @@ fn decode_chunk<R: Read + Seek>(
     limit: usize,
     err: &(dyn Fn(tiff::TiffError) -> crate::Error + Sync),
 ) -> crate::Result<DecodedChunk> {
-    let decoded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    guard_chunk_decode(idx as usize, || {
         let bytes = match codec {
             Some(codec) => codec.allocation_bytes(dec, idx).map_err(err)?,
             None => {
@@ -1242,14 +1242,17 @@ fn decode_chunk<R: Read + Seek>(
         let addressable = (bytes <= isize::MAX as usize).then_some(bytes);
         crate::dataset::fallible::check_usable(addressable, || format!("decoded TIFF chunk {idx} is too large to allocate"))
             .map_err(crate::Error::ResourceLimit)?;
-        read_chunk(dec, codec, idx, limit).map_err(err)
-    }));
+        let chunk = read_chunk(dec, codec, idx, limit).map_err(err)?;
+        let (w, h) = dec.chunk_data_dimensions(idx);
+        Ok((idx, chunk, (w as usize, h as usize)))
+    })
+}
+
+/// Converts a panic in a chunk codec on malformed input into a TIFF read error.
+pub(crate) fn guard_chunk_decode<T>(idx: usize, decode: impl FnOnce() -> crate::Result<T>) -> crate::Result<T> {
+    let decoded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(decode));
     match decoded {
-        Ok(chunk) => {
-            let chunk = chunk?;
-            let (w, h) = dec.chunk_data_dimensions(idx);
-            Ok((idx, chunk, (w as usize, h as usize)))
-        }
+        Ok(result) => result,
         Err(payload) => {
             let message = payload
                 .downcast_ref::<&str>()

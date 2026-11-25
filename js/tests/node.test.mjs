@@ -52,6 +52,21 @@ const SQUARES = {
   ],
 };
 
+test("readBandInto fills a typed-array view with native TIFF window samples", () => {
+  const source = terrio.rasterFromArray(Float32Array.from({length: 39 * 35}, (_, i) => i - 99), 39, 35,
+    [10, 1, 0, 46, 0, -1], "EPSG:4326", -99);
+  const raster = terrio.open(source.toBytes("source.tif", {format: "COG", compress: "DEFLATE", tileSize: 16}), "source.tif");
+  const window = [7, 13, 32, 22];
+  const backing = new Float32Array(2 + 32 * 22).fill(42);
+  const out = backing.subarray(1, -1);
+  raster.readBandInto(1, out, window);
+  assert.deepEqual(out, raster.readBand(1, window));
+  assert.equal(backing[0], 42);
+  assert.equal(backing[backing.length - 1], 42);
+  assert.throws(() => raster.readBandInto(1, new Int32Array(out.length), window), /Float32Array/);
+  assert.throws(() => raster.readBandInto(1, new Float32Array(1), window), /length/);
+});
+
 test("periodicLongitude: false keeps bilinear inside a full-turn source's stored columns", () => {
   // Each pixel holds its centre longitude: -179.5 and 179.5 meet at the stored edge.
   const values = Float64Array.from({length: 360 * 180}, (_, i) => (i % 360) - 179.5);
@@ -246,6 +261,18 @@ test("whole-raster toBytes keeps source items before explicit overrides and doma
   const cropItems = Object.fromEntries(terrio.open(cropped, "crop.tif").info().metadata);
   assert.equal(cropItems.A, undefined);
   assert.equal(cropItems.B, "2");
+});
+
+test("BIGTIFF creation options take GDAL's values: only YES makes a small raster a BigTIFF", () => {
+  const base = terrio.rasterFromArray(new Float32Array(70 * 50).map((_, i) => i), 70, 50, [0, 1, 0, 50, 0, -1], "EPSG:4326");
+  for (const format of ["GTiff", "COG"]) {
+    for (const [BIGTIFF, version] of [["YES", 43], ["NO", 42], ["IF_NEEDED", 42], ["if_safer", 42]]) {
+      const bytes = base.toBytes("b.tif", { format, compress: "DEFLATE", creationOptions: { BIGTIFF } });
+      assert.equal(bytes[2] | (bytes[3] << 8), version, `${format} BIGTIFF=${BIGTIFF}`);
+      assert.deepEqual(terrio.open(bytes, "b.tif").readBand(1), base.readBand(1));
+    }
+    assert.throws(() => base.toBytes("b.tif", { format, creationOptions: { BIGTIFF: "SOMETIMES" } }), /BIGTIFF/);
+  }
 });
 
 test("Zstandard GeoTIFFs with predictors, decoded without the C library", () => {

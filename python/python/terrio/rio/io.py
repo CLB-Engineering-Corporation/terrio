@@ -2073,6 +2073,37 @@ class DatasetReader(DatasetBase):
             buf = (int(out_shape[-2]), int(out_shape[-1]))
         else:
             buf = win_shape
+        # A contiguous, native-type single-band output can receive the decoded TIFF pixels.
+        # Keep the existing read path for masks, resampling, casts and sources that need it.
+        if (
+            type(out) in (np.ndarray, np.memmap)
+            and out.ndim == 3
+            and out.flags.c_contiguous
+            and out.flags.aligned
+            and out.flags.writeable
+            and out.dtype.isnative
+            and out.dtype == np.dtype(self._dtype)
+            and len(idx) == 1
+            and buf == win_shape
+            and min(buf) > 0
+            and not (boundless or masked)
+            and fill_value is None
+            and resampling == Resampling.nearest
+            and getattr(self, "_raster", None) is not None
+            and type(self)._read_level is DatasetReader._read_level
+        ):
+            x, y = (0, 0) if win is None else (win.col_off, win.row_off)
+            if win is None or all(int(v) == v for v in (x, y, win.width, win.height)):
+                try:
+                    if self._raster._read_geotiff_into(
+                        idx[0], (int(x), int(y), buf[1], buf[0]), out
+                    ):
+                        return out[0] if return2d else out
+                except ResourceLimitError:
+                    raise
+                except Exception as err:
+                    raise RasterioIOError(f"Read failed: {err}") from err
+
         # Preserve components for wide real/complex outputs before their final conversion.
         precise = self._exact_complex_read() and (
             (dtype.kind in "iu" and dtype.itemsize >= 4)

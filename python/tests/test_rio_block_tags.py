@@ -1,6 +1,8 @@
 """TIFF block metadata agrees with stored tables and GDAL 3.12.1 without pixel reads."""
 
 import struct
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
 from types import SimpleNamespace
 
 import numpy as np
@@ -99,6 +101,48 @@ def test_block_items_match_stored_tables(tmp_path, tiled, interleave, bigtiff):
         np.testing.assert_array_equal(actual.read(), values)
     with rio.MemoryFile(path.read_bytes()) as memory, memory.open() as actual:
         assert actual.get_tag_item("BLOCK_OFFSET_0_0", "TIFF", bidx=1) == str(offsets[0])
+
+
+def test_sparse_block_items_from_concurrent_queries(tmp_path):
+    """Shared readers report stored sparse pairs and match GDAL for stored tiles.
+
+    Args:
+        tmp_path: Temporary directory.
+    """
+    gdal = pytest.importorskip("osgeo.gdal")
+    path = tmp_path / "sparse.tif"
+    dataset = gdal.GetDriverByName("GTiff").Create(
+        str(path),
+        32,
+        16,
+        1,
+        gdal.GDT_Byte,
+        options=["TILED=YES", "BLOCKXSIZE=16", "BLOCKYSIZE=16", "SPARSE_OK=YES"],
+    )
+    dataset.SetGeoTransform((10, 1, 0, 46, 0, -1))
+    dataset.GetRasterBand(1).WriteArray(np.full((16, 16), 100, dtype="uint8"))
+    dataset = None
+
+    workers = 8
+    gate = Barrier(workers)
+    dataset = gdal.Open(str(path))
+    band = dataset.GetRasterBand(1)
+    with rio.open(path) as actual:
+
+        def query(_):
+            gate.wait()
+            return [
+                actual.get_tag_item(f"BLOCK_{kind}_{x}_0", "TIFF", bidx=1)
+                for x in [0, 1]
+                for kind in ["OFFSET", "SIZE"]
+            ]
+
+        want = [band.GetMetadataItem(f"BLOCK_{kind}_0_0", "TIFF") for kind in ["OFFSET", "SIZE"]]
+        assert all(want)
+        assert band.GetMetadataItem("BLOCK_SIZE_1_0", "TIFF") is None
+        assert band.GetMetadataItem("BLOCK_OFFSET_1_0", "TIFF") is None
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            assert list(pool.map(query, range(workers))) == [want + ["0", "0"]] * workers
 
 
 def test_block_queries_over_http_do_not_fetch_pixels(tmp_path, record_property):

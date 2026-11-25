@@ -352,17 +352,77 @@ LZW. LERC levels must lie within `MAX_Z_ERROR` plus one Float32 spacing of the s
 values (the decoded sample's rounding; GDAL's own levels need the same allowance), with nodata
 pixels exact; the two LERC encoders' bytes are not compared.
 
+## BigTIFF creation options
+
+`python scripts/conformance.py DATA --only bigtiff --strict` runs
+`scripts/compare_bigtiff_with_gdal.py` (osgeo, GDAL 3.13.3). Its 17 large cases create the same
+empty image with GDAL (`SPARSE_OK=TRUE`, as `gdal_create`) and with `terrio create-raster`, on
+both sides of the sizes where GDAL's choice changes: 4.2 GB of padded tiles for `IF_NEEDED`
+and `NO` (uncompressed images only), 2 GB for `IF_SAFER` (compressed or not), strips unpadded,
+every band counted. Each pair must be two classic TIFFs, two BigTIFFs or two refusals, and GDAL
+must read terrio's file. Blocks of zeros are left out, so no file takes more than a few
+megabytes. Its 16 small cases convert a Float32 raster to GeoTIFF and COG with each policy,
+compressed or not: a classic TIFF unless `BIGTIFF=YES`, as GDAL's, read back by GDAL sample for
+sample.
+
+The unit tests of `drivers/gtiff_write.rs` hold the same thresholds, and the COG case GDAL's COG
+driver measures (its overviews count, unpadded). Where GDAL writes a classic TIFF that later
+fails past 4 GiB (`IF_NEEDED` with compression), terrio writes a BigTIFF when the file is known
+to exceed 4 GiB (written whole, or a COG) or estimated to (rows written as they come, a quarter
+more than the uncompressed samples): a known difference, which the suite's 4.2 GB DEFLATE case
+reports as not compared.
+
+## TIFF reads into caller buffers
+
+`python scripts/conformance.py DATA --only tiff-read-into --strict` compares
+caller-buffer reads with GDAL 3.12.2 via rasterio. The samples must match exactly
+for strips and tiles (including partial edge tiles), pixel and band interleave,
+and Byte, Int16 and Float32 bands. Stored nodata and NaN values are preserved, and
+scale and offset metadata remain separate from the samples. Sparse blocks are
+also checked. Rust tests compare concurrent reads with the owned TIFF read and
+verify zero additional worker decoder opens after the file is renamed.
+
+The positioned decoder is also compared with GDAL 3.13.3 on a real DEM
+subset retiled with LZW and the floating-point predictor. Rust regressions
+check that nested callers stay on their Rayon workers, that the raw and
+typed buffers retain their allocations across full and edge tiles, and
+that concurrent window reads produce exact values without opening worker
+decoders. Calls outside Rayon use Terrio's fork-aware pool under its
+ordinary contention guard, sized by `RAYON_NUM_THREADS`.
+
+## GeoTIFF tiles in any order
+
+`python scripts/conformance.py DATA --only tiled-writes --strict` runs
+`scripts/compare_tiled_writes_with_gdal.py` (osgeo, GDAL 3.13.3), which needs no test data. It
+writes the tiles of a 300 x 217 raster of 64-pixel tiles, whose right and bottom tiles are cut by
+its edges, in a shuffled order with `terrio.GeoTiffWriter.write_tile`, and GDAL writes the same
+tiles in the same order to a file of the same creation options (`Create`, then one `WriteRaster`
+per tile). For Byte, Int16, Int32, Float32 and Float64 rasters, LZW, DEFLATE and ZSTD, predictors
+1, 2 and 3 (floating point only) and pixel and band interleaving, GDAL reads both files: samples
+bit for bit, data type, block size, compression, predictor, interleaving, nodata, geotransform and
+CRS must be the same. Tiles never given are filled with nodata by both, or, with `SPARSE_OK=YES`,
+left out by both, with the tiles given whose samples are all nodata: the same blocks have an
+offset of 0 (`BLOCK_OFFSET_x_y` of the `TIFF` metadata domain). `terrio translate --co
+SPARSE_OK=YES` and `gdal_translate -co SPARSE_OK=TRUE` of the same source leave out the same
+blocks and read the same; uncompressed, the blocks kept hold the same bytes. File sizes are
+reported; compressed bytes are not compared. The Rust tests of `drivers::gtiff_write` hold the
+tiles' compressed chunks byte for byte to those of the same raster written in rows.
+
 ## TIFF block metadata
 
 `python scripts/conformance.py DATA --only tiff-block-tags --strict` requires
-all 15 checks in `python/tests/test_rio_block_tags.py`, including corrupt-table
+all 16 checks in `python/tests/test_rio_block_tags.py`, including corrupt-table
 open-time refusal and propagation of a native corruption exception at the facade
 query boundary. TIFF-domain
 `BLOCK_OFFSET_x_y` and `BLOCK_SIZE_x_y` items match the file's chunk arrays and
 GDAL exactly for tiles, strips, classic TIFF, BigTIFF, planar/interleaved bands,
 complex samples, MemoryFile, overviews and real Landsat data. External overview
 offsets refer to the `.ovr` file. Block items are queried individually and are
-not enumerated in `tags()`.
+not enumerated in `tags()`. Concurrent queries through one handle also check a
+GDAL-written sparse TIFF: stored tiles match GDAL, while Terrio reports the stored
+zero offset and size of omitted tiles that GDAL leaves absent. The Rust regression
+evicts the source bytes and holds the decoder lock while cached range queries
+complete, with no file bytes requested.
 
 The loopback HTTP COG test measures transferred bytes and requests. Opening
 the dataset and querying all base blocks transfers less than one quarter of

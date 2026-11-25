@@ -23,23 +23,12 @@ mod owned;
 pub use float::{BandLayout, FloatElement};
 pub use owned::ArrayError;
 
+pub use crate::pixel::RasterElement;
 use crate::{Error, Raster, Result};
 use ndarray::{ArrayView2, ArrayView3, ArrayViewMut2, ArrayViewMut3, Axis};
 use wbraster::DataType;
-use wbraster::raster::RasterData;
 
 mod sealed {
-    use wbraster::raster::RasterData;
-
-    /// The variant of `RasterData` holding a type.
-    pub trait Sealed: Sized {
-        fn slice(data: &RasterData) -> Option<&[Self]>;
-        fn slice_mut(data: &mut RasterData) -> Option<&mut [Self]>;
-        /// The buffer, leaving an empty one (`Vec::new`, which allocates nothing) of the same type.
-        fn take(data: &mut RasterData) -> Option<Vec<Self>>;
-        fn wrap(values: Vec<Self>) -> RasterData;
-    }
-
     /// The types `RasterArrayExt` is implemented for.
     pub trait Viewed {}
 
@@ -50,54 +39,6 @@ mod sealed {
 
     impl Floating for f32 {}
     impl Floating for f64 {}
-}
-
-/// A type of raster pixels, and of the arrays viewing them: `u8`, `i8`, `u16`, `i16`, `u32`, `i32`,
-/// `u64`, `i64`, `f32` or `f64`, the types [`RasterData`]'s variants hold.
-///
-/// Implemented for these types only.
-pub trait RasterElement: sealed::Sealed + Copy + Send + Sync + 'static {
-    /// The data type of rasters holding this type: [`DataType::F32`] for `f32`.
-    const DATA_TYPE: DataType;
-}
-
-macro_rules! element {
-    ($($t:ty: $variant:ident, $slice:ident, $slice_mut:ident;)*) => {$(
-        impl sealed::Sealed for $t {
-            fn slice(data: &RasterData) -> Option<&[Self]> {
-                data.$slice()
-            }
-            fn slice_mut(data: &mut RasterData) -> Option<&mut [Self]> {
-                data.$slice_mut()
-            }
-            fn take(data: &mut RasterData) -> Option<Vec<Self>> {
-                match data {
-                    RasterData::$variant(values) => Some(std::mem::take(values)),
-                    _ => None,
-                }
-            }
-            fn wrap(values: Vec<Self>) -> RasterData {
-                RasterData::$variant(values)
-            }
-        }
-
-        impl RasterElement for $t {
-            const DATA_TYPE: DataType = DataType::$variant;
-        }
-    )*};
-}
-
-element! {
-    u8: U8, as_u8_slice, as_u8_slice_mut;
-    i8: I8, as_i8_slice, as_i8_slice_mut;
-    u16: U16, as_u16_slice, as_u16_slice_mut;
-    i16: I16, as_i16_slice, as_i16_slice_mut;
-    u32: U32, as_u32_slice, as_u32_slice_mut;
-    i32: I32, as_i32_slice, as_i32_slice_mut;
-    u64: U64, as_u64_slice, as_u64_slice_mut;
-    i64: I64, as_i64_slice, as_i64_slice_mut;
-    f32: F32, as_f32_slice, as_f32_slice_mut;
-    f64: F64, as_f64_slice, as_f64_slice_mut;
 }
 
 /// Views of a raster's pixels as `ndarray` arrays, without copying them.

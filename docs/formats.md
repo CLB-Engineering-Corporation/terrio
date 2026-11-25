@@ -261,6 +261,14 @@ with a warning:
 
 A COG writes every tile, and warns that it does.
 
+A tiled GeoTIFF without an internal mask can be written tile by tile in any order
+(`GeoTiffWriter::write_tile` in Rust, `GeoTiffWriter.write_tile` in Python), each tile from its
+pixels within the raster, unpadded at the right and bottom edges, and appended to the file as it
+comes. In Rust, a `TileEncoder` compresses tiles on any thread while the writer appends those
+compressed (`write_compressed_tile`). Tiles never written are filled with nodata, or 0, when the
+file is finished, or left out with `SPARSE_OK=YES`, as GDAL fills or leaves out the blocks it was
+never given. A file is written in tiles or in rows, not both.
+
 terrio reads the pixels of a block left out of a GeoTIFF as nodata, or 0, whichever writer left it
 out: read whole or by window, from an overview, or over HTTP. That nodata is the file's (exactly,
 for 64-bit integer samples) or, in local reads, a band's own from the `.aux.xml` sidecar, as the
@@ -1518,7 +1526,10 @@ geometry-column options to distinguish it from coordinate-like attributes.
   a limit is refused with a resource-limit error, which is not retried with GDAL. Zip archives
   opened from memory (Python and JavaScript byte reads) read their members within the same
   archive limits; an archive in another's member shares its `TERRIO_ZIP_MAX_SIZE`, and archives
-  nest at most 8 deep.
+  nest at most 8 deep. Gzip-compressed tar archives read through `/vsitar/` (`.tar.gz`, `.tgz`)
+  also cap the decompressed stream, skipped members included, at `TERRIO_ZIP_MAX_SIZE` (default
+  4 GiB) plus the tar framing of the entries read (2 KiB each for headers and padding, and 4 KiB
+  more), which `TERRIO_ZIP_MAX_ENTRIES` bounds.
 - **KML styles** (`<Style>`, `<StyleMap>`) are read into an `OGR_STYLE` field holding GDAL's style
   strings (`PEN(c:#FF0000FF,w:2.000000px);BRUSH(fc:#00FF0040)`), and written back as KML styles;
   OGR's null brush (`BRUSH(id:"ogr-brush-1")`) and null pen (`PEN(id:"ogr-pen-1")`) are written as

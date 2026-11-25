@@ -56,7 +56,14 @@ mask = terrio.open_raster("masked.tif", lazy=True).read_mask()  # a GeoTIFF's in
 w = terrio.GeoTiffWriter("big.tif", 100000, 80000, 1, "uint16", transform, crs="EPSG:32610",
                          compress="DEFLATE", tile_size=512, mask=True)
 for rows, valid in row_blocks:  # (1, n, 100000) uint16 and (n, 100000) uint8 arrays
-    w.write(rows, valid)
+    w.write(rows, valid)  # read where they are when read-only and C-contiguous, else copied
+w.close()
+# A tiled GeoTIFF written tile by tile, in any order (tiles never written are nodata).
+w = terrio.GeoTiffWriter("tiles.tif", 100000, 80000, 1, "float32", transform, nodata=-9999.0,
+                         compress="DEFLATE", options={"TILED": "YES"})
+tile_width, tile_height, across, down = w.tile_grid
+for col, row, tile in finished_tiles:  # float32 tiles, cut at the right and bottom edges
+    w.write_tile(col, row, tile)
 w.close()
 
 out = terrio.Raster.from_array(elevation * 3.28084, dem.transform, crs=dem.crs, nodata=dem.nodata)
@@ -496,7 +503,9 @@ reject duplicate names that differ only in case, such as `COMPRESS` and
 `compress`, so conflicting aliases cannot depend on a writer's precedence rules.
 `create_raster` requires `dst` whenever file-output options, including `options`, are supplied.
 For GeoTIFF/COG, `compress` overrides `options["COMPRESS"]`, and `bigtiff=True` forces BigTIFF
-even with `options={"BIGTIFF": "NO"}`. Explicit block-size creation options override `tile_size`:
+even with `options={"BIGTIFF": "NO"}`. `options["BIGTIFF"]` takes GDAL's `YES`, `NO`,
+`IF_NEEDED` (the default) and `IF_SAFER`, chosen as GDAL chooses (see `terrio::BigTiffPolicy`).
+Explicit block-size creation options override `tile_size`:
 `BLOCKXSIZE`/`BLOCKYSIZE` for tiled GeoTIFF, or `BLOCKSIZE` for COG. Otherwise `tile_size`
 supplies the tile dimensions. These GeoTIFF/COG precedence rules also apply to `Raster.write`.
 Other formats use their own writer rules; for example, netCDF's `options["COMPRESS"]`

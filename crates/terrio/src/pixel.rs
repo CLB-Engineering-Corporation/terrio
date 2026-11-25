@@ -2,7 +2,8 @@
 //! every pixel to `f64` and back.
 
 /// A sample type of `RasterData`.
-pub(crate) trait Pixel: Copy + Default + Send + Sync + PartialEq + 'static {
+// `pub` in this private module: a supertrait of the sealed `RasterElement`, unnameable outside the crate.
+pub trait Pixel: Copy + Default + Send + Sync + PartialEq + 'static {
     /// The size of a sample in bytes.
     const SIZE: usize;
     /// The sample as `f64` (`as` conversion).
@@ -215,4 +216,70 @@ mod tests {
         let big = RasterConfig { cols: usize::MAX, rows: 2, bands: 1, ..cfg() };
         assert!(raster_from_data(big, RasterData::I16(Vec::new())).is_err());
     }
+}
+
+pub(crate) mod sealed {
+    use wbraster::raster::RasterData;
+
+    /// The variant of `RasterData` holding a type.
+    pub trait Sealed: super::Pixel + Sized {
+        fn slice(data: &RasterData) -> Option<&[Self]>;
+        fn slice_mut(data: &mut RasterData) -> Option<&mut [Self]>;
+        /// The buffer, leaving an empty one (`Vec::new`, which allocates nothing) of the same type.
+        #[cfg_attr(not(feature = "ndarray"), allow(dead_code))]
+        fn take(data: &mut RasterData) -> Option<Vec<Self>>;
+        #[cfg_attr(not(feature = "ndarray"), allow(dead_code))]
+        fn wrap(values: Vec<Self>) -> RasterData;
+    }
+}
+
+/// A type of raster pixels: `u8`, `i8`, `u16`, `i16`, `u32`, `i32`, `u64`, `i64`, `f32` or `f64`,
+/// the types [`RasterData`](wbraster::raster::RasterData)'s variants hold. Typed slices of pixels
+/// ([`GeoTiffWriter::write_rows_slice`](crate::GeoTiffWriter::write_rows_slice)) and, with the
+/// `ndarray` feature, arrays viewing a raster's pixels are of these types.
+///
+/// Implemented for these types only.
+pub trait RasterElement: sealed::Sealed + Copy + Send + Sync + 'static {
+    /// The data type of rasters holding this type: [`DataType::F32`](wbraster::DataType::F32) for
+    /// `f32`.
+    const DATA_TYPE: wbraster::DataType;
+}
+
+macro_rules! element {
+    ($($t:ty: $variant:ident, $slice:ident, $slice_mut:ident;)*) => {$(
+        impl sealed::Sealed for $t {
+            fn slice(data: &wbraster::raster::RasterData) -> Option<&[Self]> {
+                data.$slice()
+            }
+            fn slice_mut(data: &mut wbraster::raster::RasterData) -> Option<&mut [Self]> {
+                data.$slice_mut()
+            }
+            fn take(data: &mut wbraster::raster::RasterData) -> Option<Vec<Self>> {
+                match data {
+                    wbraster::raster::RasterData::$variant(values) => Some(std::mem::take(values)),
+                    _ => None,
+                }
+            }
+            fn wrap(values: Vec<Self>) -> wbraster::raster::RasterData {
+                wbraster::raster::RasterData::$variant(values)
+            }
+        }
+
+        impl RasterElement for $t {
+            const DATA_TYPE: wbraster::DataType = wbraster::DataType::$variant;
+        }
+    )*};
+}
+
+element! {
+    u8: U8, as_u8_slice, as_u8_slice_mut;
+    i8: I8, as_i8_slice, as_i8_slice_mut;
+    u16: U16, as_u16_slice, as_u16_slice_mut;
+    i16: I16, as_i16_slice, as_i16_slice_mut;
+    u32: U32, as_u32_slice, as_u32_slice_mut;
+    i32: I32, as_i32_slice, as_i32_slice_mut;
+    u64: U64, as_u64_slice, as_u64_slice_mut;
+    i64: I64, as_i64_slice, as_i64_slice_mut;
+    f32: F32, as_f32_slice, as_f32_slice_mut;
+    f64: F64, as_f64_slice, as_f64_slice_mut;
 }

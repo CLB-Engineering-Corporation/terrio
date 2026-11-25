@@ -1103,6 +1103,16 @@ pub(crate) fn open_vector_native(path: &str, options: &VectorOpenOptions) -> Res
         layers.iter_mut().for_each(|l| options.keep_range(l));
         return Ok(finish_vector(layers, path, VectorDriver::Parquet));
     }
+    // A remote FlatGeobuf with a spatial index is read with a bbox by range requests: the index
+    // nodes on the way and the features found, not the whole file.
+    #[cfg(all(remote, feature = "flatgeobuf"))]
+    if let Some(bbox) = options.spatial_filter
+        && let Some(layer) = crate::drivers::vector::flatgeobuf::read_remote(path, bbox)?
+    {
+        let mut layers = select_layers(vec![layer], path, options)?;
+        layers.iter_mut().for_each(|l| options.keep_range(l));
+        return Ok(finish_vector(layers, path, VectorDriver::FlatGeobuf));
+    }
     let local = vfs::resolve(path)?;
     match open_local(local.as_str(), options).map_err(|e| naming_resolved_dataset(e, path, &local))? {
         Dataset::Vector(v) => {
@@ -1757,12 +1767,14 @@ pub struct RasterWriteOptions {
     pub compression: Option<String>,
     /// Write GeoTIFF tiles of this size (COG tiles default to 512).
     pub tile_size: Option<u32>,
-    /// Force BigTIFF.
+    /// Force BigTIFF (GeoTIFF and COG), whatever the `BIGTIFF` creation option says: the same as
+    /// `BIGTIFF=YES` (see [`RasterWriteOptions::bigtiff_policy`]).
     pub bigtiff: bool,
     /// Format-specific creation options, as GDAL names them (`KEY`, `VALUE`): Zarr
     /// `FORMAT=ZARR_V2|ZARR_V3`; netCDF `FORMAT=NC|NC2|NC5`; GeoTIFF `TILED=YES`,
     /// `BLOCKXSIZE`, `BLOCKYSIZE`, `INTERLEAVE=PIXEL|BAND`, `PHOTOMETRIC=MINISBLACK|RGB|PALETTE`,
-    /// `ALPHA=YES`, `BIGTIFF=YES`, `COMPRESS`, and terrio's `GEOREFERENCED=NO` (no geotransform).
+    /// `ALPHA=YES`, `BIGTIFF=YES|NO|IF_NEEDED|IF_SAFER` ([`BigTiffPolicy`]), `COMPRESS`, and
+    /// terrio's `GEOREFERENCED=NO` (no geotransform).
     pub creation_options: Vec<(String, String)>,
     /// Descriptive metadata of each band (GeoTIFF: written to the `GDAL_METADATA` tag).
     pub band_metadata: Vec<BandMetadata>,
@@ -1854,6 +1866,78 @@ pub struct RasterWriteOptions {
     /// from 64 to 4096), of 128 otherwise, and the blocks set how its kernels round. Set by
     /// [`crate::LazyRaster::write`].
     pub source_block_size: Option<(usize, usize)>,
+}
+
+/// Whether a GeoTIFF or COG is written as a BigTIFF: GDAL's `BIGTIFF` creation option, which
+/// [`RasterWriteOptions::bigtiff_policy`] reads.
+///
+/// GDAL (3.13) decides from the image's uncompressed size, the bands' samples of its padded
+/// tiles (or of its rows, in strips), and terrio makes the same choice. terrio also writes a
+/// BigTIFF where a classic TIFF would not hold the file: with [`BigTiffPolicy::IfNeeded`] or
+/// [`BigTiffPolicy::IfSafer`] when its compressed size is known (an in-memory raster or a COG) or
+/// estimated (rows written as they come: a quarter more than the uncompressed size) to exceed
+/// 4 GiB, where GDAL writes a classic TIFF and fails once it does.
+///
+/// ```
+/// use terrio::BigTiffPolicy;
+///
+/// assert_eq!("if_safer".parse::<BigTiffPolicy>()?, BigTiffPolicy::IfSafer);
+/// assert_eq!(BigTiffPolicy::default().to_string(), "IF_NEEDED");
+/// # Ok::<(), terrio::Error>(())
+/// ```
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum BigTiffPolicy {
+    /// `IF_NEEDED`, the default: a BigTIFF when an uncompressed image exceeds 4.2 GB
+    /// (4,200,000,000 bytes), or the file would exceed 4 GiB.
+    #[default]
+    IfNeeded,
+    /// `IF_SAFER`: a BigTIFF when the uncompressed image, compressed or not, exceeds 2 GB
+    /// (2,000,000,000 bytes), or the file would exceed 4 GiB.
+    IfSafer,
+    /// `YES` (or `TRUE`, `ON`, `1`): always a BigTIFF.
+    Yes,
+    /// `NO` (or `FALSE`, `OFF`, `0`): always a classic TIFF. Writing fails, as in GDAL, before any
+    /// pixel is written when an uncompressed image exceeds 4.2 GB, and otherwise once the file
+    /// would exceed 4 GiB.
+    No,
+}
+
+impl BigTiffPolicy {
+    /// The policy of a `BIGTIFF` value, case-insensitive; `None` for other values (which GDAL
+    /// warns about and reads as `YES`, unless they mean no).
+    pub fn parse(value: &str) -> Option<Self> {
+        Some(match value.trim().to_ascii_uppercase().as_str() {
+            "IF_NEEDED" => Self::IfNeeded,
+            "IF_SAFER" => Self::IfSafer,
+            "YES" | "TRUE" | "ON" | "1" => Self::Yes,
+            "NO" | "FALSE" | "OFF" | "0" => Self::No,
+            _ => return None,
+        })
+    }
+
+    /// The option's value, as GDAL names it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::IfNeeded => "IF_NEEDED",
+            Self::IfSafer => "IF_SAFER",
+            Self::Yes => "YES",
+            Self::No => "NO",
+        }
+    }
+}
+
+impl std::str::FromStr for BigTiffPolicy {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        Self::parse(s).ok_or_else(|| Error::InvalidArgument(format!("invalid BIGTIFF '{s}' (YES, NO, IF_NEEDED or IF_SAFER)")))
+    }
+}
+
+impl std::fmt::Display for BigTiffPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 /// A ground control point: a pixel position and its georeferenced coordinates, as GDAL's
@@ -2176,12 +2260,14 @@ fn write_raster_with_nodata(
     let compression = options.compression.as_deref().map(parse_compression).transpose()?;
     match driver {
         RasterDriver::Cog => {
-            let opts = wbraster::CogWriteOptions { compression, bigtiff: Some(options.bigtiff), tile_size: options.tile_size };
+            let bigtiff = Some(options.bigtiff_policy()? == BigTiffPolicy::Yes);
+            let opts = wbraster::CogWriteOptions { compression, bigtiff, tile_size: options.tile_size };
             raster.write_cog_with_options(path, &opts)?;
         }
         RasterDriver::GTiff => {
             let layout = options.tile_size.map(|t| wbraster::GeoTiffLayout::Tiled { tile_width: t, tile_height: t });
-            let opts = wbraster::GeoTiffWriteOptions { compression, bigtiff: Some(options.bigtiff), layout };
+            let bigtiff = Some(options.bigtiff_policy()? == BigTiffPolicy::Yes);
+            let opts = wbraster::GeoTiffWriteOptions { compression, bigtiff, layout };
             raster.write_geotiff_with_options(path, &opts)?;
         }
         RasterDriver::VRT => {
@@ -2404,6 +2490,32 @@ pub(crate) fn ensure_writable_location(path: &str) -> Result<()> {
 }
 
 impl RasterWriteOptions {
+    /// Whether a GeoTIFF or COG is written as a BigTIFF: [`BigTiffPolicy::Yes`] when
+    /// [`RasterWriteOptions::bigtiff`] is set, otherwise the last `BIGTIFF` creation option
+    /// (names are case-insensitive), and [`BigTiffPolicy::IfNeeded`] without one.
+    ///
+    /// # Errors
+    /// When the `BIGTIFF` value is not one of GDAL's (`YES`, `NO`, `IF_NEEDED`, `IF_SAFER`).
+    ///
+    /// ```
+    /// use terrio::{BigTiffPolicy, RasterWriteOptions};
+    ///
+    /// let options =
+    ///     RasterWriteOptions { creation_options: vec![("BIGTIFF".into(), "IF_SAFER".into())], ..Default::default() };
+    /// assert_eq!(options.bigtiff_policy()?, BigTiffPolicy::IfSafer);
+    /// # Ok::<(), terrio::Error>(())
+    /// ```
+    pub fn bigtiff_policy(&self) -> Result<BigTiffPolicy> {
+        if self.bigtiff {
+            return Ok(BigTiffPolicy::Yes);
+        }
+        self.creation_options
+            .iter()
+            .rev()
+            .find(|(k, _)| k.eq_ignore_ascii_case("BIGTIFF"))
+            .map_or(Ok(BigTiffPolicy::IfNeeded), |(_, v)| v.parse())
+    }
+
     /// Selects a compatible inherited unsigned TIFF width (GDAL 3.13.3 NBITS).
     /// Returns `None` for inconsistent/missing source widths, an explicit NBITS override,
     /// incompatible output options, or nodata outside the stored domain. With uncompressed
@@ -2565,18 +2677,91 @@ pub(crate) mod fallible {
         Ok(v)
     }
 
-    /// The bytes of memory the process can use, as GDAL 3.12.1 counts them
-    /// (`CPLGetUsablePhysicalRAM`): the physical memory (`MemTotal`), less under the memory limit
-    /// of the process's cgroup or of one above it (`memory.max`, or `memory.limit_in_bytes` in
-    /// cgroup version 1), and less under its address-space or resident-set limit (`RLIMIT_AS`,
-    /// `RLIMIT_RSS`). `None` where none of them can be read (systems without `/proc`).
+    /// A memory budget ceiling in bytes, based on total physical RAM and OS limits.
     ///
-    /// Where the system overcommits memory, an allocation of more succeeds and the process is
-    /// killed as its pages are written: a buffer sized from a file is checked against this first.
+    /// Linux uses `MemTotal` capped by cgroup, address-space and resident-set limits
+    /// (the semantics of GDAL 3.12.1's `CPLGetUsablePhysicalRAM`). Windows caps physical RAM
+    /// by the process's virtual address-space size and the immediate job's process and job
+    /// memory limits, when present. macOS caps physical RAM by the soft address-space limit.
+    /// Returns `None` when no budget can be determined, including on unsupported platforms.
+    ///
+    /// This is a ceiling for sizing allocations. It does not measure free memory, subtract
+    /// current usage, or guarantee that a given allocation will succeed.
     pub fn usable_memory() -> Option<u64> {
-        static PHYSICAL: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
-        let physical = *PHYSICAL.get_or_init(|| physical_memory(&|path| std::fs::read_to_string(path).ok()));
-        usable_within(physical, &std::fs::read_to_string("/proc/self/limits").unwrap_or_default())
+        #[cfg(target_os = "linux")]
+        {
+            static PHYSICAL: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+            let physical = *PHYSICAL.get_or_init(|| physical_memory(&|path| std::fs::read_to_string(path).ok()));
+            usable_within(physical, &std::fs::read_to_string("/proc/self/limits").unwrap_or_default())
+        }
+        #[cfg(windows)]
+        {
+            windows_memory()
+        }
+        #[cfg(target_os = "macos")]
+        {
+            macos_memory()
+        }
+        #[cfg(not(any(target_os = "linux", windows, target_os = "macos")))]
+        {
+            None
+        }
+    }
+
+    #[cfg(windows)]
+    fn windows_memory() -> Option<u64> {
+        use windows_sys::Win32::System::JobObjects::{
+            JOB_OBJECT_LIMIT_JOB_MEMORY, JOB_OBJECT_LIMIT_PROCESS_MEMORY, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+            JobObjectExtendedLimitInformation, QueryInformationJobObject,
+        };
+        use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+
+        let mut status = MEMORYSTATUSEX { dwLength: size_of::<MEMORYSTATUSEX>() as u32, ..Default::default() };
+        // SAFETY: status is writable and dwLength gives its size as required by the API.
+        let has_status = unsafe { GlobalMemoryStatusEx(&mut status) } != 0;
+        let mut job = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        // SAFETY: a null job handle asks about the calling process's immediate job.
+        // The output buffer has the layout and size required by this information class.
+        let has_job = unsafe {
+            QueryInformationJobObject(
+                std::ptr::null_mut(),
+                JobObjectExtendedLimitInformation,
+                std::ptr::from_mut(&mut job).cast(),
+                size_of_val(&job) as u32,
+                std::ptr::null_mut(),
+            )
+        } != 0;
+        let flags = job.BasicLimitInformation.LimitFlags;
+        [
+            has_status.then_some(status.ullTotalPhys).filter(|&bytes| bytes > 0),
+            has_status.then_some(status.ullTotalVirtual).filter(|&bytes| bytes > 0),
+            (has_job && flags & JOB_OBJECT_LIMIT_PROCESS_MEMORY != 0).then_some(job.ProcessMemoryLimit as u64),
+            (has_job && flags & JOB_OBJECT_LIMIT_JOB_MEMORY != 0).then_some(job.JobMemoryLimit as u64),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
+    }
+
+    #[cfg(target_os = "macos")]
+    fn macos_memory() -> Option<u64> {
+        let mut total = 0u64;
+        let mut len = size_of_val(&total);
+        // SAFETY: hw.memsize is a 64-bit value. The output buffer and its length are
+        // writable. A null input and zero input size make this a read-only query.
+        let has_total =
+            unsafe { libc::sysctlbyname(c"hw.memsize".as_ptr(), std::ptr::from_mut(&mut total).cast(), &mut len, std::ptr::null_mut(), 0) }
+                == 0;
+        let mut limit = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+        // SAFETY: limit is writable. On macOS RLIMIT_RSS aliases RLIMIT_AS.
+        let has_limit = unsafe { libc::getrlimit(libc::RLIMIT_AS, &mut limit) } == 0;
+        [
+            (has_total && len == size_of_val(&total) && total > 0).then_some(total),
+            (has_limit && limit.rlim_cur != libc::RLIM_INFINITY).then_some(limit.rlim_cur),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
     }
 
     /// [`usable_memory`] read from the files `read` gives (the file's text, `None` when it cannot
@@ -2589,6 +2774,7 @@ pub(crate) mod fallible {
 
     /// The least of `physical` and the address-space and resident-set limits in `limits`, the
     /// text of `/proc/self/limits`.
+    #[cfg(any(target_os = "linux", test))]
     fn usable_within(physical: Option<u64>, limits: &str) -> Option<u64> {
         // "Max address space   4294967296   4294967296   bytes": the soft limit, unless unlimited.
         let limit = |name: &str| {
@@ -2600,6 +2786,7 @@ pub(crate) mod fallible {
     /// GDAL's `CPLGetPhysicalRAM` on Linux: `MemTotal`, and the memory limits of the cgroups from
     /// the process's up to the root, the files read with `read` (the file's text, `None` when it
     /// cannot be read).
+    #[cfg(any(target_os = "linux", test))]
     pub(crate) fn physical_memory(read: &dyn Fn(&str) -> Option<String>) -> Option<u64> {
         let meminfo = read("/proc/meminfo")?;
         let total = meminfo.lines().find_map(|l| l.strip_prefix("MemTotal:"))?.trim().strip_suffix("kB")?.trim().parse::<u64>().ok()?;
@@ -2925,6 +3112,67 @@ mod tests {
         std::fs::copy(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/grib/temperature.grib2"), &path).unwrap();
         let result = crate::open(path.to_str().unwrap());
         assert!(matches!(result, Err(crate::Error::ResourceLimit(_))), "{result:?}");
+    }
+
+    #[cfg(any(target_os = "linux", windows, target_os = "macos"))]
+    #[test]
+    fn usable_memory_reports_a_plausible_host_budget() {
+        let bytes = crate::usable_memory().expect("the host reports a memory budget");
+        assert!((1 << 20..=1 << 50).contains(&bytes), "unexpected memory budget: {bytes} bytes");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn usable_memory_respects_the_current_job_limits() {
+        use std::os::windows::io::{FromRawHandle, OwnedHandle};
+        use windows_sys::Win32::System::JobObjects::{
+            AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_JOB_MEMORY, JOB_OBJECT_LIMIT_PROCESS_MEMORY,
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation, SetInformationJobObject,
+        };
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+        // A process cannot leave its job, so do not apply the limits to the test runner.
+        const CHILD: &str = "TERRIO_TEST_USABLE_MEMORY_JOB";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "dataset::tests::usable_memory_respects_the_current_job_limits"])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stdout));
+            return;
+        }
+
+        // SAFETY: null arguments request an unnamed job with default security.
+        let raw = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+        assert!(!raw.is_null(), "{}", std::io::Error::last_os_error());
+        // SAFETY: raw is a newly owned job handle. Keep it alive until the checks finish.
+        let _job = unsafe { OwnedHandle::from_raw_handle(raw) };
+        let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_PROCESS_MEMORY | JOB_OBJECT_LIMIT_JOB_MEMORY;
+        limits.ProcessMemoryLimit = 128 << 20;
+        limits.JobMemoryLimit = 256 << 20;
+        let set_limits = |limits: &JOBOBJECT_EXTENDED_LIMIT_INFORMATION| {
+            // SAFETY: raw is live and the input has the required layout and size.
+            let ok = unsafe {
+                SetInformationJobObject(
+                    raw,
+                    JobObjectExtendedLimitInformation,
+                    std::ptr::from_ref(limits).cast(),
+                    size_of_val(limits) as u32,
+                )
+            };
+            assert_ne!(ok, 0, "{}", std::io::Error::last_os_error());
+        };
+        set_limits(&limits);
+        // SAFETY: both handles are valid in this process.
+        let assigned = unsafe { AssignProcessToJobObject(raw, GetCurrentProcess()) };
+        assert_ne!(assigned, 0, "{}", std::io::Error::last_os_error());
+        assert_eq!(crate::usable_memory(), Some(128 << 20));
+
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_JOB_MEMORY;
+        set_limits(&limits);
+        assert_eq!(crate::usable_memory(), Some(256 << 20));
     }
 
     /// The memory a process can use counts its cgroup's limit and those of the groups above it
