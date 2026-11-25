@@ -257,9 +257,8 @@ jobs:
         run: |
           cargo test -p terrio -p terrio-crs --doc
           cargo test -p terrio --doc --features ndarray
-      # The CLB fork: the crates depend on `zstd-rust` from git (gpt-cmdr/zstd-rs, not on crates.io),
-      # which `cargo publish` refuses, and the fork publishes no crates. The packages' file lists are
-      # checked and the crates built instead; the other jobs test the code.
+      # The CLB fork publishes no crates (they share upstream's names and versions). The packages'
+      # file lists are checked and the crates built instead; the other jobs test the code.
       - name: The crates package (file lists) and build
         run: |
           cargo package -p terrio-crs -p terrio -p terrio-cli --list --locked
@@ -437,22 +436,18 @@ jobs:
         run: |
           cargo test -p terrio --features libzstd --lib zstandard
           cargo test -p terrio --features libzstd --test merged -- zstd_tiff_samples:: zstd_input_limits:: parquet_zstd::
-      # HTTPS is `rustls` with `ring` in every native build (CLB fork): `rustls-graviola` 0.4 panics
-      # on the first HTTPS request on x86-64 CPUs without AVX2, ADX or BMI2. No default native build
-      # (the library, the command, the Python wheels and the Docker image, on each release
-      # architecture) may link graviola, and each must link ring.
-      - name: No default native build links graviola
+      # HTTPS is upstream's `rustls-graviola`, with its CPU-feature check. The CLB fork's command and
+      # Python wheels also turn on `ring-fallback`, so HTTPS works on CPUs graviola cannot run on:
+      # each must link ring on every release architecture.
+      - name: The command and the Python wheels fall back to ring
         run: |
           set -o pipefail
           for target in x86_64-unknown-linux-gnu x86_64-unknown-linux-musl aarch64-unknown-linux-gnu aarch64-unknown-linux-musl x86_64-apple-darwin aarch64-apple-darwin x86_64-pc-windows-msvc aarch64-pc-windows-msvc; do
-            for package in terrio terrio-cli terrio-py; do
+            for package in terrio-cli terrio-py; do
               crates=$(cargo tree -p "$package" -e normal,build --target "$target" --prefix none | cut -d' ' -f1 | sort -u)
-              found=$(echo "$crates" | grep -E 'graviola' || true)
-              if [ -n "$found" ]; then echo "$package for $target links $found"; exit 1; fi
-              echo "$crates" | grep -qx ring || { echo "$package for $target has no ring: update this check"; exit 1; }
+              echo "$crates" | grep -qx ring || { echo "$package for $target has no ring: ring-fallback is off"; exit 1; }
             done
           done
-          ! grep -rn graviola Cargo.lock
       - name: The command-line build without a C toolchain
         env:
           CC: "false"
