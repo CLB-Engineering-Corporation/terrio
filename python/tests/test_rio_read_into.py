@@ -117,3 +117,28 @@ def test_complex_destination_uses_existing_conversion(tmp_path):
         got = actual.read(1, out=out)
         assert np.shares_memory(got, out)
         np.testing.assert_array_equal(got, reference.read(1))
+
+
+def test_lzw_destination_matches_gdal_on_terrain(tmp_path, data_dir):
+    gdal = pytest.importorskip("osgeo.gdal")
+    source = data_dir / "dem.tif"
+    if not source.exists():
+        pytest.skip("needs dem.tif")
+    path = tmp_path / "terrain.tif"
+    dataset = gdal.Translate(
+        str(path),
+        str(source),
+        srcWin=[7, 11, 513, 401],
+        outputType=gdal.GDT_Float32,
+        creationOptions=["TILED=YES", "COMPRESS=LZW", "PREDICTOR=3"],
+    )
+    dataset.Close()
+    reference = gdal.Open(str(path))
+    expected = reference.ReadAsArray(3, 5, 510, 396)
+    out = np.empty((396, 510), dtype="float32")
+    with rio.open(path) as actual:
+        # Require the positioned decoder, including both edge tiles and the predictor.
+        assert actual._raster._read_geotiff_into(1, (3, 5, 510, 396), out)
+        np.testing.assert_array_equal(out, expected)
+        assert actual.nodata == reference.GetRasterBand(1).GetNoDataValue()
+        assert actual.transform.to_gdal() == reference.GetGeoTransform()

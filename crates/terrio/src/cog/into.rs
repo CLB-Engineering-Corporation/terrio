@@ -9,7 +9,7 @@ use super::{
     TiffReadLimits, Window, WindowDecoder, nodata_filled, place,
 };
 use crate::dataset::fallible;
-use crate::tiff_codecs::ChunkCodec;
+use crate::tiff_codecs::{ChunkCodec, ChunkScratch};
 use crate::tiff_strip_rows::Rows;
 use std::io::{Read, Seek, SeekFrom};
 use std::sync::Arc;
@@ -112,6 +112,9 @@ impl LazyRaster {
     /// bytes using positioned codecs can be read concurrently through the same handle. The
     /// first read of a level prepares its block tables and codec. Each worker then places blocks
     /// into its own rows of the slice, independently of the owned reader's decoded-block cache.
+    /// A caller already running on a Rayon worker decodes on that worker. Ordinary calls
+    /// can use Terrio's pool (sized by `RAYON_NUM_THREADS`); overlapping outside calls stay
+    /// on their own threads while the pool is in use.
     ///
     /// # Errors
     ///
@@ -223,12 +226,11 @@ impl TiffRaster {
             .and_then(|n| n.checked_mul(across))
             .ok_or_else(|| Error::InvalidData("TIFF chunk index overflow".into()))?;
         let err = self.limits.error();
-        let read = |job: usize, dst: &mut [T]| -> Result<()> {
+        let read = |(cursor, scratch): &mut (Source, ChunkScratch), job: usize, dst: &mut [T]| -> Result<()> {
             let ty = first_y + job;
             let y0 = ty * ch;
             let dh = ch.min(image.height - y0);
             let w = Window::new(w.x, w.y.max(y0), w.width, dst.len() / w.width);
-            let mut cursor = source.cursor();
             for tx in w.x / cw..=(w.x + w.width - 1) / cw {
                 let x0 = tx * cw;
                 let dw = cw.min(image.width - x0);
@@ -252,12 +254,12 @@ impl TiffRaster {
                         let bytes = codec.positioned_bytes((dw, dh)).map_err(err)?;
                         fallible::check_usable(Some(bytes), || format!("decoded TIFF chunk {idx} is too large to allocate"))
                             .map_err(Error::ResourceLimit)?;
-                        codec.read_positioned(&mut cursor, idx, (dw, dh)).map_err(err)
+                        codec.read_positioned_into(cursor, idx, (dw, dh), scratch, true).map_err(err)
                     }
                     DirectCodec::Stored(rows) => {
                         let len = fallible::len(&[dw, dh, spp], "a TIFF chunk")?;
                         fallible::check_raster_buffer("a TIFF chunk", dw, dh, spp, self.data_type)?;
-                        let mut samples = crate::tiff_strip_rows::sample_buffer(self.data_type, len)?;
+                        let samples = scratch.stored_samples(self.data_type, len)?;
                         let mut strip = rows.strip(stored, dw, spp, dh);
                         strip.read(
                             &mut |offset, bytes| {
@@ -280,24 +282,17 @@ impl TiffRaster {
                                 Ok(())
                             },
                             0,
-                            &mut samples,
+                            samples,
                         )?;
                         Ok(samples)
                     }
                 })?;
-                let values = T::decoded(&samples).ok_or_else(|| Error::InvalidData("TIFF chunks differ in sample type".into()))?;
+                let values = T::decoded(samples).ok_or_else(|| Error::InvalidData("TIFF chunks differ in sample type".into()))?;
                 place(dst, values, &ChunkGeom { x0, y0, dw, dh, spp }, w, &[(sample, 0)]);
             }
             Ok(())
         };
-        #[cfg(threads)]
-        if jobs.len() > 1 && crate::par::threads() > 1 {
-            use rayon::prelude::*;
-            // Always use Terrio's fork-aware pool.
-            #[allow(clippy::disallowed_methods)]
-            return crate::par::install(|| jobs.into_par_iter().enumerate().try_for_each(|(i, dst)| read(i, dst)));
-        }
-        jobs.into_iter().enumerate().try_for_each(|(i, dst)| read(i, dst))
+        crate::par::try_for_each_owned_init(jobs, || (source.cursor(), ChunkScratch::default()), read)
     }
 }
 
@@ -345,6 +340,39 @@ mod tests {
             }
         });
         assert_eq!(tiff.workers.opened.load(Relaxed), before, "no new worker decoders");
+    }
+
+    /// Local timing harness. Set TERRIO_READ_INTO_BENCH_TIFF to a tiled Float32 TIFF
+    /// containing pixel values (linear index % 1021), and RAYON_NUM_THREADS to 8.
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    #[ignore = "requires a local tiled Float32 TIFF and measures elapsed time"]
+    #[allow(clippy::disallowed_methods)]
+    fn concurrent_destination_reads_benchmark() {
+        use rayon::prelude::*;
+
+        let path = std::env::var("TERRIO_READ_INTO_BENCH_TIFF").unwrap();
+        let raster = LazyRaster::open(&path).unwrap();
+        let (width, height) = (raster.width(), raster.height());
+        let w = Window::full(width, height);
+        for callers in [1, 8] {
+            let pool = rayon::ThreadPoolBuilder::new().num_threads(callers).build().unwrap();
+            let mut buffers = vec![vec![f32::NAN; width * height]; callers];
+            for pass in 0..4 {
+                let start = std::time::Instant::now();
+                pool.install(|| {
+                    buffers.par_iter_mut().for_each(|buffer| {
+                        for _ in 0..4 {
+                            raster.read_geotiff_samples_into(w, 1, None, buffer).unwrap();
+                        }
+                    });
+                });
+                println!("{callers} callers, pass {pass}: {:.2} ms", start.elapsed().as_secs_f64() * 1000.0);
+            }
+            for buffer in buffers {
+                assert!(buffer.iter().enumerate().all(|(i, &v)| v == (i % 1021) as f32));
+            }
+        }
     }
 
     #[test]

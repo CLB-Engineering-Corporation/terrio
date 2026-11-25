@@ -382,6 +382,14 @@ scale and offset metadata remain separate from the samples. Sparse blocks are
 also checked. Rust tests compare concurrent reads with the owned TIFF read and
 verify zero additional worker decoder opens after the file is renamed.
 
+The positioned decoder is also compared with GDAL 3.13.3 on a real DEM
+subset retiled with LZW and the floating-point predictor. Rust regressions
+check that nested callers stay on their Rayon workers, that the raw and
+typed buffers retain their allocations across full and edge tiles, and
+that concurrent window reads produce exact values without opening worker
+decoders. Calls outside Rayon use Terrio's fork-aware pool under its
+ordinary contention guard, sized by `RAYON_NUM_THREADS`.
+
 ## GeoTIFF tiles in any order
 
 `python scripts/conformance.py DATA --only tiled-writes --strict` runs
