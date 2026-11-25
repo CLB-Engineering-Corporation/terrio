@@ -2464,14 +2464,14 @@ def suite_tiff_read_into(ctx):
     """Compare TIFF samples read directly into a NumPy destination with GDAL."""
     suite = Suite("tiff-read-into", "TIFF reads into caller buffers", "GDAL via rasterio",
                   "Exact native samples for strips, partial edge tiles, pixel and band "
-                  "interleave, sparse blocks, nodata and unscaled integer and float values.")
-    missing = missing_modules("terrio", "pytest", "numpy", "rasterio")
+                  "interleave, sparse blocks, nodata and types, and LZW terrain via osgeo.gdal.")
+    missing = missing_modules("terrio", "pytest", "numpy", "rasterio", "osgeo")
     if missing:
         suite.skipped = "needs " + ", ".join(missing)
         return suite
     import rasterio
     suite.reference = f"GDAL {rasterio.__gdal_version__} via rasterio {rasterio.__version__}"
-    complete, detail = _pytest_module_conformance(ctx, "test_rio_read_into.py", expected_count=26)
+    complete, detail = _pytest_module_conformance(ctx, "test_rio_read_into.py", expected_count=27)
     suite.cases.append(Case("TIFF", "native samples in caller buffers", IDENTICAL if complete else DIFFERS, detail))
     return suite
 

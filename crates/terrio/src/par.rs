@@ -627,6 +627,40 @@ pub(crate) fn map_init<T: Sync, S, R: Send>(
     items.iter().map(|t| f(&mut s, t)).collect()
 }
 
+/// Processes disjoint jobs with scratch reused within each group of jobs. A call already on a
+/// Rayon worker keeps its work on that worker, so nested callers need no second pool. Ordinary
+/// callers use the configured Terrio pool, with the same contention guard as other coarse work.
+#[cfg(feature = "geotiff")]
+pub(crate) fn try_for_each_owned_init<T: Send, S, E: Send>(
+    items: Vec<T>,
+    init: impl Fn() -> S + Sync + Send,
+    f: impl Fn(&mut S, usize, T) -> Result<(), E> + Sync + Send,
+) -> Result<(), E> {
+    let serial = |items: Vec<T>| {
+        let mut scratch = init();
+        items.into_iter().enumerate().try_for_each(|(i, item)| f(&mut scratch, i, item))
+    };
+    #[cfg(threads)]
+    if rayon::current_thread_index().is_none()
+        && let Some(pool) = pool_for(true, items.len(), 2)
+        && pool.0.current_num_threads() > 1
+    {
+        return pool.run(|parallel| {
+            if parallel {
+                // Bound scratch allocations to one per group, at most the worker count.
+                let per_group = items.len().div_ceil(pool.0.current_num_threads());
+                items.into_par_iter().enumerate().chunks(per_group).try_for_each(|group| {
+                    let mut scratch = init();
+                    group.into_iter().try_for_each(|(i, item)| f(&mut scratch, i, item))
+                })
+            } else {
+                serial(items)
+            }
+        });
+    }
+    serial(items)
+}
+
 /// Calls `f` on each item of an owned list with its index, in parallel.
 fn for_each_owned_on<const COARSE: bool, T: Send>(items: Vec<T>, f: impl Fn(usize, T) + Sync + Send) {
     #[cfg(threads)]
@@ -1023,6 +1057,27 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         spawn(move || tx.send(7).unwrap());
         assert_eq!(rx.recv_timeout(std::time::Duration::from_secs(30)), Ok(7));
+    }
+
+    #[test]
+    #[cfg(all(feature = "geotiff", not(target_family = "wasm")))]
+    fn nested_jobs_reuse_scratch_on_the_calling_worker() {
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(8).build().unwrap();
+        pool.broadcast(|_| {
+            let caller = std::thread::current().id();
+            try_for_each_owned_init(
+                (0..16).collect(),
+                || 0,
+                |scratch, i, item| {
+                    assert_eq!(std::thread::current().id(), caller);
+                    assert_eq!(*scratch, i);
+                    assert_eq!(item, i);
+                    *scratch += 1;
+                    Ok::<_, ()>(())
+                },
+            )
+            .unwrap();
+        });
     }
 
     #[test]
