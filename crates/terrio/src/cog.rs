@@ -24,6 +24,11 @@
 //! # Ok::<(), terrio::Error>(())
 //! ```
 
+mod into;
+
+pub use into::TiffSample;
+use into::{DirectImage, DirectSource};
+
 use crate::crs::SpatialRef;
 use crate::formats::RasterDriver;
 use crate::geotiff::{ChunkTables, GeoTags, PatchedReader, try_read_geo_tags_from};
@@ -1094,8 +1099,8 @@ impl LazyRaster {
         if tags.band_nodata.iter().any(|(b, _)| *b == band) { None } else { tags.integer_nodata }
     }
 
-    /// The declared band type, falling back to the shared raster type.
-    pub(crate) fn band_data_type(&self, band: usize) -> DataType {
+    /// The declared type of a band (numbered from 1), falling back to the shared raster type.
+    pub fn band_data_type(&self, band: usize) -> DataType {
         match &self.inner {
             Inner::Source(_, source) => source.band_data_type(band).unwrap_or_else(|| self.data_type()),
             _ => self.data_type(),
@@ -2607,12 +2612,13 @@ struct Level {
     /// The level of the `.ovr` file (see [`TiffRaster::ovr`]) this one is, rather than an image
     /// of this file.
     external: Option<usize>,
-    /// The image's chunk tables, read by the level's first window read and reused by the next.
+    /// The image's chunk tables, retained at open for positioned sources or on the first read.
     tables: Option<Arc<ChunkTables>>,
-    /// How the image's chunks are decoded, settled by the level's first window read that gets to
-    /// decoding: `Some(None)` when the `tiff` crate decodes them itself.
-    codec: Option<Option<crate::tiff_codecs::ChunkCodec>>,
-    /// How the image's chunks are stored, read by the level's first window read.
+    /// The image's codec, determined at open for positioned sources or before the first decode.
+    /// `Some(None)` means the TIFF crate decodes the chunks itself.
+    codec: Option<Option<Arc<crate::tiff_codecs::ChunkCodec>>>,
+    direct: Option<DirectImage>,
+    /// How the image's chunks are stored, determined with the chunk tables.
     storage: Option<Storage>,
     /// Cached GDAL RESAMPLING metadata, including absence, for repeated selection.
     resampling: Option<Option<String>>,
@@ -2629,6 +2635,7 @@ struct Storage {
 
 struct TiffRaster {
     decoder: Decoder<PatchedReader<Source>>,
+    direct_source: Option<DirectSource>,
     tags: GeoTags,
     /// The bands reported: the samples per pixel, or 4 for CMYK read as RGBA.
     bands: usize,
@@ -2772,6 +2779,7 @@ impl TiffRaster {
         let tiff_err = limits.error();
         // The caller's limits, within the file's bounds (see `TiffReadLimits::tiff_within`).
         let mut dec = Decoder::new(PatchedReader::new(source, &tags)).map_err(tiff_err)?.with_limits(limits.tiff_within(len));
+        let direct_source = DirectSource::new(dec.inner().get_ref());
         let (w, h) = dec.dimensions().map_err(tiff_err)?;
         crate::geotiff::check_open(&mut dec, tiff_err)?;
         let samples = dec.find_tag_unsigned::<u16>(Tag::SamplesPerPixel).map_err(tiff_err)?.unwrap_or(1).max(1) as usize;
@@ -2798,9 +2806,16 @@ impl TiffRaster {
             external: None,
             tables: None,
             codec: None,
+            direct: None,
             storage: None,
             resampling: None,
         }];
+        let prepare = |level: &mut Level, dec: &mut Decoder<_>| {
+            if direct_source.is_some() && !cmyk && !complex {
+                level.prepare_direct(dec, limits, data_type);
+            }
+        };
+        prepare(&mut levels[0], &mut dec);
         let mut ifd = 1;
         while dec.more_images() && ifd < MAX_IMAGES {
             // Images the decoder cannot read (such as unusual masks) are skipped.
@@ -2818,7 +2833,7 @@ impl TiffRaster {
                         .map_err(tiff_err)?
                         .and_then(|v| v.first().copied())
                         .unwrap_or(1);
-                    levels.push(Level {
+                    let mut level = Level {
                         bits,
                         ifd,
                         reduced: subfile & 1 != 0,
@@ -2828,9 +2843,12 @@ impl TiffRaster {
                         external: None,
                         tables: None,
                         codec: None,
+                        direct: None,
                         storage: None,
                         resampling: None,
-                    });
+                    };
+                    prepare(&mut level, &mut dec);
+                    levels.push(level);
                 }
             }
             ifd += 1;
@@ -2844,6 +2862,7 @@ impl TiffRaster {
         let geo_transform = tags.corner_geo_transform().unwrap_or([0.0, 1.0, 0.0, h as f64, 0.0, -1.0]);
         Ok(Self {
             decoder: dec,
+            direct_source,
             tags,
             bands,
             samples,
@@ -2895,6 +2914,7 @@ impl TiffRaster {
                 external: Some(i),
                 tables: None,
                 codec: None,
+                direct: None,
                 storage: None,
                 resampling: None,
             });
@@ -3321,9 +3341,10 @@ impl TiffRaster {
         // level's codec is made once, with the level's tables, and kept, as is the lack of one.
         let codec = &mut self.levels[level].codec;
         if codec.is_none() {
-            *codec = Some(crate::tiff_codecs::ChunkCodec::new(dec, limits.chunk_bytes, Some(tables.clone())).map_err(tiff_err)?);
+            *codec =
+                Some(crate::tiff_codecs::ChunkCodec::new(dec, limits.chunk_bytes, Some(tables.clone())).map_err(tiff_err)?.map(Arc::new));
         }
-        let codec = codec.as_ref().and_then(Option::as_ref);
+        let codec = codec.as_ref().and_then(Option::as_deref);
         let pool = Some(&self.workers);
         crate::geotiff::decode_chunks(dec, reopen, pool, ifd, &misses, codec, limits.chunk_bytes, &tiff_err, |(idx, chunk, dims)| {
             place_decoded(&mut out, &chunk, dims, &targets[&idx], w, spp)?;

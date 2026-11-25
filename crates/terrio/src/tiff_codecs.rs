@@ -537,23 +537,33 @@ impl ChunkCodec {
             let bytes = dec.image_chunk_buffer_layout(idx)?.len.max(self.decoded_size(dw, dh)?);
             return if bytes > self.limit { Err(TiffError::LimitsExceeded) } else { Ok(bytes) };
         }
+        match self.positioned_bytes((dw, dh)) {
+            // The crate can stream past an edge tile's padding when its clipped pixels fit.
+            Err(TiffError::LimitsExceeded) if self.codec == Codec::Deflate && self.decoded_size(dw, dh)? <= self.limit => {
+                let bytes = dec.image_chunk_buffer_layout(idx)?.len;
+                if bytes > self.limit { Err(TiffError::LimitsExceeded) } else { Ok(bytes) }
+            }
+            result => result,
+        }
+    }
+
+    /// Working size for a decode that uses only the parsed image and the stored bytes.
+    pub(crate) fn positioned_bytes(&self, (dw, dh): (usize, usize)) -> TiffResult<usize> {
         let (w, h) = if self.tiled { self.chunk } else { (dw, dh) };
         let decoded = self.decoded_size(w, h)?;
         if decoded > self.limit {
-            // Preserve the existing Deflate edge-tile fallback: the crate retains only
-            // clipped image data and streams past padding instead of holding the full tile.
-            if self.codec == Codec::Deflate && self.decoded_size(dw, dh)? <= self.limit {
-                let bytes = dec.image_chunk_buffer_layout(idx)?.len;
-                return if bytes > self.limit { Err(TiffError::LimitsExceeded) } else { Ok(bytes) };
-            }
             return Err(TiffError::LimitsExceeded);
         }
-        let working = if matches!(self.codec, Codec::Lerc | Codec::Jxl) {
-            fallible::len(&[w, h, self.spp, size_of::<f64>()], "a TIFF chunk")?
+        if matches!(self.codec, Codec::Lerc | Codec::Jxl) {
+            Ok(decoded.max(fallible::len(&[w, h, self.spp, size_of::<f64>()], "a TIFF chunk")?))
         } else {
-            decoded
-        };
-        Ok(decoded.max(working))
+            Ok(decoded)
+        }
+    }
+
+    /// Whether decoding requires the TIFF crate's image state.
+    pub(crate) fn is_positioned(&self) -> bool {
+        self.codec != Codec::CratePacked
     }
 
     /// Decodes chunk `idx`, as `Decoder::read_chunk` does: the samples of the chunk's image data,
@@ -562,23 +572,24 @@ impl ChunkCodec {
         if self.codec == Codec::CratePacked {
             return self.read_crate_packed(dec, idx);
         }
-        let Some((offset, count)) = self.tables.get(idx as usize) else {
-            return Err(invalid(format!("no TIFF chunk {idx}")));
-        };
         let (dw, dh) = dec.chunk_data_dimensions(idx);
         let (dw, dh) = (dw as usize, dh as usize);
-        // Tiles are coded whole, strips with their own rows.
-        let (w, h) = if self.tiled { self.chunk } else { (dw, dh) };
-        // Over the limit, the chunk is refused before any of it is read. A Deflate edge tile over
-        // it only with its padding is left to the `tiff` crate, as before: the crate keeps the
-        // image data only, and skips the padding.
-        if self.decoded_size(w, h)? > self.limit {
+        if let Err(error) = self.positioned_bytes((dw, dh)) {
             if self.codec == Codec::Deflate && self.decoded_size(dw, dh)? <= self.limit {
                 return dec.read_chunk(idx);
             }
-            return Err(TiffError::LimitsExceeded);
+            return Err(error);
         }
-        let r = dec.inner();
+        self.read_positioned(dec.inner(), idx as usize, (dw, dh))
+    }
+
+    /// Decodes from a cursor over the file without reading TIFF metadata.
+    pub(crate) fn read_positioned(&self, r: &mut (impl Read + Seek), idx: usize, (dw, dh): (usize, usize)) -> TiffResult<DecodingResult> {
+        let Some((offset, count)) = self.tables.get(idx) else {
+            return Err(invalid(format!("no TIFF chunk {idx}")));
+        };
+        let (w, h) = if self.tiled { self.chunk } else { (dw, dh) };
+        self.positioned_bytes((dw, dh))?;
         r.seek(SeekFrom::Start(offset))?;
         // The buffer grows as bytes arrive: a corrupt byte count allocates no more than the file holds.
         let mut raw = Vec::new();
