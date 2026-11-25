@@ -2471,15 +2471,15 @@ def suite_tiff_block_tags(ctx):
     suite = Suite("tiff-block-tags", "TIFF block metadata", "GDAL via rasterio",
                   "Classic TIFF and BigTIFF tiles/strips, planar/interleaved bands, "
                   "complex samples, internal/external overviews and real Landsat storage: "
-                  "offsets and sizes match exactly. HTTP COG queries transfer less than "
-                  "one quarter of the file and repeated queries send no requests.")
+                  "stored offsets and sizes match exactly; sparse entries report zero bytes. "
+                  "HTTP COG queries transfer less than one quarter of the file and repeated queries send no requests.")
     missing = missing_modules("terrio", "pytest", "numpy", "rasterio", "osgeo")
     if missing:
         suite.skipped = "needs " + ", ".join(missing)
         return suite
     import rasterio
     suite.reference = f"GDAL {rasterio.__gdal_version__} via rasterio {rasterio.__version__}"
-    complete, detail = _pytest_module_conformance(ctx, "test_rio_block_tags.py", expected_count=15)
+    complete, detail = _pytest_module_conformance(ctx, "test_rio_block_tags.py", expected_count=16)
     suite.cases.append(Case("TIFF", "stored block addresses", IDENTICAL if complete else DIFFERS, detail))
     return suite
 

@@ -896,14 +896,7 @@ impl PyRaster {
     /// Returns:
     ///     tuple[int, int] | None: Offset and size, or None if absent.
     #[pyo3(signature = (band, x, y, overview=None))]
-    fn _tiff_block_range(
-        &mut self,
-        py: Python<'_>,
-        band: usize,
-        x: usize,
-        y: usize,
-        overview: Option<usize>,
-    ) -> PyResult<Option<(u64, u64)>> {
+    fn _tiff_block_range(&self, py: Python<'_>, band: usize, x: usize, y: usize, overview: Option<usize>) -> PyResult<Option<(u64, u64)>> {
         if band == 0 || band > self.count() {
             return Ok(None);
         }
