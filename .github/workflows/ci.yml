@@ -257,8 +257,9 @@ jobs:
         run: |
           cargo test -p terrio -p terrio-crs --doc
           cargo test -p terrio --doc --features ndarray
-      # The CLB fork publishes no crates (they share upstream's names and versions). The packages'
-      # file lists are checked and the crates built instead; the other jobs test the code.
+      # The CLB fork publishes no crates (they share upstream's names and versions, and terrio
+      # depends on `zstd-rust` from git, which `cargo publish` refuses). The packages' file lists
+      # are checked and the crates built instead; the other jobs test the code.
       - name: The crates package (file lists) and build
         run: |
           cargo package -p terrio-crs -p terrio -p terrio-cli --list --locked
@@ -436,6 +437,16 @@ jobs:
         run: |
           cargo test -p terrio --features libzstd --lib zstandard
           cargo test -p terrio --features libzstd --test merged -- zstd_tiff_samples:: zstd_input_limits:: parquet_zstd::
+      # CLB fork: `zstd-rust` writes the Zstandard levels above 4 without C (`zrip` writes them at
+      # level 4). The library, the command and the Python wheels link it by default; without it,
+      # upstream's behaviour (the lib tests need `drivers` and `remote`).
+      - name: Zstandard above level 4 without C (zstd-rust)
+        run: |
+          set -o pipefail
+          for package in terrio terrio-cli terrio-py; do
+            cargo tree -p "$package" -e normal --prefix none | cut -d' ' -f1 | grep -qx zstd-rust || { echo "::error::$package does not link zstd-rust"; exit 1; }
+          done
+          cargo test -p terrio --no-default-features --features drivers,remote --lib zstandard
       # HTTPS is upstream's `rustls-graviola`, with its CPU-feature check. The CLB fork's command and
       # Python wheels also turn on `ring-fallback`, so HTTPS works on CPUs graviola cannot run on:
       # each must link ring on every release architecture.

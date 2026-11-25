@@ -66,7 +66,8 @@ pub(crate) struct CodecParams {
     /// Deflate and LERC_DEFLATE: the level (`ZLEVEL`, 1 to 9, default 6).
     pub deflate_level: crate::deflate_compress::Level,
     /// ZSTD and LERC_ZSTD: the level (`ZSTD_LEVEL`, 1 to 22, default 9). Without the
-    /// `libzstd-geotiff` feature, `zrip` writes levels above 4 at level 4.
+    /// `libzstd-geotiff` feature, `zrip` writes levels up to 4, and `zstd-rust` the higher ones
+    /// (CLB fork; `zrip` at level 4 without the `zstd-rust` feature).
     pub zstd_level: i32,
 }
 
@@ -366,8 +367,8 @@ fn jpeg_encode(data: &[u8], c: &ChunkInfo, quality: u8, ycbcr: bool) -> Result<V
     Ok(out)
 }
 
-/// A Zstandard chunk at `level` (with the `libzstd-geotiff` feature; without it, `zrip`, at most
-/// level 4).
+/// A Zstandard chunk at `level` (with the `libzstd-geotiff` feature; without it, `zrip` up to
+/// level 4 and `zstd-rust` above, or `zrip` at level 4 without the `zstd-rust` feature).
 fn zstd_compress(data: &[u8], level: i32) -> Result<Vec<u8>> {
     Ok(crate::zstandard::geotiff::compress(data, level)?)
 }
@@ -428,7 +429,8 @@ fn encoder_bytes(compression: Compression, raw: usize) -> (usize, usize) {
         Compression::Deflate => (doubled, most),
         // As measured: Zstandard's encoder holds up to 2.3 MiB besides its output (`zrip`'s, at its
         // level 4; with the `libzstd` feature, the C library's context grows with `ZSTD_LEVEL` and
-        // the tile, and is not counted).
+        // the tile, and is not counted, nor are the tables `zstd-rust` keeps per thread for the
+        // levels above 4, CLB fork).
         Compression::Zstd => (doubled, most.saturating_add(raw).saturating_add(2 << 20)),
         // As measured on chunks of samples none compresses: JPEG writes up to 1.6 times its samples
         // (at quality 100; less at lower ones), and JPEG XL up to 1.13 times.
@@ -6899,8 +6901,11 @@ mod tests {
         assert_eq!(zstd("9"), encode_with("ZSTD", &[]).unwrap());
 
         // `zrip` finds the same matches in this noisy gradient at every level (it writes levels
-        // up to 4); the C library at level 22 finds more. LERC_ZSTD's blob below shows the level.
-        assert_eq!(zstd("1") != zstd("22"), libzstd);
+        // up to 4); the C library at level 22 finds more, and so does `zstd-rust`, which writes
+        // the levels above 4 without the C library (CLB fork). LERC_ZSTD's blob below shows the
+        // level.
+        let zstd_rust = cfg!(feature = "zstd-rust");
+        assert_eq!(zstd("1") != zstd("22"), libzstd || zstd_rust);
 
         assert_eq!(read_back(&zstd("22")), r.data.to_f64_vec());
         // Natural-language repetitions distinguish zrip's level-1 and level-4 match searches.
@@ -6919,11 +6924,16 @@ following conditions:
         let text_raster = Raster::from_data_native(cfg, RasterData::U8(text.to_vec())).unwrap();
         let encoded = |level: &str| encode_raster(&text_raster, "ZSTD", false, &[("ZSTD_LEVEL", level)]).unwrap();
         let (one, four) = (encoded("1"), encoded("4"));
+        let twenty_two = encoded("22");
         if !libzstd {
             assert_ne!(one, four, "ZSTD_LEVEL must reach the pure encoder");
-            assert_eq!(four, encoded("22"), "the pure encoder clamps higher levels to 4");
+            if zstd_rust {
+                assert_ne!(four, twenty_two, "levels above 4 must reach zstd-rust");
+            } else {
+                assert_eq!(four, twenty_two, "zrip alone clamps higher levels to 4");
+            }
         }
-        for bytes in [&one, &four] {
+        for bytes in [&one, &four, &twenty_two] {
             assert_eq!(read_back(bytes), text_raster.data.to_f64_vec());
         }
         if cfg!(feature = "lerc") {

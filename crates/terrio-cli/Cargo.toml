@@ -13,10 +13,13 @@ homepage.workspace = true
 authors.workspace = true
 
 [features]
-default = ["remote", "ring-fallback"]
+default = ["remote", "ring-fallback", "zstd-rust"]
 ## GeoTIFF/COG Zstandard with the zstd C library (`terrio/libzstd-geotiff`), opt-in: without it
 ## the command writes and reads it in pure Rust.
 libzstd-geotiff = ["terrio/libzstd-geotiff"]
+## Zstandard levels above 4 in pure Rust (`terrio/zstd-rust`), on by default in the CLB fork:
+## without it, and without `libzstd-geotiff`, `ZSTD_LEVEL` above 4 writes level 4.
+zstd-rust = ["terrio/zstd-rust"]
 ## Remote inputs (`terrio/remote`): HTTP(S), S3, GCS and Azure, with `rustls-graviola`.
 remote = ["terrio/remote"]
 ## HTTPS with `ring` on CPUs `rustls-graviola` cannot run on (`terrio/ring-fallback`; C and
