@@ -771,6 +771,13 @@ impl TiffOptions {
             rpc: options.rpc.clone(),
             ..Default::default()
         };
+        // GDAL's GTiff and COG drivers have no LERC_VERSION creation option: whatever its value
+        // and the compression, they warn so and write the Lerc2 v4 blobs they always write (GDAL
+        // 3.12.2, 3.13.3). LERC_VERSION=2.4 is the IMAGE_STRUCTURE item GDAL reads back from the
+        // LercParameters tag.
+        if co("LERC_VERSION").is_some() {
+            crate::warnings::warn(format!("driver {} does not support creation option LERC_VERSION", if cog { "COG" } else { "GTiff" }));
+        }
         if let Some(bits) = size("NBITS")? {
             o.nbits = Some(u16::try_from(bits).map_err(|_| Error::InvalidArgument(format!("invalid NBITS '{bits}'")))?);
         }
@@ -7901,5 +7908,72 @@ mod lerc_encoder_tests {
         let c = super::ChunkInfo { w: 128, h: 128, spp: 1, t: wbraster::DataType::F32, valid: (128, 128) };
         let bytes: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
         assert_eq!(super::lerc_encode(&bytes, &c, &p).unwrap(), expected);
+    }
+
+    /// Integer chunks of every type LERC stores, one sample or three interleaved, are the blobs
+    /// of `lerc-writer`'s GDAL profile with that depth, and `COMPACT` selects its compact one.
+    /// (python/tests/test_lerc_encoder.py compares them with GDAL's.)
+    #[test]
+    fn integer_and_interleaved_chunks_use_the_selected_profile() {
+        use lerc_writer::EncoderProfile;
+        let (w, h) = (40usize, 24usize);
+        fn check<T: lerc_core::Sample>(t: wbraster::DataType, spp: usize, values: Vec<T>, bytes: Vec<u8>, w: usize, h: usize) {
+            for (compact, profile) in [(false, EncoderProfile::Gdal), (true, EncoderProfile::Compact)] {
+                for max_z_error in [0.0, 1.0] {
+                    let options = lerc_writer::EncodeOptions::new().with_max_z_error(max_z_error).with_profile(profile);
+                    let raster = lerc_writer::RasterView::new(w as u32, h as u32, spp as u32, &values).unwrap();
+                    let expected = lerc_writer::encode(raster, None, options).unwrap();
+                    let p = super::CodecParams { max_z_error, lerc_compact: compact, ..Default::default() };
+                    let c = super::ChunkInfo { w, h, spp, t, valid: (w, h) };
+                    assert_eq!(super::lerc_encode(&bytes, &c, &p).unwrap(), expected, "{t:?} x{spp} compact={compact} {max_z_error}");
+                }
+            }
+        }
+        macro_rules! case {
+            ($t:ty, $dt:expr, $f:expr) => {
+                for spp in [1usize, 3] {
+                    let values: Vec<$t> = (0..w * h * spp).map(|i| $f(i)).collect();
+                    let bytes = values.iter().flat_map(|x| x.to_le_bytes()).collect();
+                    check::<$t>($dt, spp, values, bytes, w, h);
+                }
+            };
+        }
+        case!(i8, wbraster::DataType::I8, |i: usize| ((i * 7 + i / 40) % 200) as i8);
+        case!(u8, wbraster::DataType::U8, |i: usize| ((i * 7 + i / 40) % 250) as u8);
+        case!(i16, wbraster::DataType::I16, |i: usize| (i as i16).wrapping_mul(37).wrapping_sub(9000));
+        case!(u16, wbraster::DataType::U16, |i: usize| (i as u16).wrapping_mul(97));
+        case!(i32, wbraster::DataType::I32, |i: usize| -100_000_000 + (i as i32) * 1013);
+        case!(u32, wbraster::DataType::U32, |i: usize| 3_000_000_000 + (i as u32) * 1013);
+    }
+
+    /// GDAL's GTiff and COG drivers have no `LERC_VERSION` creation option: they warn and write
+    /// what they write without it (GDAL 3.12.2, 3.13.3). So does terrio.
+    #[test]
+    fn lerc_version_warns_as_gdal_and_changes_nothing() {
+        let ds = surface();
+        for cog in [false, true] {
+            let _ = crate::warnings::take();
+            let (_p, plain) = write(&ds, cog, &[]).unwrap();
+            assert!(crate::warnings::take().iter().all(|w| !w.contains("LERC_VERSION")));
+            let (_v, versioned) = write(&ds, cog, &[("LERC_VERSION", "3")]).unwrap();
+            let driver = if cog { "COG" } else { "GTiff" };
+            let expected = format!("driver {driver} does not support creation option LERC_VERSION");
+            assert!(crate::warnings::take().contains(&expected), "cog={cog}");
+            assert_eq!(std::fs::read(plain).unwrap(), std::fs::read(versioned).unwrap(), "cog={cog}");
+        }
+    }
+
+    /// `LERC_ENCODER` takes GDAL or COMPACT in any case, with surrounding spaces; anything else
+    /// is refused with the values it takes.
+    #[test]
+    fn lerc_encoder_refuses_other_values() {
+        let ds = surface();
+        for value in [" Compact ", "gdal"] {
+            write(&ds, false, &[("LERC_ENCODER", value)]).unwrap();
+        }
+        for value in ["", "FAST", "LIBLERC", "GDAL,COMPACT"] {
+            let Err(Error::InvalidArgument(message)) = write(&ds, true, &[("LERC_ENCODER", value)]) else { panic!("{value:?} accepted") };
+            assert!(message.starts_with("invalid LERC_ENCODER") && message.ends_with("(GDAL, COMPACT)"), "{message}");
+        }
     }
 }

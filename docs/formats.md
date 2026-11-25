@@ -230,11 +230,7 @@ JPEG XL, with horizontal and floating-point predictors, tiled or striped, chunky
 libjpeg decodes it: the same integer IDCT, chroma upsampling and YCbCr conversion, so the pixels are
 GDAL's. Lossy JPEG XL can differ from libjxl's by 1 in a few pixels. LERC (`--compress LERC`,
 `LERC_DEFLATE`, `LERC_ZSTD`) and lossless JPEG XL (`JXL`, for Byte and UInt16) are written too;
-LZMA is read, not written. LERC blobs are GDAL's by default (`LERC_ENCODER=GDAL`): `lerc-writer`'s
-GDAL profile makes the block choices of libLerc's codec v4, which GDAL calls, so the tiles are
-GDAL's byte for byte (compared for Float32, Float64, Int16 and UInt16 data). `LERC_ENCODER=COMPACT`
-selects `lerc-writer`'s compact profile, whose blobs (which may be Lerc2 v5) are no larger, within
-the same `MAX_Z_ERROR`. Unsigned samples packed in 9 to 15 or 17 to 31 bits (GDAL's
+LZMA is read, not written (see below for LERC's options). Unsigned samples packed in 9 to 15 or 17 to 31 bits (GDAL's
 `NBITS`, as GDAL writes Sentinel-2's 15-bit bands) are read as UInt16 or UInt32, as GDAL reads them,
 in either bit order (`FillOrder`); packed signed samples and packed samples with a predictor are
 not supported (GDAL writes neither). WhiteIsZero samples are read as stored, as GDAL reads them,
@@ -250,6 +246,35 @@ compresses higher ones at 4. A `ZLEVEL` or `ZSTD_LEVEL` out of range is refused,
 compression. A COG also takes GDAL's COG option `LEVEL`, ahead of either: the Deflate
 level of `DEFLATE` and `LERC_DEFLATE`, the Zstandard level of `ZSTD` and `LERC_ZSTD`; other
 compressions ignore it, as GDAL does.
+
+LERC tiles (`LERC`, `LERC_DEFLATE`, `LERC_ZSTD`) take these creation options:
+
+| Option | Values | GDAL | Effect |
+|---|---|---|---|
+| `MAX_Z_ERROR` | 0 or more, 0 by default | the same | The largest error allowed; 0 is lossless. Recorded in `GDAL_METADATA` as GDAL records it: `MAX_Z_ERROR` as given, or `COMPRESSION_REVERSIBILITY=LOSSLESS`. |
+| `LERC_ENCODER` | `GDAL` (default), `COMPACT` | terrio's own | `GDAL` writes the Lerc2 v4 blobs GDAL writes, byte for byte; `COMPACT` writes `lerc-writer`'s smallest blobs (which may be Lerc2 v5), no larger and within the same `MAX_Z_ERROR`. Other values are refused. |
+| `LERC_VERSION` | any | not an option | Ignored with GDAL's warning, `driver GTiff (COG) does not support creation option LERC_VERSION`: GDAL's GTiff and COG drivers have no such option and always write Lerc2 v4. `LERC_VERSION=2.4` is the IMAGE_STRUCTURE item GDAL reads back from the `LercParameters` tag. |
+| `MAX_Z_ERROR_OVERVIEW` | | the overviews' error | Not supported, and ignored: overviews use `MAX_Z_ERROR`, which is GDAL's default for them. |
+
+`LERC_ENCODER=GDAL` uses `lerc-writer`'s GDAL profile, which makes the choices of libLerc's codec
+v4 that GDAL calls. With it, every tile's Lerc2 blob is GDAL 3.12.2's (rasterio 1.5.2) byte for
+byte for Int8, Byte, Int16, UInt16, Int32, UInt32, Float32 and Float64 data, lossless and lossy,
+one band or three pixel- or band-interleaved, with NaN, a nodata value or a per-dataset mask, as
+GTiff or COG, overviews and partial edge tiles included; for `LERC_DEFLATE` and `LERC_ZSTD`, the
+blob inflated from the chunk (the outer Deflate and Zstandard streams are terrio's encoders', not
+zlib's or libzstd's, so the stored chunks can differ), and the checksum of a blob is the
+checksum of GDAL's. Known differences:
+
+- Lossless Int8 and Byte data (`MAX_Z_ERROR` below 1): libLerc codes a tile with Huffman codes
+  when they are smaller than its blocks, and `lerc-writer` 0.5.2 writes another code table
+  (version 2, libLerc's is version 4) and other codes there. Those blobs differ from GDAL's; the
+  pixels read back are the same.
+- GDAL 3.13.3 also masks the padding of partial edge tiles of pixel-interleaved floating-point
+  bands, as GDAL 3.12.2 masks it for one band. terrio masks it as GDAL 3.12.2, the reference, so
+  those edge tiles differ from GDAL 3.13.3's; lossy values near the image's right and bottom edges
+  can then differ from GDAL 3.13.3's within `MAX_Z_ERROR`.
+- Pixel-interleaved floating-point bands with NaN in some bands of a pixel only are refused
+  (write them with `INTERLEAVE=BAND`); GDAL writes one Lerc2 blob per band there.
 
 A COG of three Byte bands compressed with JPEG is written in YCbCr, subsampled as with
 `PHOTOMETRIC=YCBCR`, as GDAL's COG driver writes it; `PHOTOMETRIC=RGB` (an option GDAL's COG driver

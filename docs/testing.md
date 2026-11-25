@@ -910,10 +910,17 @@ synthetic rasters whose right and bottom tiles are partial with GDAL and with Te
 COG, and reads each stored edge tile: the valid-pixel mask of every LERC blob, padding included,
 and the padding bytes of uncompressed tiles must be GDAL's, at every level, and the pixels read
 back must be GDAL's exactly (reference: GDAL 3.12.2, rasterio 1.5.2). `test_lerc_encoder.py` compares
-every tile's Lerc2 blob (inflated for `LERC_DEFLATE`) byte for byte under the default
-`LERC_ENCODER=GDAL`, for Float32, Float64, Int16 and UInt16 data, lossless and lossy, with NaN or
-a nodata value, checks that `LERC_ENCODER=COMPACT` blobs are no larger and within
-`MAX_Z_ERROR`, and that the `GDAL_METADATA` tag and the IMAGE_STRUCTURE items GDAL reads are GDAL's.
+every chunk's Lerc2 blob, of every band and COG level, byte for byte under the default
+`LERC_ENCODER=GDAL` (inflated for `LERC_DEFLATE` and decompressed for `LERC_ZSTD`, which needs
+`zstandard` or `numcodecs` before Python 3.14), for Int8, Byte, Int16, UInt16, Int32, UInt32,
+Float32 and Float64 data, lossless and lossy, one band or three pixel- or band-interleaved, with
+NaN, a nodata value or a per-dataset mask, as GTiff and COG, nearest-neighbour overviews included.
+It checks that `LERC_ENCODER=COMPACT` blobs are no larger and within `MAX_Z_ERROR`, that other
+values are refused, that `LERC_VERSION` warns as GDAL warns and changes nothing, and that the
+`GDAL_METADATA` tag and the IMAGE_STRUCTURE items GDAL reads are GDAL's. Lossless Int8 and Byte
+blobs, which libLerc codes with Huffman codes, are a known difference (see
+[Formats](formats.md)): their pixels are compared, and `test_lossless_8bit_lerc_blobs_are_gdal_s`
+is a strict expected failure, which the conformance suite leaves out.
 
 Standalone WebP creation options are checked with
 `python scripts/conformance.py DATA --only webp-writer --strict`, using the

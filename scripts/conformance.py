@@ -4569,11 +4569,20 @@ def suite_lerc_writer(ctx):
     complete, detail = _pytest_module_conformance(ctx, "test_gtiff_padding.py", expected_count=36)
     s.cases.append(Case("Edge-tile padding", "float, integer, band- and pixel-interleaved; GTiff and COG",
                         IDENTICAL if complete else DIFFERS, detail))
-    complete, detail = _pytest_module_conformance(ctx, "test_lerc_encoder.py", expected_count=35)
-    s.cases.append(Case("LERC blobs", "LERC and LERC_DEFLATE, lossless and lossy, NaN and nodata; GTiff and COG",
+    complete, detail = _pytest_module_conformance(ctx, "test_lerc_encoder.py", selection="not lossless_8bit",
+                                                  expected_count=284)
+    s.cases.append(Case("LERC blobs", "LERC, LERC_DEFLATE and LERC_ZSTD; Int8 to Float64, lossless and lossy; "
+                        "one band, pixel and band interleaved; NaN, nodata and masks; GTiff and COG with overviews",
                         IDENTICAL if complete else DIFFERS,
-                        "Every tile's Lerc2 blob byte for byte (default LERC_ENCODER=GDAL); "
-                        "COMPACT blobs no larger within MAX_Z_ERROR; GDAL_METADATA and IMAGE_STRUCTURE items exact. " + detail))
+                        "Every chunk's Lerc2 blob byte for byte (default LERC_ENCODER=GDAL); "
+                        "COMPACT blobs no larger within MAX_Z_ERROR; LERC_ENCODER values, the LERC_VERSION warning; "
+                        "GDAL_METADATA and IMAGE_STRUCTURE items exact. " + detail))
+    complete, detail = _pytest_module_conformance(ctx, "test_lerc_encoder.py", selection="lossless_8bit_lerc_reads",
+                                                  expected_count=48)
+    s.cases.append(Case("LERC blobs", "lossless Int8 and Byte (libLerc's Huffman coding)",
+                        NOT_COMPARED if complete else DIFFERS,
+                        "Known difference: lerc-writer 0.5.2's Huffman code table and codes are not libLerc's, "
+                        "so the blobs differ; the pixels and masks GDAL reads are the same. " + detail))
     return s
 
 

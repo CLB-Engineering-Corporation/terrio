@@ -2461,6 +2461,31 @@ test("netCDF, HDF5 and Zarr in memory; LERC, JPEG XL and JPEG GeoTIFFs", { skip:
   assert.throws(() => floats.toBytes("j.tif", { compress: "JPEG" }), /JPEG is written for/);
 });
 
+test("LERC_ENCODER: GDAL's LERC blobs by default, COMPACT on request, other values refused", { skip: needs("lerc") }, () => {
+  // Three pixel-interleaved UInt16 bands, where the compact profile's blobs are smaller.
+  const [w, h] = [300, 200];
+  const data = Uint16Array.from({ length: 3 * w * h }, (_, i) => {
+    const [c, r, b] = [i % w, Math.floor(i / w) % h, Math.floor(i / w / h)];
+    return Math.round(32768 + 4000 * (0.013 * c + 0.007 * r + 2 * Math.sin(c / 17 + b) * Math.cos(r / 23)) + ((i * 2654435761) >>> 29));
+  });
+  const ds = terrio.rasterFromArray(data, w, h, [500000, 10, 0, 4000000, 0, -10], "EPSG:32615");
+  for (const format of ["GTiff", "COG"]) {
+    const write = (creationOptions) => ds.toBytes("l.tif", { format, compress: "LERC", tileSize: 128, creationOptions });
+    const [plain, gdal, compact] = [write({}), write({ LERC_ENCODER: "gdal" }), write({ LERC_ENCODER: "COMPACT" })];
+    assert.deepEqual(gdal, plain, format);
+    assert.ok(compact.length < gdal.length, `${format}: ${compact.length} >= ${gdal.length}`);
+    for (const bytes of [plain, compact]) {
+      const back = terrio.open(bytes, "l.tif");
+      for (let b = 1; b <= 3; b++) assert.deepEqual([...back.readBand(b)], [...ds.readBand(b)], format);
+    }
+    assert.throws(() => write({ LERC_ENCODER: "FAST" }), /invalid LERC_ENCODER 'FAST' \(GDAL, COMPACT\)/);
+    // GDAL has no LERC_VERSION creation option: it warns and writes what it would have.
+    terrio.takeWarnings();
+    assert.deepEqual(write({ LERC_VERSION: "3" }), plain, format);
+    assert.ok(terrio.takeWarnings().includes(`driver ${format} does not support creation option LERC_VERSION`), format);
+  }
+});
+
 test("packed unsigned TIFF exports retain bit width and row-edge samples", () => {
   for (const [bits, ArrayType] of [[1, Uint8Array], [4, Uint8Array], [7, Uint8Array],
     [9, Uint16Array], [15, Uint16Array], [17, Uint32Array], [24, Uint32Array], [31, Uint32Array]]) {
