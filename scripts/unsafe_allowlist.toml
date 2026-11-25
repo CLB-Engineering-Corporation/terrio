@@ -27,6 +27,11 @@ count = 1
 origin = "added"
 reason = "GetLogicalDrives, a Windows call with no arguments, lists the drives for the file browser of terrio ui without touching each disk"
 
+[files."crates/terrio/src/dataset.rs"]
+count = 4
+origin = "added"
+reason = "Read-only OS queries for physical memory and process limits on Windows and macOS, using initialized output buffers with the required sizes"
+
 [files."crates/terrio/src/drivers/jp2.rs"]
 count = 37
 origin = "existing"
