@@ -2,29 +2,8 @@
 
 ## Unreleased (CLB fork)
 
-Changes of the CLB fork (CLB-Engineering-Corporation/terrio) on top of upstream 0.10.0 and the
-commits after it, to ef45a4c. Upstream's own entries are below, unchanged.
-
-- Synced with upstream main at ef45a4c (2026-11-25). Where upstream merged its own version of a
-  fork feature, upstream's implementation and API are kept: LERC edge-tile padding, either-side
-  tiling in `validate_cog`, area-matched overviews (`AREA_MATCHED` on GDAL's sizes, reports in
-  each band's `OVERVIEW_AREA_RATIOS` and `OVERVIEW_BASE_VALID_PIXELS`), Douglas-Peucker
-  (`simplify_wkb`), the TLS CPU-feature check, `PREDICTOR=YES` by data type, supplied overview
-  arrays (any decreasing sizes, `gdaladdo`'s ceil ones and the COG driver's floored ones) and
-  `metadata=`, the LZW encoder, and `zrip` as the pure-Rust Zstandard.
-- Changed (CLB fork): pure-Rust Zstandard is upstream's `zrip` instead of `zstd-rust`. Without
-  a `libzstd-*` feature, `ZSTD_LEVEL` (and `LEVEL`) above 4 writes level 4, where `zstd-rust`
-  mapped 6 to 9 to its `Better` and 10 and up to its `Best`. The per-format `libzstd-geotiff`,
-  `libzstd-ept` and `libzstd-geoparquet` features stay; `libzstd` turns on all three.
-- Changed (CLB fork): HTTPS is upstream's `rustls-graviola` with its CPU-feature check. The fork's
-  `terrio` command and Python package turn on upstream's `ring-fallback` by default, so HTTPS
-  still works on every CPU there (`ring` where graviola cannot run).
-- Kept (CLB fork): `COG_OVERVIEW_POLICY=SOURCE`. Area-matched overviews under it are still
-  ras2cng's, output for output (ceil sizes), with `area_matched_nan_valid` and the
-  `OVERVIEW_REPORT` domain; `report_metadata=` and the returned report dict now work with
-  upstream's area-matched overviews too. Supplied overview arrays no longer need `SOURCE`.
-- Changed (CLB fork): `OVERVIEWS=FORCE_USE_EXISTING` without existing overviews warns and writes
-  none, as upstream (and GDAL's COG driver), where the fork refused it.
+Changes of the CLB fork (CLB-Engineering-Corporation/terrio) on top of upstream 0.9.0 and the nine
+commits after it (a7473c2). Upstream's own entries are below, unchanged.
 
 - Changed default (CLB fork, owner's decision of 2026-11-21): COG overviews are upstream's again,
   `COG_OVERVIEW_POLICY=GDAL_3_13` (GDAL's recursive kernels, `cubic` by default, `nearest` for

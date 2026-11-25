@@ -24,5 +24,10 @@ jobs:
             echo "Release pull request: the changelog may change."
             exit 0
           fi
+          # CLB fork: a sync with upstream brings upstream's own release entries in.
+          if [[ "$TITLE" =~ ^Sync\ with\ upstream\  ]]; then
+            echo "Upstream sync pull request: upstream's changelog entries come in with the merge."
+            exit 0
+          fi
           echo "::error file=CHANGELOG.md::Feature pull requests do not edit CHANGELOG.md. Revert it to main's version and describe the change in the pull request description; the release pull request writes the changelog (see Changelog in docs/contributing.md)."
           exit 1
