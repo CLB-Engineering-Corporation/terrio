@@ -473,7 +473,9 @@ reject duplicate names that differ only in case, such as `COMPRESS` and
 `compress`, so conflicting aliases cannot depend on a writer's precedence rules.
 `create_raster` requires `dst` whenever file-output options, including `options`, are supplied.
 For GeoTIFF/COG, `compress` overrides `options["COMPRESS"]`, and `bigtiff=True` forces BigTIFF
-even with `options={"BIGTIFF": "NO"}`. Explicit block-size creation options override `tile_size`:
+even with `options={"BIGTIFF": "NO"}`. `options["BIGTIFF"]` takes GDAL's `YES`, `NO`,
+`IF_NEEDED` (the default) and `IF_SAFER`, chosen as GDAL chooses (see `terrio::BigTiffPolicy`).
+Explicit block-size creation options override `tile_size`:
 `BLOCKXSIZE`/`BLOCKYSIZE` for tiled GeoTIFF, or `BLOCKSIZE` for COG. Otherwise `tile_size`
 supplies the tile dimensions. These GeoTIFF/COG precedence rules also apply to `Raster.write`.
 Other formats use their own writer rules; for example, netCDF's `options["COMPRESS"]`

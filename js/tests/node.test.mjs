@@ -248,6 +248,18 @@ test("whole-raster toBytes keeps source items before explicit overrides and doma
   assert.equal(cropItems.B, "2");
 });
 
+test("BIGTIFF creation options take GDAL's values: only YES makes a small raster a BigTIFF", () => {
+  const base = terrio.rasterFromArray(new Float32Array(70 * 50).map((_, i) => i), 70, 50, [0, 1, 0, 50, 0, -1], "EPSG:4326");
+  for (const format of ["GTiff", "COG"]) {
+    for (const [BIGTIFF, version] of [["YES", 43], ["NO", 42], ["IF_NEEDED", 42], ["if_safer", 42]]) {
+      const bytes = base.toBytes("b.tif", { format, compress: "DEFLATE", creationOptions: { BIGTIFF } });
+      assert.equal(bytes[2] | (bytes[3] << 8), version, `${format} BIGTIFF=${BIGTIFF}`);
+      assert.deepEqual(terrio.open(bytes, "b.tif").readBand(1), base.readBand(1));
+    }
+    assert.throws(() => base.toBytes("b.tif", { format, creationOptions: { BIGTIFF: "SOMETIMES" } }), /BIGTIFF/);
+  }
+});
+
 test("Zstandard GeoTIFFs with predictors, decoded without the C library", () => {
   // Tiled and in strips, interleaved bands, the horizontal and floating-point predictors.
   const ints = new Int16Array(3 * 70 * 50).map((_, i) => ((i * 37) % 2001) - 1000);

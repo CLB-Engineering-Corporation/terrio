@@ -951,7 +951,7 @@ impl Dataset {
     /// `{ "icons/pin.png": Uint8Array }`), for rasters `srcwin`, `overview`, `bands`, `compress`
     /// (GeoTIFF/COG: `NONE`, `LZW`, `DEFLATE`, `PACKBITS`, `ZSTD`, `LERC`, `LERC_DEFLATE`,
     /// `LERC_ZSTD`, `JXL`, `JPEG`), `tileSize` and `creationOptions` (GDAL's: `MAX_Z_ERROR`,
-    /// `JPEG_QUALITY`, `PREDICTOR`, `FORMAT=NC4` for netCDF, `FORMAT=ZARR_V3` for Zarr...),
+    /// `JPEG_QUALITY`, `PREDICTOR`, `BIGTIFF=YES|NO|IF_NEEDED|IF_SAFER`, `FORMAT=NC4` for netCDF, `FORMAT=ZARR_V3` for Zarr...),
     /// `overviews` (GeoTIFF factors such as `[2,4,8]`) and `overviewResampling`, or
     /// `overviewData` (GeoTIFF/COG overviews written as they are, from the largest:
     /// `[{ width, height, data }]`, `data` a typed array of the raster's type with every band,

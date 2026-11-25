@@ -40,7 +40,7 @@ pub struct Args {
     /// GeoTIFF/COG tile size.
     #[arg(long)]
     tile_size: Option<u32>,
-    /// Write BigTIFF.
+    /// Write BigTIFF, whatever `--co BIGTIFF` says (BIGTIFF=YES).
     #[arg(long)]
     bigtiff: bool,
     /// Convert only this window of a raster: first column, first row, width and height (in the

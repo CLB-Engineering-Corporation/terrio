@@ -637,7 +637,10 @@ mod tests {
     fn sample(big: bool) -> Vec<u8> {
         let cfg = wbraster::RasterConfig { cols: 20, rows: 10, bands: 1, data_type: wbraster::DataType::U8, ..Default::default() };
         let r = wbraster::Raster::from_data(cfg, (0..200).map(|v| v as f64).collect()).unwrap();
-        let opts = super::super::gtiff_write::TiffOptions { bigtiff: big, ..Default::default() };
+        let opts = super::super::gtiff_write::TiffOptions {
+            bigtiff: if big { crate::BigTiffPolicy::Yes } else { crate::BigTiffPolicy::No },
+            ..Default::default()
+        };
         super::super::gtiff_write::encode(&r, &opts).unwrap()
     }
 

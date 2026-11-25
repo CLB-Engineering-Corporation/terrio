@@ -23,7 +23,7 @@ use super::area_matched::{self, AreaMatched, IntoRasterData};
 use super::common::{Rewrite, create_replacing};
 use super::gdal_overview::{self, Method};
 use crate::pixel::{Pixel, map_data, with_data};
-use crate::{Error, Result};
+use crate::{BigTiffPolicy, Error, Result};
 use std::io::Write;
 use wbraster::raster::RasterData;
 use wbraster::{DataType, Raster};
@@ -437,8 +437,8 @@ pub(crate) struct TiffOptions {
     pub compression: Compression,
     /// Tile size; strips when `None`.
     pub tile_size: Option<u32>,
-    /// Force BigTIFF; otherwise used only when the file would exceed 4 GiB.
-    pub bigtiff: bool,
+    /// Whether the file is a BigTIFF (`BIGTIFF`): see [`BigTiffPolicy::bigtiff`].
+    pub bigtiff: BigTiffPolicy,
     /// Write a Cloud Optimized GeoTIFF: tiled, with overviews and GDAL's layout.
     pub cog: bool,
     /// The nodata value to declare.
@@ -592,7 +592,7 @@ impl Default for TiffOptions {
         Self {
             compression: Compression::None,
             tile_size: None,
-            bigtiff: false,
+            bigtiff: BigTiffPolicy::IfNeeded,
             cog: false,
             nodata: None,
             cog_resampling: None,
@@ -702,6 +702,80 @@ fn unsupported_resampling(name: &str) -> Error {
 /// The warning for a requested sparse COG, whose tiles are always written.
 pub(crate) const SPARSE_COG_WARNING: &str = "SPARSE_OK is not supported for COGs: every tile is written";
 
+/// The largest classic TIFF written: 16 MiB below 4 GiB, left for the directories after the data.
+const CLASSIC_LIMIT: u64 = u32::MAX as u64 - (1 << 24);
+
+/// The uncompressed size of an image past which GDAL's `BIGTIFF=IF_NEEDED` writes an
+/// uncompressed GeoTIFF as a BigTIFF (and `BIGTIFF=NO` refuses it).
+const IF_NEEDED_BYTES: u64 = 4_200_000_000;
+
+/// The uncompressed size of an image past which GDAL's `BIGTIFF=IF_SAFER` writes a BigTIFF.
+const IF_SAFER_BYTES: u64 = 2_000_000_000;
+
+/// GDAL's uncompressed size of an image, which its `BIGTIFF` choice reads (`GTiffDataset::CreateLL`
+/// and `CreateCopy` of GDAL 3.13): the bands' samples of its tiles, padding included, or of its
+/// rows in strips, and of the `overviews` it copies, unpadded (a COG's, or a GeoTIFF's given
+/// ones). `None` when it overflows.
+fn uncompressed_size(
+    (cols, rows): (usize, usize),
+    bands: usize,
+    sample_bytes: usize,
+    tile: Option<(u32, u32)>,
+    overviews: impl IntoIterator<Item = (usize, usize)>,
+) -> Option<u64> {
+    let (cols, rows) = (u64::try_from(cols).ok()?, u64::try_from(rows).ok()?);
+    let padded = |n: u64, block: u32| n.div_ceil(u64::from(block.max(1))).checked_mul(u64::from(block.max(1)));
+    let pixels = match tile {
+        Some((tw, th)) => padded(cols, tw)?.checked_mul(padded(rows, th)?)?,
+        None => cols.checked_mul(rows)?,
+    };
+    let pixels = overviews
+        .into_iter()
+        .try_fold(pixels, |sum, (c, r)| sum.checked_add(u64::try_from(c).ok()?.checked_mul(u64::try_from(r).ok()?)?))?;
+    pixels.checked_mul(u64::try_from(bands).ok()?)?.checked_mul(u64::try_from(sample_bytes).ok()?)
+}
+
+/// The size of a GeoTIFF about to be written, past [`CLASSIC_LIMIT`] or not.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum FileSize {
+    /// Its bytes and those of its directories' arrays, its chunks compressed: `BIGTIFF=NO`
+    /// refuses the file when they exceed a classic TIFF's.
+    Known(u64),
+    /// An estimate, written as the rows come (`None` when it overflows): `BIGTIFF=NO` leaves
+    /// the file to fail once it exceeds a classic TIFF's.
+    Estimated(Option<u64>),
+}
+
+impl BigTiffPolicy {
+    /// Whether a GeoTIFF is written as a BigTIFF: as GDAL 3.13 chooses from the image's
+    /// `uncompressed` size ([`uncompressed_size`], `None` when it overflows) and whether its
+    /// chunks are `compressed`, or else when its `file` size exceeds a classic TIFF's.
+    ///
+    /// # Errors
+    /// With `NO`, when GDAL refuses the file (an uncompressed image of over 4.2 GB) or its known
+    /// size exceeds a classic TIFF's.
+    pub(crate) fn bigtiff(self, uncompressed: Option<u64>, compressed: bool, file: FileSize) -> Result<bool> {
+        let over = |limit: u64| uncompressed.is_none_or(|n| n > limit);
+        let gdal_needs = !compressed && over(IF_NEEDED_BYTES);
+        let exceeds = match file {
+            FileSize::Known(n) => n > CLASSIC_LIMIT,
+            FileSize::Estimated(n) => n.is_none_or(|n| n > CLASSIC_LIMIT),
+        };
+        Ok(match self {
+            Self::Yes => true,
+            Self::IfNeeded => gdal_needs || exceeds,
+            Self::IfSafer => over(IF_SAFER_BYTES) || exceeds,
+            Self::No if gdal_needs || (exceeds && matches!(file, FileSize::Known(_))) => {
+                return Err(Error::InvalidArgument(
+                    "the GeoTIFF would exceed 4 GiB, which BIGTIFF=NO refuses: write it as a BigTIFF (BIGTIFF=YES, IF_NEEDED or IF_SAFER)"
+                        .into(),
+                ));
+            }
+            Self::No => false,
+        })
+    }
+}
+
 /// Whether a creation option value means yes.
 pub(crate) fn yes(v: &str) -> bool {
     matches!(v.to_ascii_uppercase().as_str(), "YES" | "TRUE" | "ON" | "1")
@@ -750,7 +824,7 @@ impl TiffOptions {
         let mut o = Self {
             compression,
             tile_size: options.tile_size,
-            bigtiff: options.bigtiff || co("BIGTIFF").is_some_and(yes),
+            bigtiff: options.bigtiff_policy()?,
             cog,
             nodata,
             band_metadata: options.band_metadata.clone(),
@@ -1424,6 +1498,16 @@ fn prepare(raster: &Raster, opts: &TiffOptions) -> Result<Prepared> {
             levels.push(Level { cols: w, rows: h, bands: raster.bands, data: std::borrow::Cow::Owned(data) });
         }
     }
+    // GDAL counts the overviews it copies (a COG's, or a GeoTIFF's given ones), not those it
+    // builds after creating a GeoTIFF.
+    let copied = if opts.cog || !opts.supplied_overviews.is_empty() { &levels[1..] } else { &[] };
+    let image = uncompressed_size(
+        (raster.cols, raster.rows),
+        raster.bands,
+        raster.data_type.size_bytes(),
+        tile,
+        copied.iter().map(|l| (l.cols, l.rows)),
+    );
     let mut images = Vec::with_capacity(levels.len());
     for (i, level) in levels.iter().enumerate() {
         // `SPARSE_OK` leaves out blocks of the full-resolution image only.
@@ -1474,7 +1558,7 @@ fn prepare(raster: &Raster, opts: &TiffOptions) -> Result<Prepared> {
     }
 
     let data_len: u64 = images.iter().flat_map(|i| i.chunks.iter()).map(|c| c.len() as u64 + 8).sum();
-    let big = opts.bigtiff || data_len > (u32::MAX as u64) - (1 << 24);
+    let big = opts.bigtiff.bigtiff(image, opts.compression != Compression::None, FileSize::Known(data_len))?;
     Ok(Prepared { images, big, cog: opts.cog })
 }
 
@@ -2648,12 +2732,19 @@ impl TiffRows {
         }
         let mut layout = plan.layout;
         layout.rows_per_strip = Some(block_rows as u32);
-        let raw = cols
-            .checked_mul(rows)
-            .and_then(|n| n.checked_mul(bands))
-            .and_then(|n| n.checked_mul(size))
-            .ok_or_else(|| Error::ResourceLimit("a GeoTIFF output is too large to address".into()))? as u64;
-        let big = opts.bigtiff || raw.checked_add(raw / 4).is_none_or(|n| n > (u32::MAX as u64) - (1 << 24));
+        // The chunks are written as they come, so the file's size is estimated: uncompressed,
+        // its padded chunks and at most a quarter more for the mask (packed in bits, then
+        // compressed); compressed, a quarter more than its samples.
+        let image = uncompressed_size((cols, rows), bands, size, plan.tile, []);
+        let compressed = opts.compression != Compression::None;
+        let estimate = if compressed {
+            uncompressed_size((cols, rows), bands, size, None, []).and_then(|raw| raw.checked_add(raw / 4))
+        } else if with_mask {
+            image.and_then(|n| n.checked_add(uncompressed_size((cols, rows), 1, 1, plan.tile, [])? / 4))
+        } else {
+            image
+        };
+        let big = opts.bigtiff.bigtiff(image, compressed, FileSize::Estimated(estimate))?;
         let mut tags = plan.geo;
         if let Some(cm) = plan.color_map {
             tags.push((320, cm));
@@ -2918,7 +3009,7 @@ impl TiffRows {
     /// Fails when a classic TIFF grows past what its 32-bit offsets address (the choice of
     /// BigTIFF is made from the uncompressed size, which compression may exceed).
     fn check_size(&self) -> Result<()> {
-        if !self.big && self.pos > (u32::MAX as u64) - (1 << 24) {
+        if !self.big && self.pos > CLASSIC_LIMIT {
             return Err(Error::InvalidData("the GeoTIFF exceeds 4 GiB: write it as a BigTIFF (BIGTIFF=YES)".into()));
         }
         Ok(())
@@ -3212,7 +3303,9 @@ pub(crate) struct CogWriter {
     alpha: (Option<usize>, bool),
     mask_without_dataset: bool,
     builds: Vec<CogBuild>,
-    bigtiff: bool,
+    bigtiff: BigTiffPolicy,
+    /// GDAL's uncompressed size of the full-resolution image ([`uncompressed_size`]).
+    image_size: Option<u64>,
     /// The full-resolution image's georeferencing and metadata tags (nodata on every level).
     geo: Vec<(u16, Value)>,
     color_map: Option<Value>,
@@ -3275,6 +3368,12 @@ impl CogWriter {
         let planes = if layout.planar { raster.bands / layout.parts } else { 1 };
         let mut sizes = vec![(raster.cols, raster.rows)];
         sizes.extend(gdal_overview::cog_sizes(raster.cols, raster.rows, tile, opts.overview_count));
+        let side = u32::try_from(tile).map_err(|_| Error::InvalidArgument(format!("invalid COG tile size {tile}")))?;
+        let image_size =
+            uncompressed_size(sizes[0], raster.bands, raster.data_type.size_bytes(), Some((side, side)), sizes[1..].iter().copied());
+        // `BIGTIFF=NO` refuses what GDAL refuses before anything is written; the file's own size
+        // is known once its tiles are compressed.
+        opts.bigtiff.bigtiff(image_size, opts.compression != Compression::None, FileSize::Estimated(Some(0)))?;
         let (method, block) = (cog_method(opts), gdal_overview::ovr_block(opts.source_block));
         let builds = (1..sizes.len())
             .map(|level| {
@@ -3332,6 +3431,7 @@ impl CogWriter {
             mask_without_dataset: opts.mask_without_dataset,
             builds,
             bigtiff: opts.bigtiff,
+            image_size,
             geo,
             color_map,
             levels,
@@ -3934,7 +4034,8 @@ impl CogWriter {
             }
         }
         let data_len: u64 = dirs.iter().flat_map(|d| &d.sizes).map(|s| s + 8).sum();
-        let big = self.bigtiff || data_len > (u32::MAX as u64) - (1 << 24);
+        let compressed = self.encoding.0 != Compression::None;
+        let big = self.bigtiff.bigtiff(self.image_size, compressed, FileSize::Known(data_len))?;
         self.file.write_all(&directories(dirs, big, true))?;
         use std::io::{Seek, SeekFrom};
         for i in data_order(self.levels.len(), true) {
@@ -4620,7 +4721,14 @@ mod tests {
         for (cog, comp, big) in
             [(true, Compression::Deflate, false), (false, Compression::Lzw, true), (false, Compression::PackBits, false)]
         {
-            let opts = TiffOptions { compression: comp, cog, tile_size: Some(32), bigtiff: big, nodata: Some(-1.0), ..Default::default() };
+            let opts = TiffOptions {
+                compression: comp,
+                cog,
+                tile_size: Some(32),
+                bigtiff: if big { BigTiffPolicy::Yes } else { BigTiffPolicy::IfNeeded },
+                nodata: Some(-1.0),
+                ..Default::default()
+            };
             let dir = tempfile::tempdir().unwrap();
             let p = dir.path().join("t.tif");
             write(&r, p.to_str().unwrap(), &opts).unwrap();
@@ -4629,6 +4737,194 @@ mod tests {
             assert_eq!(ds.nodata(), Some(-1.0));
             assert_eq!(ds.crs().epsg, Some(32610));
             assert_eq!(ds.geo_transform(), [500000.0, 10.0, 0.0, 4000500.0, 0.0, -10.0]);
+        }
+    }
+
+    /// The `BIGTIFF` choices of GDAL 3.13.3's `gdal_create` (Byte images, `SPARSE_OK=TRUE`) and
+    /// `gdal_translate -of COG`, at the sizes where they change: tiles count with their padding,
+    /// strips without, a COG's overviews unpadded; `IF_NEEDED` and `NO` read the size of
+    /// uncompressed images only.
+    #[test]
+    fn bigtiff_policies_choose_as_gdal_from_the_uncompressed_size() {
+        use BigTiffPolicy::{IfNeeded, IfSafer, No, Yes};
+        let tiled = |cols, rows| uncompressed_size((cols, rows), 1, 1, Some((256, 256)), []);
+        let small = FileSize::Known(1 << 20);
+        let choose = |policy: BigTiffPolicy, size, compressed| policy.bigtiff(size, compressed, small).ok();
+        // 100096 x 41728 padded pixels are below 4.2 GB, 100096 x 41984 above.
+        let (below, above) = (tiled(100_000, 41_728), tiled(100_000, 41_729));
+        assert_eq!((below, above), (Some(100_096 * 41_728), Some(100_096 * 41_984)));
+        for (size, compressed, if_needed, no) in [
+            (below, false, Some(false), Some(false)),
+            (above, false, Some(true), None),
+            (below, true, Some(false), Some(false)),
+            (above, true, Some(false), Some(false)),
+            (None, false, Some(true), None),
+        ] {
+            assert_eq!(choose(IfNeeded, size, compressed), if_needed, "{size:?} {compressed}");
+            assert_eq!(choose(No, size, compressed), no, "{size:?} {compressed}");
+            assert_eq!(choose(Yes, size, compressed), Some(true), "{size:?} {compressed}");
+        }
+        // IF_SAFER: 100096 x 19968 pixels below 2 GB, 100096 x 20224 above, compressed or not.
+        for compressed in [false, true] {
+            assert_eq!(choose(IfSafer, tiled(100_000, 19_968), compressed), Some(false));
+            assert_eq!(choose(IfSafer, tiled(100_000, 19_969), compressed), Some(true));
+            assert_eq!(choose(IfSafer, None, compressed), Some(true));
+        }
+        // Strips are not padded: 100000 x 20000 is not above 2 GB, 100000 x 20001 is.
+        assert_eq!(choose(IfSafer, uncompressed_size((100_000, 20_000), 1, 1, None, []), false), Some(false));
+        assert_eq!(choose(IfSafer, uncompressed_size((100_000, 20_001), 1, 1, None, []), false), Some(true));
+        // Every band's samples count: 4 bands of 50000 x 10001 Byte exceed 2 GB.
+        assert_eq!(choose(IfSafer, uncompressed_size((50_000, 10_000), 4, 1, None, []), false), Some(false));
+        assert_eq!(choose(IfSafer, uncompressed_size((50_000, 10_001), 4, 1, None, []), false), Some(true));
+        // A COG of 100352 x 19456 (512-pixel tiles, 1.95 GB) exceeds 2 GB with its overviews; one
+        // of 100352 x 10240 does not.
+        let cog = |rows| uncompressed_size((100_352, rows), 1, 1, Some((512, 512)), gdal_overview::cog_sizes(100_352, rows, 512, None));
+        assert_eq!(choose(IfSafer, cog(19_456), true), Some(true));
+        assert_eq!(choose(IfSafer, cog(10_240), true), Some(false));
+    }
+
+    /// Beyond GDAL's choice, `IF_NEEDED` and `IF_SAFER` write a BigTIFF when the file would not
+    /// fit a classic TIFF, and `NO` refuses a file known to exceed one but leaves an estimated one
+    /// to fail as it is written.
+    #[test]
+    fn bigtiff_policies_follow_the_file_size_past_4_gib() {
+        let over = CLASSIC_LIMIT + 1;
+        for (file, if_needed, no) in [
+            (FileSize::Known(CLASSIC_LIMIT), false, Some(false)),
+            (FileSize::Known(over), true, None),
+            (FileSize::Estimated(Some(over)), true, Some(false)),
+            (FileSize::Estimated(None), true, Some(false)),
+        ] {
+            let small = Some(1 << 20);
+            assert_eq!(BigTiffPolicy::IfNeeded.bigtiff(small, true, file).unwrap(), if_needed, "{file:?}");
+            assert_eq!(BigTiffPolicy::IfSafer.bigtiff(small, true, file).unwrap(), if_needed, "{file:?}");
+            assert_eq!(BigTiffPolicy::No.bigtiff(small, true, file).ok(), no, "{file:?}");
+        }
+    }
+
+    /// `BIGTIFF` takes GDAL's values in any case, the last one given wins, an unknown one is
+    /// refused, and `bigtiff: true` forces a BigTIFF whatever the option says.
+    #[test]
+    fn bigtiff_creation_option_reads_gdal_values() {
+        let policy = |bigtiff: bool, values: &[&str]| {
+            let creation_options = values.iter().map(|v| ("BigTiff".to_string(), v.to_string())).collect();
+            let options = crate::RasterWriteOptions { bigtiff, creation_options, ..Default::default() };
+            let from_options = TiffOptions::from_write_options(&options, false, None).map(|o| o.unwrap().bigtiff);
+            assert_eq!(options.bigtiff_policy().ok(), from_options.as_ref().ok().copied());
+            from_options
+        };
+        for (value, expected) in [
+            ("YES", BigTiffPolicy::Yes),
+            ("true", BigTiffPolicy::Yes),
+            ("1", BigTiffPolicy::Yes),
+            ("no", BigTiffPolicy::No),
+            ("OFF", BigTiffPolicy::No),
+            ("If_Needed", BigTiffPolicy::IfNeeded),
+            ("if_safer", BigTiffPolicy::IfSafer),
+        ] {
+            assert_eq!(policy(false, &[value]).unwrap(), expected, "{value}");
+            assert_eq!(value.parse::<BigTiffPolicy>().unwrap(), expected, "{value}");
+            assert_eq!(expected.to_string().parse::<BigTiffPolicy>().unwrap(), expected);
+        }
+        assert_eq!(policy(false, &[]).unwrap(), BigTiffPolicy::IfNeeded);
+        assert_eq!(policy(false, &["NO", "IF_SAFER"]).unwrap(), BigTiffPolicy::IfSafer);
+        assert_eq!(policy(true, &["NO"]).unwrap(), BigTiffPolicy::Yes);
+        assert!(matches!(policy(false, &["SOMETIMES"]), Err(Error::InvalidArgument(_))));
+    }
+
+    /// A header of `cols` x `rows` Byte pixels, which writers read without its pixels.
+    fn large_header(cols: usize, rows: usize) -> crate::RasterDataset {
+        let mut header = crate::RasterDataset::new(overview_fixture(1, DataType::U8, RasterData::U8(vec![0; 65 * 35])), false);
+        (header.raster.cols, header.raster.rows, header.raster.data) = (cols, rows, RasterData::U8(Vec::new()));
+        header
+    }
+
+    /// A GeoTIFF written in rows is a BigTIFF or not before its pixels come, as GDAL chooses: its
+    /// padded tiles of over 4.2 GB uncompressed make one with `IF_NEEDED` (no longer from 3.4 GB
+    /// on), `NO` refuses them, and `IF_SAFER` makes one from 2 GB, compressed or not.
+    #[test]
+    fn streamed_geotiffs_choose_bigtiff_before_their_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("large.tif");
+        let path = path.to_str().unwrap();
+        for (rows, compress, policy, expected) in [
+            (41_728, "NONE", "IF_NEEDED", Some(false)),
+            (38_000, "NONE", "IF_NEEDED", Some(false)),
+            (41_729, "NONE", "IF_NEEDED", Some(true)),
+            (41_729, "NONE", "NO", None),
+            (41_729, "NONE", "IF_SAFER", Some(true)),
+            (41_729, "NONE", "YES", Some(true)),
+            (19_968, "DEFLATE", "IF_SAFER", Some(false)),
+            (19_969, "DEFLATE", "IF_SAFER", Some(true)),
+            (19_969, "DEFLATE", "YES", Some(true)),
+            (19_969, "DEFLATE", "NO", Some(false)),
+            (19_969, "DEFLATE", "IF_NEEDED", Some(false)),
+            // Compressed rows of over 3.4 GB could exceed 4 GiB: terrio's estimate, past GDAL's.
+            (34_400, "DEFLATE", "IF_NEEDED", Some(true)),
+            (34_400, "DEFLATE", "NO", Some(false)),
+        ] {
+            let header = large_header(100_000, rows);
+            let creation_options =
+                [("TILED", "YES"), ("COMPRESS", compress), ("BIGTIFF", policy)].map(|(k, v)| (k.to_string(), v.to_string())).to_vec();
+            let options = crate::RasterWriteOptions { creation_options, ..Default::default() };
+            let big = TiffRows::create(path, &header, &options, None).map(|w| w.big);
+            assert_eq!(big.as_ref().ok().copied(), expected, "{rows} rows, {compress}, BIGTIFF={policy}: {big:?}");
+            if expected.is_none() {
+                assert!(matches!(big, Err(Error::InvalidArgument(_))), "{big:?}");
+            }
+        }
+    }
+
+    /// A COG with `BIGTIFF=NO` is refused before it is written when GDAL refuses it: uncompressed,
+    /// over 4.2 GB with its overviews.
+    #[test]
+    fn cogs_with_bigtiff_no_are_refused_when_gdal_refuses_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("large.tif");
+        for (rows, compression, refused) in
+            [(36_000, Compression::None, true), (30_000, Compression::None, false), (36_000, Compression::Deflate, false)]
+        {
+            let header = large_header(100_000, rows);
+            let opts = TiffOptions { cog: true, compression, bigtiff: BigTiffPolicy::No, ..Default::default() };
+            let result = CogWriter::create(path.to_str().unwrap(), &header.raster, &opts);
+            assert_eq!(matches!(result, Err(Error::InvalidArgument(_))), refused, "{rows} rows, {compression:?}");
+        }
+    }
+
+    /// Every policy writes a file of its kind that reads back the same: small images are classic
+    /// TIFFs unless `BIGTIFF=YES`, whole or in rows, GeoTIFF or COG.
+    #[test]
+    fn small_images_are_classic_tiffs_unless_bigtiff_is_forced() {
+        let raster = overview_fixture(1, DataType::U8, RasterData::U8((0..65 * 35).map(|i| (i % 251) as u8).collect()));
+        let dataset = crate::RasterDataset::new(raster.clone(), false);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("small.tif");
+        let path = path.to_str().unwrap();
+        for driver in [crate::formats::RasterDriver::GTiff, crate::formats::RasterDriver::Cog] {
+            for compress in ["NONE", "DEFLATE"] {
+                for policy in ["YES", "NO", "IF_NEEDED", "IF_SAFER"] {
+                    let creation_options =
+                        [("COMPRESS", compress), ("BIGTIFF", policy)].map(|(k, v)| (k.to_string(), v.to_string())).to_vec();
+                    let options = crate::RasterWriteOptions { driver: Some(driver), creation_options, ..Default::default() };
+                    for streamed in [false, true] {
+                        if streamed {
+                            let mut w = GeoTiffWriter::create(path, &dataset, &options).unwrap();
+                            w.write_rows(&raster.data, 35, None).unwrap();
+                            w.finish().unwrap();
+                        } else {
+                            crate::write_raster_dataset(&dataset, path, &options).unwrap();
+                        }
+                        let case = format!("{driver:?}, {compress}, BIGTIFF={policy}, streamed {streamed}");
+                        let version = u16::from_le_bytes(std::fs::read(path).unwrap()[2..4].try_into().unwrap());
+                        assert_eq!(version, if policy == "YES" { 43 } else { 42 }, "{case}");
+                        assert_eq!(
+                            crate::geotiff::read_geotiff(std::path::Path::new(path)).unwrap().raster.data_u8().unwrap(),
+                            raster.data_u8().unwrap(),
+                            "{case}"
+                        );
+                    }
+                }
+            }
         }
     }
 

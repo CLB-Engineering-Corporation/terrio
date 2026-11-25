@@ -25,6 +25,7 @@ Suites:
     vrt               serialized warped/derived/kernel VRTs, masks and lazy windows
     jp2-colors        JPEG 2000 component roles and masks on real Landsat data
     overviews         source overview selection and HTTP COG bytes vs gdalwarp -ovr
+    bigtiff           BIGTIFF=YES/NO/IF_NEEDED/IF_SAFER at GDAL's thresholds (compare_bigtiff_with_gdal.py)
     supplied-overviews  COG overviews supplied as arrays vs GDAL's OVERVIEWS=FORCE_USE_EXISTING copy
                       (compare_supplied_overviews_with_gdal.py)
     warp-grid         aligned warp tiles and windows on real terrain
@@ -613,6 +614,33 @@ def suite_deflate(ctx):
         suite.cases.append(Case("Deflate", row["name"], IDENTICAL if row["status"] == "identical" else DIFFERS, row["detail"]))
     if len(rows) < 5 or code and not any(case.status == DIFFERS for case in suite.cases):
         suite.error = tail(err or out) or "incomplete Deflate comparisons"
+    return suite
+
+
+def suite_bigtiff(ctx):
+    """GeoTIFF BIGTIFF creation options against GDAL's GTiff driver, at the sizes its choice changes."""
+    suite = Suite("bigtiff", "BigTIFF creation options", "GDAL GTiff and COG drivers",
+                  "Sparse empty images created by GDAL and by terrio create-raster with BIGTIFF=YES, NO, IF_NEEDED and "
+                  "IF_SAFER on both sides of GDAL's 4.2 GB and 2 GB thresholds (padded tiles, strips, bands, compressed "
+                  "or not): the same TIFF version or the same refusal, terrio's file read by GDAL; a Float32 raster "
+                  "converted with every policy to GeoTIFF and COG, read back by GDAL sample for sample. Not compared: "
+                  "the known difference of compressed rows written as they come (IF_NEEDED), a BigTIFF once they could "
+                  "exceed 4 GiB.")
+    missing = missing_modules("numpy", "osgeo")
+    if missing:
+        suite.skipped = "needs " + ", ".join(missing)
+        return suite
+    code, out, err = run([sys.executable, str(SCRIPTS / "compare_bigtiff_with_gdal.py"), "--terrio", ctx.terrio, "--json"])
+    try:
+        rows = json.loads(out)
+    except json.JSONDecodeError:
+        suite.error = tail(err or out)
+        return suite
+    statuses = {"identical": IDENTICAL, "not compared": NOT_COMPARED}
+    for row in rows:
+        suite.cases.append(Case("BIGTIFF", row["name"], statuses.get(row["status"], DIFFERS), row["detail"]))
+    if len(rows) < 33 or code and not any(case.status == DIFFERS for case in suite.cases):
+        suite.error = tail(err or out) or "incomplete BIGTIFF comparisons"
     return suite
 
 
@@ -4576,6 +4604,7 @@ SUITES = OrderedDict(
         ("lerc-writer", suite_lerc_writer),
         ("webp-writer", suite_webp_writer),
         ("deflate", suite_deflate),
+        ("bigtiff", suite_bigtiff),
         ("supplied-overviews", suite_supplied_overviews),
         ("windows", suite_windows),
         ("ops", suite_ops),
