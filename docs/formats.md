@@ -261,6 +261,14 @@ with a warning:
 
 A COG writes every tile, and warns that it does.
 
+A tiled GeoTIFF without an internal mask can be written tile by tile in any order
+(`GeoTiffWriter::write_tile` in Rust, `GeoTiffWriter.write_tile` in Python), each tile from its
+pixels within the raster, unpadded at the right and bottom edges, and appended to the file as it
+comes. In Rust, a `TileEncoder` compresses tiles on any thread while the writer appends those
+compressed (`write_compressed_tile`). Tiles never written are filled with nodata, or 0, when the
+file is finished, or left out with `SPARSE_OK=YES`, as GDAL fills or leaves out the blocks it was
+never given. A file is written in tiles or in rows, not both.
+
 terrio reads the pixels of a block left out of a GeoTIFF as nodata, or 0, whichever writer left it
 out: read whole or by window, from an overview, or over HTTP. That nodata is the file's (exactly,
 for 64-bit integer samples) or, in local reads, a band's own from the `.aux.xml` sidecar, as the

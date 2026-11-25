@@ -1394,7 +1394,8 @@ pub(crate) fn parse_band_metadata(d: &Bound<'_, PyDict>) -> PyResult<terrio::Ban
 /// compressed and written as soon as they are complete, the image directory at the end. The
 /// lossless compressions, tiles or strips, interleaving, georeferencing (rotated or by GCPs),
 /// metadata, color tables, RPCs and an internal mask are written as `Raster.write` writes them;
-/// overviews and COGs, which need the whole raster, are not.
+/// overviews and COGs, which need the whole raster, are not. A tiled GeoTIFF without a mask can
+/// instead be written tile by tile, in any order (`write_tile`).
 ///
 /// Args:
 ///     path: The output path.
@@ -1571,10 +1572,107 @@ impl PyGeoTiffWriter {
         with_warnings(py, || w.write_rows(&data, rows, mask.as_deref()))
     }
 
+    /// The tiles of a tiled GeoTIFF: `(tile_width, tile_height, across, down)`, or `None` for
+    /// strips and COGs.
+    #[getter]
+    fn tile_grid(&self) -> Option<(usize, usize, usize, usize)> {
+        let grid = self.inner.as_ref()?.tile_grid()?;
+        let ((width, height), (across, down)) = (grid.tile_size(), grid.tiles());
+        Some((width, height, across, down))
+    }
+
+    /// The number of tiles written so far.
+    #[getter]
+    fn tiles_written(&self) -> usize {
+        self.inner.as_ref().map_or(0, |w| w.tiles_written())
+    }
+
+    /// Writes tile `(col, row)` of a tiled GeoTIFF, in any order: a `(count, height, width)`
+    /// array (or `(height, width)` for one band) of the writer's real dtype, the tile's pixels
+    /// within the raster (a tile at the right or bottom edge is cut there). Tiles not written are
+    /// filled with nodata (or 0) when the file is closed, or left out with `SPARSE_OK=YES`, as
+    /// GDAL leaves the blocks never written. A read-only C-contiguous array is compressed where
+    /// it is, the GIL held meanwhile; other arrays are copied first, the GIL released while they
+    /// are written. A file is written in tiles or in rows (`write`), not both.
+    ///
+    /// Args:
+    ///     col: The tile's column, from 0.
+    ///     row: The tile's row, from 0.
+    ///     array: The tile's pixels.
+    ///
+    /// Raises:
+    ///     InvalidArgumentError: If the tile does not exist or was written, the array's shape or
+    ///         dtype is not the tile's, rows were written, or the writer is closed.
+    ///     UnsupportedError: If the file has strips, a mask or complex samples, or is a COG.
+    fn write_tile(&mut self, py: Python<'_>, col: usize, row: usize, array: &Bound<'_, PyUntypedArray>) -> PyResult<()> {
+        let w = self.inner.as_mut().ok_or_else(|| invalid("the writer is closed"))?;
+        if self.complex {
+            return Err(terrio::Error::Unsupported("tiles of complex samples are not written in any order: write the rows".into())).py();
+        }
+        let shape = array.shape().to_vec();
+        let bands = match shape[..] {
+            [_, _] => 1,
+            [b, _, _] => b,
+            _ => return Err(invalid("expected a 2-D or 3-D array")),
+        };
+        if bands != self.count {
+            return Err(invalid(format!("expected {} bands, got {bands}", self.count)));
+        }
+        let encoder = w.tile_encoder().py()?;
+        let window = encoder.grid().window(col, row);
+        if let Some((_, _, tw, th)) = window
+            && shape[shape.len() - 2..] != [th, tw]
+        {
+            return Err(invalid(format!("expected a tile of {th} rows of {tw} columns, got {:?}", &shape[shape.len() - 2..])));
+        }
+        let writeable: bool = array.getattr("flags")?.getattr("writeable")?.extract()?;
+        if !writeable && array.is_c_contiguous() {
+            let dtype = array.dtype();
+            macro_rules! borrowed {
+                ($($t:ty),*) => {$(
+                    if <$t as terrio::RasterElement>::DATA_TYPE == self.data_type
+                        && dtype.is_equiv_to(&numpy::dtype::<$t>(py))
+                        && let Ok(a) = array.cast::<PyArrayDyn<$t>>()
+                        && let Ok(a) = a.try_readonly()
+                        && let Ok(values) = a.as_slice()
+                    {
+                        let _ = terrio::warnings::take();
+                        let write = || encoder.compress(col, row, values).and_then(|tile| w.write_compressed_tile(tile));
+                        let written = std::panic::catch_unwind(std::panic::AssertUnwindSafe(write)).unwrap_or_else(|p| Err(crate::panicked(p)));
+                        drop(a);
+                        let warned = crate::issue_warnings(py, terrio::warnings::take());
+                        written.py()?;
+                        return warned;
+                    }
+                )*};
+            }
+            borrowed!(u8, i8, u16, i16, u32, i32, u64, i64, f32, f64);
+        }
+        let data = from_numpy(array)?;
+        if data.data_type() != self.data_type {
+            return Err(invalid("the array's dtype is not the writer's"));
+        }
+        with_warnings(py, || {
+            let tile = match &data {
+                RasterData::U8(v) => encoder.compress(col, row, v),
+                RasterData::I8(v) => encoder.compress(col, row, v),
+                RasterData::U16(v) => encoder.compress(col, row, v),
+                RasterData::I16(v) => encoder.compress(col, row, v),
+                RasterData::U32(v) => encoder.compress(col, row, v),
+                RasterData::I32(v) => encoder.compress(col, row, v),
+                RasterData::U64(v) => encoder.compress(col, row, v),
+                RasterData::I64(v) => encoder.compress(col, row, v),
+                RasterData::F32(v) => encoder.compress(col, row, v),
+                RasterData::F64(v) => encoder.compress(col, row, v),
+            }?;
+            w.write_compressed_tile(tile)
+        })
+    }
+
     /// Writes the directory and closes the file.
     ///
     /// Raises:
-    ///     InvalidArgumentError: If rows are missing.
+    ///     InvalidArgumentError: If rows are missing (a file written in tiles has none missing).
     fn close(&mut self, py: Python<'_>) -> PyResult<()> {
         match self.inner.take() {
             Some(w) => with_warnings(py, || w.finish()),

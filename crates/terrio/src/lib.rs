@@ -339,7 +339,7 @@ pub use dataset::{
     geo_transform, is_north_up, list_layers, open, open_raster, open_raster_with_tiff_limits, open_vector, read_gcps, write_netcdf_groups,
     write_raster, write_raster_dataset, write_vector,
 };
-pub use drivers::gtiff_write::GeoTiffWriter;
+pub use drivers::gtiff_write::{CompressedTile, GeoTiffWriter, TileEncoder, TileGrid};
 pub use drivers::vector::citygml_write::{CityGmlLod0Surface, CityGmlVersion};
 pub use drivers::vector::cityjson_write::CityJsonVersion;
 pub use drivers::vector::csv::{CsvGeometry, CsvOptions};
