@@ -690,22 +690,19 @@ fn read_at_most(r: impl Read, most: usize, what: &str) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+/// The bytes past a block's end that `zrip` keeps room for in its output, which a buffer it
+/// decodes into needs besides the output so that it does not grow.
+const ZRIP_SLACK: usize = 64;
+
 /// Decompresses every frame of `b`, to at most `most` bytes: more is an error rather than an
-/// allocation of whatever a small chunk expands to.
+/// allocation of whatever a small chunk expands to. The output is reserved at once, fallibly, as
+/// `codec_output`'s is.
 fn zstd_decode(b: &[u8], most: usize) -> Result<Vec<u8>> {
-    // Frames that record their size, of no more than `most` bytes in all, are decoded at once.
-    if let Some(out) = crate::zstandard::pure::whole(b, most).map_err(|e| bad(e.to_string().replacen("Zstandard", "zstd", 1)))? {
-        return Ok(out);
-    }
-    let mut out = codec_output(most)?;
-    let mut src = b;
-    while !src.is_empty() && out.len() <= most {
-        let d = ruzstd::decoding::StreamingDecoder::new(&mut src).map_err(|e| bad(format!("zstd: {e}")))?;
-        d.take(((most - out.len()) as u64).saturating_add(1)).read_to_end(&mut out)?;
-    }
-    if out.len() > most {
-        return Err(bad(format!("zstd: a chunk decompressing to more than {most} bytes")));
-    }
+    let mut out = buffer(most.saturating_add(ZRIP_SLACK), "a Zarr chunk's decoded bytes")?;
+    zrip::DecompressContext::new().decompress_into_with_limit(b, &mut out, most).map_err(|e| match e {
+        zrip::DecompressError::OutputTooSmall => bad(format!("zstd: a chunk decompressing to more than {most} bytes")),
+        e => bad(format!("zstd: {e}")),
+    })?;
     Ok(out)
 }
 
@@ -2542,8 +2539,7 @@ fn compress(codec: &Option<Codec>, data: Vec<u8>) -> Result<Vec<u8>> {
             e.write_all(&data)?;
             e.finish()?
         }
-        // Pure Rust in every build, at zstd's level 1 (`ruzstd`'s `Fastest`).
-        Some(Codec::Zstd) => crate::zstandard::pure::compress(&data, 1)?,
+        Some(Codec::Zstd) => zrip::compress(&data, 1).map_err(|e| bad(format!("zstd: {e}")))?,
         _ => data,
     })
 }

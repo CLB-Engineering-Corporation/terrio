@@ -119,6 +119,12 @@ terrio.write_vector(layer, "world.gpkg", append=True)
 terrio.convert("more.shp", "world.gpkg", nln="countries", overwrite=True)
 ```
 
+Use `preserve_fid=True` on `write_vector`, `convert`, `Layer.write`,
+`Layer.to_bytes` or `VectorDataset.write` to use feature IDs as GeoPackage
+primary keys, including IDs substituted by a reader. Conflicting key attributes and
+duplicate IDs raise an error. See the [GeoPackage write options](rust.md#writing)
+for GeoJSON limitations, precedence and signed IDs.
+
 The GeoPackage is changed in place, as SQLite changes it: only the pages that change are written (new
 rows, R-tree nodes, the tables describing the layer), in a transaction protected by a rollback
 journal, so appending to a large GeoPackage costs about as much as the features appended, and a
@@ -414,12 +420,20 @@ and `sort` run the [vector geometry commands](cli.md#vector-geometry-commands) (
 `gdal vector` commands of those names) and return a `Layer`. Inputs may be a vector path,
 `VectorDataset`, `Layer`, list of layers, or GeoJSON, with a single layer, or the one `layer=`
 names. `convert(..., simplify=TOLERANCE)` and `convert(..., segmentize=MAX_LENGTH)` are
-`ogr2ogr`'s `-simplify` and `-segmentize`.
+`ogr2ogr`'s `-simplify` and `-segmentize`. `simplify(..., method="douglas-peucker")` runs
+Douglas-Peucker instead of the topology-preserving simplifier (see
+[simplify](cli.md#vector-geometry-commands)), and `simplify_wkb` runs it directly on WKB: Arrow
+binary arrays (pyarrow `binary`, `large_binary`, `binary_view`, a ChunkedArray of one) or
+sequences of `bytes`, in parallel over features, returning the same kind of array (a
+`terrio.ArrowArray` when pyarrow is not installed) and, with `stats=True`, counts of vertices and
+collapsed rings.
 
 ```python
 groups = terrio.combine("places.gpkg", group_by=["adm0_a3"])
 hulls = terrio.concave_hull(groups, 0.3, allow_holes=True)
 simple = terrio.simplify("counties.gpkg", 0.01)
+fast = terrio.simplify("counties.gpkg", 0.01, method="douglas-peucker")
+wkb, counts = terrio.simplify_wkb(table["geometry"], 0.1, stats=True)  # a pyarrow binary column
 dense = terrio.segmentize(simple, 0.1)
 multi = terrio.set_geom_type("roads.gpkg", multi=True, dim="XYZ")
 ordered = terrio.sort(multi, method="strtree")
@@ -738,7 +752,8 @@ Their keyword options follow the CLI, including compression, partial refresh,
 clipping geometry and overview updates. Local writable little-endian GeoTIFFs
 are required for in-place changes; external overview updates can fail after the
 base update commits. External overviews (`external=True`) write only the `.ovr`
-sidecar, so the GeoTIFF may be read-only, as with `gdaladdo -ro`. They read that
+sidecar (and, for a `.msk` sidecar mask, the mask's overviews in its `.msk.ovr`, as
+GDAL does), so the GeoTIFF may be read-only, as with `gdaladdo -ro`. They read that
 `.ovr` under `TERRIO_DISABLE_READDIR_ON_OPEN=EMPTY_DIR` too; the `.msk`, `.aux.xml`
 and `.ovr.msk` beside the GeoTIFF still follow the option. Overviews are
 managed for GeoTIFFs only.
@@ -748,7 +763,8 @@ overviews are computed, with a fraction from 0 to 1 that never decreases (1 once
 every overview is computed, before they are written). A falsy return value other
 than `None` cancels, as with GDAL's Python callbacks, raising
 `terrio.errors.CancelledError`; an exception the callback raises cancels too and
-propagates. A cancellation changes no file: an existing `.ovr` stays as it was.
+propagates. A cancellation changes no file: an existing `.ovr` (and `.msk.ovr`)
+stays as it was.
 
 ```python
 def report(fraction):
@@ -1046,7 +1062,7 @@ terrio.network_stats()  # {"request_count": 1, "received_bytes": 16384, "sent_by
 terrio.clear_http_cache()
 
 # The cache of decoded GeoTIFF/COG chunks (GDAL's GetCacheMax/SetCacheMax): TERRIO_CACHEMAX, else
-# GDAL_CACHEMAX, else 64 MiB; 0 turns it off.
+# GDAL_CACHEMAX, else 64 MiB; 0 turns it off. It also keeps the bands lazy GRIB reads decode.
 terrio.block_cache_max()  # 67108864
 terrio.set_block_cache_max(256 << 20)
 terrio.clear_block_cache()
@@ -1089,6 +1105,21 @@ with Env(TERRIO_TIFF_MAX_CHUNK_BYTES=str(1 << 30)):
     da = terrio.xarray.open_rasterio("pixel_interleaved_1488_bands.tif")
 ```
 
+An image stored as one strip larger than the limit is read by the rows a window needs, when
+those rows fit the limit as they are stored: at the strip's full width and with all of its
+samples, whatever width and bands the window returns. Uncompressed, Deflate, LZW, Zstandard
+and PackBits strips of the sample layouts [Rasters](formats.md#rasters) lists are read so,
+decoded from the start of the strip to the window's last row. A nearest-neighbour
+`read_resampled` (or `terrio.rio`'s `read(out_shape=...)`) smaller than the image reads the
+rows it samples the same way, a row at a time. Reading the whole strip is still refused, and
+so is a read that would decode more than four times the limit (1 GiB by default) by rows,
+summed over the compressed strips and bands it reads, each from its start to the last row it
+needs there, or a compressed strip that declares more: that bounds the decoding a read does
+(a read of the last pixel of a 1 GiB strip of zeros takes 0.2 to 0.4 s). An uncompressed
+strip is read by rows whatever its size. For files you do not trust,
+`TERRIO_MAX_DECLARED_BYTES` (below) bounds what a raster declares further (see
+[Rasters](formats.md#rasters)).
+
 A GeoTIFF read whole or by window (`terrio.open_raster`, `Raster.read`, `terrio.rio`'s `read`)
 raises `ResourceLimitError` before its buffer is allocated when the process cannot hold it (more
 than the physical memory, or than the limit of its cgroup or its address space), and so does
@@ -1098,7 +1129,9 @@ through open, read, resampled read and mask reads, so callers can distinguish a 
 from an ordinary `RasterioIOError`. For files you do not trust, `TERRIO_MAX_DECLARED_BYTES` (width x height x bands x bytes
 per sample) and `TERRIO_MAX_BANDS`, positive integers in the environment or an `Env`, refuse a
 raster that declares more when it is opened, whatever its format, with `ResourceLimitError`
-naming the option. See [Rasters](formats.md#rasters) for declaration checks and reader details:
+naming the option. No read decodes more than its raster declares, so
+`TERRIO_MAX_DECLARED_BYTES` also bounds what a read of strips over the chunk limit decodes by
+rows. See [Rasters](formats.md#rasters) for declaration checks and reader details:
 
 ```python
 with Env(TERRIO_MAX_DECLARED_BYTES=str(1 << 30), TERRIO_MAX_BANDS="64"):

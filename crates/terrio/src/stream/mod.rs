@@ -330,6 +330,12 @@ impl FeatureReader {
         Ok(Some(chunk))
     }
 
+    /// Pushes an attribute predicate into the source before the first batch: a GeoParquet file
+    /// reads only the rows it may match. Other sources ignore it.
+    pub(crate) fn filter_attributes(&mut self, expression: &crate::ops::sql::Expression) -> Result<()> {
+        self.source.filter_attributes(expression)
+    }
+
     /// Reads the remaining features into a layer.
     pub fn read_all(mut self) -> Result<Layer> {
         let mut layer = schema_of(&self.layer);
@@ -829,6 +835,7 @@ impl FeatureSource for FgbSource {
 
 #[cfg(feature = "flatgeobuf")]
 fn open_fgb(path: &str, batch: usize, bbox: Option<(f64, f64, f64, f64)>) -> Result<(Layer, Box<dyn FeatureSource>)> {
+    let bbox = bbox.map(crate::drivers::vector::corners_extent);
     let mut r = BufReader::with_capacity(1 << 20, File::open(path)?);
     let mut start = [0u8; 12];
     let n = read_full(&mut r, &mut start)?;
@@ -1059,7 +1066,8 @@ impl FeatureWriter {
     /// Creates the file of a layer (`layer` gives its name, fields, geometry type and CRS; its
     /// features are not written) at `path`. Writers that [`needs_profile`] use `profile`, the
     /// profile of all the features to be written; without it they write the features whole when
-    /// the writer finishes.
+    /// the writer finishes. GeoPackage FID preservation also buffers the features before
+    /// writing, since IDs must be validated and may arrive out of order.
     pub fn create(path: &str, layer: &Layer, profile: Option<&LayerProfile>, options: &VectorWriteOptions) -> Result<Self> {
         if !crate::vfs::Location::parse(path).is_local() {
             return Err(Error::Unsupported(format!("cannot write to '{path}': only local outputs are supported")));
@@ -1071,7 +1079,7 @@ impl FeatureWriter {
         };
         crate::dataset::ensure_vector_options_apply(options, Some(driver))?;
         let schema = schema_of(layer);
-        let streamed = can_write_stream(driver) && (profile.is_some() || !needs_profile(driver, &schema));
+        let streamed = !options.preserve_fid && can_write_stream(driver) && (profile.is_some() || !needs_profile(driver, &schema));
         let sink: Box<dyn FeatureSink> = match (streamed, driver, profile) {
             (false, ..) => Box::new(WholeSink {
                 layer: schema,
@@ -1989,6 +1997,7 @@ pub fn can_convert_stream(src: &str, dst: &str, options: &ConvertOptions) -> boo
     let input = VectorDriver::for_extension(src).filter(|_| ext.as_deref() != Some("json"));
     let pbf = || input == Some(VectorDriver::OSM) && ext.as_deref() == Some("pbf") && osm_sorted(src);
     options.translate.sql.is_none()
+        && !options.write.preserve_fid
         && out.is_some_and(can_write_stream)
         && (input.is_some_and(can_read_stream) || pbf())
         && (crate::vfs::Location::parse(src).is_local() || {
@@ -2051,6 +2060,9 @@ pub fn convert(src: &str, dst: &str, options: &ConvertOptions) -> Result<()> {
     // The source is read by the driver its name points to (OpenStreetMap files by a reader of their
     // own), as `open_vector` reads it: judged as that open judges a dataset.
     crate::formats::check_allowed(src, Some(crate::formats::Kind::Vector))?;
+    if options.write.preserve_fid {
+        return convert_whole(src, dst, options);
+    }
     if let Some(done) = convert_osm(src, dst, options) {
         return done;
     }

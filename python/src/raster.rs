@@ -35,7 +35,8 @@ pub struct PyRaster {
 /// that overlaps one in progress (which holds the raster's own reader) takes one of them, or
 /// opens one, and leaves it for the next. Opening again reads the headers from the process-wide
 /// caches. Each reader has its own file handle; their decoded chunks share the process-wide block
-/// cache, under its one byte cap, without being shared between readers.
+/// cache, under its one byte cap, without being shared between readers, except the bands of a
+/// local GRIB file, which the readers of one version of the file share on Unix.
 #[pyclass(frozen)]
 pub(crate) struct Readers {
     path: String,
@@ -330,25 +331,6 @@ pub(crate) fn with_numpy<R>(array: &Bound<'_, PyUntypedArray>, f: impl FnOnce(Ra
     }
     let data = from_numpy(array)?;
     Ok(f(RasterDataRef::from(&data), false))
-}
-
-/// A supplied overview: a `Raster` (read whole), or a `(rows, cols)` or `(bands, rows, cols)`
-/// array. Only its pixels are written, so an array needs no georeferencing.
-fn overview_raster(obj: &Bound<'_, PyAny>) -> PyResult<std::sync::Arc<terrio::Raster>> {
-    if let Ok(mut r) = obj.cast::<PyRaster>().map(|r| r.borrow_mut()) {
-        let raster = r.with_dataset(|ds| Ok(ds.raster.clone())).py()?;
-        return Ok(std::sync::Arc::new(raster));
-    }
-    let array = obj.cast::<PyUntypedArray>().map_err(|_| invalid("an overview is a Raster or a NumPy array (or every one a factor)"))?;
-    let (bands, rows, cols) = match array.shape()[..] {
-        [r, c] => (1, r, c),
-        [b, r, c] => (b, r, c),
-        _ => return Err(invalid("an overview array is 2-D (rows, cols) or 3-D (bands, rows, cols)")),
-    };
-    let data = from_numpy(array)?;
-    let cfg = terrio::RasterConfig { cols, rows, bands, data_type: data.data_type(), ..Default::default() };
-    let raster = terrio::Raster::from_data_native(cfg, data).map_err(terrio::Error::from).py()?;
-    Ok(std::sync::Arc::new(raster))
 }
 
 /// Parses a `band` argument: `None` (all bands), an int, or a sequence of ints. Returns the bands
@@ -1151,28 +1133,31 @@ impl PyRaster {
     ///         leave it unset when assigning new colour roles.
     ///     colormap: The color table of a single-band Byte or UInt16 GeoTIFF: `(r, g, b, a)`
     ///         entries from index 0.
-    ///     overviews: Overviews to build, as decimation factors such as `[2, 4]`: for a COG, the
-    ///         levels written instead of halving until one fits in a tile, as GDAL's COG driver
-    ///         reuses its source's overviews (`OVERVIEWS=NONE` or `IGNORE_EXISTING` with factors
-    ///         raises); or the overviews themselves (GeoTIFF or COG), written as they are instead
-    ///         of computed:
-    ///         `Raster`s or arrays (`(rows, cols)` or `(bands, rows, cols)`) of the raster's dtype,
-    ///         from the largest, at factors 2, 4, 8...: for a COG, halved and floored from level
-    ///         to level under the default `COG_OVERVIEW_POLICY=GDAL_3_13`, or
-    ///         `ceil(width / f) x ceil(height / f)` (GDAL's GTiff overview sizes, and a GeoTIFF's)
-    ///         with `options={"COG_OVERVIEW_POLICY": "SOURCE"}`.
-    ///     overview_resampling: GDAL's names (`"nearest"`, `"average"`, `"bilinear"`, `"cubic"`,
-    ///         `"cubicspline"`, `"lanczos"`, `"rms"`, `"mode"`), `"min"` or `"max"`; or
-    ///         `"area_matched"` (`"area_matched_mode"` for categorical rasters), whose levels keep
-    ///         the full-resolution valid area instead of growing it, with the mean (or mode) of the
-    ///         valid pixels (needs a nodata value, and for a COG `COG_OVERVIEW_POLICY=SOURCE`).
-    ///         Defaults to `"nearest"` for GeoTIFF and GDAL's `"cubic"` for COG under its default
-    ///         `COG_OVERVIEW_POLICY=GDAL_3_13` (`"nearest"` for palettes). The CLB fork's
-    ///         `COG_OVERVIEW_POLICY=SOURCE` (a creation option) builds ceil-sized levels from the
-    ///         source blocks with `"nearest"`, `"average"` (its default), `"min"`, `"max"` or
-    ///         `"mode"`.
-    ///     metadata: Dataset metadata items (GDAL's default domain) to set over the raster's
-    ///         own: a mapping or `(key, value)` pairs.
+    ///     overviews: Overviews to build, as decimation factors such as `[2, 4]` (for a COG,
+    ///         the CLB fork's: the levels written instead of halving until one fits in a tile, as
+    ///         GDAL's COG driver reuses its source's overviews; `OVERVIEWS=NONE` or
+    ///         `IGNORE_EXISTING` with factors raises); or GeoTIFF/COG overviews to write as they
+    ///         are, from the largest: `Raster`s or `(rows, cols)` / `(bands, rows, cols)` arrays
+    ///         of the raster's bands and dtype, each smaller than the level before it
+    ///         (`gdaladdo`'s `ceil(n / factor)` sizes and the COG driver's halved ones qualify).
+    ///         As GDAL's COG driver writes a source's existing overviews with `OVERVIEWS=AUTO`
+    ///         or `FORCE_USE_EXISTING`; `OVERVIEWS=NONE` or `IGNORE_EXISTING` and an overview
+    ///         resampling refuse them. Only their pixels are read.
+    ///     overview_resampling: As GDAL names them: `"nearest"`, `"average"`, `"rms"`,
+    ///         `"bilinear"`, `"cubic"`, `"cubicspline"`, `"lanczos"`, `"mode"` (and terrio's
+    ///         `"min"` and `"max"` for GeoTIFF overviews). GeoTIFF overviews default to
+    ///         `"nearest"`; COGs to GDAL's COG driver's `"cubic"` (`"nearest"` when paletted)
+    ///         under the default `COG_OVERVIEW_POLICY=GDAL_3_13`. The `OVERVIEW_RESAMPLING` and
+    ///         `RESAMPLING` creation options come first. terrio's `"area_matched"`
+    ///         (`"area_matched_mode"` for classes) builds GeoTIFF and COG overviews that keep the
+    ///         valid area of a raster with nodata, and records the area each level keeps in the
+    ///         band metadata items `OVERVIEW_AREA_RATIOS` and `OVERVIEW_BASE_VALID_PIXELS`. The
+    ///         CLB fork's `COG_OVERVIEW_POLICY=SOURCE` (a creation option) builds ceil-sized
+    ///         levels from the source blocks with `"nearest"`, `"average"` (its default),
+    ///         `"min"`, `"max"` or `"mode"`, and area-matched levels as ras2cng builds them.
+    ///     metadata: Dataset metadata items (GDAL's default domain) set over the raster's own, as
+    ///         `gdal_translate -mo` sets them: a mapping, or `(key, value)` pairs. GeoTIFF and COG
+    ///         store them in the `GDAL_METADATA` tag; other formats refuse them.
     ///     gcps: GeoTIFF ground control points, in the raster's CRS: `(pixel, line, x, y, z)`
     ///         tuples, written as tie points instead of the geotransform.
     ///     mask: A per-dataset validity mask, a 2-D uint8 array (0 for invalid pixels), written
@@ -1259,10 +1244,15 @@ impl PyRaster {
         options_.band_metadata = band_metadata.unwrap_or_default().iter().map(parse_band_metadata).collect::<PyResult<_>>()?;
         options_.color_table = colormap.unwrap_or_default();
         let overviews = overviews.unwrap_or_default();
-        if overviews.iter().all(|o| o.extract::<usize>().is_ok()) {
-            options_.overviews = overviews.iter().map(|o| o.extract::<usize>()).collect::<PyResult<_>>()?;
+        let factors: Vec<Option<usize>> = overviews.iter().map(|o| o.extract::<usize>().ok()).collect();
+        if factors.iter().all(Option::is_some) {
+            options_.overviews = factors.into_iter().flatten().collect();
+        } else if factors.iter().all(Option::is_none) {
+            let complex = self.is_complex();
+            let component = self.inner.data_type();
+            options_.overview_data = overviews.iter().map(|o| overview_raster(o, complex, component)).collect::<PyResult<_>>()?;
         } else {
-            options_.overview_data = overviews.iter().map(overview_raster).collect::<PyResult<_>>()?;
+            return Err(invalid("overviews are all factors (ints) or all levels (Rasters or arrays)"));
         }
         options_.overview_resampling = overview_resampling;
         options_.metadata = metadata.map(string_pairs).transpose()?.unwrap_or_default();
@@ -1359,6 +1349,40 @@ impl PyRaster {
             if self.inner.is_lazy() { " lazy" } else { "" }
         )
     }
+}
+
+/// A supplied overview: a `Raster` (read whole), or a `(rows, cols)` or `(bands, rows, cols)`
+/// array (complex dtypes as for `Raster.from_array`). Only its pixels are written, so an array
+/// needs no georeferencing. A level's bands are complex exactly when the raster's are (`complex`):
+/// each complex band is two component bands, so a level of the other kind can match their count
+/// and type and would otherwise be written as the wrong samples.
+fn overview_raster(obj: &Bound<'_, PyAny>, complex: bool, component: DataType) -> PyResult<std::sync::Arc<terrio::Raster>> {
+    let kind = |c: bool| if c { "complex" } else { "real" };
+    let check = |level: bool| {
+        if level == complex {
+            Ok(())
+        } else {
+            Err(invalid(format!("an overview's bands are {}, the raster's {}", kind(level), kind(complex))))
+        }
+    };
+    if let Ok(r) = obj.cast::<PyRaster>() {
+        // `write` already holds this raster's borrow when it is its own overview.
+        let mut r = r.try_borrow_mut().map_err(|_| invalid("a raster cannot be its own overview"))?;
+        let (raster, level) = r.with_dataset(|ds| Ok((ds.raster.clone(), ds.complex))).py()?;
+        check(level)?;
+        return Ok(std::sync::Arc::new(raster));
+    }
+    let array = obj.cast::<PyUntypedArray>().map_err(|_| invalid("an overview is a Raster or a NumPy array (or every one a factor)"))?;
+    let (bands, rows, cols) = match array.shape()[..] {
+        [r, c] => (1, r, c),
+        [b, r, c] => (b, r, c),
+        _ => return Err(invalid("an overview array is 2-D (rows, cols) or 3-D (bands, rows, cols)")),
+    };
+    let (data, level) = raster_array_data(array, complex.then_some(component))?;
+    check(level)?;
+    let cfg =
+        terrio::RasterConfig { cols, rows, bands: bands * if level { 2 } else { 1 }, data_type: data.data_type(), ..Default::default() };
+    Ok(std::sync::Arc::new(terrio::raster_from_data(cfg, data).py()?))
 }
 
 /// A GCP as Python gives it: `(pixel, line, x, y, z)`.
@@ -1490,6 +1514,7 @@ impl PyGeoTiffWriter {
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
+        py: Python<'_>,
         path: &str,
         width: usize,
         height: usize,
@@ -1541,7 +1566,7 @@ impl PyGeoTiffWriter {
         if mask {
             o.mask = Some(Vec::new());
         }
-        let inner = terrio::GeoTiffWriter::create(path, &header, &o).py()?;
+        let inner = crate::with_warnings(py, || terrio::GeoTiffWriter::create(path, &header, &o))?;
         Ok(Self { inner: Some(inner), width, count, data_type, complex })
     }
 
@@ -1562,9 +1587,13 @@ impl PyGeoTiffWriter {
     ///     mask: The mask's rows.
     ///
     /// Raises:
-    ///     InvalidArgumentError: If the shapes or dtype do not match, or the writer is closed.
+    ///     InvalidArgumentError: If the array's shape or dtype, or the mask's shape, is not the
+    ///         writer's, a mask is given to a writer without one or none to a writer with one, or
+    ///         the writer is closed.
+    ///     TypeError: If the mask is not a 2-D uint8 array.
     #[pyo3(signature = (array, mask=None))]
     fn write(&mut self, py: Python<'_>, array: &Bound<'_, PyUntypedArray>, mask: Option<numpy::PyReadonlyArray2<'_, u8>>) -> PyResult<()> {
+        let w = self.inner.as_mut().ok_or_else(|| invalid("the writer is closed"))?;
         let shape = array.shape().to_vec();
         let (bands, rows, cols) = match shape[..] {
             [r, c] => (1, r, c),
@@ -1578,8 +1607,14 @@ impl PyGeoTiffWriter {
         if complex != self.complex || data.data_type() != self.data_type {
             return Err(invalid("the array's dtype is not the writer's"));
         }
-        let mask: Option<Vec<u8>> = mask.map(|m| m.as_array().iter().copied().collect());
-        let w = self.inner.as_mut().ok_or_else(|| invalid("the writer is closed"))?;
+        // Flattened, a mask of the same size in another shape would mask other pixels.
+        let mask: Option<Vec<u8>> = match mask {
+            Some(m) if m.shape() != [rows, cols].as_slice() => {
+                return Err(invalid(format!("expected a mask of {rows} rows of {cols} columns, got one of shape {:?}", m.shape())));
+            }
+            Some(m) => Some(m.as_array().iter().copied().collect()),
+            None => None,
+        };
         with_warnings(py, || w.write_rows(&data, rows, mask.as_deref()))
     }
 

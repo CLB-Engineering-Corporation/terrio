@@ -913,11 +913,10 @@ fn validate(tiff: Option<Tiff>, sidecar: Option<Tiff>, strict: bool, gdal: bool)
     let factors: Vec<usize> = overviews.iter().map(|o| (main.width as f64 / o.width.max(1) as f64).round_ties_even() as usize).collect();
     v.overview_factors = factors.clone();
     let (block_w, block_h) = main.block();
-    // GDAL's validation script and rio-cogeo 7.0.4 both check images larger than 512 pixels on
-    // either side (`width > 512 or height > 512`, for the image and for each overview). CLB fork:
-    // upstream's rio-cogeo mode checks those larger on both sides only, and then disagrees with
-    // rio-cogeo on a striped 525 x 375 overview (python/tests/test_cog_validate.py,
-    // `test_agrees_with_rio_cogeo`).
+    // Images larger than 512 pixels on either side are checked for tiling, the image and each
+    // overview: `width > 512 or height > 512` in rio-cogeo 7.0.4 (since 7.0.3; 5.0.0 to 7.0.2
+    // checked both sides) and in GDAL's validation script, whose strips up to 1024 wide pass as
+    // tiles.
     let large = |w: u64, h: u64| w > 512 || h > 512;
     if large(main.width, main.height) {
         if block_w == main.width && (!gdal || block_w > 1024) {
@@ -1634,7 +1633,7 @@ mod tests {
     #[test]
     fn rio_cogeo_checks_tiling_of_images_larger_than_512_on_either_side() {
         // A 525 x 375 striped overview: larger than 512 on one side only, which rio-cogeo 7.0.4
-        // reports as not tiled (upstream's rule skips it).
+        // reports as not tiled.
         let main = tiled_ifd(8, 1050, 5000, 0);
         let mut overview =
             Ifd { offset: 300, width: 525, height: 375, subfile_type: 1, samples: 1, rows_per_strip: 1, ..Default::default() };

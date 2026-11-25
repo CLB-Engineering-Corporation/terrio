@@ -57,7 +57,7 @@ fdeflate.workspace = true
 weezl.workspace = true
 png.workspace = true
 lz4_flex = { workspace = true, optional = true }
-ruzstd.workspace = true
+zrip.workspace = true
 netcdf-reader = { workspace = true, optional = true }
 hdf5-reader = { workspace = true, optional = true }
 ras-commander-fast-hdf = { workspace = true, optional = true }
@@ -95,14 +95,14 @@ chrono = { version = "0.4", default-features = false, features = ["alloc"], opti
 # feature), without copying the pixels.
 ndarray = { workspace = true, optional = true }
 
-# Every driver is on by default (`drivers` and `remote`). Zstandard is pure Rust (`ruzstd`); the
-# zstd C library is opt-in (`libzstd-*`). A build with `default-features = false`
-# keeps the core: GeoTIFF and COG (deflate, LZW, PackBits, ZSTD, WebP, JPEG, JPEG XL), the raw and
-# ASCII rasters (AAIGrid, EHdr, ENVI, ERS, HFA, RST, SAGA, GSBG, XYZ...), PNG, JPEG, VRT, GeoJSON,
-# Shapefile, KML/KMZ, GML, GPX, CSV, MapInfo, the CRS engine and the operations, without C
-# (Zstandard with `ruzstd`). `default-features = false, features = ["drivers"]` is every driver
-# without C, for hosts with no C toolchain: everything but remote inputs, whose HTTPS is `ring`. Disabled drivers stay in the API (`RasterDriver`,
-# `VectorDriver`) and fail with "built without the `...` feature".
+# Every driver is on by default (`drivers` and `remote`). Zstandard is pure Rust (`zrip`); the
+# zstd C library is opt-in (`libzstd-*`). A build with `default-features = false` keeps the core:
+# GeoTIFF and COG (deflate, LZW, PackBits, ZSTD, WebP, JPEG, JPEG XL), the raw and ASCII rasters
+# (AAIGrid, EHdr, ENVI, ERS, HFA, RST, SAGA, GSBG, XYZ...), PNG, JPEG, VRT, GeoJSON, Shapefile,
+# KML/KMZ, GML, GPX, CSV, MapInfo, the CRS engine and the operations, without C (Zstandard with
+# `zrip`). `default-features = false, features = ["drivers"]` is every driver without remote
+# inputs. Disabled drivers stay in the API (`RasterDriver`, `VectorDriver`) and fail with "built
+# without the `...` feature".
 [features]
 default = ["drivers", "remote"]
 ## Every format driver: the default features but `remote`, so pure Rust (no C compiler needed)
@@ -118,13 +118,16 @@ cad = ["dep:acadrust"]
 parquet = ["dep:parquet", "dep:arrow-array", "dep:arrow-schema", "dep:arrow-ipc", "dep:arrow-buffer", "dep:arrow-select", "dep:bytes"]
 ## ZSTD GeoParquet pages written by the `parquet` crate's own codec, the zstd C library. Opt-in:
 ## without it terrio has the crate write the pages uncompressed and compresses each one itself,
-## with `ruzstd` (or the C library with `libzstd-geoparquet`), so the default and WebAssembly builds
+## with `zrip` (or the C library with `libzstd-geoparquet`), so the default and WebAssembly builds
 ## write ZSTD GeoParquet without C. Pages, encodings, dictionaries and statistics are the same either way.
 parquet-zstd = ["parquet", "parquet/zstd"]
 ## HTTP(S), S3, GCS and Azure inputs, range reads of remote COGs and STAC (native builds only).
-## HTTPS uses `rustls` with `ring` (C and assembly, CLB fork), so natively this feature needs a C
-## compiler; in WebAssembly it builds nothing. Not in `drivers`, on by default.
-remote = ["dep:ureq", "dep:rustls", "dep:webpki-roots", "dep:hmac", "dep:sha2", "terrio-crs/grid-transport"]
+## Not in `drivers`, on by default.
+remote = ["dep:ureq", "dep:rustls-graviola", "dep:rustls", "dep:webpki-roots", "dep:hmac", "dep:sha2", "terrio-crs/grid-transport"]
+## HTTPS with `ring` on x86-64 and AArch64 CPUs without the features `rustls-graviola` needs
+## (AVX2, ADX and BMI2 among them on x86-64; see docs/architecture.md). Needs a C compiler. Off by
+## default: without it, HTTPS on such a CPU fails with an error naming the missing features.
+ring-fallback = ["remote", "rustls/ring"]
 ## AVIF tiles of PMTiles and MBTiles archives.
 avif = ["tiles", "dep:rusty_av1d"]
 ## NetCDF, HDF5 and HDF-EOS reading, netCDF writing.
@@ -164,29 +167,22 @@ zarr = ["dep:lz4_flex"]
 ## GeoPackage (vector and raster tiles), SQLite/SpatiaLite and the SQLite store of MBTiles.
 sqlite = ["dep:memmap2"]
 ## Zstandard of GeoTIFF/COG chunks (ZSTD and LERC_ZSTD writing, ZSTD reading) with the zstd C
-## library, in native builds. Opt-in (it was a default feature of the CLB fork from 2026-11-08 to
-## 2026-11-10): it writes the C library's bytes at each of zstd's 22 levels, on one thread in
-## 0.7 to 1.15 of the time. Without it, and always in WebAssembly, GeoTIFF/COG Zstandard is the
-## pure-Rust `ruzstd` (the `zstd-rust` crate), which reads these as fast, writes them to within
-## about 3% of the size at levels 1 to 9 and larger above (docs/testing.md, "Zstandard: pure Rust
-## against the C library"), decodes to the same pixels and maps zstd's levels to its four (`Fastest`,
-## `Default`, `Better`, `Best`; see `zstandard::pure::ruzstd_level`). terrio decodes every ZSTD GeoTIFF
-## chunk itself, Float16, complex and WhiteIsZero samples included: the `tiff` crate is built
-## without its Zstandard (zstd 0.13, whose streaming decoder has known advisories), so ZSTD datum
-## grids, which terrio-crs reads with the crate, are not read (PROJ's are DEFLATE-compressed).
+## library, in native builds: it writes levels above 4, which `zrip`, used without it and in
+## WebAssembly, writes at level 4. terrio decodes every ZSTD GeoTIFF chunk itself, Float16,
+## complex and WhiteIsZero samples included: the `tiff` crate is built without its Zstandard (zstd
+## 0.13, whose streaming decoder has known advisories), so ZSTD datum grids, which terrio-crs reads
+## with the crate, are not read (PROJ's are DEFLATE-compressed).
 libzstd-geotiff = ["dep:zstd"]
 ## Zstandard of EPT tiles (the `pointcloud` feature) with the zstd C library, natively. Opt-in:
-## without it, and in WebAssembly, `ruzstd`.
+## without it, and in WebAssembly, `zrip`.
 libzstd-ept = ["dep:zstd"]
 ## Zstandard of the GeoParquet pages terrio compresses itself (ZSTD GeoParquet written without
 ## `parquet-zstd`, and every ZSTD page read; the `parquet` feature) with the zstd C library,
-## natively. Opt-in: without it, and in WebAssembly, `ruzstd`. Zarr's Zstandard is `ruzstd` in
-## every build.
+## natively. Opt-in: without it, and in WebAssembly, `zrip`. Zarr's Zstandard is `zrip` in every
+## build.
 libzstd-geoparquet = ["dep:zstd"]
 ## Every Zstandard path above with the zstd C library: `libzstd-geotiff`, `libzstd-ept` and
-## `libzstd-geoparquet`. The C library compresses in 0.6 to 0.85 of the time of `ruzstd` (a
-## chunk alone, by platform), to about the same size at levels 1 to 9, and decodes in 0.73 to 1.09
-## of its time.
+## `libzstd-geoparquet` (upstream's `libzstd`).
 libzstd = ["libzstd-geotiff", "libzstd-ept", "libzstd-geoparquet"]
 ## Open any format GDAL reads, through the same data model, when terrio has no driver for it.
 gdal = ["dep:gdal", "dep:gdal-sys", "dep:chrono"]
@@ -199,7 +195,7 @@ ndarray = ["dep:ndarray"]
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 # Memory-mapped reads of SQLite files (`sqlite`) and OSM PBF files (`osm`).
 memmap2 = { workspace = true, optional = true }
-# The `libzstd-*` features' zstd C library, natively (in WebAssembly, `ruzstd` whatever the features).
+# The `libzstd-*` features' zstd C library, natively (in WebAssembly, `zrip` whatever the features).
 zstd = { workspace = true, optional = true }
 tempfile.workspace = true
 # Listing and extracting tar archives (`terrio::vsi`).
@@ -214,6 +210,16 @@ sha2 = { workspace = true, optional = true }
 # writes stage their output in a temporary file there too.
 [target.'cfg(target_os = "wasi")'.dependencies]
 tempfile.workspace = true
+
+# HTTPS without a C compiler, on the architectures `rustls-graviola` supports (and on CPUs
+# without the features it needs, with `ring` through `ring-fallback`).
+[target.'cfg(all(not(target_family = "wasm"), any(target_arch = "x86_64", target_arch = "aarch64")))'.dependencies]
+rustls-graviola = { workspace = true, optional = true }
+
+# Elsewhere (no release is built for these), HTTPS with `ring`, which needs a C compiler.
+[target.'cfg(all(not(target_family = "wasm"), not(any(target_arch = "x86_64", target_arch = "aarch64"))))'.dependencies]
+ureq = { workspace = true, optional = true, features = ["rustls"] }
+rustls = { workspace = true, optional = true, features = ["ring"] }
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
@@ -312,6 +318,10 @@ path = "tests/crs_vertical.rs"
 [[test]]
 name = "declared_size"
 path = "tests/declared_size.rs"
+
+[[test]]
+name = "ehdr_overviews"
+path = "tests/ehdr_overviews.rs"
 
 [[test]]
 name = "entry_allow_list"
@@ -473,3 +483,8 @@ path = "tests/zarr_input_limits.rs"
 [[test]]
 name = "zonal_scoped_options"
 path = "tests/zonal_scoped_options.rs"
+
+[[test]]
+name = "lzw_write_reuse"
+path = "tests/lzw_write_reuse.rs"
+required-features = ["geotiff"]
