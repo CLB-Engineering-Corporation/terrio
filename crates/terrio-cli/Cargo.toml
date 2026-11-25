@@ -13,13 +13,16 @@ homepage.workspace = true
 authors.workspace = true
 
 [features]
-default = ["remote"]
+default = ["remote", "ring-fallback"]
 ## GeoTIFF/COG Zstandard with the zstd C library (`terrio/libzstd-geotiff`), opt-in: without it
 ## the command writes and reads it in pure Rust.
 libzstd-geotiff = ["terrio/libzstd-geotiff"]
-## Remote inputs (`terrio/remote`): HTTP(S), S3, GCS and Azure. HTTPS is `rustls` with `ring`
-## (C and assembly) in this fork, so `--no-default-features` builds the command without them.
+## Remote inputs (`terrio/remote`): HTTP(S), S3, GCS and Azure, with `rustls-graviola`.
 remote = ["terrio/remote"]
+## HTTPS with `ring` on CPUs `rustls-graviola` cannot run on (`terrio/ring-fallback`; C and
+## assembly). On by default in the CLB fork, so HTTPS works on every CPU as it did with `ring`
+## alone; `--no-default-features` builds the command without C.
+ring-fallback = ["remote", "terrio/ring-fallback"]
 ## The optional GDAL backend: open anything GDAL can (`GDAL:` paths, `--driver gdal`), write
 ## rasters with GDAL's drivers (`-f NITF`). Needs GDAL installed.
 gdal = ["terrio/gdal"]
