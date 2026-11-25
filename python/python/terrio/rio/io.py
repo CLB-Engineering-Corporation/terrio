@@ -2076,7 +2076,8 @@ class DatasetReader(DatasetBase):
         # A contiguous, native-type single-band output can receive the decoded TIFF pixels.
         # Keep the existing read path for masks, resampling, casts and sources that need it.
         if (
-            type(out) in (np.ndarray, np.memmap)
+            out is not None
+            and type(out) in (np.ndarray, np.memmap)
             and out.ndim == 3
             and out.flags.c_contiguous
             and out.flags.aligned
