@@ -352,6 +352,16 @@ LZW. LERC levels must lie within `MAX_Z_ERROR` plus one Float32 spacing of the s
 values (the decoded sample's rounding; GDAL's own levels need the same allowance), with nodata
 pixels exact; the two LERC encoders' bytes are not compared.
 
+## TIFF reads into caller buffers
+
+`python scripts/conformance.py DATA --only tiff-read-into --strict` compares
+caller-buffer reads with GDAL 3.12.2 via rasterio. The samples must match exactly
+for strips and tiles (including partial edge tiles), pixel and band interleave,
+and Byte, Int16 and Float32 bands. Stored nodata and NaN values are preserved, and
+scale and offset metadata remain separate from the samples. Sparse blocks are
+also checked. Rust tests compare concurrent reads with the owned TIFF read and
+verify zero additional worker decoder opens after the file is renamed.
+
 ## TIFF block metadata
 
 `python scripts/conformance.py DATA --only tiff-block-tags --strict` requires

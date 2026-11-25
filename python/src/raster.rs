@@ -694,6 +694,37 @@ impl PyRaster {
         })
     }
 
+    /// Tries a native, unresampled TIFF band read into an existing NumPy array.
+    fn _read_geotiff_into(
+        slf: &Bound<'_, Self>,
+        band: usize,
+        window: (usize, usize, usize, usize),
+        out: &Bound<'_, PyUntypedArray>,
+    ) -> PyResult<bool> {
+        // An overlapping owned read can hold the raster's mutable borrow while detached.
+        // Let the caller take the usual spare-reader path in that case.
+        let Ok(this) = slf.try_borrow() else { return Ok(false) };
+        let (x, y, w, h) = window;
+        let window = Window::new(x, y, w, h);
+        macro_rules! read_into {
+            ($($dtype:ident => $ty:ty),* $(,)?) => {
+                match this.inner.band_data_type(band) {
+                    $(DataType::$dtype => {
+                        let Ok(out) = out.cast::<PyArrayDyn<$ty>>() else { return Ok(false) };
+                        let mut out = out.try_readwrite().map_err(|e| invalid(e.to_string()))?;
+                        let dst = out.as_slice_mut().map_err(|e| invalid(e.to_string()))?;
+                        match this.inner.read_geotiff_samples_into(window, band, None, dst) {
+                            Ok(()) => Ok(true),
+                            Err(terrio::Error::Unsupported(_)) => Ok(false),
+                            Err(e) => Err(e).py(),
+                        }
+                    })*
+                }
+            };
+        }
+        read_into!(U8 => u8, I8 => i8, U16 => u16, I16 => i16, U32 => u32, I32 => i32, U64 => u64, I64 => i64, F32 => f32, F64 => f64)
+    }
+
     /// Reads the pixels at some columns of some rows, as nearest-neighbour resampling picks them,
     /// from the blocks that hold them alone (GDAL's decimated read), when the format's reader can
     /// (Zarr).

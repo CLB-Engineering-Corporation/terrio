@@ -327,7 +327,7 @@ pub mod xlsx {
     };
 }
 
-pub use cog::{LazyRaster, TiffReadLimits, Window, WindowOptions, open_raster_lazy};
+pub use cog::{LazyRaster, TiffReadLimits, TiffSample, Window, WindowOptions, open_raster_lazy};
 pub use cog_validate::{
     CogValidation, CogValidationOptions, CogValidationProfile, gdal_infers_cog_layout, validate_cog, validate_cog_bytes,
     validate_cog_with_options,

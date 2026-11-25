@@ -52,6 +52,21 @@ const SQUARES = {
   ],
 };
 
+test("readBandInto fills a typed-array view with native TIFF window samples", () => {
+  const source = terrio.rasterFromArray(Float32Array.from({length: 39 * 35}, (_, i) => i - 99), 39, 35,
+    [10, 1, 0, 46, 0, -1], "EPSG:4326", -99);
+  const raster = terrio.open(source.toBytes("source.tif", {format: "COG", compress: "DEFLATE", tileSize: 16}), "source.tif");
+  const window = [7, 13, 32, 22];
+  const backing = new Float32Array(2 + 32 * 22).fill(42);
+  const out = backing.subarray(1, -1);
+  raster.readBandInto(1, out, window);
+  assert.deepEqual(out, raster.readBand(1, window));
+  assert.equal(backing[0], 42);
+  assert.equal(backing[backing.length - 1], 42);
+  assert.throws(() => raster.readBandInto(1, new Int32Array(out.length), window), /Float32Array/);
+  assert.throws(() => raster.readBandInto(1, new Float32Array(1), window), /length/);
+});
+
 test("periodicLongitude: false keeps bilinear inside a full-turn source's stored columns", () => {
   // Each pixel holds its centre longitude: -179.5 and 179.5 meet at the stored edge.
   const values = Float64Array.from({length: 360 * 180}, (_, i) => (i % 360) - 179.5);

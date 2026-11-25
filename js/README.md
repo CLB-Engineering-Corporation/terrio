@@ -24,6 +24,8 @@ dem.info();                       // the summary `terrio info --json` prints
 dem.width, dem.height, dem.count, dem.dtype, dem.crs, dem.transform, dem.nodata
 const band = dem.readBand(1);     // Float32Array, Uint8Array... row after row
 const tile = dem.readBand(1, [0, 0, 256, 256]);   // a window [col_off, row_off, width, height]
+const destination = new Float32Array(256 * 256);   // for a Float32 DEM
+dem.readBandInto(1, destination, [0, 0, 256, 256]);
 // An output of another size, as GDAL's RasterIO reads it (gdal_translate -outsize), from the
 // overview it chooses: bands one after another. Also on remote datasets (openUrl), as promises.
 const small = dem.readResampled({ size: [256, 256], resampling: "average" });
