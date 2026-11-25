@@ -5,8 +5,8 @@
 //! block row. It reads and places every block in that row without sharing a decoder or output.
 
 use super::{
-    ChunkGeom, ChunkTables, DataType, Decoder, DecodingResult, Error, LazyRaster, Level, PatchedReader, RasterData, Result, Source,
-    Storage, Tag, TiffRaster, TiffReadLimits, Window, nodata_filled, place,
+    ChunkGeom, ChunkTables, DataType, DecodingResult, Error, LazyRaster, Level, RasterData, Result, Source, Storage, TiffRaster,
+    TiffReadLimits, Window, WindowDecoder, nodata_filled, place,
 };
 use crate::dataset::fallible;
 use crate::tiff_codecs::ChunkCodec;
@@ -90,31 +90,16 @@ pub(super) struct DirectImage {
 }
 
 impl Level {
-    /// Retain the block tables and codec selected from the decoder's current image. Share these
-    /// with the owned path, which still handles codecs that require a TIFF decoder.
-    pub(super) fn prepare_direct(&mut self, dec: &mut Decoder<PatchedReader<Source>>, limits: TiffReadLimits, dtype: DataType) {
-        let mut prepare = || -> tiff::TiffResult<_> {
-            let storage = Storage {
-                planar: dec.find_tag_unsigned::<u16>(Tag::PlanarConfiguration)? == Some(2),
-                compression: dec.find_tag_unsigned::<u16>(Tag::Compression)?.unwrap_or(1),
-            };
-            let tables = Arc::new(ChunkTables::read(dec)?);
-            let codec = ChunkCodec::new(dec, limits.chunk_bytes, Some(tables.clone()))?.map(Arc::new);
-            let direct = match &codec {
-                Some(codec) if codec.is_positioned() && (self.bits != 16 || dtype != DataType::F32) => {
-                    Some(DirectCodec::Chunk(codec.clone()))
-                }
-                None if storage.compression == 1 => Rows::of(dec, dtype, 1)?.map(DirectCodec::Stored),
-                _ => None,
-            };
-            Ok((storage, tables, codec, direct))
+    /// Prepare the positioned read with the same tables and codec as the owned reader.
+    fn prepare_direct(&self, dec: &mut WindowDecoder, limits: TiffReadLimits, dtype: DataType) -> tiff::TiffResult<Option<DirectImage>> {
+        let storage = self.storage(dec)?;
+        let tables = self.tables(dec)?;
+        let codec = match self.codec(dec, limits.chunk_bytes, tables)? {
+            Some(codec) if codec.is_positioned() && (self.bits != 16 || dtype != DataType::F32) => Some(DirectCodec::Chunk(codec.clone())),
+            None if storage.compression == 1 => Rows::of(dec, dtype, 1)?.map(DirectCodec::Stored),
+            _ => None,
         };
-        if let Ok((storage, tables, codec, direct)) = prepare() {
-            self.storage = Some(storage);
-            self.tables = Some(tables.clone());
-            self.codec = Some(codec);
-            self.direct = direct.map(|codec| DirectImage { storage, tables, codec });
-        }
+        Ok(codec.map(|codec| DirectImage { storage, tables: tables.clone(), codec }))
     }
 }
 
@@ -124,9 +109,9 @@ impl LazyRaster {
     /// The band is numbered from 1 and the overview, when given, from 0. Samples have the same
     /// values as in [`Self::read_geotiff_samples`]. Scale, offset and masks are left to the caller,
     /// and sparse blocks have the band's nodata value (or zero). Local files and immutable TIFF
-    /// bytes using positioned codecs can be read concurrently through the same handle. Each
-    /// worker places decoded blocks into its own rows of the slice, independently of the
-    /// decoded-block cache used by the owned reader.
+    /// bytes using positioned codecs can be read concurrently through the same handle. The
+    /// first read of a level prepares its block tables and codec. Each worker then places blocks
+    /// into its own rows of the slice, independently of the owned reader's decoded-block cache.
     ///
     /// # Errors
     ///
@@ -182,6 +167,19 @@ fn unsupported() -> Error {
 }
 
 impl TiffRaster {
+    fn direct_image<'a>(&self, image: &'a Level) -> Result<&'a DirectImage> {
+        if image.direct.get().is_none() {
+            let mut decoder = self.decoder.lock().map_err(|_| Error::InvalidData("TIFF decoder lock poisoned".into()))?;
+            if image.direct.get().is_none() {
+                let error = self.limits.error();
+                decoder.select(image.ifd).map_err(error)?;
+                let direct = image.prepare_direct(&mut decoder.decoder, self.limits, self.data_type).map_err(error)?;
+                image.direct.get_or_init(|| direct);
+            }
+        }
+        image.direct.get().and_then(Option::as_ref).ok_or_else(unsupported)
+    }
+
     fn read_into<T: TiffSample>(&self, w: Window, band: usize, level: usize, dst: &mut [T]) -> Result<()> {
         let image = &self.levels[level];
         if let Some(i) = image.external
@@ -189,7 +187,11 @@ impl TiffRaster {
         {
             return ovr.read_into(w, band, i, dst);
         }
-        let (Some(source), Some(direct)) = (&self.direct_source, &image.direct) else { return Err(unsupported()) };
+        let Some(source) = &self.direct_source else { return Err(unsupported()) };
+        if self.cmyk || self.complex {
+            return Err(unsupported());
+        }
+        let direct = self.direct_image(image)?;
         let (cw, ch) = image.block;
         let spp = if direct.storage.planar { 1 } else { self.samples };
         // Large strips and edge tiles can need the owned reader's strip-row or cropped tile
@@ -317,13 +319,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("source.tif");
         write_cog(&path);
-        let mut raster = LazyRaster::open(path.to_str().unwrap()).unwrap();
+        let mut owned = LazyRaster::open(path.to_str().unwrap()).unwrap();
         let windows = [Window::new(13, 17, 520, 490), Window::new(239, 251, 302, 278), Window::new(121, 13, 217, 482)];
-        let expected = windows.map(|window| raster.read_geotiff_samples(window, &crate::WindowOptions::default()).unwrap());
+        let expected = windows.map(|window| owned.read_geotiff_samples(window, &crate::WindowOptions::default()).unwrap());
+        drop(owned);
+        let raster = LazyRaster::open(path.to_str().unwrap()).unwrap();
         let renamed = dir.path().join("renamed.tif");
         std::fs::rename(path, renamed).unwrap();
         let super::super::Inner::Tiff(tiff) = &raster.inner else { panic!("expected a TIFF") };
         use std::sync::atomic::Ordering::Relaxed;
+        assert!(tiff.levels[0].tables.get().is_none(), "opening does not load the window reader's tables");
         let before = tiff.workers.opened.load(Relaxed);
         let barrier = std::sync::Barrier::new(windows.len());
         std::thread::scope(|scope| {
