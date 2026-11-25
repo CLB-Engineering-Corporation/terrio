@@ -2,13 +2,19 @@
 # SPDX-License-Identifier: MIT
 """The tiled-write comparison reports why a terrio command failed."""
 
+import importlib.util
 import sys
+import types
 from pathlib import Path
 
 import pytest
 
 pytest.importorskip("osgeo.gdal")
-pytest.importorskip("terrio")
+# These tests exercise only the script's command runner and argument parsing, never terrio
+# itself, so they run where the wheel is not installed yet (the real-data CI job runs
+# scripts/tests before building it). The script imports terrio at module level.
+if importlib.util.find_spec("terrio") is None:
+    sys.modules["terrio"] = types.ModuleType("terrio")
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import compare_tiled_writes_with_gdal as tiled  # noqa: E402
 
