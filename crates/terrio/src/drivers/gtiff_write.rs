@@ -4478,7 +4478,7 @@ impl TiffRows {
         let (across, down) = encoder.grid.tiles();
         for row in 0..down {
             for col in 0..across {
-                if self.tiles_done[row * across + col] {
+                if self.tiles_done.get(row * across + col).copied().unwrap_or(false) {
                     continue;
                 }
                 let (_, _, w, h) = encoder.grid.window(col, row).unwrap_or_default();
@@ -4500,6 +4500,8 @@ impl TiffRows {
     }
 
     /// Writes the image's directory (and the mask's) and closes the file.
+    /// A tiled GeoTIFF without a mask or any rows fills or omits all unwritten tiles
+    /// according to `SPARSE_OK`, even when the caller supplied none.
     ///
     /// # Errors
     /// When rows are missing, a block row failed to be written, or the file cannot be written.
@@ -4507,7 +4509,7 @@ impl TiffRows {
         if self.failed {
             return Err(Error::InvalidData("a block of the GeoTIFF failed to be written".into()));
         }
-        if !self.tiles_done.is_empty() {
+        if self.layout.tile.is_some() && self.mask.is_none() && self.rows_written() == 0 {
             self.fill_missing_tiles()?;
         } else if self.rows_written() != self.rows {
             return Err(Error::InvalidArgument(format!("{} rows written of {}", self.rows_written(), self.rows)));
@@ -9736,6 +9738,15 @@ following conditions:
                 creation_options: co.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
                 ..Default::default()
             };
+            let empty = dir.path().join("empty.tif");
+            let name = empty.to_str().unwrap();
+            GeoTiffWriter::create(name, &header, &options).unwrap().finish().unwrap();
+            let blank = crate::open_raster(name).unwrap();
+            assert_eq!(blank.raster.data.as_f32_slice().unwrap(), &vec![fill; cols * rows * 2]);
+            let chunks = tiff_chunks(&empty);
+            assert_eq!(chunks.len(), if planar { 30 } else { 15 });
+            assert!(chunks.iter().all(|chunk| chunk.is_empty() == sparse));
+
             let path = dir.path().join("partial.tif");
             let mut w = GeoTiffWriter::create(path.to_str().unwrap(), &header, &options).unwrap();
             let grid = w.tile_grid().unwrap();

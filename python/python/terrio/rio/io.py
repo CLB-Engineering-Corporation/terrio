@@ -2089,7 +2089,7 @@ class DatasetReader(DatasetBase):
             and not (boundless or masked)
             and fill_value is None
             and resampling == Resampling.nearest
-            and getattr(self, "_raster", None) is not None
+            and isinstance(getattr(self, "_raster", None), _terrio.Raster)
             and type(self)._read_level is DatasetReader._read_level
         ):
             x, y = (0, 0) if win is None else (win.col_off, win.row_off)

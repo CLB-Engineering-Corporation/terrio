@@ -630,7 +630,6 @@ pub(crate) fn map_init<T: Sync, S, R: Send>(
 /// Processes disjoint jobs with scratch reused within each group of jobs. A call already on a
 /// Rayon worker keeps its work on that worker, so nested callers need no second pool. Ordinary
 /// callers use the configured Terrio pool, with the same contention guard as other coarse work.
-#[cfg(feature = "geotiff")]
 pub(crate) fn try_for_each_owned_init<T: Send, S, E: Send>(
     items: Vec<T>,
     init: impl Fn() -> S + Sync + Send,
@@ -1060,7 +1059,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(all(feature = "geotiff", not(target_family = "wasm")))]
+    #[cfg(not(target_family = "wasm"))]
     fn nested_jobs_reuse_scratch_on_the_calling_worker() {
         let pool = rayon::ThreadPoolBuilder::new().num_threads(8).build().unwrap();
         pool.broadcast(|_| {
