@@ -140,5 +140,5 @@ def test_lzw_destination_matches_gdal_on_terrain(tmp_path, data_dir):
         # Require the positioned decoder, including both edge tiles and the predictor.
         assert actual._raster._read_geotiff_into(1, (3, 5, 510, 396), out)
         np.testing.assert_array_equal(out, expected)
-        assert actual.nodata == reference.GetRasterBand(1).GetNoDataValue()
+        np.testing.assert_equal(actual.nodata, reference.GetRasterBand(1).GetNoDataValue())
         assert actual.transform.to_gdal() == reference.GetGeoTransform()
