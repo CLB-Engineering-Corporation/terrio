@@ -194,9 +194,8 @@ fn pass_on(py: Python<'_>, warnings: Vec<String>, logger: &std::sync::Mutex<Opti
     }
 }
 
-/// The bytes of memory the process can use, as GDAL counts them (`CPLGetUsablePhysicalRAM`: the
-/// physical memory, less under a cgroup's memory limit or an address-space limit), which reads
-/// refuse windows past; `None` where it cannot be read.
+/// The memory budget ceiling in bytes on Linux, Windows and macOS, or `None` if unknown.
+/// This is based on total physical RAM and process limits, rather than current free memory.
 #[pyfunction]
 fn usable_memory() -> Option<u64> {
     terrio::usable_memory()
