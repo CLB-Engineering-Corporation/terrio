@@ -88,8 +88,10 @@ Three choices keep the drivers pure Rust:
 
 - Zstandard is decoded and written with `zrip`, GeoParquet's pages included. The opt-in
   `libzstd-geotiff`, `libzstd-ept` and `libzstd-geoparquet` features (or `libzstd`, all three; CLB
-  fork) use the zstd C library natively instead, which writes levels above 4: `zrip` writes levels
-  up to 4, and level 4 for higher ones.
+  fork) use the zstd C library natively instead. Without them, `zrip` writes levels up to 4, and
+  `zstd-rust` (gpt-cmdr/zstd-rs, CLB's fork of `ruzstd`) the higher ones: 5 to 9 at its `Better`
+  level, 10 and above at its `Best` (the `zstd-rust` feature, on by default; CLB fork). Without
+  that feature too, `zrip` writes level 4 for them. `zrip` decodes in every case.
 - HTTPS uses `rustls` with `rustls-graviola`, whose cryptography is Rust and assembly and needs no
   C compiler. It requires `aes`, `pclmulqdq`, `ssse3`, `avx`, `avx2`, `adx`, `bmi1` and `bmi2` on
   x86-64 (most CPUs since about 2014), and `aes`, `sha2`, `pmull` and `neon` on AArch64. terrio

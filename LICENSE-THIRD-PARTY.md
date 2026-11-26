@@ -11,9 +11,9 @@ LICENSE-THIRD-PARTY.md`, from `about.toml`.
 ## Overview
 
 - Apache License 2.0 (264)
-- MIT License (75)
+- MIT License (76)
 - ISC License (20)
-- BSD 3-Clause "New" or "Revised" License (15)
+- BSD 3-Clause "New" or "Revised" License (16)
 - BSD 2-Clause "Simplified" License (9)
 - Mozilla Public License 2.0 (4)
 - Creative Commons Zero v1.0 Universal (2)
@@ -7352,6 +7352,7 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 Used by:
 
+- [zstd-rust 0.1.0](https://github.com/gpt-cmdr/zstd-rs)
 - [zstd-sys 2.1.3+zstd.1.5.7](https://github.com/gyscos/zstd-rs)
 
 ```text
@@ -9043,6 +9044,38 @@ Used by:
 MIT License
 
 Copyright (c) 2019 Moritz Borcherding
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+```
+
+## MIT License
+
+Used by:
+
+- [zstd-rust 0.1.0](https://github.com/gpt-cmdr/zstd-rs)
+
+```text
+MIT License
+
+Copyright (c) 2019 Moritz Borcherding
+Copyright (c) 2026 William Katzenmeyer / CLB Engineering Corporation
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal

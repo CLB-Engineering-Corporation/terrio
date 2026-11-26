@@ -72,6 +72,11 @@ weezl = "0.2"
 png = "0.18"
 lz4_flex = { version = "0.14", default-features = false, features = ["alloc", "safe-decode", "checked-decode"] }
 zrip = { version = "0.8.25", default-features = false, features = ["std", "simd"] }
+# CLB fork: `zstd-rust`, CLB's fork of `ruzstd` with the `Better` and `Best` levels and the
+# matchers of the reference implementation, writes the Zstandard levels above zrip's highest (4)
+# without C (terrio's `zstd-rust` feature; see `zstandard::pure`). From git (gpt-cmdr/zstd-rs
+# `main`); it is not on crates.io, and upstream does not take it (fork-only by design).
+zstd-rust = { git = "https://github.com/gpt-cmdr/zstd-rs", rev = "de91207843185acceda9f94b1623af8860c347e3" }
 # 0.10 reads HDF5 files written in the earliest format with version 1/2 compound datatypes
 # (every HEC-RAS geometry and plan file, among others) and old fill value messages
 # (roteiro-gis/netcdf-rust#95). Keep netcdf-reader and the direct hdf5-reader on compatible

@@ -972,11 +972,12 @@ operations and the streams. The other drivers are features:
 | `ndarray` | off | Raster pixels as `ndarray` arrays, without copying them: views, owned transfers and the masks of lazy reads, with the crate re-exported as `terrio::ndarray`; floating-point windows as owned arrays, bands first or last. See [ndarray](#ndarray). |
 | `cad` | on | DWG and DXF, read and written, through acadrust. See [CAD drawings](formats.md#cad-drawings-dwg-and-dxf). |
 | `drivers` | on | Every driver above that is on by default: the default features but `remote` (CLB fork). |
-| `libzstd-geotiff` | off | GeoTIFF/COG Zstandard (ZSTD and LERC_ZSTD chunks written, ZSTD chunks read) through the zstd C library, natively: levels above 4, which the default `zrip` writes at level 4. Needs a C compiler. |
+| `libzstd-geotiff` | off | GeoTIFF/COG Zstandard (ZSTD and LERC_ZSTD chunks written, ZSTD chunks read) through the zstd C library, natively: the C library's bytes at every level. Without it, `zrip` writes levels up to 4 and `zstd-rust` the higher ones. Needs a C compiler. |
 | `libzstd-ept` | off | EPT tiles' Zstandard through the zstd C library, natively. |
 | `libzstd-geoparquet` | off | The Zstandard of the GeoParquet pages terrio compresses and decompresses itself through the zstd C library, natively: then the same bytes as `parquet-zstd`'s. |
 | `libzstd` | off | `libzstd-geotiff`, `libzstd-ept` and `libzstd-geoparquet`: every Zstandard path but Zarr's through the zstd C library. |
 | `parquet-zstd` | off | ZSTD GeoParquet pages written by the `parquet` crate's own codec, the zstd C library. Without it terrio compresses the pages in pure Rust (or with `libzstd-geoparquet`), to the same pages. |
+| `zstd-rust` | on | Zstandard levels above 4 in pure Rust (CLB fork): `zstd-rust` (gpt-cmdr/zstd-rs, CLB's fork of `ruzstd`) writes 5 to 9 at its `Better` level and 10 and above at its `Best`, wherever a `libzstd-*` feature does not apply (WebAssembly included). Without it, `zrip` writes them at level 4. A git dependency, so `cargo publish` refuses it; the fork publishes no crates. |
 | `ring-fallback` | off | HTTPS with `ring` (needs a C compiler) on x86-64 and AArch64 CPUs without the features `rustls-graviola` needs; without it, HTTPS on such a CPU fails naming them. See [the architecture notes](architecture.md). Implies `remote`. On by default in the CLB fork's `terrio-cli` and Python package. |
 
 The drivers stay in the API whatever the features (`formats::RasterDriver`,

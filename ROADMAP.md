@@ -843,8 +843,10 @@ Windows read as `f32` or `f64` values, NaN where GDAL's mask band marks pixels i
 The CLB fork's default build compiled the zstd C library for GeoTIFF/COG Zstandard
 (`libzstd-geotiff`, owner's decision of 2026-11-08), which this roadmap's first principle does not
 allow upstream. Since 2026-11-10 the default is pure Rust again (`zstd-rust` for every Zstandard
-path, C opt-in): the owner judged the remaining difference in write speed acceptable. What is left
-for the upstream contribution:
+path, C opt-in): the owner judged the remaining difference in write speed acceptable. Since the
+sync with upstream of 2026-11-25, upstream's `zrip` decodes every Zstandard stream and writes the
+levels up to 4, and `zstd-rust` writes only the levels above 4, which `zrip` writes at 4 (the
+`zstd-rust` feature, on by default in the fork). What is left for the upstream contribution:
 
 - [ ] `zstd-rust` writes GeoTIFF/COG chunks at the speed of the zstd C library at the same level.
       Measured for #35 (Windows x86-64, release, Bald Eagle Depth (Max) and Terrain50 1x float32

@@ -4,6 +4,10 @@
 //! `libzstd-geoparquet` (`libzstd` turns on all three). WebAssembly is always `zrip`, and so are
 //! Zarr and terrio-crs's bundled tables. Both read every frame of a stream (skippable frames
 //! skipped), and each reads what the other writes.
+//!
+//! CLB fork: without the C library, the levels above `zrip`'s highest (4) are written by
+//! `zstd-rust` with the `zstd-rust` feature (on by default), rather than at level 4 (see
+//! [`pure::compress`]). `zrip` still writes every level up to 4 and decodes everything.
 
 use std::io::{Error, ErrorKind, Read, Result};
 
@@ -147,11 +151,48 @@ pub(crate) mod pure {
     use super::*;
     use zrip::DecompressError;
 
-    /// Compresses `data` at `level`: 0 is zstd's default, 3, and `zrip` writes levels -7 to 4, so a
-    /// higher level writes level 4.
+    /// Compresses `data` at `level`: 0 is zstd's default, 3. `zrip` writes levels -7 to 4 (a
+    /// lower level writes -7). A higher level is `zstd-rust`'s with the `zstd-rust` feature (CLB
+    /// fork; see [`rust_level`]), and `zrip`'s level 4 without it.
     pub(crate) fn compress(data: &[u8], level: i32) -> Result<Vec<u8>> {
-        let level = if level == 0 { 3 } else { level.clamp(zrip::MIN_LEVEL, zrip::MAX_LEVEL) };
+        let level = if level == 0 { 3 } else { level };
+        #[cfg(feature = "zstd-rust")]
+        if level > zrip::MAX_LEVEL {
+            return Ok(rust::compress(data, rust_level(level)));
+        }
+        let level = level.clamp(zrip::MIN_LEVEL, zrip::MAX_LEVEL);
         zrip::compress(data, level).map_err(|e| Error::new(ErrorKind::InvalidInput, format!("Zstandard: {e}")))
+    }
+
+    /// The `zstd-rust` level for a zstd level above `zrip`'s highest (CLB fork): 5 to 9 its
+    /// `Better` (about zstd's 7 to 9, and smaller than `zrip`'s 4), 10 and above its `Best`.
+    #[cfg(feature = "zstd-rust")]
+    pub(crate) fn rust_level(level: i32) -> zstd_rust::encoding::CompressionLevel {
+        use zstd_rust::encoding::CompressionLevel as L;
+        if level >= 10 { L::Best } else { L::Better }
+    }
+
+    /// `zstd-rust`'s encoder (CLB fork), for the levels above `zrip`'s.
+    #[cfg(feature = "zstd-rust")]
+    mod rust {
+        use std::cell::RefCell;
+        use zstd_rust::encoding::{CompressionLevel, Compressor};
+
+        thread_local! {
+            /// The compressor of this thread, kept from chunk to chunk: its tables (megabytes at
+            /// these levels) are then allocated once per thread, not once per chunk.
+            static COMPRESSOR: RefCell<Option<Compressor>> = const { RefCell::new(None) };
+        }
+
+        /// One frame holding `data`, which records its size, as the C library's and `zrip`'s do.
+        pub(super) fn compress(data: &[u8], level: CompressionLevel) -> Vec<u8> {
+            COMPRESSOR.with(|compressor| {
+                let mut compressor = compressor.borrow_mut();
+                let compressor = compressor.get_or_insert_with(|| Compressor::new(level));
+                compressor.set_compression_level(level);
+                compressor.compress(data)
+            })
+        }
     }
 
     /// Decompresses every frame of `data`, to at most `limit` bytes (more is an error).
@@ -264,9 +305,78 @@ mod tests {
         assert_eq!(frames(&bomb, usize::MAX).unwrap().len(), (64 << 20) + 100);
     }
 
+    /// 300 kB of words drawn at random from a list of common English ones: repetitions far apart,
+    /// which `zrip`'s level 4, `zstd-rust`'s `Better` and its `Best` each find more of.
+    fn words() -> Vec<u8> {
+        let list: Vec<&str> = "the of and to a in is that for it as was with be by on not he this are or his from at \
+            which but have an they you were her she there would their we him been has when who will more no if out so said \
+            what up its about into than them can only other new some could time these two may then do first any my now such \
+            like our over man me even most made after also did many before must through back years where much your way well \
+            down should because each just those people how too little state good very make world still own see men work long \
+            here get both between life being under never day same another know while last might us great old year off come \
+            since against go came right used take three"
+            .split_whitespace()
+            .collect();
+        let (mut seed, mut out) = (7u32, Vec::with_capacity(300_016));
+        while out.len() < 300_000 {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            out.extend_from_slice(list[(seed >> 8) as usize % list.len()].as_bytes());
+            out.push(if seed & 0xf == 0 { b'\n' } else { b' ' });
+        }
+        out
+    }
+
+    /// CLB fork: the levels above 4 are `zstd-rust`'s, smaller than `zrip`'s level 4 (what they
+    /// were without it) and smaller again at 10 and above, to one frame that records its size and
+    /// that `zrip` and the C library decode. The levels up to 4 stay `zrip`'s, byte for byte.
+    #[cfg(feature = "zstd-rust")]
+    #[test]
+    fn levels_above_4_are_written_by_zstd_rust() {
+        use zstd_rust::encoding::{CompressionLevel as L, Compressor};
+        let a = words();
+        let at = |level| pure::compress(&a, level).unwrap();
+        for level in [-7, -1, 1, 2, 3, 4] {
+            assert_eq!(at(level), zrip::compress(&a, level).unwrap(), "level {level}");
+        }
+        assert_eq!(at(0), at(3));
+        for (levels, want) in [(&[5, 7, 9][..], L::Better), (&[10, 15, 19, 22][..], L::Best)] {
+            let bytes = Compressor::new(want).compress(&a);
+            for &level in levels {
+                assert_eq!(format!("{:?}", pure::rust_level(level)), format!("{want:?}"));
+                assert_eq!(at(level), bytes, "level {level}");
+            }
+        }
+        let (four, nine, nineteen) = (at(4), at(9), at(19));
+        assert!(nine.len() < four.len(), "level 9: {} bytes, level 4: {}", nine.len(), four.len());
+        assert!(nineteen.len() < nine.len(), "level 19: {} bytes, level 9: {}", nineteen.len(), nine.len());
+        for frame in [&nine, &nineteen] {
+            assert_eq!(pure::decompress(frame, a.len()).unwrap(), a);
+            assert_eq!(pure::frames(frame, usize::MAX).unwrap(), a);
+            #[cfg(all(
+                any(feature = "libzstd-geotiff", feature = "libzstd-ept", feature = "libzstd-geoparquet"),
+                not(target_family = "wasm")
+            ))]
+            {
+                assert_eq!(zstd::zstd_safe::get_frame_content_size(frame).unwrap(), Some(a.len() as u64));
+                assert_eq!(zstd::bulk::decompress(frame, a.len()).unwrap(), a);
+            }
+        }
+    }
+
+    /// Without the `zstd-rust` feature, as upstream, `zrip` writes the levels above 4 at level 4.
+    #[cfg(not(feature = "zstd-rust"))]
+    #[test]
+    fn levels_above_4_are_zrip_s_level_4_without_zstd_rust() {
+        let a = words();
+        let four = zrip::compress(&a, 4).unwrap();
+        for level in [5, 9, 19, 22] {
+            assert_eq!(pure::compress(&a, level).unwrap(), four, "level {level}");
+        }
+    }
+
     /// Each format's Zstandard is the C library exactly when its feature is on (natively), as its
-    /// output shows: `zrip`'s level 4 (what it writes for 9) and the C library's level 9 write
-    /// different bytes.
+    /// output shows: the pure path's level 9 (`zstd-rust`'s `Better`, or `zrip`'s level 4 without
+    /// the `zstd-rust` feature) and the C library's level 9 write different bytes.
     #[test]
     fn each_format_uses_the_library_its_feature_names() {
         let a = data(200_000, 13);
@@ -323,8 +433,11 @@ mod tests {
             let c = libzstd::compress(&a, level).unwrap();
             assert_eq!(pure::decompress(&c, a.len()).unwrap(), a, "level {level}");
         }
-        let p = pure::compress(&a, 9).unwrap();
-        assert_eq!(libzstd::decompress(&p, a.len()).unwrap(), a);
+        // `zrip`'s levels and, with the `zstd-rust` feature, `zstd-rust`'s above 4 (CLB fork).
+        for level in [-7, 1, 3, 4, 9, 19] {
+            let p = pure::compress(&a, level).unwrap();
+            assert_eq!(libzstd::decompress(&p, a.len()).unwrap(), a, "level {level}");
+        }
         let mixed = [libzstd::compress(&a, 9).unwrap(), skippable(3), pure::compress(&b, 9).unwrap()].concat();
         let both = [a, b].concat();
         assert_eq!(pure::decompress(&mixed, both.len()).unwrap(), both);

@@ -2721,6 +2721,7 @@ dependencies = [
  "zlib-rs",
  "zrip",
  "zstd 0.14.4",
+ "zstd-rust",
  "zune-core",
  "zune-jpegxl",
 ]
@@ -3622,6 +3623,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ad5020ab8f27bfc0024ad0a07aed6bf022a16208f479686fbed4fdd0c85eb0b3"
 dependencies = [
  "zstd-safe 8.3.0",
+]
+
+[[package]]
+name = "zstd-rust"
+version = "0.1.0"
+source = "git+https://github.com/gpt-cmdr/zstd-rs?rev=de91207843185acceda9f94b1623af8860c347e3#de91207843185acceda9f94b1623af8860c347e3"
+dependencies = [
+ "twox-hash",
 ]
 
 [[package]]

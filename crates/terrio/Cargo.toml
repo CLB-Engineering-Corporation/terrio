@@ -58,6 +58,8 @@ weezl.workspace = true
 png.workspace = true
 lz4_flex = { workspace = true, optional = true }
 zrip.workspace = true
+# Zstandard above level 4 without C (the `zstd-rust` feature, CLB fork).
+zstd-rust = { workspace = true, optional = true }
 netcdf-reader = { workspace = true, optional = true }
 hdf5-reader = { workspace = true, optional = true }
 ras-commander-fast-hdf = { workspace = true, optional = true }
@@ -95,16 +97,17 @@ chrono = { version = "0.4", default-features = false, features = ["alloc"], opti
 # feature), without copying the pixels.
 ndarray = { workspace = true, optional = true }
 
-# Every driver is on by default (`drivers` and `remote`). Zstandard is pure Rust (`zrip`); the
-# zstd C library is opt-in (`libzstd-*`). A build with `default-features = false` keeps the core:
-# GeoTIFF and COG (deflate, LZW, PackBits, ZSTD, WebP, JPEG, JPEG XL), the raw and ASCII rasters
-# (AAIGrid, EHdr, ENVI, ERS, HFA, RST, SAGA, GSBG, XYZ...), PNG, JPEG, VRT, GeoJSON, Shapefile,
-# KML/KMZ, GML, GPX, CSV, MapInfo, the CRS engine and the operations, without C (Zstandard with
-# `zrip`). `default-features = false, features = ["drivers"]` is every driver without remote
+# Every driver is on by default (`drivers` and `remote`), and so is `zstd-rust` (CLB fork).
+# Zstandard is pure Rust (`zrip`, and `zstd-rust` above level 4); the zstd C library is opt-in
+# (`libzstd-*`). A build with `default-features = false` keeps the core: GeoTIFF and COG
+# (deflate, LZW, PackBits, ZSTD, WebP, JPEG, JPEG XL), the raw and ASCII rasters (AAIGrid, EHdr,
+# ENVI, ERS, HFA, RST, SAGA, GSBG, XYZ...), PNG, JPEG, VRT, GeoJSON, Shapefile, KML/KMZ, GML, GPX,
+# CSV, MapInfo, the CRS engine and the operations, without C (Zstandard with `zrip`, at most
+# level 4). `default-features = false, features = ["drivers"]` is every driver without remote
 # inputs. Disabled drivers stay in the API (`RasterDriver`, `VectorDriver`) and fail with "built
 # without the `...` feature".
 [features]
-default = ["drivers", "remote"]
+default = ["drivers", "remote", "zstd-rust"]
 ## Every format driver: the default features but `remote`, so pure Rust (no C compiler needed)
 ## natively as in WebAssembly.
 drivers = ["cad", "geotiff", "parquet", "avif", "netcdf-hdf5", "osm", "lzma", "flatgeobuf", "jp2", "lerc", "jxl", "pointcloud", "tiles", "zarr", "sqlite", "grib", "hecras", "xlsx", "filegdb"]
@@ -167,9 +170,10 @@ zarr = ["dep:lz4_flex"]
 ## GeoPackage (vector and raster tiles), SQLite/SpatiaLite and the SQLite store of MBTiles.
 sqlite = ["dep:memmap2"]
 ## Zstandard of GeoTIFF/COG chunks (ZSTD and LERC_ZSTD writing, ZSTD reading) with the zstd C
-## library, in native builds: it writes levels above 4, which `zrip`, used without it and in
-## WebAssembly, writes at level 4. terrio decodes every ZSTD GeoTIFF chunk itself, Float16,
-## complex and WhiteIsZero samples included: the `tiff` crate is built without its Zstandard (zstd
+## library, in native builds. Without it, and always in WebAssembly, levels up to 4 are `zrip`'s,
+## and levels above 4 `zstd-rust`'s with the `zstd-rust` feature (on by default) or `zrip`'s level
+## 4 without it. terrio decodes every ZSTD GeoTIFF chunk itself, Float16, complex and WhiteIsZero
+## samples included: the `tiff` crate is built without its Zstandard (zstd
 ## 0.13, whose streaming decoder has known advisories), so ZSTD datum grids, which terrio-crs reads
 ## with the crate, are not read (PROJ's are DEFLATE-compressed).
 libzstd-geotiff = ["dep:zstd"]
@@ -184,6 +188,14 @@ libzstd-geoparquet = ["dep:zstd"]
 ## Every Zstandard path above with the zstd C library: `libzstd-geotiff`, `libzstd-ept` and
 ## `libzstd-geoparquet` (upstream's `libzstd`).
 libzstd = ["libzstd-geotiff", "libzstd-ept", "libzstd-geoparquet"]
+## Zstandard levels above 4 in pure Rust (CLB fork, on by default), wherever terrio compresses
+## without the C library: GeoTIFF/COG chunks, EPT tiles and GeoParquet pages without their
+## `libzstd-*` feature, natively and in WebAssembly. `zrip` writes levels -7 to 4 (and every level
+## without this feature, a higher one at 4); with it, `zstd-rust` (gpt-cmdr/zstd-rs, CLB's fork of
+## `ruzstd`) writes 5 to 9 at its `Better` level and 10 and above at its `Best` (see
+## `zstandard::pure`). Decoding is `zrip`'s either way. A git dependency, which `cargo publish`
+## refuses even when optional: the fork publishes no crates.
+zstd-rust = ["dep:zstd-rust"]
 ## Open any format GDAL reads, through the same data model, when terrio has no driver for it.
 gdal = ["dep:gdal", "dep:gdal-sys", "dep:chrono"]
 ## Raster pixels as `ndarray` arrays without copying them: borrowed and mutable views, owned

@@ -101,8 +101,8 @@ jobs:
         with:
           packages-dir: dist
 
-  # CLB fork: the crates are NOT published (they share upstream's names and versions; the fork's
-  # `zstd-rust` git dependency, which once also prevented it, was replaced by upstream's `zrip`).
+  # CLB fork: the crates are NOT published (they share upstream's names and versions, and terrio
+  # depends on `zstd-rust` from git, gpt-cmdr/zstd-rs, which `cargo publish` refuses).
   # This job checks what `cargo publish` would package and builds the crates, as
   # release-dry-run.yml does, so a tag fails here only for a real packaging or build error. The
   # wheels, the npm package and the command-line binaries are unaffected.
