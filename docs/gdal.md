@@ -56,6 +56,7 @@ terrio's commands map onto GDAL's utilities, with GDAL's option names in kebab c
 | `-of GTiff` / `-f GPKG` | `-f GTiff` / `-f GPKG` |
 | `-co COMPRESS=DEFLATE -co TILED=YES -co BLOCKXSIZE=512` | `--compress DEFLATE --tile-size 512` |
 | `-co BIGTIFF=YES` | `--bigtiff` |
+| `-co BIGTIFF=NO`, `-co BIGTIFF=IF_NEEDED`, `-co BIGTIFF=IF_SAFER` | `--co BIGTIFF=NO`, `--co BIGTIFF=IF_NEEDED`, `--co BIGTIFF=IF_SAFER` |
 | `-t_srs`, `-s_srs`, `-a_srs` | `--t-srs`, `--s-srs`, `--a-srs` |
 | `-srcwin`, `-projwin`, `-projwin_srs` | `--srcwin`, `--projwin`, `--projwin-srs` |
 | `-ot`, `-scale`, `-exponent`, `-outsize`, `-a_nodata`, `-a_ullr` | `--ot`, `--scale`, `--exponent`, `--outsize`, `--a-nodata`, `--a-ullr` |

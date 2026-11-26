@@ -27,7 +27,8 @@ zstd_for!(
     geotiff,
     "libzstd-geotiff",
     compress,
-    frames
+    frames,
+    frames_into
 );
 zstd_for!(
     /// EPT tiles.
@@ -48,7 +49,7 @@ zstd_for!(
 #[allow(unused_imports)]
 pub(crate) use ept::decompress;
 #[allow(unused_imports)]
-pub(crate) use geotiff::{compress, frames};
+pub(crate) use geotiff::{compress, frames, frames_into};
 
 /// The output limit of a `zrip` streaming decoder read for its first `max` bytes at most: one
 /// block more, since the block holding the last byte read is decoded whole. The decoder reserves
@@ -100,12 +101,21 @@ mod libzstd {
     /// A stream recording a size of no more than `max` is decompressed in one call, as by
     /// [`decompress`]; others as a stream, to `max` bytes.
     pub(crate) fn frames(data: &[u8], max: usize) -> Result<Vec<u8>> {
-        if let Some(size) = recorded_size(data).filter(|&size| size <= max as u64) {
-            return zstd::bulk::decompress(data, size as usize);
-        }
         let mut out = Vec::new();
-        zstd::stream::read::Decoder::with_buffer(data)?.take(max as u64).read_to_end(&mut out)?;
+        frames_into(data, max, &mut out)?;
         Ok(out)
+    }
+
+    /// [`frames`] into `out`, replacing what it holds and keeping its allocation.
+    pub(crate) fn frames_into(data: &[u8], max: usize, out: &mut Vec<u8>) -> Result<()> {
+        out.clear();
+        if let Some(size) = recorded_size(data).filter(|&size| size <= max as u64) {
+            out.try_reserve(size as usize).map_err(|e| Error::new(ErrorKind::OutOfMemory, e))?;
+            zstd::bulk::Decompressor::new()?.decompress_to_buffer(data, out)?;
+            return Ok(());
+        }
+        zstd::stream::read::Decoder::with_buffer(data)?.take(max as u64).read_to_end(out)?;
+        Ok(())
     }
 
     /// The bytes `data` decompresses to as its frames record them (a skippable frame's are none),
@@ -156,13 +166,21 @@ pub(crate) mod pure {
     /// a stream decoding to more is decoded again as a stream, up to `max` bytes, the rest not
     /// decoded.
     pub(crate) fn frames(data: &[u8], max: usize) -> Result<Vec<u8>> {
-        match zrip::decompress_with_limit(data, max) {
+        let mut out = Vec::new();
+        frames_into(data, max, &mut out)?;
+        Ok(out)
+    }
+
+    /// [`frames`] into `out`, replacing what it holds and keeping its allocation.
+    pub(crate) fn frames_into(data: &[u8], max: usize, out: &mut Vec<u8>) -> Result<()> {
+        out.clear();
+        match zrip::DecompressContext::new().decompress_into_with_limit(data, out, max) {
             Err(DecompressError::OutputTooSmall) => {
-                let mut out = Vec::new();
-                zrip::FrameDecoder::with_limit(data, read_limit(max)).take(max as u64).read_to_end(&mut out)?;
-                Ok(out)
+                out.clear();
+                zrip::FrameDecoder::with_limit(data, read_limit(max)).take(max as u64).read_to_end(out)?;
+                Ok(())
             }
-            r => r.map_err(invalid),
+            r => r.map(drop).map_err(invalid),
         }
     }
 

@@ -76,6 +76,10 @@ def test_overview_levels_open_as_in_rasterio(tmp_path, kind):
             np.testing.assert_array_equal(t.dataset_mask(), g.dataset_mask())
             w = (RW(3, 5, 60, 40), TW(3, 5, 60, 40))
             np.testing.assert_array_equal(t.read(1, window=w[1]), g.read(1, window=w[0]))
+            out = np.empty((40, 60), dtype=g.dtypes[0])
+            result = t.read(1, window=w[1], out=out)
+            np.testing.assert_array_equal(out, g.read(1, window=w[0]))
+            assert np.shares_memory(result, out)
             np.testing.assert_array_equal(
                 t.read(1, out_shape=(t.height // 3, t.width // 3)),
                 g.read(1, out_shape=(g.height // 3, g.width // 3)),

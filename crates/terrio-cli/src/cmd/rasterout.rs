@@ -21,10 +21,11 @@ pub struct OutputArgs {
     /// GeoTIFF/COG tile size.
     #[arg(long)]
     pub tile_size: Option<u32>,
-    /// Write BigTIFF.
+    /// Write BigTIFF, whatever `--co BIGTIFF` says (BIGTIFF=YES).
     #[arg(long)]
     pub bigtiff: bool,
-    /// A creation option, as GDAL names it: `KEY=VALUE` (Zarr: FORMAT=ZARR_V2|ZARR_V3; netCDF:
+    /// A creation option, as GDAL names it: `KEY=VALUE` (GeoTIFF/COG:
+    /// BIGTIFF=YES|NO|IF_NEEDED|IF_SAFER; Zarr: FORMAT=ZARR_V2|ZARR_V3; netCDF:
     /// FORMAT=NC|NC2|NC5|NC4|NC4C, COMPRESS=DEFLATE, ZLEVEL=1..9, CHUNKING=YES|NO).
     #[arg(long = "co", value_name = "KEY=VALUE")]
     pub creation_options: Vec<String>,
